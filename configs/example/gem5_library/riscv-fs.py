@@ -39,10 +39,7 @@ Characteristics
   password: `root`)
 """
 
-import CXLtest
-
 from m5.objects import *
-from m5.objects import MemBus
 from m5.params import *
 
 from gem5.components.boards.riscv_board import RiscvBoard
@@ -90,8 +87,7 @@ board.set_kernel_disk_workload(
 )
 
 # Get the memory bus from the board using the proper method
-board.membus = MemBus()
-xbar = board.membus
+xbar = board.get_cache_hierarchy().membus
 
 # create memory ranges for the serial links
 slar0 = AddrRange(start="0x200000000", size="1GB")
