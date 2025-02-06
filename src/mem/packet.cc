@@ -237,6 +237,13 @@ MemCmd::commandInfo[] =
     { {IsRead, IsResponse}, InvalidCmd, "HTMReqResp" },
     { {IsRead, IsRequest}, InvalidCmd, "HTMAbort" },
     { {IsRequest}, InvalidCmd, "TlbiExtSync" },
+    { {IsRead, IsRequest, NeedsResponse}, MemData, "MemRd"},
+    { {IsWrite, IsRequest, IsEviction, HasData, NeedsResponse, FromCache},
+    Cmp, "MemWr"},
+    { {}, MemWrPtl, "MemWrPtl"},
+    { {}, DataFlit, "DataFlit"},
+    { {IsRead, IsResponse, HasData}, MemData, "MemData"},
+    { {IsResponse}, Cmp, "Cmp"}
 };
 
 AddrRange

@@ -64,8 +64,16 @@ cache_hierarchy = PrivateL1PrivateL2WalkCacheHierarchy(
     l1d_size="32KiB", l1i_size="32KiB", l2_size="512KiB"
 )
 
-# Setup the syste
-memory = SingleChannelDDR3_1600(size="1GB")
+# Setup the system memory with its own range (0x80000000 - 0xBFFFFFFF)
+memory = SingleChannelDDR3_1600()
+# memory.range = AddrRange(start="0x80000000", size="1GB")
+
+# Create non-overlapping memory ranges for CXL devices
+# Start CXL ranges at 0x400000000 to avoid overlap with system memory
+slar0 = AddrRange(start="0x400000000", size="1024MiB")  # CXL controller
+slar = AddrRange(start="0x440000000", size="512MiB")  # CXL device 1
+slar2 = AddrRange(start="0x460000000", size="512MiB")  # CXL device 2
+
 # Setup a single core Processor.
 processor = SimpleProcessor(
     cpu_type=CPUTypes.TIMING, isa=ISA.RISCV, num_cores=1
@@ -88,11 +96,6 @@ board.set_kernel_disk_workload(
 
 # Get the memory bus from the board using the proper method
 xbar = board.get_cache_hierarchy().membus
-
-# create memory ranges for the serial links
-slar0 = AddrRange(start="0x200000000", size="1GB")
-slar = AddrRange(start="0x220000000", size="512MB")
-slar2 = AddrRange(start="0x200000000", size="512MB")
 
 # Create CXL components
 board.cxl_controller = CXLController(
@@ -182,17 +185,17 @@ sl3.mem_side_port = board.pciexbar2.cpu_side_ports
 board.pciexbar2.mem_side_ports = sl4.cpu_side_port
 sl4.mem_side_port = board.cxl_device2.cpu_side_ports
 
-# Memory controller setup
+# Memory controller setup with adjusted ranges
 board.mem_ctrl = MemCtrl()
 mc = board.mem_ctrl
 mc.dram = DDR3_1600_8x8()
-mc.dram.range = AddrRange(start="0x220000000", size="512MB")
+mc.dram.range = AddrRange(start="0x440000000", size="512MiB")  # Match slar
 mc.port = board.cxl_device.mem_side_ports
 
 board.mem_ctrl2 = MemCtrl()
 mc2 = board.mem_ctrl2
 mc2.dram = DDR3_1600_8x8()
-mc2.dram.range = AddrRange(start="0x200000000", size="512MB")
+mc2.dram.range = AddrRange(start="0x460000000", size="512MiB")  # Match slar2
 board.cxl_device2.mem_side_ports = mc2.port
 
 
