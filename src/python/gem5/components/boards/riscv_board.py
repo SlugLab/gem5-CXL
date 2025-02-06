@@ -124,7 +124,6 @@ class RiscvBoard(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
             self.iobus = IOXBar()
             self.iobus.badaddr_responder = BadAddr()
             self.iobus.default = self.iobus.badaddr_responder.pio
-
             # The virtio disk
             self.disk = RiscvMmioVirtIO(
                 vio=VirtIOBlock(),

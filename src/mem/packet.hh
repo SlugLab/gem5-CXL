@@ -149,6 +149,12 @@ class MemCmd
         HTMAbort,
         // Tlb shootdown
         TlbiExtSync,
+        MemRd,
+        MemWr,
+        MemWrPtl,
+        DataFlit,
+        MemData,
+        Cmp,
         NUM_MEM_CMDS
     };
 
@@ -1545,8 +1551,27 @@ class Packet : public Printable, public Extensible<Packet>
      * failed transaction, this function returns the failure reason.
      */
     HtmCacheFailure getHtmTransactionFailedInCacheRC() const;
-};
 
+    public:
+    Command cxl_comm;
+    unsigned cxl_size;
+    unsigned ResCrd;
+    unsigned ReqCrd;
+    unsigned DataCrd;
+    unsigned rollover;
+    bool is_combined;
+
+    unsigned reserved_for_more_NDR;
+    unsigned reserved_for_more_DRS;
+
+    void update_size(unsigned size){
+        this->size = size;
+    };
+
+    AddrRange getCXLAddrRange() const{
+        return RangeSize(getAddr(), cxl_size);
+    };
+};
 } // namespace gem5
 
 #endif //__MEM_PACKET_HH

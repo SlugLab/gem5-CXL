@@ -39,6 +39,12 @@ Characteristics
   password: `root`)
 """
 
+import CXLtest
+
+from m5.objects import *
+from m5.objects import MemBus
+from m5.params import *
+
 from gem5.components.boards.riscv_board import RiscvBoard
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_walk_cache_hierarchy import (
     PrivateL1PrivateL2WalkCacheHierarchy,
@@ -61,9 +67,8 @@ cache_hierarchy = PrivateL1PrivateL2WalkCacheHierarchy(
     l1d_size="32KiB", l1i_size="32KiB", l2_size="512KiB"
 )
 
-# Setup the system memory.
-memory = SingleChannelDDR3_1600()
-
+# Setup the syste
+memory = SingleChannelDDR3_1600(size="1GB")
 # Setup a single core Processor.
 processor = SimpleProcessor(
     cpu_type=CPUTypes.TIMING, isa=ISA.RISCV, num_cores=1
@@ -76,14 +81,124 @@ board = RiscvBoard(
     memory=memory,
     cache_hierarchy=cache_hierarchy,
 )
-
-# Set the Full System workload.
+# Set the Full board workload.
 board.set_kernel_disk_workload(
     kernel=obtain_resource(
         "riscv-bootloader-vmlinux-5.10", resource_version="1.0.0"
     ),
     disk_image=obtain_resource("riscv-disk-img", resource_version="1.0.0"),
 )
+
+# Get the memory bus from the board using the proper method
+board.membus = MemBus()
+xbar = board.membus
+
+# create memory ranges for the serial links
+slar0 = AddrRange(start="0x200000000", size="1GB")
+slar = AddrRange(start="0x220000000", size="512MB")
+slar2 = AddrRange(start="0x200000000", size="512MB")
+
+# Create CXL components
+board.cxl_controller = CXLController(
+    width=16,
+    frontend_latency=2,
+    forward_latency=3,
+    response_latency=3,
+)
+board.cxl_device = CXLDevice(
+    width=16,
+    frontend_latency=2,
+    forward_latency=2,
+    response_latency=4,
+)
+board.cxl_controller.seriallink = SerialLink(
+    ranges=slar0,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+board.cxl_device.seriallink = SerialLink(
+    ranges=slar,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+board.pciexbar = CXLXBar(
+    width=16,
+    frontend_latency=2,
+    forward_latency=1,
+    response_latency=2,
+)
+board.pciexbar2 = CXLXBar(
+    width=16,
+    frontend_latency=2,
+    forward_latency=1,
+    response_latency=2,
+)
+board.cxl_device2 = CXLDevice(
+    width=16,
+    frontend_latency=2,
+    forward_latency=2,
+    response_latency=4,
+)
+board.cxl_device2.seriallink = SerialLink(
+    ranges=slar2,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+board.pciexbar2.seriallink = SerialLink(
+    ranges=slar2,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+
+board.cxl_controller.monitor = CommMonitor()
+
+# Connect the components
+xbar.mem_side_ports = board.cxl_controller.cpu_side_ports
+sl = board.cxl_controller.seriallink
+board.cxl_controller.mem_side_ports = (
+    board.cxl_controller.monitor.cpu_side_port
+)
+board.cxl_controller.monitor.mem_side_port = sl.cpu_side_port
+sl.mem_side_port = board.pciexbar.cpu_side_ports
+
+# cxl board 1
+sl2 = board.cxl_device.seriallink
+board.pciexbar.mem_side_ports = sl2.cpu_side_port
+sl2.mem_side_port = board.cxl_device.cpu_side_ports
+
+# cxl board 2
+sl3 = board.pciexbar2.seriallink
+sl4 = board.cxl_device2.seriallink
+board.pciexbar.mem_side_ports = sl3.cpu_side_port
+sl3.mem_side_port = board.pciexbar2.cpu_side_ports
+board.pciexbar2.mem_side_ports = sl4.cpu_side_port
+sl4.mem_side_port = board.cxl_device2.cpu_side_ports
+
+# Memory controller setup
+board.mem_ctrl = MemCtrl()
+mc = board.mem_ctrl
+mc.dram = DDR3_1600_8x8()
+mc.dram.range = AddrRange(start="0x220000000", size="512MB")
+mc.port = board.cxl_device.mem_side_ports
+
+board.mem_ctrl2 = MemCtrl()
+mc2 = board.mem_ctrl2
+mc2.dram = DDR3_1600_8x8()
+mc2.dram.range = AddrRange(start="0x200000000", size="512MB")
+board.cxl_device2.mem_side_ports = mc2.port
+
 
 simulator = Simulator(board=board)
 print("Beginning simulation!")
