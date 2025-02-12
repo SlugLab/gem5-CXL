@@ -312,7 +312,15 @@ Process::drain()
     fds->updateFileOffsets();
     return DrainState::Drained;
 }
-
+static int id = 0;
+static int get_pool_id() {
+    // return 0;`
+    id++;
+    if (id < 50) {
+        return 0;
+    }
+    return (id % 2) + 1;
+}
 void
 Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
 {
@@ -336,11 +344,13 @@ Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
     }
 
     const int npages = divCeil(size, page_size);
-    const Addr paddr = seWorkload->allocPhysPages(npages);
+    const int pool_id = get_pool_id();
+    const Addr paddr = seWorkload->memPools.allocPhysPages(npages, pool_id);
     const Addr pages_size = npages * page_size;
     pTable->map(page_addr, paddr, pages_size,
                 clobber ? EmulationPageTable::Clobber :
                           EmulationPageTable::MappingFlags(0));
+
 }
 
 void

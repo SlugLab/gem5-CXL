@@ -37,11 +37,9 @@ namespace gem5
 
 class SEWorkload : public Workload
 {
-  protected:
+  public:
     /** Memory allocation objects for all physical memories in the system. */
     MemPools memPools;
-
-  public:
     using Params = SEWorkloadParams;
 
     SEWorkload(const Params &p, Addr page_shift=0);

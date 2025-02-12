@@ -44,6 +44,8 @@ scons build/X86/gem5.opt
 ```
 """
 
+from m5.objects import *
+
 from gem5.prebuilt.demo.x86_demo_board import X86DemoBoard
 from gem5.resources.resource import obtain_resource
 from gem5.simulate.exit_event import ExitEvent
@@ -55,6 +57,111 @@ board = X86DemoBoard()
 
 workload = obtain_resource("x86-ubuntu-24.04-boot-with-systemd")
 board.set_workload(workload)
+xbar = board.get_cache_hierarchy().membus
+slar0 = AddrRange(start="0x400000000", size="1024MiB")  # CXL controller
+slar = AddrRange(start="0x440000000", size="512MiB")  # CXL device 1
+slar2 = AddrRange(start="0x460000000", size="512MiB")  # CXL device 2
+
+# Create CXL components
+board.cxl_controller = CXLController(
+    width=16,
+    frontend_latency=2,
+    forward_latency=3,
+    response_latency=3,
+)
+board.cxl_device = CXLDevice(
+    width=16,
+    frontend_latency=2,
+    forward_latency=2,
+    response_latency=4,
+)
+board.cxl_controller.seriallink = SerialLink(
+    ranges=slar0,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+board.cxl_device.seriallink = SerialLink(
+    ranges=slar,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+board.pciexbar = CXLXBar(
+    width=16,
+    frontend_latency=2,
+    forward_latency=1,
+    response_latency=2,
+)
+board.pciexbar2 = CXLXBar(
+    width=16,
+    frontend_latency=2,
+    forward_latency=1,
+    response_latency=2,
+)
+board.cxl_device2 = CXLDevice(
+    width=16,
+    frontend_latency=2,
+    forward_latency=2,
+    response_latency=4,
+)
+board.cxl_device2.seriallink = SerialLink(
+    ranges=slar2,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+board.pciexbar2.seriallink = SerialLink(
+    ranges=slar2,
+    req_size=10,
+    resp_size=10,
+    num_lanes=16,
+    link_speed=31,
+    delay="100ns",
+)
+
+board.cxl_controller.monitor = CommMonitor()
+
+# Connect the components
+xbar.mem_side_ports = board.cxl_controller.cpu_side_ports
+sl = board.cxl_controller.seriallink
+board.cxl_controller.mem_side_ports = (
+    board.cxl_controller.monitor.cpu_side_port
+)
+board.cxl_controller.monitor.mem_side_port = sl.cpu_side_port
+sl.mem_side_port = board.pciexbar.cpu_side_ports
+
+# cxl board 1
+sl2 = board.cxl_device.seriallink
+board.pciexbar.mem_side_ports = sl2.cpu_side_port
+sl2.mem_side_port = board.cxl_device.cpu_side_ports
+
+# cxl board 2
+sl3 = board.pciexbar2.seriallink
+sl4 = board.cxl_device2.seriallink
+board.pciexbar.mem_side_ports = sl3.cpu_side_port
+sl3.mem_side_port = board.pciexbar2.cpu_side_ports
+board.pciexbar2.mem_side_ports = sl4.cpu_side_port
+sl4.mem_side_port = board.cxl_device2.cpu_side_ports
+
+# Memory controller setup with adjusted ranges
+board.mem_ctrl = MemCtrl()
+mc = board.mem_ctrl
+mc.dram = DDR3_1600_8x8()
+mc.dram.range = AddrRange(start="0x440000000", size="512MiB")  # Match slar
+mc.port = board.cxl_device.mem_side_ports
+
+board.mem_ctrl2 = MemCtrl()
+mc2 = board.mem_ctrl2
+mc2.dram = DDR3_1600_8x8()
+mc2.dram.range = AddrRange(start="0x460000000", size="512MiB")  # Match slar2
+board.cxl_device2.mem_side_ports = mc2.port
 
 
 def exit_event_handler():

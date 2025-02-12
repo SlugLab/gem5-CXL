@@ -247,6 +247,14 @@ DynInst::~DynInst()
             Tick valS = (storeTick == -1) ? 0 : fetch + storeTick;
             DPRINTFR(O3PipeView, "O3PipeView:retire:%llu:store:%llu\n",
                     val, valS);
+            if (this->isStore()) {
+                DPRINTFR(O3PipeView, "O3PipeView:address:%llu\n",
+                    this->effAddr);
+            }
+            if (this->isLoad()) {
+                DPRINTFR(O3PipeView, "O3PipeView:address:%llu\n",
+                    this->effAddr);
+            }
         }
     }
 #endif
