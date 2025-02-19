@@ -451,7 +451,7 @@ CoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
 
     // determine the destination
     const auto route_lookup = routeTo.find(pkt->req);
-    assert(route_lookup != routeTo.end());
+    if (route_lookup != routeTo.end()) return false;
     const PortID cpu_side_port_id = route_lookup->second;
     assert(cpu_side_port_id != InvalidPortID);
     assert(cpu_side_port_id < respLayers.size());

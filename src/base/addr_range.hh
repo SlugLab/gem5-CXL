@@ -81,8 +81,7 @@ typedef std::list<AddrRange> AddrRangeList;
 class AddrRange
 {
 
-  private:
-
+  public:
     /// Private fields for the start and end of the range
     /// _start is the beginning of the range (inclusive).
     /// _end is not part of the range.

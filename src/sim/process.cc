@@ -312,14 +312,9 @@ Process::drain()
     fds->updateFileOffsets();
     return DrainState::Drained;
 }
-static int id = 0;
 static int get_pool_id() {
     // return 0;`
-    id++;
-    if (id < 50) {
-        return 0;
-    }
-    return (id % 2) + 1;
+    return 1;
 }
 void
 Process::allocateMem(Addr vaddr, int64_t size, bool clobber)

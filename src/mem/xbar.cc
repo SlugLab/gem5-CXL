@@ -336,8 +336,10 @@ BaseXBar::findPort(AddrRange addr_range, PacketPtr pkt)
     // we should never see any address lookups before we've got the
     // ranges of all connected CPU-side-port modules
     assert(gotAllAddrRanges);
-
     // Check the address map interval tree
+    if (addr_range._start == addr_range._end) {
+        return portMap.end()->second;
+    }
     auto i = portMap.contains(addr_range);
     if (i != portMap.end()) {
         return i->second;

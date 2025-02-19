@@ -1,11 +1,12 @@
 #ifndef __CXL_CONTROLLER_HH__
 #define __CXL_CONTROLLER_HH__
 
+#include <vector>
+
+#include "base/addr_range.hh"
 #include "mem/xbar.hh"
 #include "params/CXLController.hh"
 
-///#include "base/addr_range.hh"
-//#include <vector>
 namespace gem5
 {
 class CXLController : public BaseXBar
@@ -135,7 +136,7 @@ protected:
       bool TestOutstanding(ResponsePort* src_port);
       bool CreditRelease(std::vector<int>::iterator CrePtr, int count);
       private:
-      CXLController::CXLControllerRequestPort& cxl_port;
+      CXLControllerRequestPort& cxl_port;
       std::deque<ResponsePort*> waitingForCredit;
       unsigned int pkt_outstanding;
     };

@@ -278,9 +278,8 @@ config_filesystem(system, args)
 if args.cxl:
     # Create non-overlapping memory ranges for CXL devices
     # Start CXL ranges at higher addresses and add them to system memory ranges
-    slar0 = AddrRange(start="0x200000000", size="1024MiB")  # CXL controller
-    slar = AddrRange(start="0x220000000", size="512MiB")  # CXL device 1
-    slar2 = AddrRange(start="0x240000000", size="512MiB")  # CXL device 2
+    slar0 = AddrRange(start="0x1ffffffff", size="1024MiB")  # CXL device 2
+    slar = AddrRange(start="0x1ffffffff", size="1024MiB")  # CXL controller
 
     # Get the memory bus from the system
     xbar = system.membus
@@ -320,35 +319,6 @@ if args.cxl:
         forward_latency=1,
         response_latency=2,
     )
-    system.pciexbar2 = CXLXBar(
-        width=16,
-        frontend_latency=2,
-        forward_latency=1,
-        response_latency=2,
-    )
-    system.cxl_device2 = CXLDevice(
-        width=16,
-        frontend_latency=2,
-        forward_latency=2,
-        response_latency=4,
-    )
-    system.cxl_device2.seriallink = SerialLink(
-        ranges=slar2,
-        req_size=10,
-        resp_size=10,
-        num_lanes=16,
-        link_speed=31,
-        delay="100ns",
-    )
-    system.pciexbar2.seriallink = SerialLink(
-        ranges=slar2,
-        req_size=10,
-        resp_size=10,
-        num_lanes=16,
-        link_speed=31,
-        delay="100ns",
-    )
-
     system.cxl_controller.monitor = CommMonitor()
 
     # Connect the components
@@ -365,28 +335,12 @@ if args.cxl:
     system.pciexbar.mem_side_ports = sl2.cpu_side_port
     sl2.mem_side_port = system.cxl_device.cpu_side_ports
 
-    # cxl system 2
-    sl3 = system.pciexbar2.seriallink
-    sl4 = system.cxl_device2.seriallink
-    system.pciexbar.mem_side_ports = sl3.cpu_side_port
-    sl3.mem_side_port = system.pciexbar2.cpu_side_ports
-    system.pciexbar2.mem_side_ports = sl4.cpu_side_port
-    sl4.mem_side_port = system.cxl_device2.cpu_side_ports
-
     # Memory controller setup with adjusted ranges
     system.mem_ctrl = MemCtrl()
     mc = system.mem_ctrl
     mc.dram = DDR3_1600_8x8()
-    mc.dram.range = AddrRange(start="0x220000000", size="512MiB")  # Match slar
+    mc.dram.range = AddrRange(start="0x200000000", size="512MiB")  # Match slar
     mc.port = system.cxl_device.mem_side_ports
-
-    system.mem_ctrl2 = MemCtrl()
-    mc2 = system.mem_ctrl2
-    mc2.dram = DDR3_1600_8x8()
-    mc2.dram.range = AddrRange(
-        start="0x200000000", size="512MiB"
-    )  # Match slar2
-    system.cxl_device2.mem_side_ports = mc2.port
 
 
 system.workload = SEWorkload.init_compatible(mp0_path)
