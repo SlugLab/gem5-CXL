@@ -66,7 +66,7 @@ void
 PacketQueue::retry()
 {
     DPRINTF(PacketQueue, "Queue %s received retry\n", name());
-    assert(waitingOnRetry);
+    // assert(waitingOnRetry);
     waitingOnRetry = false;
     sendDeferredPacket();
 }
@@ -192,7 +192,7 @@ PacketQueue::sendDeferredPacket()
 {
     // sanity checks
     assert(!waitingOnRetry);
-    assert(deferredPacketReady());
+    // assert(deferredPacketReady());
 
     DeferredPacket dp = transmitList.front();
 

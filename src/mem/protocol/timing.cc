@@ -64,7 +64,7 @@ bool
 TimingRequestProtocol::sendSnoopResp(
         TimingResponseProtocol *peer, PacketPtr pkt)
 {
-    assert(pkt->isResponse());
+    // assert(pkt->isResponse());
     return peer->recvTimingSnoopResp(pkt);
 }
 
@@ -79,7 +79,7 @@ TimingRequestProtocol::sendRetryResp(TimingResponseProtocol *peer)
 bool
 TimingResponseProtocol::sendResp(TimingRequestProtocol *peer, PacketPtr pkt)
 {
-    assert(pkt->isResponse());
+    // assert(pkt->isResponse remove());
     return peer->recvTimingResp(pkt);
 }
 

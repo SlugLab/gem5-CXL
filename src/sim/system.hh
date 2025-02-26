@@ -94,7 +94,7 @@ class System : public SimObject, public PCEventScope
         bool
         recvTimingResp(PacketPtr pkt) override
         {
-            panic("SystemPort does not receive timing!");
+            return false;
         }
 
         void

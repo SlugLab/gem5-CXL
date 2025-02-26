@@ -154,6 +154,8 @@ class MemCmd
         MemWrPtl,
         DataFlit,
         MemData,
+        ClFlush,
+        MFence,
         Cmp,
         NUM_MEM_CMDS
     };

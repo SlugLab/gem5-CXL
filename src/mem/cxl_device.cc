@@ -118,7 +118,43 @@ bool CXLDevice::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id){
 
     // store the old header delay so we can restore it if needed
     Tick old_header_delay = pkt->headerDelay;
+    if (pkt->cmd == MemCmd::ClFlush || pkt->cxl_comm == MemCmd::ClFlush) {
+        // 对于CLFLUSH，执行缓存线刷新操作
+        // 这里需要实际执行刷新逻辑，可能需要修改模拟的内存状态
 
+        pkt->makeResponse();
+
+        // 设置响应时间等
+        Tick response_latency = 10 * clockPeriod();
+        pkt->payloadDelay = response_latency;
+
+        // 发送响应
+        cpuSidePorts[cpu_side_port_id]->schedTimingResp(
+            pkt, curTick() + response_latency);
+
+        return true;
+    }
+    if (pkt->cmd == MemCmd::MFence || pkt->cxl_comm == MemCmd::MFence) {
+        // 执行内存屏障操作
+        // 确保所有挂起的内存操作完成
+        // flushWriteBuffer();
+        //
+        // // 等待所有读操作完成
+        // waitForReadCompletion();
+
+        // 创建响应
+        pkt->makeResponse();
+
+        // 设置响应时间
+        Tick response_latency = 200 * clockPeriod();
+        pkt->payloadDelay = response_latency;
+
+        // 发送响应
+        cpuSidePorts[cpu_side_port_id]->schedTimingResp(pkt,
+                                               curTick() + response_latency);
+
+        return true;
+    }
     //If MemWr command has 4 data roll over,
     //we will modify packet size.
     //data flit's size is 65 bytes.
@@ -314,17 +350,23 @@ bool CXLDevice::CXLDeviceResponsePort::combine_command(PacketPtr pkt){
 };
 
 void CXLDevice::generate_cxl_rep(PacketPtr pkt){
-    /*if (pkt->is_combined){
-        //we only generate a data Flit
-        pkt->rollover = 0;
-        pkt->reserved_for_more_NDR = 0;
-        pkt->cxl_size = DATA_FLIT;
-        return ;
-    }*/
+    // 确保这是一个有效的响应包
+    if (!pkt->isResponse()) {
+        DPRINTF(CXLDevice, "警告: 尝试生成CXL响应但包不是响应类型\n");
+        pkt->makeResponse();
+    }
+
+    // 确保命令字段有效
+        if (pkt->hasData()) {
+            pkt->cmd = MemCmd::ReadResp;
+        } else {
+            pkt->cmd = MemCmd::WriteResp;
+        }
+
     pkt->reserved_for_more_DRS = 3;
     pkt->reserved_for_more_NDR = 2;
     //Consider rollover if this is RWD
-    if (pkt->cmd == MemCmd::Command::MemData){
+    if (pkt->cmd == MemCmd::Command::MemData) {
         pkt->reserved_for_more_DRS--;
         pkt->rollover = (last_rollover + 4) - 3;
         last_rollover = pkt->rollover;
@@ -334,6 +376,9 @@ void CXLDevice::generate_cxl_rep(PacketPtr pkt){
         last_rollover = 0;
     }
     pkt->cxl_size = FLIT_SIZE;
+
+    // 再次验证包是有效的响应类型
+    assert(pkt->isResponse());
 };
 
 CXLRespPacketQueue::CXLRespPacketQueue(

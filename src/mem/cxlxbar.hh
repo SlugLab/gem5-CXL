@@ -67,7 +67,6 @@ namespace gem5
 class CXLXBar : public BaseXBar
 {
 
-  protected:
 
     /**
      * Declare the layers of this crossbar, one vector for requests

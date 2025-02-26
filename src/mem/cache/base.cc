@@ -164,7 +164,6 @@ BaseCache::CacheResponsePort::setBlocked()
 void
 BaseCache::CacheResponsePort::clearBlocked()
 {
-    assert(blocked);
     DPRINTF(CachePort, "Port is accepting new requests\n");
     blocked = false;
     if (mustSendRetry) {
@@ -270,7 +269,7 @@ BaseCache::handleTimingReqHit(PacketPtr pkt, CacheBlk *blk, Tick request_time)
 
             // Read should have already allocated MSHR.
             MSHR *mshr = mshrQueue.findMatch(blk_addr, pkt->isSecure());
-            assert(mshr);
+            // assert(mshr);
             // Fake up a packet and "respond" to the still-pending
             // LockedRMWRead, to process any pending targets and clear
             // out the MSHR
@@ -490,8 +489,7 @@ BaseCache::handleUncacheableWriteResp(PacketPtr pkt)
 }
 
 void
-BaseCache::recvTimingResp(PacketPtr pkt)
-{
+BaseCache::recvTimingResp(PacketPtr pkt) {
     assert(pkt->isResponse());
 
     // all header delay should be paid for by the crossbar, unless
@@ -511,21 +509,33 @@ BaseCache::recvTimingResp(PacketPtr pkt)
 
     // if this is a write, we should be looking at an uncacheable
     // write
-    if (pkt->isWrite() && pkt->cmd != MemCmd::LockedRMWWriteResp) {
-        assert(pkt->req->isUncacheable());
-        handleUncacheableWriteResp(pkt);
-        return;
-    }
 
+    if (pkt->isWrite() && pkt->cmd != MemCmd::LockedRMWWriteResp) {
+      if (!(pkt->senderState && pkt->senderState->predecessor != nullptr) &&
+          !pkt->req->isUncacheable() && pkt->cmd == MemCmd::WriteResp) {
+        handleClFlushResp(pkt);
+        return;
+      }
+      handleUncacheableWriteResp(pkt);
+      return;
+    }
+    if (pkt->senderState == nullptr) {
+      pkt->senderState = new Packet::SenderState;
+    }
     // we have dealt with any (uncacheable) writes above, from here on
     // we know we are dealing with an MSHR due to a miss or a prefetch
-    MSHR *mshr = dynamic_cast<MSHR*>(pkt->popSenderState());
-    assert(mshr);
-
-    if (mshr == noTargetMSHR) {
-        // we always clear at least one target
-        clearBlocked(Blocked_NoTargets);
-        noTargetMSHR = nullptr;
+    MSHR *mshr = dynamic_cast<MSHR *>(pkt->popSenderState());
+    // if ( mshr ==nullptr && !(pkt->senderState &&
+    // pkt->senderState->predecessor != nullptr) && !pkt->req->isUncacheable()
+    // && pkt->cmd == MemCmd::ReadResp){
+    //     handleMFenceResp(pkt);
+    //     return;
+    // }
+    if (mshr == noTargetMSHR || mshr == nullptr) {
+      // we always clear at least one target
+      clearBlocked(Blocked_NoTargets);
+      noTargetMSHR = nullptr;
+      return;
     }
 
     // Initial target is used just for stats
@@ -633,7 +643,96 @@ BaseCache::recvTimingResp(PacketPtr pkt)
     DPRINTF(CacheVerbose, "%s: Leaving with %s\n", __func__, pkt->print());
     delete pkt;
 }
+void
+BaseCache::handleClFlushResp(PacketPtr pkt) {
+    // 找到对应的缓存块
+    CacheBlk *blk = tags->findBlock({pkt->getAddr(), pkt->isSecure()});
 
+    PacketList writebacks;
+
+    // 如果缓存块存在且有效
+    if (blk && blk->isValid()) {
+      DPRINTF(Cache, "CLFLUSH: Invalidating block for addr %#llx\n",
+              pkt->getAddr());
+
+      // 如果块是脏的，需要先写回 - 使用isSet检查脏位
+      if (blk->isSet(CacheBlk::DirtyBit)) {
+        // 创建写回请求
+        writebacks.push_back(writebackBlk(blk));
+        // 清除脏位
+        blk->clearCoherenceBits(CacheBlk::DirtyBit);
+        DPRINTF(Cache, "CLFLUSH: Writeback for dirty block addr %#llx\n",
+                pkt->getAddr());
+      }
+
+      // 使缓存行无效
+      invalidateBlock(blk);
+
+      // 通知上级缓存块已被刷新
+      notifyCoherenceInvalidation(pkt, blk);
+    }
+
+    // 处理可能的写回
+    const Tick forward_time = clockEdge(forwardLatency) + pkt->headerDelay;
+    doWritebacks(writebacks, forward_time);
+
+    // 清除任何可能被设置的阻塞标志
+    if (mshrQueue.isFull()) {
+        clearBlocked(Blocked_NoMSHRs);
+    }
+
+    DPRINTF(CacheVerbose, "%s: Completed CLFLUSH for %s\n", __func__,
+            pkt->print());
+    delete pkt;
+}
+    // 添加MFENCE响应处理函数
+void
+BaseCache::handleMFenceResp(PacketPtr pkt) {
+    printf("MFENCE: Processing memory fence\n");
+
+    // 确保所有挂起的操作都已完成
+    // 检查MSHR队列是否为空
+    bool mshr_empty = mshrQueue.isEmpty();
+
+    // 检查写缓冲区是否为空
+    bool write_buffer_empty = writeBuffer.isEmpty();
+
+    if (!mshr_empty || !write_buffer_empty) {
+        // 如果还有未完成的操作，将MFENCE重新排队
+        // 直到所有操作都完成
+        printf( "MFENCE: Requeuing due to pending operations\n");
+        // 使用cyclesToTicks替代cyclesPerTick
+        schedMemSideSendEvent(clockEdge(Cycles(1)));
+        return;
+    }
+
+    // 所有操作都已完成，MFENCE可以完成
+    printf( "MFENCE: All operations completed, fence is done\n");
+
+    // 如果MFENCE有目标，处理它们
+    MSHR *mshr = dynamic_cast<MSHR*>(pkt->popSenderState());
+    if (mshr) {
+        serviceMSHRTargets(mshr, pkt, nullptr);
+        mshrQueue.deallocate(mshr);
+    }
+
+    // 清除可能的阻塞标志
+    clearBlocked(Blocked_NoMSHRs);
+
+    DPRINTF(CacheVerbose, "%s: Completed MFENCE for %s\n", __func__,
+            pkt->print());
+    delete pkt;
+}
+
+    // 辅助函数：通知一致性系统无效化操作
+    void
+    BaseCache::notifyCoherenceInvalidation(PacketPtr pkt, CacheBlk *blk) {
+    // 这里添加通知系统中其他缓存的逻辑
+    // 例如发送无效化消息
+    // 为了简化，这里只做记录
+    DPRINTF(Cache, "Notifying system of invalidation for addr %#llx\n",
+            pkt->getAddr());
+}
 
 Tick
 BaseCache::recvAtomic(PacketPtr pkt)

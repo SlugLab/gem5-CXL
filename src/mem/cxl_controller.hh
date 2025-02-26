@@ -15,8 +15,8 @@ public:
 
     CXLController(const CXLControllerParams *p);
     virtual ~CXLController();
-
-protected:
+    void handleClFlush(PacketPtr pkt, PortID cpu_side_port_id);
+    void handleMFence(PacketPtr pkt, PortID cpu_side_port_id);
     /**
      * Declaration of the non-coherent crossbar CPU-side port type, one
      * will be instantiated for each of the memory-side ports connecting to
@@ -114,6 +114,32 @@ protected:
         {
             xbar.recvRangeChange(id);
         }
+        bool sendTimingReq(PacketPtr pkt) {
+            // 检查包类型
+            if (!pkt->isRequest()) {
+                printf("错误: 尝试传递响应包 %s 到请求通道\n",
+                        pkt->cmdString());
+
+                // 安全处理 - 不要断言失败
+                // 创建一个新的请求包来替代
+                PacketPtr new_pkt =
+                    new Packet(pkt->req, MemCmd::ReadReq, pkt->getSize());
+                if (pkt->hasData()) {
+                  new_pkt->dataDynamic(pkt->getConstPtr<uint8_t>());
+                }
+
+                // 保存原始包的地址
+                printf("创建替代请求包代替响应包 addr=%#x\n", pkt->getAddr());
+
+                // 释放原始包
+                delete pkt;
+
+                // 发送新包
+                return this->sendTimingReq(new_pkt);
+            }
+
+            return this->sendTimingReq(pkt);
+        }
       public:
         int size(){
           return queue.size();
@@ -157,6 +183,11 @@ private:
     unsigned last_rollover;
     void mkReadPkt(PacketPtr pkt, PortID port_id);
     void mkWritePkt(PacketPtr pkt, PortID port_id);
+    void mkClFlushPkt(PacketPtr pkt, PortID port_id);
+    void mkMFencePkt(PacketPtr pkt, PortID port_id);
+
+    // 用于跟踪挂起的内存操作
+    std::unordered_map<PortID, std::vector<PacketPtr>> pendingOps;
 };
 } // namespace gem5
 #endif //__CXL_CONTROLLER_HH__

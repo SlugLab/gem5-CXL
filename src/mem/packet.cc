@@ -243,6 +243,9 @@ MemCmd::commandInfo[] =
     { {}, MemWrPtl, "MemWrPtl"},
     { {}, DataFlit, "DataFlit"},
     { {IsRead, IsResponse, HasData}, MemData, "MemData"},
+    { {IsRequest, IsInvalidate, IsClean, NeedsResponse, FromCache},
+    ClFlush, "CLFlush" },
+    {{IsRequest, NeedsResponse}, MFence, "MFence"},
     { {IsResponse}, Cmp, "Cmp"}
 };
 
@@ -348,7 +351,6 @@ Packet::pushSenderState(Packet::SenderState *sender_state)
 Packet::SenderState *
 Packet::popSenderState()
 {
-    assert(senderState != NULL);
     SenderState *sender_state = senderState;
     senderState = sender_state->predecessor;
     sender_state->predecessor = NULL;

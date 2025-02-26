@@ -337,9 +337,7 @@ BaseXBar::findPort(AddrRange addr_range, PacketPtr pkt)
     // ranges of all connected CPU-side-port modules
     assert(gotAllAddrRanges);
     // Check the address map interval tree
-    if (addr_range._start == addr_range._end) {
-        return portMap.end()->second;
-    }
+
     auto i = portMap.contains(addr_range);
     if (i != portMap.end()) {
         return i->second;
@@ -366,6 +364,9 @@ BaseXBar::findPort(AddrRange addr_range, PacketPtr pkt)
             pkt->getExtension<TracingExtension>();
         port_trace = ext ? ext->getTraceInString() :
             "Use --debug-flags=PortTrace to see the port trace of the packet.";
+    }
+    if (addr_range._start == addr_range._end) {
+        return portMap.end()->second;
     }
     fatal("Unable to find destination for %s on %s\n%s\n",
           addr_range.to_string(), name(), port_trace);

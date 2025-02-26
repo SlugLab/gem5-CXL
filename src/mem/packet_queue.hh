@@ -221,6 +221,27 @@ public:
     void disableSanityCheck() { _disableSanityCheck = true; }
 
     DrainState drain() override;
+    DeferredPacketList::iterator queue_ptr;
+
+    void resetQueuePtr(){
+      queue_ptr = transmitList.begin();
+    }
+
+    PacketPtr workAroundQueue(){
+      if (queue_ptr == transmitList.end())
+      return NULL;
+      PacketPtr tmp = queue_ptr->pkt;
+      queue_ptr++;
+      return tmp;
+    }
+
+    PacketPtr LastPkt(){
+      return transmitList.back().pkt;
+    }
+
+    void pop_back(){
+      transmitList.pop_back();
+    }
 };
 
 class ReqPacketQueue : public PacketQueue

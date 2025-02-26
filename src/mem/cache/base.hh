@@ -119,7 +119,9 @@ class BaseCache : public ClockedObject
         Blocked_NoTargets,
         NUM_BLOCKED_CAUSES
     };
-
+ void notifyCoherenceInvalidation(PacketPtr pkt, CacheBlk *blk);
+ void handleClFlushResp(PacketPtr pkt);
+ void handleMFenceResp(PacketPtr pkt);
   protected:
 
     /**

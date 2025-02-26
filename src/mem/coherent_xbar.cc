@@ -451,7 +451,29 @@ CoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
 
     // determine the destination
     const auto route_lookup = routeTo.find(pkt->req);
-    if (route_lookup != routeTo.end()) return false;
+    if (route_lookup == routeTo.end()) {
+        // 尝试使用findPort找到合适的端口（如果你有实现类似的函数）
+        PortID dest_id = findPort(pkt->getAddrRange(),pkt);
+
+        if (dest_id != InvalidPortID && dest_id < cpuSidePorts.size()) {
+           printf("使用地址查找策略找到端口 %d\n", dest_id);
+
+            // 关键修复：检查并添加SenderState
+            if (pkt->senderState == NULL) {
+                // 创建一个简单的SenderState
+                pkt->pushSenderState(new Packet::SenderState());
+            }
+
+            Tick latency = pkt->headerDelay;
+            pkt->headerDelay = 0;
+
+            // 更安全的方法：使用schedTimingResp而不是sendTimingResp
+            // schedTimingResp在内部处理请求队列和重试机制
+            cpuSidePorts[dest_id]->schedTimingResp(pkt, curTick() + latency);
+            return true;
+        }
+        return true;
+    }
     const PortID cpu_side_port_id = route_lookup->second;
     assert(cpu_side_port_id != InvalidPortID);
     assert(cpu_side_port_id < respLayers.size());

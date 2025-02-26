@@ -40,7 +40,6 @@ public:
     CXLDevice(const CXLDeviceParams *p);
     virtual ~CXLDevice();
     friend class CXLRespPacketQueue;
-protected:
     //std::vector<QueuedRequestPort*> memSidePorts;
 
     /**
