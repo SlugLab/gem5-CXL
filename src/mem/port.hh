@@ -580,6 +580,10 @@ RequestPort::sendFunctional(PacketPtr pkt) const
 {
     try {
         addTrace(pkt);
+        if ((long)this < 0x1836573 || (long)this > 0x60000000000) {
+            removeTrace(pkt);
+            return;
+        }
         FunctionalRequestProtocol::send(_responsePort, pkt);
         removeTrace(pkt);
     } catch (UnboundPortException) {

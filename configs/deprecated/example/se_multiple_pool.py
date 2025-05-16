@@ -266,9 +266,6 @@ for i in range(np):
         )
         system.cpu[i].branchPred.indirectBranchPred = indirectBPClass()
 
-    system.cpu[i].numROBEntries = 512
-    system.cpu[i].LQEntries = 512
-    system.cpu[i].SQEntries = 512
     system.cpu[i].createThreads()
 
 MemClass = Simulation.setMemClass(args)
@@ -279,73 +276,174 @@ MemConfig.config_mem(args, system)
 config_filesystem(system, args)
 
 if args.cxl:
-    # Create non-overlapping memory ranges for CXL devices
-    # Start CXL ranges at higher addresses and add them to system memory ranges
-    slar0 = AddrRange(start="0x1ffffffff", size="1024MiB")  # CXL device 2
-    slar = AddrRange(start="0x1ffffffff", size="1024MiB")  # CXL controller
 
-    # Get the memory bus from the system
-    xbar = system.membus
+    # 1) Root-level memory
+    system.main_mem_ctrl = MemCtrl()
+    system.main_mem_ctrl.dram = DDR3_1600_8x8()
+    system.main_mem_ctrl.dram.range = AddrRange("0x80000000", size="512MiB")
+    system.main_mem_ctrl.port = system.membus.mem_side_ports
 
-    # Create CXL components
-    system.cxl_controller = CXLController(
-        width=16,
-        frontend_latency=2,
-        forward_latency=3,
-        response_latency=3,
-    )
-    system.cxl_device = CXLDevice(
+    # 2) Root crossbar (acting like an upstream aggregator)
+    system.root_xbar = CXLXBar(
         width=16,
         frontend_latency=2,
         forward_latency=2,
-        response_latency=4,
-    )
-    system.cxl_controller.seriallink = SerialLink(
-        ranges=slar0,
-        req_size=10,
-        resp_size=10,
-        num_lanes=16,
-        link_speed=31,
-        delay="100ns",
-    )
-    system.cxl_device.seriallink = SerialLink(
-        ranges=slar,
-        req_size=10,
-        resp_size=10,
-        num_lanes=16,
-        link_speed=31,
-        delay="100ns",
-    )
-    system.pciexbar = CXLXBar(
-        width=16,
-        frontend_latency=2,
-        forward_latency=1,
         response_latency=2,
     )
-    system.cxl_controller.monitor = CommMonitor()
 
-    # Connect the components
-    xbar.mem_side_ports = system.cxl_controller.cpu_side_ports
-    sl = system.cxl_controller.seriallink
-    system.cxl_controller.mem_side_ports = (
-        system.cxl_controller.monitor.cpu_side_port
+    # Connect system bus -> root_xbar
+    system.membus.mem_side_ports = system.root_xbar.cpu_side_ports
+
+    # 3) Two separate CXL controllers (branches)
+    system.cxl_controllerA = CXLController(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
     )
-    system.cxl_controller.monitor.mem_side_port = sl.cpu_side_port
-    sl.mem_side_port = system.pciexbar.cpu_side_ports
+    system.cxl_controllerB = CXLController(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
 
-    # cxl system 1
-    sl2 = system.cxl_device.seriallink
-    system.pciexbar.mem_side_ports = sl2.cpu_side_port
-    sl2.mem_side_port = system.cxl_device.cpu_side_ports
+    system.cxl_controllerA.monitor = CommMonitor()
+    system.cxl_controllerB.monitor = CommMonitor()
 
-    # Memory controller setup with adjusted ranges
-    system.mem_ctrl = MemCtrl()
-    mc = system.mem_ctrl
-    mc.dram = DDR3_1600_8x8()
-    mc.dram.range = AddrRange(
-        start="0x200000000", size="1024MiB"
-    )  # Match slar
-    mc.port = system.cxl_device.mem_side_ports
+    # A) Connect controller A to root_xbar
+    system.root_xbar.mem_side_ports = system.cxl_controllerA.cpu_side_ports
+    system.cxl_controllerA.mem_side_ports = (
+        system.cxl_controllerA.monitor.cpu_side_port
+    )
+
+    # B) Connect controller B to root_xbar
+    system.root_xbar.mem_side_ports = system.cxl_controllerB.cpu_side_ports
+    system.cxl_controllerB.mem_side_ports = (
+        system.cxl_controllerB.monitor.cpu_side_port
+    )
+
+    # 4) Each controller has its own "downstream" crossbar
+    system.xbarA = CXLXBar(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
+    system.xbarB = CXLXBar(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
+
+    # Controller A -> serial link -> xbarA
+    system.cxl_controllerA.seriallink = SerialLink(
+        ranges=AddrRange(
+            "0x200000000", size="2GiB"
+        ),  # large range covering multiple devices
+        req_size=10,
+        resp_size=10,
+        num_lanes=16,
+        link_speed=31,
+        delay="100ns",
+    )
+    A_monitor = system.cxl_controllerA.monitor
+    A_monitor.mem_side_port = system.cxl_controllerA.seriallink.cpu_side_port
+    system.cxl_controllerA.seriallink.mem_side_port = (
+        system.xbarA.cpu_side_ports
+    )
+
+    # Controller B -> serial link -> xbarB
+    system.cxl_controllerB.seriallink = SerialLink(
+        ranges=AddrRange("0x300000000", size="2GiB"),
+        req_size=10,
+        resp_size=10,
+        num_lanes=16,
+        link_speed=31,
+        delay="100ns",
+    )
+    B_monitor = system.cxl_controllerB.monitor
+    B_monitor.mem_side_port = system.cxl_controllerB.seriallink.cpu_side_port
+    system.cxl_controllerB.seriallink.mem_side_port = (
+        system.xbarB.cpu_side_ports
+    )
+
+    # 5) Multiple devices behind each crossbar (pooling)
+
+    # --- Pool A: Device 0 and 1 ---
+    system.cxl_deviceA0 = CXLDevice(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
+    system.cxl_deviceA0.seriallink = SerialLink(
+        ranges=AddrRange("0x200000000", size="512MiB"),
+        req_size=10,
+        resp_size=10,
+        num_lanes=16,
+        link_speed=31,
+        delay="100ns",
+    )
+    system.xbarA.mem_side_ports = system.cxl_deviceA0.seriallink.cpu_side_port
+    system.cxl_deviceA0.seriallink.mem_side_port = (
+        system.cxl_deviceA0.cpu_side_ports
+    )
+
+    system.mem_ctrlA0 = MemCtrl()
+    system.mem_ctrlA0.dram = DDR3_1600_8x8()
+    system.mem_ctrlA0.dram.range = AddrRange("0x200000000", size="512MiB")
+    system.mem_ctrlA0.port = system.cxl_deviceA0.mem_side_ports
+
+    system.cxl_deviceA1 = CXLDevice(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
+    system.cxl_deviceA1.seriallink = SerialLink(
+        ranges=AddrRange("0x280000000", size="512MiB"),
+        req_size=10,
+        resp_size=10,
+        num_lanes=16,
+        link_speed=31,
+        delay="100ns",
+    )
+    system.xbarA.mem_side_ports = system.cxl_deviceA1.seriallink.cpu_side_port
+    system.cxl_deviceA1.seriallink.mem_side_port = (
+        system.cxl_deviceA1.cpu_side_ports
+    )
+
+    system.mem_ctrlA1 = MemCtrl()
+    system.mem_ctrlA1.dram = DDR3_1600_8x8()
+    system.mem_ctrlA1.dram.range = AddrRange("0x280000000", size="512MiB")
+    system.mem_ctrlA1.port = system.cxl_deviceA1.mem_side_ports
+
+    # --- Pool B: Device 0 and 1 ---
+    system.cxl_deviceB0 = CXLDevice(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
+    system.cxl_deviceB0.seriallink = SerialLink(
+        ranges=AddrRange("0x300000000", size="512MiB"),
+        req_size=10,
+        resp_size=10,
+        num_lanes=16,
+        link_speed=31,
+        delay="100ns",
+    )
+    system.xbarB.mem_side_ports = system.cxl_deviceB0.seriallink.cpu_side_port
+    system.cxl_deviceB0.seriallink.mem_side_port = (
+        system.cxl_deviceB0.cpu_side_ports
+    )
+
+    system.mem_ctrlB0 = MemCtrl()
+    system.mem_ctrlB0.dram = DDR3_1600_8x8()
+    system.mem_ctrlB0.dram.range = AddrRange("0x300000000", size="512MiB")
+    system.mem_ctrlB0.port = system.cxl_deviceB0.mem_side_ports
+
+    system.cxl_deviceB1 = CXLDevice(
+        width=16, frontend_latency=2, forward_latency=2, response_latency=2
+    )
+    system.cxl_deviceB1.seriallink = SerialLink(
+        ranges=AddrRange("0x380000000", size="512MiB"),
+        req_size=10,
+        resp_size=10,
+        num_lanes=16,
+        link_speed=31,
+        delay="100ns",
+    )
+    system.xbarB.mem_side_ports = system.cxl_deviceB1.seriallink.cpu_side_port
+    system.cxl_deviceB1.seriallink.mem_side_port = (
+        system.cxl_deviceB1.cpu_side_ports
+    )
+
+    system.mem_ctrlB1 = MemCtrl()
+    system.mem_ctrlB1.dram = DDR3_1600_8x8()
+    system.mem_ctrlB1.dram.range = AddrRange("0x380000000", size="512MiB")
+    system.mem_ctrlB1.port = system.cxl_deviceB1.mem_side_ports
 
 
 system.workload = SEWorkload.init_compatible(mp0_path)

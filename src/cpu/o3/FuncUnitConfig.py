@@ -180,7 +180,7 @@ class RdWrPort(FUDesc):
         OpDesc(opClass="SimdWholeRegisterLoad"),
         OpDesc(opClass="SimdWholeRegisterStore"),
     ]
-    count = 4
+    count = 8
 
 
 class IprPort(FUDesc):

@@ -186,7 +186,7 @@ const int cpx_numarb=8;
 
 const int numPhysFloatRegs=256;
 const int numPhysIntRegs=32;
-const int numROBEntries=192;
+const int numROBEntries=512;
 const int umRobs=1;
 
 const int BTBEntries=4096;
