@@ -67,11 +67,11 @@
 #define M5OP_ADD_SYMBOL         0x53
 #define M5OP_PANIC              0x54
 
-#define M5OP_RESERVED1          0x55 // Reserved for user, used to be annotate
-#define M5OP_RESERVED2          0x56 // Reserved for user
-#define M5OP_RESERVED3          0x57 // Reserved for user
-#define M5OP_RESERVED4          0x58 // Reserved for user
-#define M5OP_RESERVED5          0x59 // Reserved for user
+#define M5OP_AMU_ALOAD          0x55
+#define M5OP_AMU_ASTORE         0x56
+#define M5OP_AMU_GETFIN         0x57
+#define M5OP_AMU_CFGWR          0x58
+#define M5OP_AMU_CFGRD          0x59
 
 #define M5OP_WORK_BEGIN         0x5a
 #define M5OP_WORK_END           0x5b
@@ -104,6 +104,11 @@
     M5OP(m5_switch_cpu, M5OP_SWITCH_CPU)                        \
     M5OP(m5_add_symbol, M5OP_ADD_SYMBOL)                        \
     M5OP(m5_panic, M5OP_PANIC)                                  \
+    M5OP(m5_amu_aload, M5OP_AMU_ALOAD)                          \
+    M5OP(m5_amu_astore, M5OP_AMU_ASTORE)                        \
+    M5OP(m5_amu_getfin, M5OP_AMU_GETFIN)                        \
+    M5OP(m5_amu_cfgwr, M5OP_AMU_CFGWR)                          \
+    M5OP(m5_amu_cfgrd, M5OP_AMU_CFGRD)                          \
     M5OP(m5_work_begin, M5OP_WORK_BEGIN)                        \
     M5OP(m5_work_end, M5OP_WORK_END)                            \
     M5OP(m5_dist_toggle_sync, M5OP_DIST_TOGGLE_SYNC)            \

@@ -58,9 +58,27 @@ board = X86DemoBoard()
 workload = obtain_resource("x86-ubuntu-24.04-boot-with-systemd")
 board.set_workload(workload)
 xbar = board.get_cache_hierarchy().membus
-slar0 = AddrRange(start="0x400000000", size="1024MiB")  # CXL controller
-slar = AddrRange(start="0x440000000", size="512MiB")  # CXL device 1
-slar2 = AddrRange(start="0x460000000", size="512MiB")  # CXL device 2
+cxl_window = AddrRange(start="0x440000000", size="1024MiB")
+cxl_range0 = AddrRange(start="0x440000000", size="512MiB")
+cxl_range1 = AddrRange(start="0x460000000", size="512MiB")
+
+# Make the CXL capacity visible to the x86 workload as ordinary RAM. The
+# default X86DemoBoard E820 table only advertises the 3GiB local DRAM range.
+board.mem_ranges.extend([cxl_range0, cxl_range1])
+board.workload.e820_table.entries.extend(
+    [
+        X86E820Entry(
+            addr=cxl_range0.start,
+            size=f"{cxl_range0.size():d}B",
+            range_type=1,
+        ),
+        X86E820Entry(
+            addr=cxl_range1.start,
+            size=f"{cxl_range1.size():d}B",
+            range_type=1,
+        ),
+    ]
+)
 
 # Create CXL components
 board.cxl_controller = CXLController(
@@ -76,7 +94,7 @@ board.cxl_device = CXLDevice(
     response_latency=4,
 )
 board.cxl_controller.seriallink = SerialLink(
-    ranges=slar0,
+    ranges=cxl_window,
     req_size=10,
     resp_size=10,
     num_lanes=16,
@@ -84,7 +102,7 @@ board.cxl_controller.seriallink = SerialLink(
     delay="100ns",
 )
 board.cxl_device.seriallink = SerialLink(
-    ranges=slar,
+    ranges=cxl_range0,
     req_size=10,
     resp_size=10,
     num_lanes=16,
@@ -110,7 +128,7 @@ board.cxl_device2 = CXLDevice(
     response_latency=4,
 )
 board.cxl_device2.seriallink = SerialLink(
-    ranges=slar2,
+    ranges=cxl_range1,
     req_size=10,
     resp_size=10,
     num_lanes=16,
@@ -118,7 +136,7 @@ board.cxl_device2.seriallink = SerialLink(
     delay="100ns",
 )
 board.pciexbar2.seriallink = SerialLink(
-    ranges=slar2,
+    ranges=cxl_range1,
     req_size=10,
     resp_size=10,
     num_lanes=16,
@@ -154,13 +172,13 @@ sl4.mem_side_port = board.cxl_device2.cpu_side_ports
 board.mem_ctrl = MemCtrl()
 mc = board.mem_ctrl
 mc.dram = DDR3_1600_8x8()
-mc.dram.range = AddrRange(start="0x440000000", size="512MiB")  # Match slar
+mc.dram.range = cxl_range0
 mc.port = board.cxl_device.mem_side_ports
 
 board.mem_ctrl2 = MemCtrl()
 mc2 = board.mem_ctrl2
 mc2.dram = DDR3_1600_8x8()
-mc2.dram.range = AddrRange(start="0x460000000", size="512MiB")  # Match slar2
+mc2.dram.range = cxl_range1
 board.cxl_device2.mem_side_ports = mc2.port
 
 

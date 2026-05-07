@@ -64,6 +64,11 @@ void m5_dist_toggle_sync(void);
 void m5_add_symbol(uint64_t addr, const char *symbol);
 void m5_load_symbol();
 void m5_panic(void);
+uint64_t m5_amu_aload(void *spm_addr, const void *mem_addr);
+uint64_t m5_amu_astore(const void *spm_addr, void *mem_addr);
+uint64_t m5_amu_getfin(void);
+uint64_t m5_amu_cfgwr(uint64_t reg, uint64_t value);
+uint64_t m5_amu_cfgrd(uint64_t reg);
 void m5_work_begin(uint64_t workid, uint64_t threadid);
 void m5_work_end(uint64_t workid, uint64_t threadid);
 

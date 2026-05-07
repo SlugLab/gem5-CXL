@@ -47,10 +47,14 @@
 
 #include <array>
 #include <cerrno>
+#include <deque>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "base/cprintf.hh"
 #include "base/debug.hh"
 #include "base/output.hh"
 #include "cpu/base.hh"
@@ -59,9 +63,11 @@
 #include "debug/Quiesce.hh"
 #include "debug/WorkItems.hh"
 #include "dev/net/dist_iface.hh"
+#include "mem/port_proxy.hh"
 #include "mem/se_translating_port_proxy.hh"
 #include "mem/translating_port_proxy.hh"
 #include "params/BaseCPU.hh"
+#include "sim/eventq.hh"
 #include "sim/full_system.hh"
 #include "sim/process.hh"
 #include "sim/serialize.hh"
@@ -100,6 +106,110 @@ const std::string DIST_RANK = "dist-rank";
  *  Unique key for "size" param (distributed gem5 runs)
  */
 const std::string DIST_SIZE = "dist-size";
+
+} // anonymous namespace
+
+namespace
+{
+
+enum class AmuReqType
+{
+    Load,
+    Store,
+};
+
+struct AmuRequest
+{
+    AmuReqType type;
+    Addr spmAddr;
+    Addr memAddr;
+    uint64_t size;
+};
+
+struct AmuState
+{
+    uint64_t granularity = 8;
+    uint64_t maxOutstanding = 256;
+    uint64_t latencyNs = 1000;
+    uint64_t nextId = 1;
+    std::unordered_map<uint64_t, AmuRequest> outstanding;
+    std::deque<uint64_t> finished;
+};
+
+std::unordered_map<ThreadContext *, AmuState> amuStates;
+
+PortProxy &
+virtProxy(ThreadContext *tc, std::unique_ptr<TranslatingPortProxy> &fsProxy,
+          std::unique_ptr<SETranslatingPortProxy> &seProxy)
+{
+    if (FullSystem) {
+        fsProxy = std::make_unique<TranslatingPortProxy>(tc);
+        return *fsProxy;
+    }
+
+    seProxy = std::make_unique<SETranslatingPortProxy>(tc);
+    return *seProxy;
+}
+
+void
+completeAmuRequest(ThreadContext *tc, uint64_t id)
+{
+    auto stateIt = amuStates.find(tc);
+    if (stateIt == amuStates.end())
+        return;
+
+    AmuState &state = stateIt->second;
+    auto reqIt = state.outstanding.find(id);
+    if (reqIt == state.outstanding.end())
+        return;
+
+    const AmuRequest req = reqIt->second;
+    std::vector<uint8_t> data(req.size);
+    std::unique_ptr<TranslatingPortProxy> fsProxy;
+    std::unique_ptr<SETranslatingPortProxy> seProxy;
+    PortProxy &proxy = virtProxy(tc, fsProxy, seProxy);
+
+    if (req.type == AmuReqType::Load) {
+        proxy.readBlob(req.memAddr, data.data(), req.size);
+        proxy.writeBlob(req.spmAddr, data.data(), req.size);
+    } else {
+        proxy.readBlob(req.spmAddr, data.data(), req.size);
+        proxy.writeBlob(req.memAddr, data.data(), req.size);
+    }
+
+    state.outstanding.erase(reqIt);
+    state.finished.push_back(id);
+    DPRINTF(PseudoInst, "AMU complete id=%#llx\n",
+            static_cast<unsigned long long>(id));
+}
+
+uint64_t
+issueAmuRequest(ThreadContext *tc, AmuReqType type, Addr spmAddr, Addr memAddr)
+{
+    AmuState &state = amuStates[tc];
+    if (state.outstanding.size() >= state.maxOutstanding)
+        return 0;
+
+    const uint64_t id = state.nextId++;
+    state.outstanding[id] = {type, spmAddr, memAddr, state.granularity};
+
+    auto *event = new EventFunctionWrapper(
+        [tc, id] { completeAmuRequest(tc, id); },
+        csprintf("%s.amu_complete_%llu", tc->getCpuPtr()->name(),
+                 static_cast<unsigned long long>(id)),
+        true);
+    tc->getCpuPtr()->schedule(
+        event, curTick() + state.latencyNs * sim_clock::as_int::ns);
+
+    DPRINTF(PseudoInst,
+            "AMU issue id=%#llx type=%s spm=%#llx mem=%#llx size=%llu\n",
+            static_cast<unsigned long long>(id),
+            type == AmuReqType::Load ? "aload" : "astore",
+            static_cast<unsigned long long>(spmAddr),
+            static_cast<unsigned long long>(memAddr),
+            static_cast<unsigned long long>(state.granularity));
+    return id;
+}
 
 } // anonymous namespace
 
@@ -486,6 +596,78 @@ triggerWorkloadEvent(ThreadContext *tc)
 {
     DPRINTF(PseudoInst, "pseudo_inst::triggerWorkloadEvent()\n");
     tc->getSystemPtr()->workload->event(tc);
+}
+
+uint64_t
+amuAload(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
+{
+    return issueAmuRequest(tc, AmuReqType::Load, spmAddr.addr, memAddr.addr);
+}
+
+uint64_t
+amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
+{
+    return issueAmuRequest(tc, AmuReqType::Store, spmAddr.addr, memAddr.addr);
+}
+
+uint64_t
+amuGetfin(ThreadContext *tc)
+{
+    AmuState &state = amuStates[tc];
+    if (state.finished.empty())
+        return 0;
+
+    const uint64_t id = state.finished.front();
+    state.finished.pop_front();
+    return id;
+}
+
+uint64_t
+amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
+{
+    AmuState &state = amuStates[tc];
+
+    switch (reg) {
+      case 0:
+        state.granularity = value ? value : 1;
+        break;
+      case 1:
+        state.maxOutstanding = value;
+        break;
+      case 2:
+        state.latencyNs = value;
+        break;
+      case 3:
+        state.outstanding.clear();
+        state.finished.clear();
+        state.nextId = 1;
+        break;
+      default:
+        return 0;
+    }
+
+    return 1;
+}
+
+uint64_t
+amuCfgrd(ThreadContext *tc, uint64_t reg)
+{
+    AmuState &state = amuStates[tc];
+
+    switch (reg) {
+      case 0:
+        return state.granularity;
+      case 1:
+        return state.maxOutstanding;
+      case 2:
+        return state.latencyNs;
+      case 3:
+        return state.outstanding.size();
+      case 4:
+        return state.finished.size();
+      default:
+        return 0;
+    }
 }
 
 //

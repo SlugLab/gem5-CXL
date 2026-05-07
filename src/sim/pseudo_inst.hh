@@ -113,6 +113,11 @@ void workend(ThreadContext *tc, uint64_t workid, uint64_t threadid);
 void m5Syscall(ThreadContext *tc);
 void togglesync(ThreadContext *tc);
 void triggerWorkloadEvent(ThreadContext *tc);
+uint64_t amuAload(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr);
+uint64_t amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr);
+uint64_t amuGetfin(ThreadContext *tc);
+uint64_t amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
+uint64_t amuCfgrd(ThreadContext *tc, uint64_t reg);
 
 
 /**
@@ -233,13 +238,25 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
         invokeSimcall<ABI>(tc, workend);
         return true;
 
-      case M5OP_RESERVED1:
-      case M5OP_RESERVED2:
-      case M5OP_RESERVED3:
-      case M5OP_RESERVED4:
-      case M5OP_RESERVED5:
-        warn("Unimplemented m5 op (%#x)\n", func);
-        return false;
+      case M5OP_AMU_ALOAD:
+        result = invokeSimcall<ABI, store_ret>(tc, amuAload);
+        return true;
+
+      case M5OP_AMU_ASTORE:
+        result = invokeSimcall<ABI, store_ret>(tc, amuAstore);
+        return true;
+
+      case M5OP_AMU_GETFIN:
+        result = invokeSimcall<ABI, store_ret>(tc, amuGetfin);
+        return true;
+
+      case M5OP_AMU_CFGWR:
+        result = invokeSimcall<ABI, store_ret>(tc, amuCfgwr);
+        return true;
+
+      case M5OP_AMU_CFGRD:
+        result = invokeSimcall<ABI, store_ret>(tc, amuCfgrd);
+        return true;
 
       /* dist-gem5 functions */
       case M5OP_DIST_TOGGLE_SYNC:
