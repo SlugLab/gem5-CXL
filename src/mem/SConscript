@@ -43,6 +43,9 @@ Import('*')
 SimObject('CommMonitor.py', sim_objects=['CommMonitor'])
 Source('comm_monitor.cc')
 
+SimObject('ASMC.py', sim_objects=['ASMC'])
+Source('asmc.cc')
+
 SimObject('AbstractMemory.py', sim_objects=['AbstractMemory'])
 SimObject('AddrMapper.py', sim_objects=['AddrMapper', 'RangeAddrMapper'])
 SimObject('Bridge.py', sim_objects=['Bridge'])
@@ -134,6 +137,7 @@ Source('mem_checker.cc')
 Source('mem_checker_monitor.cc')
 
 DebugFlag('AddrRanges')
+DebugFlag('ASMC')
 DebugFlag('BaseXBar')
 DebugFlag('CoherentXBar')
 DebugFlag('CFI')

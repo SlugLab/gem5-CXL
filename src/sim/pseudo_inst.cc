@@ -63,6 +63,7 @@
 #include "debug/Quiesce.hh"
 #include "debug/WorkItems.hh"
 #include "dev/net/dist_iface.hh"
+#include "mem/asmc.hh"
 #include "mem/port_proxy.hh"
 #include "mem/se_translating_port_proxy.hh"
 #include "mem/translating_port_proxy.hh"
@@ -601,18 +602,27 @@ triggerWorkloadEvent(ThreadContext *tc)
 uint64_t
 amuAload(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
 {
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->issueAload(tc, spmAddr.addr, memAddr.addr);
+
     return issueAmuRequest(tc, AmuReqType::Load, spmAddr.addr, memAddr.addr);
 }
 
 uint64_t
 amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
 {
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->issueAstore(tc, spmAddr.addr, memAddr.addr);
+
     return issueAmuRequest(tc, AmuReqType::Store, spmAddr.addr, memAddr.addr);
 }
 
 uint64_t
 amuGetfin(ThreadContext *tc)
 {
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->getFinished(tc);
+
     AmuState &state = amuStates[tc];
     if (state.finished.empty())
         return 0;
@@ -625,6 +635,9 @@ amuGetfin(ThreadContext *tc)
 uint64_t
 amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
 {
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->cfgWrite(tc, reg, value);
+
     AmuState &state = amuStates[tc];
 
     switch (reg) {
@@ -652,6 +665,9 @@ amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
 uint64_t
 amuCfgrd(ThreadContext *tc, uint64_t reg)
 {
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->cfgRead(tc, reg);
+
     AmuState &state = amuStates[tc];
 
     switch (reg) {

@@ -178,7 +178,7 @@ def template MicroStoreExecute {{
         %(code)s;
 
         if (fault == NoFault) {
-            fault = writeMemAtomic(xc, traceData, Mem, dataSize, EA,
+            fault = writeMemAtomic(xc, traceData, %(memDataArg)s, dataSize, EA,
                     memFlags, NULL);
             if (fault == NoFault) {
                 %(op_wb)s;
@@ -205,7 +205,7 @@ def template MicroStoreInitiateAcc {{
         %(code)s;
 
         if (fault == NoFault) {
-            fault = writeMemTiming(xc, traceData, Mem, dataSize, EA,
+            fault = writeMemTiming(xc, traceData, %(memDataArg)s, dataSize, EA,
                     memFlags, NULL);
         }
         return fault;
@@ -612,7 +612,8 @@ let {{
                             { "code": code,
                               "complete_code": completeCode,
                               "ea_code": calculateEA,
-                              "memDataSize": "dataSize" })
+                              "memDataSize": "dataSize",
+                              "memDataArg": "Mem" if has_data else "nullptr" })
         header_output += MicroLdStOpDeclare.subst(iop)
         exec_output += MicroStoreExecute.subst(iop)
         exec_output += MicroStoreInitiateAcc.subst(iop)
@@ -683,7 +684,8 @@ let {{
                             { "code": code,
                               "complete_code": completeCode,
                               "ea_code": calculateEA,
-                              "memDataSize": "2 * dataSize" })
+                              "memDataSize": "2 * dataSize",
+                              "memDataArg": "Mem_u2qw" })
 
         header_output += MicroLdStSplitOpDeclare.subst(iop)
         decoder_output += MicroLdStSplitOpConstructor.subst(iop)

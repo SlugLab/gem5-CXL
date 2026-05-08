@@ -31,6 +31,7 @@
 #define __ARCH_X86_MEMHELPERS_HH__
 
 #include <array>
+#include <cstddef>
 
 #include "base/types.hh"
 #include "cpu/exec_context.hh"
@@ -195,6 +196,17 @@ writeMemTiming(ExecContext *xc, trace::InstRecord *traceData, uint64_t mem,
                         res, byte_enable);
 }
 
+static Fault
+writeMemTiming(ExecContext *xc, trace::InstRecord *traceData,
+               std::nullptr_t, unsigned dataSize, Addr addr,
+               Request::Flags flags, uint64_t *res)
+{
+    if (traceData)
+        traceData->setData(0);
+    const std::vector<bool> byte_enable(dataSize, true);
+    return xc->writeMem(nullptr, dataSize, addr, flags, res, byte_enable);
+}
+
 template <size_t N>
 static Fault
 writeMemTiming(ExecContext *xc, trace::InstRecord *traceData,
@@ -225,6 +237,21 @@ writeMemAtomic(ExecContext *xc, trace::InstRecord *traceData, uint64_t mem,
     const std::vector<bool> byte_enable(dataSize, true);
     Fault fault = xc->writeMem((uint8_t *)&host_mem, dataSize, addr,
                                flags, res, byte_enable);
+    if (fault == NoFault && res)
+        *res = letoh(*res);
+    return fault;
+}
+
+static Fault
+writeMemAtomic(ExecContext *xc, trace::InstRecord *traceData,
+               std::nullptr_t, unsigned dataSize, Addr addr,
+               Request::Flags flags, uint64_t *res)
+{
+    if (traceData)
+        traceData->setData(0);
+    const std::vector<bool> byte_enable(dataSize, true);
+    Fault fault = xc->writeMem(nullptr, dataSize, addr, flags, res,
+                               byte_enable);
     if (fault == NoFault && res)
         *res = letoh(*res);
     return fault;

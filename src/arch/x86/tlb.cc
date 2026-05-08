@@ -560,10 +560,11 @@ TLB::translateTiming(const RequestPtr &req, ThreadContext *tc,
     bool delayedResponse;
     assert(translation);
     // CLFLUSHOPT/WB/FLUSH should be treated as read for protection checks
+    BaseMMU::Mode check_mode = mode;
     if (req->isCacheClean())
-        mode = BaseMMU::Read;
+        check_mode = BaseMMU::Read;
     Fault fault =
-        TLB::translate(req, tc, translation, mode, delayedResponse, true);
+        TLB::translate(req, tc, translation, check_mode, delayedResponse, true);
     if (!delayedResponse)
         translation->finish(fault, req, tc, mode);
     else

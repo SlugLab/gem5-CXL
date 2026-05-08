@@ -543,12 +543,6 @@ X86_64Process::initState()
         pTable->map(ISTVirtAddr, istPhysAddr, PageBytes, false);
         /* PF handler */
         pTable->map(PFHandlerVirtAddr, pfHandlerPhysAddr, PageBytes, false);
-        /* MMIO region for m5ops */
-        auto m5op_range = system->m5opRange();
-        if (m5op_range.size()) {
-            pTable->map(MMIORegionVirtAddr, m5op_range.start(),
-                        m5op_range.size(), false);
-        }
     } else {
         for (int i = 0; i < contextIds.size(); i++) {
             ThreadContext * tc = system->threads[contextIds[i]];
@@ -631,6 +625,13 @@ X86_64Process::initState()
             cr4.pcide = 1;
             tc->setMiscReg(misc_reg::Cr4, cr4);
         }
+    }
+
+    /* MMIO region for m5ops */
+    auto m5op_range = system->m5opRange();
+    if (m5op_range.size()) {
+        pTable->map(MMIORegionVirtAddr, m5op_range.start(),
+                    m5op_range.size(), false);
     }
 }
 

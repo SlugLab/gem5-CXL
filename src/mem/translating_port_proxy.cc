@@ -56,7 +56,10 @@ namespace gem5
 
 TranslatingPortProxy::TranslatingPortProxy(
         ThreadContext *tc, Request::Flags _flags) :
-    PortProxy(tc, tc->getSystemPtr()->cacheLineSize()), _tc(tc), flags(_flags)
+    PortProxy([tc](PacketPtr pkt)->void {
+            tc->getSystemPtr()->getPhysMem().functionalAccess(pkt);
+        }, tc->getSystemPtr()->cacheLineSize()),
+    _tc(tc), flags(_flags)
 {}
 
 bool

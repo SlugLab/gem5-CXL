@@ -71,6 +71,15 @@ if main['HAVE_PROTOC'] and not main['CONF']['HAVE_PROTOBUF']:
             'Please install libprotobuf-dev for tracing support.')
 
 if main['CONF']['HAVE_PROTOBUF']:
+    if main['HAVE_PKG_CONFIG']:
+        try:
+            protobuf_libdir = readCommand(
+                ['pkg-config', '--variable=libdir', 'protobuf']).strip()
+            if protobuf_libdir:
+                main.PrependUnique(LIBPATH=[protobuf_libdir])
+        except Exception as e:
+            warning('While checking protobuf libdir:', str(e))
+
     main.TagImplies('protobuf', 'gem5 lib')
     # protoc relies on the fact that undefined preprocessor symbols are
     # explanded to 0 but since we use -Wundef they end up generating

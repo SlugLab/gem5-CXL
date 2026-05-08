@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <climits>
 #include <csignal>
@@ -304,6 +305,35 @@ Process::initState()
     // load object file into target memory
     image.write(*initVirtMem);
     interpImage.write(*initVirtMem);
+
+    auto loadImagePhys = [this](const auto &mem_image) {
+        const Addr page_size = pTable->pageSize();
+
+        for (const auto &seg : mem_image.segments()) {
+            for (Addr off = 0; off < seg.size;) {
+                const Addr vaddr = seg.base + off;
+                const Addr page_left = page_size - (vaddr % page_size);
+                const Addr chunk = std::min<Addr>(page_left, seg.size - off);
+                Addr paddr = 0;
+
+                if (!pTable->translate(vaddr, paddr)) {
+                    allocateMem(vaddr, chunk);
+                    panic_if(!pTable->translate(vaddr, paddr),
+                            "Could not map loader segment at %#x", vaddr);
+                }
+
+                if (seg.data) {
+                    system->physProxy.writeBlob(paddr, seg.data + off, chunk);
+                } else {
+                    system->physProxy.memsetBlob(paddr, 0, chunk);
+                }
+                off += chunk;
+            }
+        }
+    };
+
+    loadImagePhys(image);
+    loadImagePhys(interpImage);
 }
 
 DrainState
@@ -313,8 +343,7 @@ Process::drain()
     return DrainState::Drained;
 }
 static int get_pool_id() {
-    // return 0;`
-    return 1;
+    return 0;
 }
 void
 Process::allocateMem(Addr vaddr, int64_t size, bool clobber)

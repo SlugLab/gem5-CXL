@@ -50,8 +50,9 @@ PortProxy::PortProxy(ThreadContext *tc, Addr cache_line_size) :
 {}
 
 PortProxy::PortProxy(const RequestPort &port, Addr cache_line_size) :
-    PortProxy([&port](PacketPtr pkt)->void { port.sendFunctional(pkt); },
-        cache_line_size)
+    PortProxy([port = &port](PacketPtr pkt)->void {
+            port->sendFunctional(pkt);
+        }, cache_line_size)
 {}
 
 void
