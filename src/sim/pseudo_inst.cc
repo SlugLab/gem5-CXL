@@ -64,6 +64,7 @@
 #include "debug/WorkItems.hh"
 #include "dev/net/dist_iface.hh"
 #include "mem/asmc.hh"
+#include "mem/cira.hh"
 #include "mem/port_proxy.hh"
 #include "mem/se_translating_port_proxy.hh"
 #include "mem/translating_port_proxy.hh"
@@ -684,6 +685,42 @@ amuCfgrd(ThreadContext *tc, uint64_t reg)
       default:
         return 0;
     }
+}
+
+uint64_t
+ciraPrefetch(ThreadContext *tc, GuestAddr addr, uint64_t size)
+{
+    if (auto *cira = CIRA::get(tc->getSystemPtr()))
+        return cira->issuePrefetch(tc, addr.addr, size);
+
+    return 0;
+}
+
+uint64_t
+ciraGetfin(ThreadContext *tc)
+{
+    if (auto *cira = CIRA::get(tc->getSystemPtr()))
+        return cira->getFinished(tc);
+
+    return 0;
+}
+
+uint64_t
+ciraCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
+{
+    if (auto *cira = CIRA::get(tc->getSystemPtr()))
+        return cira->cfgWrite(tc, reg, value);
+
+    return 0;
+}
+
+uint64_t
+ciraCfgrd(ThreadContext *tc, uint64_t reg)
+{
+    if (auto *cira = CIRA::get(tc->getSystemPtr()))
+        return cira->cfgRead(tc, reg);
+
+    return 0;
 }
 
 //

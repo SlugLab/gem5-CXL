@@ -75,6 +75,10 @@
 
 #define M5OP_WORK_BEGIN         0x5a
 #define M5OP_WORK_END           0x5b
+#define M5OP_CIRA_PREFETCH      0x5c
+#define M5OP_CIRA_GETFIN        0x5d
+#define M5OP_CIRA_CFGWR         0x5e
+#define M5OP_CIRA_CFGRD         0x5f
 
 #define M5OP_DIST_TOGGLE_SYNC   0x62
 
@@ -111,6 +115,10 @@
     M5OP(m5_amu_cfgrd, M5OP_AMU_CFGRD)                          \
     M5OP(m5_work_begin, M5OP_WORK_BEGIN)                        \
     M5OP(m5_work_end, M5OP_WORK_END)                            \
+    M5OP(m5_cira_prefetch, M5OP_CIRA_PREFETCH)                  \
+    M5OP(m5_cira_getfin, M5OP_CIRA_GETFIN)                      \
+    M5OP(m5_cira_cfgwr, M5OP_CIRA_CFGWR)                        \
+    M5OP(m5_cira_cfgrd, M5OP_CIRA_CFGRD)                        \
     M5OP(m5_dist_toggle_sync, M5OP_DIST_TOGGLE_SYNC)            \
     M5OP(m5_workload, M5OP_WORKLOAD)                            \
 

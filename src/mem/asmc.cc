@@ -248,10 +248,12 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     state->issueTick = curTick();
     state->data.resize(granularity);
 
-    if (type == ReqType::Store &&
-        !readSpm(spm_addr, state->data.data(), state->size)) {
-        ++stats.translationFaults;
-        return 0;
+    if (type == ReqType::Store) {
+        if (!readSpm(spm_addr, state->data.data(), state->size) &&
+            !readGuest(tc, spm_addr, state->data.data(), state->size)) {
+            ++stats.translationFaults;
+            return 0;
+        }
     }
 
     spmUsed += state->size;
@@ -400,8 +402,10 @@ ASMC::completeRequest(uint64_t id)
         return;
 
     RequestState &state = *it->second;
-    if (state.type == ReqType::Load)
+    if (state.type == ReqType::Load) {
         writeSpm(state.spmAddr, state.data.data(), state.size);
+        writeGuest(state.tc, state.spmAddr, state.data.data(), state.size);
+    }
 
     finished[state.tc].push_back(id);
     spmUsed -= state.size;

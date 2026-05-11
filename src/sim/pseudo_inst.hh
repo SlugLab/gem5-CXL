@@ -118,6 +118,10 @@ uint64_t amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr);
 uint64_t amuGetfin(ThreadContext *tc);
 uint64_t amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
 uint64_t amuCfgrd(ThreadContext *tc, uint64_t reg);
+uint64_t ciraPrefetch(ThreadContext *tc, GuestAddr addr, uint64_t size);
+uint64_t ciraGetfin(ThreadContext *tc);
+uint64_t ciraCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
+uint64_t ciraCfgrd(ThreadContext *tc, uint64_t reg);
 
 
 /**
@@ -256,6 +260,22 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
 
       case M5OP_AMU_CFGRD:
         result = invokeSimcall<ABI, store_ret>(tc, amuCfgrd);
+        return true;
+
+      case M5OP_CIRA_PREFETCH:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraPrefetch);
+        return true;
+
+      case M5OP_CIRA_GETFIN:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraGetfin);
+        return true;
+
+      case M5OP_CIRA_CFGWR:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraCfgwr);
+        return true;
+
+      case M5OP_CIRA_CFGRD:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraCfgrd);
         return true;
 
       /* dist-gem5 functions */

@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 import m5
-from m5.objects import ASMC
+from m5.objects import ASMC, CIRA, SerialLink
 
 from gem5.components.boards.simple_board import SimpleBoard
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierarchy import (
@@ -30,6 +30,48 @@ from gem5.utils.requires import requires
 
 
 requires(isa_required=ISA.X86)
+
+
+class CXLSimpleBoard(SimpleBoard):
+    def __init__(
+        self,
+        *args,
+        cxl_memory=False,
+        cxl_args=None,
+        cira_to_l2=False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_cxl_memory", cxl_memory)
+        object.__setattr__(self, "_cxl_args", cxl_args or {})
+        object.__setattr__(self, "_cxl_mem_ports", None)
+        object.__setattr__(self, "_cira_to_l2", cira_to_l2)
+
+    def get_mem_ports(self):
+        if not self._cxl_memory:
+            return super().get_mem_ports()
+
+        if self._cxl_mem_ports is None:
+            cxl_mem_ports = []
+            for idx, (addr_range, port) in enumerate(super().get_mem_ports()):
+                link = SerialLink(ranges=[addr_range], **self._cxl_args)
+                link.mem_side_port = port
+                setattr(self, f"cxl_mem_link{idx}", link)
+                cxl_mem_ports.append((addr_range, link.cpu_side_port))
+            object.__setattr__(self, "_cxl_mem_ports", cxl_mem_ports)
+
+        return self._cxl_mem_ports
+
+    def _connect_things(self):
+        super()._connect_things()
+        cira = getattr(self, "cira", None)
+        if cira is None:
+            return
+
+        if self._cira_to_l2 and hasattr(self.cache_hierarchy, "l2buses"):
+            cira.mem_side_port = self.cache_hierarchy.l2buses[0].cpu_side_ports
+        else:
+            cira.mem_side_port = self.cache_hierarchy.get_cpu_side_port()
 
 parser = argparse.ArgumentParser(
     description="Run local X86 GAPBS binaries, including AMU-instrumented ones."
@@ -54,7 +96,27 @@ parser.add_argument("--asmc-max-outstanding", type=int, default=256)
 parser.add_argument("--asmc-max-send-queue", type=int, default=512)
 parser.add_argument("--asmc-issue-latency", default="1ns")
 parser.add_argument("--asmc-completion-latency", default="0ns")
-parser.add_argument("--asmc-latency", default="1000ns")
+parser.add_argument("--asmc-latency", default="0ns")
+parser.add_argument(
+    "--cxl-memory",
+    action="store_true",
+    help="Route normal cache/memory traffic through a CXL SerialLink.",
+)
+parser.add_argument("--cxl-link-delay", default="1us")
+parser.add_argument("--cxl-link-speed", type=int, default=32)
+parser.add_argument("--cxl-link-lanes", type=int, default=16)
+parser.add_argument("--cxl-link-req-size", type=int, default=256)
+parser.add_argument("--cxl-link-resp-size", type=int, default=256)
+parser.add_argument("--cira", action="store_true", help="Enable CIRA model.")
+parser.add_argument(
+    "--cira-to-l2",
+    action="store_true",
+    help="Send CIRA cacheline installs through the first private L2.",
+)
+parser.add_argument("--cira-max-outstanding", type=int, default=256)
+parser.add_argument("--cira-max-send-queue", type=int, default=1024)
+parser.add_argument("--cira-issue-latency", default="1ns")
+parser.add_argument("--cira-completion-latency", default="0ns")
 
 args = parser.parse_args()
 
@@ -76,11 +138,20 @@ cache_hierarchy = PrivateL1PrivateL2CacheHierarchy(
 memory = SingleChannelDDR4_2400(size=args.mem_size)
 processor = SimpleProcessor(cpu_type=cpu_type, isa=ISA.X86, num_cores=args.cores)
 
-board = SimpleBoard(
+board = CXLSimpleBoard(
     clk_freq=args.clk,
     processor=processor,
     memory=memory,
     cache_hierarchy=cache_hierarchy,
+    cxl_memory=args.cxl_memory,
+    cxl_args={
+        "delay": args.cxl_link_delay,
+        "link_speed": args.cxl_link_speed,
+        "num_lanes": args.cxl_link_lanes,
+        "req_size": args.cxl_link_req_size,
+        "resp_size": args.cxl_link_resp_size,
+    },
+    cira_to_l2=args.cira_to_l2,
 )
 board.m5ops_base = 0xFFFF0000
 
@@ -94,7 +165,26 @@ if not args.no_asmc:
         completion_latency=args.asmc_completion_latency,
         asmc_latency=args.asmc_latency,
     )
-    board.asmc.mem_side_port = cache_hierarchy.get_cpu_side_port()
+    if args.cxl_memory:
+        board.asmc.mem_side_port = cache_hierarchy.get_cpu_side_port()
+    else:
+        board.cxl_link = SerialLink(
+            delay=args.cxl_link_delay,
+            link_speed=args.cxl_link_speed,
+            num_lanes=args.cxl_link_lanes,
+            req_size=args.cxl_link_req_size,
+            resp_size=args.cxl_link_resp_size,
+        )
+        board.asmc.mem_side_port = board.cxl_link.cpu_side_port
+        board.cxl_link.mem_side_port = cache_hierarchy.get_cpu_side_port()
+
+if args.cira:
+    board.cira = CIRA(
+        max_outstanding=args.cira_max_outstanding,
+        max_send_queue=args.cira_max_send_queue,
+        issue_latency=args.cira_issue_latency,
+        completion_latency=args.cira_completion_latency,
+    )
 
 board.set_se_binary_workload(
     BinaryResource(local_path=str(binary)),
