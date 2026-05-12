@@ -58,6 +58,17 @@ def has_env(envs, key):
     return any(env == key or env.startswith(f"{key}=") for env in envs)
 
 
+def env_flag_enabled(envs, key):
+    for env in envs:
+        if env == key:
+            return True
+        prefix = f"{key}="
+        if env.startswith(prefix):
+            value = env[len(prefix):]
+            return value != "" and value != "0"
+    return False
+
+
 def run_one(args, benchmark, label, binary_dir, kind):
     binary = (binary_dir / benchmark).resolve()
     run_dir = args.outdir / benchmark / label
@@ -93,6 +104,8 @@ def run_one(args, benchmark, label, binary_dir, kind):
 
     if args.disable_hw_prefetchers:
         cmd.append("--disable-hw-prefetchers")
+    if args.roi_work_events:
+        cmd.append("--roi-work-events")
     add_optional(cmd, "--l1-mshrs", args.l1_mshrs)
     add_optional(cmd, "--l1-tgts-per-mshr", args.l1_tgts_per_mshr)
     add_optional(cmd, "--l2-mshrs", args.l2_mshrs)
@@ -174,6 +187,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         and cira_prefetches == 0
         and cira_indexed_prefetches == 0
         and cira_csr_prefetches == 0
+        and not env_flag_enabled(args.env, "CIRA_GAPBS_DEVICE_OFFLOAD")
         and not args.allow_zero_cira
     ):
         status = "no-cira-events"
@@ -268,6 +282,11 @@ def main():
     parser.add_argument("--cira-max-send-queue", type=int, default=1024)
     parser.add_argument("--cira-issue-latency", default="1ns")
     parser.add_argument("--cira-completion-latency", default="0ns")
+    parser.add_argument(
+        "--roi-work-events",
+        action="store_true",
+        help="Reset stats at m5_work_begin and stop at m5_work_end.",
+    )
     parser.add_argument("--env", action="append", default=[])
     parser.add_argument(
         "--allow-zero-cira",

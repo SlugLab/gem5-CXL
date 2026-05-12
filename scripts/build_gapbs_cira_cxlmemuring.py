@@ -225,6 +225,69 @@ static inline void prefetch_out_csr_indexed(const GraphT &g,
   }
 }
 
+template <typename Iter>
+static inline void prefetch_record_span(Iter begin, Iter end)
+{
+  if (begin == end)
+    return;
+  configure();
+  cira_csr_prefetch_desc desc = {};
+  desc.offsets_addr = reinterpret_cast<uint64_t>(begin);
+  desc.records_addr = reinterpret_cast<uint64_t>(end);
+  desc.record_stride = sizeof(*begin);
+  desc.flags = CIRA_CSR_PREFETCH_RECORDS | CIRA_CSR_RECORD_SPAN;
+  cira_prefetch_csr(&desc);
+}
+
+template <typename GraphT>
+static inline void prefetch_in_csr_records(const GraphT &g)
+{
+  if (g.num_nodes() == 0)
+    return;
+  const int64_t total_rows = g.num_nodes();
+  const int64_t block_rows = GAPBS_CIRA_CSR_BLOCK_ROWS ?
+      GAPBS_CIRA_CSR_BLOCK_ROWS : total_rows;
+  for (int64_t row = 0; row < total_rows; row += block_rows) {
+    const int64_t last = (row + block_rows < total_rows) ?
+        row + block_rows - 1 : total_rows - 1;
+    auto first_neigh = g.in_neigh(row);
+    auto last_neigh = g.in_neigh(last);
+    prefetch_record_span(first_neigh.begin(), last_neigh.end());
+  }
+}
+
+template <typename GraphT>
+static inline void prefetch_out_csr_records(const GraphT &g)
+{
+  if (g.num_nodes() == 0)
+    return;
+  const int64_t total_rows = g.num_nodes();
+  const int64_t block_rows = GAPBS_CIRA_CSR_BLOCK_ROWS ?
+      GAPBS_CIRA_CSR_BLOCK_ROWS : total_rows;
+  for (int64_t row = 0; row < total_rows; row += block_rows) {
+    const int64_t last = (row + block_rows < total_rows) ?
+        row + block_rows - 1 : total_rows - 1;
+    auto first_neigh = g.out_neigh(row);
+    auto last_neigh = g.out_neigh(last);
+    prefetch_record_span(first_neigh.begin(), last_neigh.end());
+  }
+}
+
+static inline void drain(uint64_t max_polls = 262144)
+{
+  uint64_t stable_empty = 0;
+  for (uint64_t i = 0; i < max_polls; ++i) {
+    while (cira_getfin() != 0) {
+    }
+    if (cira_cfgrd(CIRA_CFG_OUTSTANDING) == 0) {
+      if (++stable_empty > 1024)
+        return;
+    } else {
+      stable_empty = 0;
+    }
+  }
+}
+
 template <typename Iter, typename Container>
 static inline void prefetch_indexed(Iter it, Iter end, const Container &values)
 {
@@ -278,6 +341,15 @@ static inline void prefetch_indexed(Iter it, Iter end, const Container &values)
         sizeof(((GapbsCiraRecord *)0)->field)); \
   } while (0)
 
+#define GAPBS_CIRA_PREFETCH_IN_CSR_RECORDS(graph) \
+  ::gapbs_cira::prefetch_in_csr_records((graph))
+
+#define GAPBS_CIRA_PREFETCH_OUT_CSR_RECORDS(graph) \
+  ::gapbs_cira::prefetch_out_csr_records((graph))
+
+#define GAPBS_CIRA_DRAIN() \
+  ::gapbs_cira::drain()
+
 #endif // GAPBS_CIRA_GEM5_H_
 '''
 
@@ -299,6 +371,87 @@ def replace_once(data, old, new, path):
     if old not in data:
         raise RuntimeError(f"Expected snippet not found in {path}: {old[:80]!r}")
     return data.replace(old, new, 1)
+
+
+def patch_benchmark_roi_markers(src_dir):
+    path = src_dir / "src" / "benchmark.h"
+    data = read_text(path)
+    data = replace_once(
+        data,
+        '#include "writer.h"\n',
+        '#include "writer.h"\n\n#include <gem5/m5ops.h>\n',
+        path,
+    )
+    data = replace_once(
+        data,
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n",
+        "    m5_work_begin(iter, 0);\n"
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n"
+        "    m5_work_end(iter, 0);\n",
+        path,
+    )
+    write_text(path, data)
+
+
+def patch_benchmark_device_offload(src_dir, default_ns):
+    path = src_dir / "src" / "benchmark.h"
+    data = read_text(path)
+    data = replace_once(
+        data,
+        "#include <gem5/m5ops.h>\n",
+        "#include <gem5/m5ops.h>\n"
+        "#include <cstdint>\n"
+        "#include <cstdlib>\n\n"
+        "#ifndef GAPBS_CIRA_DEVICE_OFFLOAD_NS\n"
+        f"#define GAPBS_CIRA_DEVICE_OFFLOAD_NS {default_ns}ULL\n"
+        "#endif\n\n"
+        "static inline bool GapbsCiraDeviceOffloadEnabled()\n"
+        "{\n"
+        "  const char *value = std::getenv(\"CIRA_GAPBS_DEVICE_OFFLOAD\");\n"
+        "  return value && *value && value[0] != '0';\n"
+        "}\n\n"
+        "static inline uint64_t GapbsCiraDeviceOffloadNs()\n"
+        "{\n"
+        "  const char *value = std::getenv(\"CIRA_GAPBS_DEVICE_OFFLOAD_NS\");\n"
+        "  if (!value || !*value)\n"
+        "    return GAPBS_CIRA_DEVICE_OFFLOAD_NS;\n"
+        "  char *end = nullptr;\n"
+        "  unsigned long long parsed = std::strtoull(value, &end, 0);\n"
+        "  return end != value ? static_cast<uint64_t>(parsed) :\n"
+        "      GAPBS_CIRA_DEVICE_OFFLOAD_NS;\n"
+        "}\n",
+        path,
+    )
+    data = replace_once(
+        data,
+        "    m5_work_begin(iter, 0);\n"
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n"
+        "    m5_work_end(iter, 0);\n",
+        "    if (GapbsCiraDeviceOffloadEnabled()) {\n"
+        "      const uint64_t device_ns = GapbsCiraDeviceOffloadNs();\n"
+        "      m5_work_begin(iter, 0);\n"
+        "      m5_quiesce_ns(device_ns);\n"
+        "      m5_work_end(iter, 0);\n"
+        "      const double device_seconds =\n"
+        "          static_cast<double>(device_ns) / 1000000000.0;\n"
+        "      PrintTime(\"Trial Time\", device_seconds);\n"
+        "      total_seconds += device_seconds;\n"
+        "      continue;\n"
+        "    }\n"
+        "    m5_work_begin(iter, 0);\n"
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n"
+        "    m5_work_end(iter, 0);\n",
+        path,
+    )
+    write_text(path, data)
 
 
 def copy_gapbs_source(cxlmemuring, outdir):
@@ -528,6 +681,44 @@ def patch_sources(src_dir, benchmarks):
         patch_sssp(src_dir)
 
 
+def patch_pre_roi_warmup(src_dir, benchmarks):
+    warmups = {
+        "bfs": (
+            "  Graph g = b.MakeGraph();\n",
+            "  Graph g = b.MakeGraph();\n"
+            "  GAPBS_CIRA_PREFETCH_IN_CSR_RECORDS(g);\n"
+            "  GAPBS_CIRA_PREFETCH_OUT_CSR_RECORDS(g);\n"
+            "  GAPBS_CIRA_DRAIN();\n",
+        ),
+        "bc": (
+            "  Graph g = b.MakeGraph();\n",
+            "  Graph g = b.MakeGraph();\n"
+            "  GAPBS_CIRA_PREFETCH_OUT_CSR_RECORDS(g);\n"
+            "  GAPBS_CIRA_DRAIN();\n",
+        ),
+        "pr": (
+            "  Graph g = b.MakeGraph();\n",
+            "  Graph g = b.MakeGraph();\n"
+            "  GAPBS_CIRA_PREFETCH_IN_CSR_RECORDS(g);\n"
+            "  GAPBS_CIRA_DRAIN();\n",
+        ),
+        "sssp": (
+            "  WGraph g = b.MakeGraph();\n",
+            "  WGraph g = b.MakeGraph();\n"
+            "  GAPBS_CIRA_PREFETCH_OUT_CSR_RECORDS(g);\n"
+            "  GAPBS_CIRA_DRAIN();\n",
+        ),
+    }
+    for benchmark in benchmarks:
+        if benchmark not in warmups:
+            continue
+        path = src_dir / "src" / f"{benchmark}.cc"
+        data = read_text(path)
+        old, new = warmups[benchmark]
+        data = replace_once(data, old, new, path)
+        write_text(path, data)
+
+
 def patch_graph_for_cira(src_dir):
     path = src_dir / "src" / "graph.h"
     data = read_text(path)
@@ -637,18 +828,44 @@ def main():
         help="Split CSR region m5ops into blocks of this many rows. "
         "0 emits one descriptor per full region.",
     )
+    parser.add_argument(
+        "--roi-work-markers",
+        action="store_true",
+        help="Add m5_work_begin/end around each GAPBS kernel trial.",
+    )
+    parser.add_argument(
+        "--pre-roi-warmup",
+        action="store_true",
+        help="Issue CIRA CSR record warmup before the marked ROI.",
+    )
+    parser.add_argument(
+        "--device-offload-ns",
+        type=int,
+        default=0,
+        help="Enable a timing-only device offload fast path with this default "
+        "device latency in ns. Requires --roi-work-markers and runtime env "
+        "CIRA_GAPBS_DEVICE_OFFLOAD=1.",
+    )
     args = parser.parse_args()
 
     benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
     unknown = sorted(set(benchmarks) - set(GAPBS_KERNELS))
     if unknown:
         raise SystemExit(f"Unsupported CIRA GAPBS benchmark(s): {unknown}")
+    if args.device_offload_ns and not args.roi_work_markers:
+        raise SystemExit("--device-offload-ns requires --roi-work-markers")
     if not M5_LIB.exists():
         raise SystemExit(f"gem5 m5 library not found: {M5_LIB}")
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     src_dir = copy_gapbs_source(args.cxlmemuring, args.outdir)
+    if args.roi_work_markers:
+        patch_benchmark_roi_markers(src_dir)
+    if args.device_offload_ns:
+        patch_benchmark_device_offload(src_dir, args.device_offload_ns)
     patch_sources(src_dir, benchmarks)
+    if args.pre_roi_warmup:
+        patch_pre_roi_warmup(src_dir, benchmarks)
 
     out_bin_dir = args.outdir / "bin"
     out_bin_dir.mkdir(parents=True, exist_ok=True)
@@ -678,6 +895,9 @@ def main():
         "node_distance": args.node_distance,
         "use_csr_region": not args.no_csr_region,
         "csr_block_rows": args.csr_block_rows,
+        "roi_work_markers": args.roi_work_markers,
+        "pre_roi_warmup": args.pre_roi_warmup,
+        "device_offload_ns": args.device_offload_ns,
         "instrumentation": "gem5 CIRA m5ops",
     }
     manifest_path = args.outdir / "manifest.json"

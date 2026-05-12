@@ -118,6 +118,30 @@ def replace_once(data, old, new, path):
     return data.replace(old, new, 1)
 
 
+def patch_benchmark_roi_markers(src_dir):
+    path = src_dir / "src" / "benchmark.h"
+    data = read_text(path)
+    data = replace_once(
+        data,
+        '#include "writer.h"\n',
+        '#include "writer.h"\n\n#include <gem5/m5ops.h>\n',
+        path,
+    )
+    data = replace_once(
+        data,
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n",
+        "    m5_work_begin(iter, 0);\n"
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n"
+        "    m5_work_end(iter, 0);\n",
+        path,
+    )
+    write_text(path, data)
+
+
 def copy_gapbs_source(cxlmemuring, outdir):
     src = cxlmemuring / "bench" / "gapbs"
     if not (src / "src" / "bfs.cc").exists():
@@ -464,6 +488,11 @@ def main():
         default=os.environ.get("GAPBS_AMU_EXTRA_CXXFLAGS", ""),
     )
     parser.add_argument("--amu-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--roi-work-markers",
+        action="store_true",
+        help="Add m5_work_begin/end around each GAPBS kernel trial.",
+    )
     args = parser.parse_args()
 
     if not M5_LIB.exists():
@@ -486,6 +515,8 @@ def main():
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     src_dir = copy_gapbs_source(args.cxlmemuring, args.outdir)
+    if args.roi_work_markers:
+        patch_benchmark_roi_markers(src_dir)
     patched = patch_sources(src_dir, benchmarks)
 
     out_bin_dir = args.outdir / "bin"
@@ -507,6 +538,7 @@ def main():
         "binaries": binaries,
         "amu_rewritten_benchmarks": patched,
         "amu_batch_size": args.amu_batch_size,
+        "roi_work_markers": args.roi_work_markers,
         "benchmarks_built_without_amu_rewrites": unsupported,
         "profiles_used": {
             benchmark: profile_for(args.cxlmemuring, benchmark)

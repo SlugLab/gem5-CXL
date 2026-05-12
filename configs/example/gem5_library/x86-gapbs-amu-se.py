@@ -25,6 +25,7 @@ from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.isas import ISA
 from gem5.resources.resource import BinaryResource
+from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 from gem5.utils.requires import requires
 
@@ -170,6 +171,11 @@ parser.add_argument("--cira-max-outstanding", type=int, default=256)
 parser.add_argument("--cira-max-send-queue", type=int, default=1024)
 parser.add_argument("--cira-issue-latency", default="1ns")
 parser.add_argument("--cira-completion-latency", default="0ns")
+parser.add_argument(
+    "--roi-work-events",
+    action="store_true",
+    help="Reset stats at m5_work_begin and stop after m5_work_end.",
+)
 
 args = parser.parse_args()
 
@@ -251,13 +257,42 @@ board.set_se_binary_workload(
     env_list=[f"OMP_NUM_THREADS={args.cores}", *args.env],
 )
 
-simulator = Simulator(board=board)
+start_tick = None
+
+
+def handle_workbegin():
+    print("Resetting stats at the start of ROI!")
+    m5.stats.reset()
+    global start_tick
+    start_tick = m5.curTick()
+    yield False
+
+
+def handle_workend():
+    print("Dump stats at the end of the ROI!")
+    m5.stats.dump()
+    yield True
+
+
+if args.roi_work_events:
+    simulator = Simulator(
+        board=board,
+        on_exit_event={
+            ExitEvent.WORKBEGIN: handle_workbegin(),
+            ExitEvent.WORKEND: handle_workend(),
+        },
+    )
+else:
+    simulator = Simulator(board=board)
 
 start_wall = time.time()
 print(f"Running {binary} {' '.join(args.arguments.split())}")
 simulator.run()
-m5.stats.dump()
+if not args.roi_work_events:
+    m5.stats.dump()
 
 print("Done with the simulation")
 print(f"Simulated ticks: {simulator.get_current_tick()}")
+if start_tick is not None:
+    print(f"Simulated ROI ticks: {m5.curTick() - start_tick}")
 print(f"Wallclock seconds: {time.time() - start_wall:.2f}")
