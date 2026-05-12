@@ -697,6 +697,47 @@ ciraPrefetch(ThreadContext *tc, GuestAddr addr, uint64_t size)
 }
 
 uint64_t
+ciraPrefetchIndexed(ThreadContext *tc, uint64_t base_addr,
+                    uint64_t records_addr, uint64_t count,
+                    uint64_t record_stride, uint64_t index_offset,
+                    uint64_t packed_sizes)
+{
+    const uint64_t index_size = packed_sizes & 0xffffffffULL;
+    const uint64_t value_size = packed_sizes >> 32;
+
+    if (auto *cira = CIRA::get(tc->getSystemPtr()))
+        return cira->issueIndexedPrefetch(tc, base_addr, records_addr, count,
+                                          record_stride, index_offset,
+                                          index_size, value_size);
+
+    return 0;
+}
+
+uint64_t
+ciraPrefetchCsr(ThreadContext *tc, uint64_t offsets_addr,
+                uint64_t records_addr, uint64_t values_addr,
+                uint64_t row_start, uint64_t row_count, uint64_t packed)
+{
+    auto *cira = CIRA::get(tc->getSystemPtr());
+    DPRINTF(PseudoInst,
+            "pseudo_inst::ciraPrefetchCsr(offsets=%#llx records=%#llx "
+            "values=%#llx row_start=%llu row_count=%llu packed=%#llx) "
+            "cira=%p\n",
+            static_cast<unsigned long long>(offsets_addr),
+            static_cast<unsigned long long>(records_addr),
+            static_cast<unsigned long long>(values_addr),
+            static_cast<unsigned long long>(row_start),
+            static_cast<unsigned long long>(row_count),
+            static_cast<unsigned long long>(packed), cira);
+    if (cira)
+        return cira->issueCsrPrefetch(tc, offsets_addr, records_addr,
+                                      values_addr, row_start, row_count,
+                                      packed);
+
+    return 0;
+}
+
+uint64_t
 ciraGetfin(ThreadContext *tc)
 {
     if (auto *cira = CIRA::get(tc->getSystemPtr()))

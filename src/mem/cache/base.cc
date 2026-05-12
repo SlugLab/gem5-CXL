@@ -1681,7 +1681,7 @@ void
 BaseCache::invalidateBlock(CacheBlk *blk)
 {
     // If block is still marked as prefetched, then it hasn't been used
-    if (blk->wasPrefetched()) {
+    if (prefetcher && blk->wasPrefetched()) {
         prefetcher->prefetchUnused();
     }
 

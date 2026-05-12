@@ -119,6 +119,14 @@ uint64_t amuGetfin(ThreadContext *tc);
 uint64_t amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
 uint64_t amuCfgrd(ThreadContext *tc, uint64_t reg);
 uint64_t ciraPrefetch(ThreadContext *tc, GuestAddr addr, uint64_t size);
+uint64_t ciraPrefetchIndexed(ThreadContext *tc, uint64_t base_addr,
+                             uint64_t records_addr, uint64_t count,
+                             uint64_t record_stride, uint64_t index_offset,
+                             uint64_t packed_sizes);
+uint64_t ciraPrefetchCsr(ThreadContext *tc, uint64_t offsets_addr,
+                         uint64_t records_addr, uint64_t values_addr,
+                         uint64_t row_start, uint64_t row_count,
+                         uint64_t packed);
 uint64_t ciraGetfin(ThreadContext *tc);
 uint64_t ciraCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
 uint64_t ciraCfgrd(ThreadContext *tc, uint64_t reg);
@@ -264,6 +272,14 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
 
       case M5OP_CIRA_PREFETCH:
         result = invokeSimcall<ABI, store_ret>(tc, ciraPrefetch);
+        return true;
+
+      case M5OP_CIRA_PREFETCH_INDEXED:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraPrefetchIndexed);
+        return true;
+
+      case M5OP_CIRA_PREFETCH_CSR:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraPrefetchCsr);
         return true;
 
       case M5OP_CIRA_GETFIN:

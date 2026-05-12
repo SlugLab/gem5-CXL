@@ -43,6 +43,16 @@ class CIRA : public ClockedObject
     static CIRA *get(System *system);
 
     uint64_t issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size);
+    uint64_t issueIndexedPrefetch(ThreadContext *tc, Addr base_addr,
+                                  Addr records_addr, uint64_t count,
+                                  uint64_t record_stride,
+                                  uint64_t index_offset,
+                                  uint64_t index_size,
+                                  uint64_t value_size);
+    uint64_t issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
+                              Addr records_addr, Addr values_addr,
+                              uint64_t row_start, uint64_t row_count,
+                              uint64_t packed);
     uint64_t getFinished(ThreadContext *tc);
     uint64_t cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value);
     uint64_t cfgRead(ThreadContext *tc, uint64_t reg) const;
@@ -75,6 +85,51 @@ class CIRA : public ClockedObject
         uint64_t id;
     };
 
+    struct IndexedPrefetchDesc
+    {
+        uint64_t baseAddr = 0;
+        uint64_t recordsAddr = 0;
+        uint64_t count = 0;
+        uint64_t recordStride = 0;
+        uint64_t indexOffset = 0;
+        uint64_t indexSize = 0;
+        uint64_t valueSize = 0;
+    };
+
+    struct CsrPrefetchDesc
+    {
+        uint64_t offsetsAddr = 0;
+        uint64_t recordsAddr = 0;
+        uint64_t valuesAddr = 0;
+        uint64_t rowStart = 0;
+        uint64_t rowCount = 0;
+        uint64_t offsetSize = 0;
+        uint64_t recordStride = 0;
+        uint64_t indexOffset = 0;
+        uint64_t indexSize = 0;
+        uint64_t valueSize = 0;
+        uint64_t flags = 0;
+    };
+
+    struct CsrWalkState
+    {
+        ThreadContext *tc = nullptr;
+        Addr recordsBegin = 0;
+        Addr recordsEnd = 0;
+        Addr recordLine = 0;
+        Addr valuesAddr = 0;
+        uint64_t recordStride = 0;
+        uint64_t indexOffset = 0;
+        uint64_t indexSize = 0;
+        uint64_t valueSize = 0;
+        uint64_t entryCount = 0;
+        uint64_t nextEntry = 0;
+        uint64_t rowStart = 0;
+        uint64_t rowCount = 0;
+        bool prefetchRecords = false;
+        bool prefetchValues = false;
+    };
+
     class MemoryPort : public RequestPort
     {
       public:
@@ -93,6 +148,9 @@ class CIRA : public ClockedObject
         CIRAStats(statistics::Group *parent);
 
         statistics::Scalar issuedPrefetches;
+        statistics::Scalar issuedIndexedPrefetches;
+        statistics::Scalar issuedCsrPrefetches;
+        statistics::Scalar csrRowsVisited;
         statistics::Scalar completedPrefetches;
         statistics::Scalar rejectedDisabled;
         statistics::Scalar rejectedQueueFull;
@@ -105,8 +163,15 @@ class CIRA : public ClockedObject
 
     bool translate(ThreadContext *tc, Addr vaddr, uint64_t size,
                    std::vector<TranslationChunk> &chunks) const;
+    bool readGuest(ThreadContext *tc, Addr addr, void *data,
+                   uint64_t size) const;
+    bool readIndex(ThreadContext *tc, Addr addr, uint64_t index_size,
+                   uint64_t &index) const;
+    bool hasPrefetchSlot() const;
+    void scheduleCsrWalk(Tick when);
+    void processCsrWalk();
     void enqueuePacket(PacketPtr pkt);
-    void scheduleSend(Tick when);
+    void scheduleSend(Tick when, bool force_retry = false);
     void trySend();
     bool recvTimingResp(PacketPtr pkt);
     void recvReqRetry();
@@ -134,6 +199,8 @@ class CIRA : public ClockedObject
     std::deque<PacketPtr> sendQueue;
     PacketPtr retryPkt = nullptr;
     EventFunctionWrapper sendEvent;
+    std::deque<CsrWalkState> csrWalkQueue;
+    EventFunctionWrapper csrWalkEvent;
 
     CIRAStats stats;
 };

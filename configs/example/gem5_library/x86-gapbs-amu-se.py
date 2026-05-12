@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 import m5
-from m5.objects import ASMC, CIRA, SerialLink
+from m5.objects import ASMC, CIRA, NULL, SerialLink
 
 from gem5.components.boards.simple_board import SimpleBoard
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierarchy import (
@@ -30,6 +30,46 @@ from gem5.utils.requires import requires
 
 
 requires(isa_required=ISA.X86)
+
+
+class TunablePrivateL1PrivateL2CacheHierarchy(PrivateL1PrivateL2CacheHierarchy):
+    def __init__(
+        self,
+        *args,
+        disable_hw_prefetchers=False,
+        l1_mshrs=None,
+        l1_tgts_per_mshr=None,
+        l2_mshrs=None,
+        l2_tgts_per_mshr=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._disable_hw_prefetchers = disable_hw_prefetchers
+        self._l1_mshrs = l1_mshrs
+        self._l1_tgts_per_mshr = l1_tgts_per_mshr
+        self._l2_mshrs = l2_mshrs
+        self._l2_tgts_per_mshr = l2_tgts_per_mshr
+
+    def incorporate_cache(self, board):
+        super().incorporate_cache(board)
+
+        for idx in range(board.get_processor().get_num_cores()):
+            l1i = getattr(self, f"l1i-cache-{idx}")
+            l1d = getattr(self, f"l1d-cache-{idx}")
+            l2 = getattr(self, f"l2-cache-{idx}")
+            for cache in (l1i, l1d):
+                if self._disable_hw_prefetchers:
+                    cache.prefetcher = NULL
+                if self._l1_mshrs is not None:
+                    cache.mshrs = self._l1_mshrs
+                if self._l1_tgts_per_mshr is not None:
+                    cache.tgts_per_mshr = self._l1_tgts_per_mshr
+            if self._disable_hw_prefetchers:
+                l2.prefetcher = NULL
+            if self._l2_mshrs is not None:
+                l2.mshrs = self._l2_mshrs
+            if self._l2_tgts_per_mshr is not None:
+                l2.tgts_per_mshr = self._l2_tgts_per_mshr
 
 
 class CXLSimpleBoard(SimpleBoard):
@@ -83,12 +123,25 @@ parser.add_argument(
     help="Arguments passed to the GAPBS binary.",
 )
 parser.add_argument("--cores", type=int, default=1)
-parser.add_argument("--cpu", choices=["atomic", "timing", "o3"], default="timing")
+parser.add_argument(
+    "--cpu", choices=["atomic", "timing", "o3", "minor"], default="timing"
+)
 parser.add_argument("--mem-size", default="4GiB")
 parser.add_argument("--clk", default="3GHz")
 parser.add_argument("--l1d-size", default="32KiB")
 parser.add_argument("--l1i-size", default="32KiB")
 parser.add_argument("--l2-size", default="256KiB")
+parser.add_argument("--disable-hw-prefetchers", action="store_true")
+parser.add_argument("--l1-mshrs", type=int)
+parser.add_argument("--l1-tgts-per-mshr", type=int)
+parser.add_argument("--l2-mshrs", type=int)
+parser.add_argument("--l2-tgts-per-mshr", type=int)
+parser.add_argument(
+    "--env",
+    action="append",
+    default=[],
+    help="Extra workload environment entry, e.g. KEY=VALUE.",
+)
 parser.add_argument("--no-asmc", action="store_true")
 parser.add_argument("--asmc-spm-size", default="256KiB")
 parser.add_argument("--asmc-granularity", type=int, default=8)
@@ -128,12 +181,18 @@ cpu_type = {
     "atomic": CPUTypes.ATOMIC,
     "timing": CPUTypes.TIMING,
     "o3": CPUTypes.O3,
+    "minor": CPUTypes.MINOR,
 }[args.cpu]
 
-cache_hierarchy = PrivateL1PrivateL2CacheHierarchy(
+cache_hierarchy = TunablePrivateL1PrivateL2CacheHierarchy(
     l1d_size=args.l1d_size,
     l1i_size=args.l1i_size,
     l2_size=args.l2_size,
+    disable_hw_prefetchers=args.disable_hw_prefetchers,
+    l1_mshrs=args.l1_mshrs,
+    l1_tgts_per_mshr=args.l1_tgts_per_mshr,
+    l2_mshrs=args.l2_mshrs,
+    l2_tgts_per_mshr=args.l2_tgts_per_mshr,
 )
 memory = SingleChannelDDR4_2400(size=args.mem_size)
 processor = SimpleProcessor(cpu_type=cpu_type, isa=ISA.X86, num_cores=args.cores)
@@ -189,7 +248,7 @@ if args.cira:
 board.set_se_binary_workload(
     BinaryResource(local_path=str(binary)),
     arguments=args.arguments.split(),
-    env_list=[f"OMP_NUM_THREADS={args.cores}"],
+    env_list=[f"OMP_NUM_THREADS={args.cores}", *args.env],
 )
 
 simulator = Simulator(board=board)

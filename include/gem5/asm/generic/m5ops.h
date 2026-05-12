@@ -79,6 +79,8 @@
 #define M5OP_CIRA_GETFIN        0x5d
 #define M5OP_CIRA_CFGWR         0x5e
 #define M5OP_CIRA_CFGRD         0x5f
+#define M5OP_CIRA_PREFETCH_INDEXED 0x60
+#define M5OP_CIRA_PREFETCH_CSR  0x61
 
 #define M5OP_DIST_TOGGLE_SYNC   0x62
 
@@ -119,6 +121,8 @@
     M5OP(m5_cira_getfin, M5OP_CIRA_GETFIN)                      \
     M5OP(m5_cira_cfgwr, M5OP_CIRA_CFGWR)                        \
     M5OP(m5_cira_cfgrd, M5OP_CIRA_CFGRD)                        \
+    M5OP(m5_cira_prefetch_indexed, M5OP_CIRA_PREFETCH_INDEXED)  \
+    M5OP(m5_cira_prefetch_csr, M5OP_CIRA_PREFETCH_CSR)          \
     M5OP(m5_dist_toggle_sync, M5OP_DIST_TOGGLE_SYNC)            \
     M5OP(m5_workload, M5OP_WORKLOAD)                            \
 
