@@ -175,8 +175,13 @@ Run all four matched workloads using
 
 Every AMU run must exit successfully, report nonzero issued loads, and satisfy
 `issuedLoads == completedLoads`. GAPBS verification output must indicate
-success. The resulting summary records baseline ticks, AMU ticks, speedup,
-AMU event counts, and run directories for auditability.
+success. Because GAPBS runs its verifier after the timed kernel, verification
+mode dumps ROI stats at `m5_work_end` but continues simulation until the
+program exits; stopping at `m5_work_end` is not valid correctness evidence.
+The workload receives `-v`, and the runner requires the exact GAPBS output
+`Verification: PASS`. The resulting summary records baseline ticks, AMU ticks,
+speedup, AMU event counts, verifier status, and run directories for
+auditability.
 
 ## Acceptance Criteria
 
