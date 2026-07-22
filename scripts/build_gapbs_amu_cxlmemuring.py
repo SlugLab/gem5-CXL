@@ -4,6 +4,7 @@
 # CXLMemUring's GAPBS checkout and compiler profile metadata as input.
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -584,6 +585,29 @@ def cxl_commit(cxlmemuring):
         return "unknown"
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_repository_state(repo):
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            text=True,
+        )
+        return {"commit": commit, "dirty": bool(status)}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": "unknown", "dirty": None}
+
+
 def profile_for(cxlmemuring, benchmark):
     candidates = [
         cxlmemuring / "profile_results" / "gapbs" / benchmark /
@@ -648,24 +672,45 @@ def main():
 
     binaries = []
     for benchmark in benchmarks:
-        binaries.append(str(build_benchmark(
+        binaries.append(build_benchmark(
             src_dir, out_bin_dir, benchmark, args.cxx, extra_cxxflags,
             args.amu_batch_size
-        )))
+        ))
+
+    gapbs_source = args.cxlmemuring / "bench" / "gapbs"
+    gapbs_state = git_repository_state(gapbs_source)
+    profiles_used = {
+        benchmark: profile_for(args.cxlmemuring, benchmark)
+        for benchmark in benchmarks
+    }
 
     manifest = {
         "cxlmemuring": str(args.cxlmemuring),
         "cxlmemuring_commit": cxl_commit(args.cxlmemuring),
-        "gapbs_source": str(args.cxlmemuring / "bench" / "gapbs"),
+        "gapbs_source": str(gapbs_source),
+        "gapbs_commit": gapbs_state["commit"],
+        "gapbs_dirty": gapbs_state["dirty"],
         "source_copy": str(src_dir),
-        "binaries": binaries,
+        "binaries": [str(path) for path in binaries],
+        "benchmark_source_sha256": {
+            benchmark: sha256_file(src_dir / "src" / f"{benchmark}.cc")
+            for benchmark in benchmarks
+        },
+        "binary_sha256": {
+            benchmark: sha256_file(binary)
+            for benchmark, binary in zip(benchmarks, binaries)
+        },
         "amu_rewritten_benchmarks": patched,
         "amu_batch_size": args.amu_batch_size,
         "roi_work_markers": args.roi_work_markers,
         "benchmarks_built_without_amu_rewrites": unsupported,
-        "profiles_used": {
-            benchmark: profile_for(args.cxlmemuring, benchmark)
-            for benchmark in benchmarks
+        "profiles_used": profiles_used,
+        "profile_sha256": {
+            benchmark: {
+                profile: sha256_file(profile)
+                for profile in profiles
+            }
+            for benchmark, profiles in profiles_used.items()
         },
     }
     manifest_path = args.outdir / "manifest.json"

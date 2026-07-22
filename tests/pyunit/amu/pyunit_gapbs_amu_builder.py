@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import importlib.util
+import hashlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -205,6 +207,60 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             transformed = target.read_text(encoding="utf-8")
         self.assertIn("bool verification_passed", transformed)
         self.assertIn("m5_fail(0, 1)", transformed)
+
+    def test_builders_hash_exact_file_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "artifact"
+            artifact.write_bytes(b"gapbs provenance\x00\xff")
+            expected = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self.assertEqual(self.builder.sha256_file(artifact), expected)
+            self.assertEqual(
+                self.baseline_builder.sha256_file(artifact), expected
+            )
+
+    def test_builders_report_nested_repo_commit_and_dirty_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test User"],
+                check=True,
+            )
+            tracked = repo / "tracked.cc"
+            tracked.write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.cc"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True
+            )
+            expected_commit = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            for builder in (self.builder, self.baseline_builder):
+                self.assertEqual(
+                    builder.git_repository_state(repo),
+                    {"commit": expected_commit, "dirty": False},
+                )
+            tracked.write_text("dirty\n", encoding="utf-8")
+            for builder in (self.builder, self.baseline_builder):
+                self.assertTrue(builder.git_repository_state(repo)["dirty"])
+
+    def test_manifest_sources_include_required_provenance_fields(self):
+        baseline_source = BASELINE_BUILDER_PATH.read_text(encoding="utf-8")
+        amu_source = BUILDER_PATH.read_text(encoding="utf-8")
+        common_fields = (
+            '"gapbs_commit"',
+            '"gapbs_dirty"',
+            '"benchmark_source_sha256"',
+            '"binary_sha256"',
+        )
+        for field in common_fields:
+            self.assertIn(field, baseline_source)
+            self.assertIn(field, amu_source)
+        self.assertIn('"profile_sha256"', amu_source)
 
     def test_verify_mode_makes_invalid_summary_nonzero(self):
         runner_source = RUNNER_PATH.read_text(encoding="utf-8")
