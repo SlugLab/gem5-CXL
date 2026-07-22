@@ -19,7 +19,11 @@ EXPECTED_LATENCIES = {
     "2us": 2_000_000,
 }
 EXPECTED_BENCHMARKS = ("bfs", "bc", "pr", "sssp")
-EXPECTED_KINDS = ("baseline", "amu", "cira")
+EXPECTED_LABEL_KINDS = (
+    ("cxl_vanilla", "baseline"),
+    ("amu", "amu"),
+    ("cira_pgo", "cira"),
+)
 ValidationResult = namedtuple(
     "ValidationResult", "row_count amu_rows cira_rows"
 )
@@ -89,15 +93,18 @@ def validate_sweep(sweep_root):
         if len(rows) != 12:
             raise ValidationError(f"{summary}: expected 12 rows, found {len(rows)}")
 
-        observed = [(row["benchmark"], row["kind"]) for row in rows]
+        observed = [
+            (row["benchmark"], row["label"], row["kind"]) for row in rows
+        ]
         expected = [
-            (benchmark, kind)
+            (benchmark, label, kind)
             for benchmark in EXPECTED_BENCHMARKS
-            for kind in EXPECTED_KINDS
+            for label, kind in EXPECTED_LABEL_KINDS
         ]
         if sorted(observed) != sorted(expected):
             raise ValidationError(
-                f"{summary}: expected one baseline/amu/cira row per workload"
+                f"{summary}: expected exact cxl_vanilla/baseline, amu/amu, "
+                "and cira_pgo/cira rows per workload"
             )
 
         for row in rows:

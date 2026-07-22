@@ -24,7 +24,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
     def setUpClass(cls):
         cls.validator = load_validator()
 
-    def make_sweep(self, root, *, completed_prefetches=8):
+    def make_sweep(self, root, *, completed_prefetches=8, cira_label="cira_pgo"):
         fields = (
             "benchmark,label,kind,status,verification,sim_ticks,sim_insts,"
             "speedup_vs_cxl,asmc_loads,cira_prefetches,"
@@ -37,7 +37,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 for label, kind in (
                     ("cxl_vanilla", "baseline"),
                     ("amu", "amu"),
-                    ("cira_pgo", "cira"),
+                    (cira_label, "cira"),
                 ):
                     run_dir = root / latency / benchmark / label
                     run_dir.mkdir(parents=True)
@@ -111,6 +111,16 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
                 "issuedPrefetches=8 != completedPrefetches=9",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_non_pgo_cira_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root, cira_label="cira_not_pgo")
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "exact cxl_vanilla/baseline, amu/amu, and cira_pgo/cira rows",
             ):
                 self.validator.validate_sweep(root)
 
