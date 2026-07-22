@@ -124,6 +124,22 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ):
                 self.validator.validate_sweep(root)
 
+    def test_rejects_truncated_first_roi_stats_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
+            stats.write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                "simTicks 100\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "missing End marker for first ROI stats section",
+            ):
+                self.validator.validate_sweep(root)
+
 
 if __name__ == "__main__":
     unittest.main()

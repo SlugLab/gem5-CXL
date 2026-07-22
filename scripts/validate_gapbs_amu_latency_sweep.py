@@ -36,6 +36,7 @@ class ValidationError(RuntimeError):
 def parse_first_stats_section(path):
     stats = {}
     in_section = False
+    ended = False
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("---------- Begin Simulation Statistics"):
             if in_section:
@@ -43,6 +44,7 @@ def parse_first_stats_section(path):
             in_section = True
             continue
         if in_section and line.startswith("---------- End Simulation Statistics"):
+            ended = True
             break
         if not in_section:
             continue
@@ -55,6 +57,10 @@ def parse_first_stats_section(path):
             continue
     if not in_section:
         raise ValidationError(f"{path}: missing simulation statistics section")
+    if not ended:
+        raise ValidationError(
+            f"{path}: missing End marker for first ROI stats section"
+        )
     return stats
 
 
