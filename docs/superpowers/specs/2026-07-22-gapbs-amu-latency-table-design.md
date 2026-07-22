@@ -24,8 +24,17 @@ execution, and the existing CIRA profile-guided static rewrite at 200 ns,
 - Latencies: `200ns`, `500ns`, `1us`, and `2us`.
 - Correctness: run GAPBS verification after the timed ROI. Every baseline, AMU,
   and CIRA run must report `status=ok` and `verification=pass` (bit-exact PASS).
-- Completion: every AMU run must have `issuedLoads == completedLoads`; every
-  CIRA run must have nonzero and equal issued/completed prefetch counts.
+- Completion: every AMU run must have
+  `board.asmc.issuedLoads == board.asmc.completedLoads > 0`. Every CIRA run
+  must independently satisfy both of these invariants in the first ROI stats
+  section:
+  1. leaf cacheline requests balance as
+     `board.cira.issuedPrefetches == board.cira.completedPrefetches > 0`; and
+  2. descriptor use is proven by
+     `board.cira.issuedIndexedPrefetches + board.cira.issuedCsrPrefetches > 0`.
+  CIRA exposes no completed indexed-descriptor or completed CSR-descriptor
+  counters. Descriptor counts must never be added to leaf request counts or
+  compared with `completedPrefetches`.
 - Metrics: AMU and CIRA speedup are each baseline ROI `simTicks` divided by the
   corresponding configuration's ROI `simTicks`.
 
@@ -51,8 +60,10 @@ Before handoff:
 
 1. Require all 48 runs (4 workloads x 4 latencies x 3 configurations) to pass.
 2. Check the configured link delay in every run's `config.ini`.
-3. Check AMU issued and completed loads match; check CIRA issued and completed
-   prefetches are nonzero and match.
+3. Run `scripts/validate_gapbs_amu_latency_sweep.py` on the sweep root. It
+   checks AMU load balance, CIRA leaf request balance, nonzero CIRA descriptor
+   use, numeric speedups, and the first ROI stats section without mixing leaf
+   and descriptor counter domains.
 4. Regenerate the table only from the validated combined CSV.
 5. Compile the Overleaf project and inspect the resulting table for overflow,
    clipping, and readable labels.

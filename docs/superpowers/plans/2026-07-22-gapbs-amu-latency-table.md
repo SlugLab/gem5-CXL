@@ -80,6 +80,8 @@ Expected: exit 0.
 ### Task 2: Run the four latency sweeps
 
 **Files:**
+- Create: `scripts/validate_gapbs_amu_latency_sweep.py`
+- Create: `tests/pyunit/amu/test_validate_gapbs_amu_latency_sweep.py`
 - Generated: `m5out/gapbs_cxl_amu_cira/latency_table_20260722/{200ns,500ns,1us,2us}/`
 
 - [ ] **Step 1: Run each latency**
@@ -100,13 +102,41 @@ python3 scripts/compare_gapbs_cxl_amu_cira.py \
 
 Expected: each invocation exits 0 and writes twelve rows.
 
-- [ ] **Step 2: Enforce the run invariants**
+- [ ] **Step 2: Write the failing sweep-validator tests**
 
-Read every summary and run directory; require 48 rows total, `status=ok`,
-`verification=pass`, the expected delay in `config.ini`, and equal
-`board.asmc.issuedLoads`/`board.asmc.completedLoads` for AMU rows. For each
-CIRA row, require the sum of issued CIRA prefetch counters to be nonzero and
-equal `board.cira.completedPrefetches`.
+Create a synthetic 48-row sweep fixture. Test that balanced AMU loads,
+balanced CIRA leaf requests, and nonzero CIRA descriptors pass. Add a
+regression fixture where eight leaf requests plus one descriptor numerically
+equals nine completed leaf requests; require rejection because leaf and
+descriptor counters are different domains.
+
+Run: `python3 tests/pyunit/amu/test_validate_gapbs_amu_latency_sweep.py -v`
+
+Expected: fail because the validator does not exist.
+
+- [ ] **Step 3: Implement the independent sweep validator**
+
+Accept the sweep root as one positional argument. Require 48 rows total,
+twelve per latency, `status=ok`, `verification=pass`, numeric finite speedups,
+and the expected `board.cxl_mem_link0.delay` in every `config.ini`. Read only
+the first ROI stats section. Require
+`board.asmc.issuedLoads == board.asmc.completedLoads > 0` for AMU rows. For
+CIRA rows require leaf cacheline balance
+`board.cira.issuedPrefetches == board.cira.completedPrefetches > 0` and
+separately require descriptor use via
+`board.cira.issuedIndexedPrefetches + board.cira.issuedCsrPrefetches > 0`.
+There are no completed descriptor counters; never add descriptor counts to
+leaf counts.
+
+- [ ] **Step 4: Verify the validator and existing artifacts**
+
+Run:
+
+```bash
+python3 tests/pyunit/amu/test_validate_gapbs_amu_latency_sweep.py -v
+python3 scripts/validate_gapbs_amu_latency_sweep.py \
+  m5out/gapbs_cxl_amu_cira/latency_table_20260722
+```
 
 Expected: a single `PASS: 48/48` message.
 
