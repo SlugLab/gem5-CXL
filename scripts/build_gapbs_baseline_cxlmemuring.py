@@ -70,6 +70,18 @@ def patch_benchmark_roi_markers(src_dir):
         "    m5_work_end(iter, 0);\n",
         path,
     )
+    data = replace_once(
+        data,
+        '      PrintLabel("Verification",\n'
+        '                 verify(std::ref(g), std::ref(result)) ? "PASS" : "FAIL");\n',
+        "      bool verification_passed =\n"
+        "          verify(std::ref(g), std::ref(result));\n"
+        '      PrintLabel("Verification",\n'
+        '                 verification_passed ? "PASS" : "FAIL");\n'
+        "      if (!verification_passed)\n"
+        "        m5_fail(0, 1);\n",
+        path,
+    )
     write_text(path, data)
 
 

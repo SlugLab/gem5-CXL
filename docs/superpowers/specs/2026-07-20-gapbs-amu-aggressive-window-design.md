@@ -37,25 +37,30 @@ The generated sources currently show this problem most clearly in BC and SSSP:
 
 ### Fixed-capacity load windows
 
-The generated AMU helper will provide a fixed-capacity `LoadWindow<T>` whose
-capacity is `GAPBS_AMU_BATCH_SIZE`. A window owns stable SPM slots, AMU request
-IDs, destination slots, and completion state for its entire lifetime.
+The generated AMU helper will provide one fixed-capacity heterogeneous
+`LoadWindow` whose capacity is `2 * GAPBS_AMU_BATCH_SIZE`. A window owns stable SPM
+slots, AMU request IDs, per-slot element sizes, value storage, and completion
+state for its entire lifetime. A single window is also a single completion
+domain: requests of different value types may overlap without one typed window
+accidentally consuming another typed window's completion ID.
 
 The interface has four explicit phases:
 
-1. `add(address)` records a source address and returns its stable slot index.
+1. `add<T>(address)` records a typed source address and returns its stable slot
+   index.
 2. `issue_all()` configures the element granularity and issues every recorded
    request without polling for completion between requests.
 3. `wait_all()` consumes completions in any order and copies each completed SPM
    slot into the corresponding typed value slot.
-4. `value(slot)` returns a value only after `wait_all()` has completed.
+4. `value<T>(slot)` returns a typed value only after `wait_all()` has completed
+   and asserts that `sizeof(T)` matches the recorded slot size.
 
 The helper rejects over-capacity additions in debug builds and does not expose
 SPM pointers or request IDs to kernels. A request ID is mapped back to its slot
 inside the window. Completion order therefore cannot change kernel iteration
 order.
 
-`load_values()` becomes a thin compatibility wrapper around `LoadWindow<T>`.
+`load_values()` becomes a thin compatibility wrapper around `LoadWindow`.
 `load_value()` remains available only for control-dependent retry paths where
 the address or required value is not known before the preceding commit.
 
@@ -93,12 +98,14 @@ The reverse dependency pass uses three stages per neighbor batch:
 
 1. Gather neighbor IDs.
 2. Identify successors using the existing successor bitmap and construct two
-   aligned windows for `path_counts[v]` and `deltas[v]`.
-3. Issue both typed windows before waiting, collect them, then update `delta_u`
-   in original successor order.
+   aligned slots for `path_counts[v]` and `deltas[v]` in one heterogeneous
+   window.
+3. Issue that window once, collect all values, then update `delta_u` in original
+   successor order.
 
-Both windows must be simultaneously alive so their requests overlap. The
-accumulation order is unchanged to preserve floating-point results exactly.
+Both value types share one completion domain so their requests overlap without
+misrouting completion IDs. The accumulation order is unchanged to preserve
+floating-point results exactly.
 
 ### PR and PR-SPMV
 

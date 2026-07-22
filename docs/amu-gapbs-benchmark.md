@@ -1,45 +1,56 @@
 # AMU GAPBS Benchmarking
 
-The paper's AMU/AMI evaluation compares a no-architecture-change baseline
-against GAPBS-style workloads rewritten to issue asynchronous memory operations.
-For a valid timing comparison, the AMU side needs both pieces:
+This flow compares matched GAPBS baseline and AMU binaries on the local gem5
+CXL model. Always use `--verify`: the runner keeps simulation alive after the
+kernel ROI, runs the GAPBS verifier, and records its result in `summary.csv`.
+A timing result without `verification=pass` is invalid.
 
-* a timing AMU/ASMC microarchitecture model in gem5, including SPM capacity,
-  request queues, completion queue, and L2/cache integration; and
-* AMU-aware GAPBS binaries that use `aload`, `astore`, and `getfin`.
+## Build matched binaries
 
-The current tree has an X86-callable functional AMU m5op path. That is useful
-for software bring-up, but it is not the full timing model from the paper and
-stock GAPBS resources do not issue AMU operations.
-
-## Build
-
-Use the system `protoc` when building this tree. The conda `protoc` may be
-newer than the system protobuf headers.
+Use the same CXLMemUring checkout for both builds. The AMU builder generates an
+asynchronous load window, preserves each kernel's ordered commit semantics, and
+adds the verifier-to-`m5_fail` handshake.
 
 ```sh
-/usr/bin/protoc --cpp_out build/X86/proto --proto_path src/proto \
-    src/proto/packet.proto src/proto/inst.proto src/proto/inst_dep_record.proto
-scons build/X86/gem5.opt -j4 PROTOC=/usr/bin/protoc
+python3 scripts/build_gapbs_baseline_cxlmemuring.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --benchmarks bfs,bc,pr,sssp --roi-work-markers \
+  --outdir m5out/gapbs_baseline_bins
+
+python3 scripts/build_gapbs_amu_cxlmemuring.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --benchmarks bfs,bc,pr,sssp --roi-work-markers \
+  --amu-batch-size 64 --outdir m5out/gapbs_amu_bins
 ```
 
-## Run
-
-Use `scripts/benchmark_gapbs_amu.py` to run matched baseline and AMU
-simulations and write `summary.csv`.
+## Run at CXL 1 us
 
 ```sh
-scripts/benchmark_gapbs_amu.py \
-    --benchmark gapbs-bfs-test \
-    --baseline-config configs/example/gem5_library/x86-gapbs-benchmarks.py \
-    --amu-config configs/example/gem5_library/x86-gapbs-amu-benchmarks.py
+python3 scripts/compare_gapbs_cxl_amu_cira.py \
+  --gem5 build/X86/gem5.opt \
+  --baseline-bin-dir m5out/gapbs_baseline_bins/bin \
+  --amu-bin-dir m5out/gapbs_amu_bins/bin \
+  --benchmarks bfs,bc,pr,sssp \
+  --scale 4 --iterations 1 --cpu timing --cores 1 \
+  --cxl-link-delay 1us --roi-work-events --verify --timeout 600 \
+  --outdir m5out/gapbs_cxl_amu_cira/window_g4_1us
 ```
 
-The reported speedup is:
+The speedup column is `baseline ROI simTicks / AMU ROI simTicks`; only the
+first stats section is used, so verifier execution is outside the timed ROI.
+Require eight rows with `status=ok` and `verification=pass` before comparing
+ticks.
 
-```text
-baseline ROI simTicks / AMU ROI simTicks
-```
+## Current model limitation
 
-For a command smoke test only, pass the same config twice with
-`--allow-same-config --dry-run`; do not use that as a performance result.
+The ASMC path is below the private CPU caches and is not cache coherent. For
+bit-exact operation, generated AMU code flushes source cache lines before
+`aload` and invalidates each SPM destination before consuming the completion.
+These operations are correctness requirements in the current model, not part
+of the intended AMU architecture. They can dominate small graphs and may make
+AMU slower even with broad asynchronous batching. Treat that result as a model
+integration limit; removing the flushes makes BC/SSSP or SPM-backed reads fail
+verification.
+
+The result artifact is `OUTDIR/summary.csv`; each row also points to the exact
+run directory containing `stats.txt`, `config.ini`, and `gem5.log`.

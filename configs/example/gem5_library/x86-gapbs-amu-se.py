@@ -176,6 +176,7 @@ parser.add_argument(
     action="store_true",
     help="Reset stats at m5_work_begin and stop after m5_work_end.",
 )
+parser.add_argument("--continue-after-roi", action="store_true")
 
 args = parser.parse_args()
 
@@ -271,7 +272,7 @@ def handle_workbegin():
 def handle_workend():
     print("Dump stats at the end of the ROI!")
     m5.stats.dump()
-    yield True
+    yield not args.continue_after_roi
 
 
 if args.roi_work_events:
@@ -288,6 +289,15 @@ else:
 start_wall = time.time()
 print(f"Running {binary} {' '.join(args.arguments.split())}")
 simulator.run()
+if args.continue_after_roi:
+    exit_cause = simulator.get_last_exit_event_cause()
+    if exit_cause == "m5_fail instruction encountered":
+        print("Verification: FAIL")
+        raise SystemExit(2)
+    if exit_cause != "exiting with last active thread context":
+        print(f"Verification: MISSING ({exit_cause})")
+        raise SystemExit(3)
+    print("Verification: PASS")
 if not args.roi_work_events:
     m5.stats.dump()
 

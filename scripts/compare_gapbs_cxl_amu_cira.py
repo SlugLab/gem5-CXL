@@ -32,7 +32,17 @@ def parse_stats(path):
     stats = {}
     if not path.exists():
         return stats
+    in_first_section = False
     for line in path.read_text(errors="replace").splitlines():
+        if line.startswith("---------- Begin Simulation Statistics"):
+            if in_first_section:
+                break
+            in_first_section = True
+            continue
+        if in_first_section and line.startswith(
+            "---------- End Simulation Statistics"
+        ):
+            break
         if not line or line.startswith("#") or line.startswith("---"):
             continue
         parts = line.split()
@@ -43,6 +53,18 @@ def parse_stats(path):
         except ValueError:
             pass
     return stats
+
+
+def parse_verification(path):
+    if not path.exists():
+        return "missing"
+    verification = "missing"
+    for line in path.read_text(errors="replace").splitlines():
+        if "Verification: PASS" in line:
+            verification = "pass"
+        elif "Verification: FAIL" in line:
+            return "fail"
+    return verification
 
 
 def sum_matching(stats, needle):
@@ -85,6 +107,8 @@ def run_one(args, benchmark, label, binary_dir, kind):
         }
 
     workload_args = f"-g {args.scale} -n {args.iterations}"
+    if args.verify:
+        workload_args += " -v"
     cmd = [
         str(args.gem5),
         f"--outdir={run_dir}",
@@ -106,6 +130,8 @@ def run_one(args, benchmark, label, binary_dir, kind):
         cmd.append("--disable-hw-prefetchers")
     if args.roi_work_events:
         cmd.append("--roi-work-events")
+    if args.verify and args.roi_work_events:
+        cmd.append("--continue-after-roi")
     add_optional(cmd, "--l1-mshrs", args.l1_mshrs)
     add_optional(cmd, "--l1-tgts-per-mshr", args.l1_tgts_per_mshr)
     add_optional(cmd, "--l2-mshrs", args.l2_mshrs)
@@ -177,7 +203,13 @@ def run_one(args, benchmark, label, binary_dir, kind):
         )
 
     stats = parse_stats(run_dir / "stats.txt")
+    verification = parse_verification(log_path)
     status = "ok" if proc.returncode == 0 else f"exit-{proc.returncode}"
+    if proc.returncode == 0 and args.verify:
+        if verification == "fail":
+            status = "verification-failed"
+        elif verification == "missing":
+            status = "verification-missing"
     cira_prefetches = stats.get("board.cira.issuedPrefetches", 0)
     cira_indexed_prefetches = stats.get("board.cira.issuedIndexedPrefetches", 0)
     cira_csr_prefetches = stats.get("board.cira.issuedCsrPrefetches", 0)
@@ -197,6 +229,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         "label": label,
         "kind": kind,
         "status": status,
+        "verification": verification,
         "sim_ticks": stats.get("simTicks", ""),
         "sim_insts": stats.get("simInsts", ""),
         "asmc_loads": stats.get("board.asmc.issuedLoads", 0),
@@ -220,6 +253,7 @@ def write_summary(path, rows):
         "label",
         "kind",
         "status",
+        "verification",
         "sim_ticks",
         "sim_insts",
         "speedup_vs_cxl",
@@ -287,6 +321,11 @@ def main():
         action="store_true",
         help="Reset stats at m5_work_begin and stop at m5_work_end.",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Run GAPBS verification after dumping kernel ROI stats.",
+    )
     parser.add_argument("--env", action="append", default=[])
     parser.add_argument(
         "--allow-zero-cira",
@@ -326,6 +365,11 @@ def main():
     summary = args.outdir / "summary.csv"
     write_summary(summary, rows)
     print(f"Wrote {summary}")
+    if args.verify and any(
+        row["status"] != "ok" or row["verification"] != "pass"
+        for row in rows
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

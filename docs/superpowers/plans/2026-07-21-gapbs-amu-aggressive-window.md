@@ -4,7 +4,7 @@
 
 **Goal:** Replace blocking scalar AMU loads in GAPBS hot paths with dependency-aware asynchronous load windows while preserving bit-exact BFS, BC, PR, and SSSP results at a 1 us CXL delay.
 
-**Architecture:** The generated `amu_gapbs.h` will own fixed-capacity typed load windows with explicit add, issue, wait, and ordered-value phases. Kernel rewrites will gather addresses by dependency stage, allow all independent requests to overlap, and retain the baseline order for floating-point accumulation, CAS, frontier insertion, and other state changes.
+**Architecture:** The generated `amu_gapbs.h` will own one fixed-capacity heterogeneous load window with typed add/value operations and explicit issue and wait phases. Kernel rewrites will gather addresses by dependency stage, overlap independent mixed-type requests in one completion domain, and retain the baseline order for floating-point accumulation, CAS, frontier insertion, and other state changes.
 
 **Tech Stack:** Python 3 generator and `unittest`, generated C++11/OpenMP GAPBS sources, gem5 AMU m5ops, X86 syscall emulation, CSV/stat validation.
 
@@ -14,12 +14,12 @@
 
 - Create `tests/pyunit/amu/pyunit_gapbs_amu_builder.py`: focused generator and transformed-source regression tests.
 - Create `tests/pyunit/amu/__init__.py`: makes the focused test directory importable by the existing pyunit runner.
-- Modify `scripts/build_gapbs_amu_cxlmemuring.py`: add `LoadWindow<T>` and rewrite BC/PR/SSSP hot paths around staged windows.
+- Modify `scripts/build_gapbs_amu_cxlmemuring.py`: add heterogeneous `LoadWindow` and rewrite BC/PR/SSSP hot paths around staged windows.
 - Modify `configs/example/gem5_library/x86-gapbs-amu-se.py`: dump ROI stats at work end and optionally continue through GAPBS verification.
 - Modify `scripts/compare_gapbs_cxl_amu_cira.py`: retain verifier evidence in the result summary and reject runs whose workload verification fails.
 - Modify `docs/amu-gapbs-benchmark.md`: replace the nonexistent legacy AMU config command with the current local SE build/run/verification workflow.
 
-### Task 1: Load-window helper contract
+### Task 1: Heterogeneous load-window helper contract
 
 **Files:**
 - Create: `tests/pyunit/amu/__init__.py`
@@ -45,7 +45,7 @@ def test_load_window_issues_before_waiting(self):
 def test_load_values_uses_the_window(self):
     header = self.builder.AMU_HEADER
     wrapper = header[header.index("static inline void load_values") :]
-    self.assertIn("LoadWindow<T>", wrapper)
+    self.assertIn("LoadWindow window", wrapper)
     self.assertIn("window.issue_all()", wrapper)
     self.assertIn("window.wait_all()", wrapper)
 
@@ -66,9 +66,12 @@ python3 -m unittest -v tests.pyunit.amu.pyunit_gapbs_amu_builder
 Expected: failures stating that `class LoadWindow`, `issue_all`, and
 `window.wait_all()` are absent from `AMU_HEADER`.
 
-- [ ] **Step 3: Implement the minimal typed window**
+- [ ] **Step 3: Implement the minimal heterogeneous window**
 
-In `AMU_HEADER`, add `<assert.h>` and a `LoadWindow<T>` containing:
+In `AMU_HEADER`, add `<assert.h>` and a `LoadWindow` with templated `add<T>()`
+and `value<T>()` methods. Record each slot's byte size, configure that size
+immediately before its `amu_aload`, and consume every completion through the
+single window ID table. Store SPM and completed values in 64-byte slot arrays.
 
 ```cpp
 template <typename T>
@@ -151,7 +154,7 @@ pass with no errors.
 - [ ] **Step 5: Compile a generated header smoke program**
 
 Generate a temporary header through `patch_sources`, then compile a small C++11
-translation unit that instantiates `LoadWindow<uint64_t>` using the repository's
+translation unit that instantiates `LoadWindow` and calls `add<uint64_t>` using the repository's
 AMU include paths. Run:
 
 ```bash
@@ -181,20 +184,15 @@ Create a temporary `src/bc.cc` fixture containing the exact original snippets
 consumed by `patch_bc()`. After patching, assert:
 
 ```python
-self.assertIn("LoadWindow<CountT> path_count_window", transformed)
-self.assertIn("LoadWindow<ScoreT> delta_window", transformed)
+self.assertIn("LoadWindow value_window", transformed)
 self.assertLess(
-    transformed.index("path_count_window.issue_all()"),
-    transformed.index("path_count_window.wait_all()"),
-)
-self.assertLess(
-    transformed.index("delta_window.issue_all()"),
-    transformed.index("path_count_window.wait_all()"),
+    transformed.index("value_window.issue_all()"),
+    transformed.index("value_window.wait_all()"),
 )
 self.assertNotIn("load_value(&path_counts[v])", transformed)
 self.assertNotIn("load_value(&deltas[v])", transformed)
-self.assertIn("path_count_window.value(amu_i)", transformed)
-self.assertIn("delta_window.value(amu_i)", transformed)
+self.assertIn("value_window.value<CountT>", transformed)
+self.assertIn("value_window.value<ScoreT>", transformed)
 ```
 
 - [ ] **Step 2: Run only the BC test and verify RED**
@@ -210,11 +208,11 @@ Expected: failure because the transformed source still contains scalar
 - [ ] **Step 3: Implement aligned BC windows**
 
 In `patch_bc()`, after the neighbor-ID batch completes, retain original
-neighbor slots and construct `path_count_window`, `delta_window`, and a compact
-`successor_slots[]` mapping only for `succ` entries. Add both addresses for each
-selected successor, issue both windows before either wait, wait for both, then
-accumulate in ascending compact-slot order. Keep `path_counts[u]` outside the
-window and preserve the original `delta_u += ...` expression order.
+neighbor slots and construct one heterogeneous `value_window` plus compact
+path-count and delta slot mappings only for `succ` entries. Add both addresses
+for each selected successor, issue and wait once, then accumulate in ascending
+successor order. Keep `path_counts[u]` outside the window and preserve the
+original `delta_u += ...` expression order.
 
 - [ ] **Step 4: Run the BC test and full focused suite**
 
@@ -240,7 +238,7 @@ git commit -m "benchmarks: overlap BC AMU value loads"
 Patch a minimal exact-match `sssp.cc` fixture and assert:
 
 ```python
-self.assertIn("LoadWindow<WeightT> distance_window", transformed)
+self.assertIn("LoadWindow distance_window", transformed)
 self.assertIn("distance_window.add(&dist[edges[amu_i].v])", transformed)
 self.assertIn("distance_window.issue_all()", transformed)
 self.assertIn("distance_window.wait_all()", transformed)
@@ -263,7 +261,7 @@ Expected: failure because each initial destination distance is scalar-loaded.
 - [ ] **Step 3: Implement the SSSP distance stage**
 
 After `load_values(edge_addrs, edges, amu_count)`, create one
-`LoadWindow<WeightT>`, add `&dist[edges[i].v]` in edge order, issue and wait,
+`LoadWindow`, add `&dist[edges[i].v]` in edge order, issue and wait,
 then use `value(i)` as the initial `old_dist`. Preserve the existing scalar
 reload following failed CAS, edge order, bin resizing, and bin insertion.
 
