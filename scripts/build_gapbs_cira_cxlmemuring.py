@@ -479,27 +479,33 @@ def copy_gapbs_source(cxlmemuring, outdir):
     return dst
 
 
-def profile_distance(cxlmemuring, benchmark):
+def resolve_profile(cxlmemuring, benchmark, prefetch_distance_override):
+    if prefetch_distance_override:
+        return prefetch_distance_override, [], prefetch_distance_override
     profile = (
         cxlmemuring / "profile_results" / "gapbs" / benchmark /
         f"{benchmark}_twopass_profile.json"
     )
     if not profile.exists():
-        return 16
-    data = json.loads(profile.read_text(encoding="utf-8"))
-    distances = [
-        int(region.get("optimal_prefetch_depth", 16))
-        for region in data.get("regions", [])
-    ]
-    return max(distances) if distances else 16
-
-
-def profile_for(cxlmemuring, benchmark):
-    profile = (
-        cxlmemuring / "profile_results" / "gapbs" / benchmark /
-        f"{benchmark}_twopass_profile.json"
-    )
-    return [str(profile)] if profile.exists() else []
+        raise SystemExit(
+            f"Missing usable CIRA PGO profile for {benchmark}: {profile}"
+        )
+    try:
+        data = json.loads(profile.read_text(encoding="utf-8"))
+        distances = [
+            int(region["optimal_prefetch_depth"])
+            for region in data.get("regions", [])
+            if "optimal_prefetch_depth" in region
+        ]
+    except (OSError, ValueError, TypeError) as exc:
+        raise SystemExit(
+            f"Missing usable CIRA PGO profile for {benchmark}: {profile}: {exc}"
+        ) from exc
+    if not distances or any(distance <= 0 for distance in distances):
+        raise SystemExit(
+            f"Missing usable CIRA PGO profile for {benchmark}: {profile}"
+        )
+    return max(distances), [str(profile)], None
 
 
 def cxl_commit(cxlmemuring):
@@ -518,6 +524,15 @@ def sha256_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_tree(root, suffixes):
+    root = Path(root)
+    return {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and path.suffix in suffixes
+    }
 
 
 def git_repository_state(repo):
@@ -927,11 +942,15 @@ def main():
 
     binaries = []
     distances = {}
+    profiles_used = {}
+    prefetch_distance_overrides = {}
     for benchmark in benchmarks:
-        distance = args.prefetch_distance or profile_distance(
-            args.cxlmemuring, benchmark
+        distance, profiles, override = resolve_profile(
+            args.cxlmemuring, benchmark, args.prefetch_distance
         )
         distances[benchmark] = distance
+        profiles_used[benchmark] = profiles
+        prefetch_distance_overrides[benchmark] = override
         binaries.append(build_benchmark(
             src_dir, out_bin_dir, benchmark, args.cxx, extra_cxxflags,
             distance, args.range_limit, args.max_outstanding,
@@ -940,11 +959,6 @@ def main():
 
     gapbs_source = args.cxlmemuring / "bench" / "gapbs"
     gapbs_state = git_repository_state(gapbs_source)
-    profiles_used = {
-        benchmark: profile_for(args.cxlmemuring, benchmark)
-        for benchmark in benchmarks
-    }
-
     manifest = {
         "cxlmemuring": str(args.cxlmemuring),
         "cxlmemuring_commit": cxl_commit(args.cxlmemuring),
@@ -957,11 +971,19 @@ def main():
             benchmark: sha256_file(src_dir / "src" / f"{benchmark}.cc")
             for benchmark in benchmarks
         },
+        "compiler_input_sha256": sha256_tree(src_dir, (".cc", ".h")),
+        "builder_script_sha256": sha256_file(Path(__file__)),
+        "m5_library_sha256": sha256_file(M5_LIB),
+        "gem5_include_sha256": sha256_tree(REPO / "include" / "gem5", (".h",)),
+        "instrumentation_include_sha256": sha256_tree(
+            REPO / "util" / "cira", (".h",)
+        ),
         "binary_sha256": {
             benchmark: sha256_file(binary)
             for benchmark, binary in zip(benchmarks, binaries)
         },
         "profiles_used": profiles_used,
+        "profile_mode": "override-non-pgo" if args.prefetch_distance else "pgo",
         "profile_sha256": {
             benchmark: {
                 profile: sha256_file(profile)
@@ -970,6 +992,7 @@ def main():
             for benchmark, profiles in profiles_used.items()
         },
         "prefetch_distances": distances,
+        "prefetch_distance_overrides": prefetch_distance_overrides,
         "range_limit": args.range_limit,
         "max_outstanding": args.max_outstanding,
         "node_distance": args.node_distance,

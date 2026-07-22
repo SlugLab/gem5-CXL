@@ -129,6 +129,15 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def sha256_tree(root, suffixes):
+    root = Path(root)
+    return {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and path.suffix in suffixes
+    }
+
+
 def git_repository_state(repo):
     try:
         commit = subprocess.check_output(
@@ -203,6 +212,11 @@ def main():
             benchmark: sha256_file(src_dir / "src" / f"{benchmark}.cc")
             for benchmark in benchmarks
         },
+        "compiler_input_sha256": sha256_tree(src_dir, (".cc", ".h")),
+        "builder_script_sha256": sha256_file(Path(__file__)),
+        "m5_library_sha256": sha256_file(M5_LIB),
+        "gem5_include_sha256": sha256_tree(REPO / "include" / "gem5", (".h",)),
+        "instrumentation_include_sha256": {},
         "binary_sha256": {
             benchmark: sha256_file(binary)
             for benchmark, binary in zip(benchmarks, binaries)

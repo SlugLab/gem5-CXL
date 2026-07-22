@@ -61,14 +61,18 @@ python3 scripts/build_gapbs_cira_cxlmemuring.py \
 ```
 
 Expected: four binaries and `manifest.json`; the manifest records GAPBS
-commit/dirty state, transformed-source and binary SHA-256 values, and every
-profile input and its SHA-256.
+commit/dirty state; SHA-256 values for the complete transformed copied `.cc`/
+`.h` tree, builder script, `libm5.a`, gem5 m5ops headers, CIRA headers, every
+profile actually used, and emitted binaries. Missing or unusable profiles fail
+the PGO build. An explicit prefetch-distance override is non-PGO, records the
+override, claims no profiles, and is outside this paper experiment.
 
 - [ ] **Step 5: Compare source manifests**
 
 Run a Python assertion requiring equal `cxlmemuring_commit`, `gapbs_commit`,
 and recorded `gapbs_dirty` fields across all three manifests, recomputed
-source, profile, and binary hashes, and the exact binary stem set
+copied compiler-input tree, builder, m5 library/header, instrumentation-header,
+profile, and binary hashes, and the exact binary stem set
 `{bfs,bc,pr,sssp}`.
 
 Expected: exit 0.

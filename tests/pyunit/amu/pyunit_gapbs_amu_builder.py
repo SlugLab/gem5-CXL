@@ -284,6 +284,54 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         self.assertIn('"profile_sha256"', amu_source)
         self.assertIn('"profile_sha256"', cira_source)
 
+        complete_fields = (
+            '"compiler_input_sha256"',
+            '"builder_script_sha256"',
+            '"m5_library_sha256"',
+            '"gem5_include_sha256"',
+            '"instrumentation_include_sha256"',
+        )
+        for field in complete_fields:
+            for source in (baseline_source, amu_source, cira_source):
+                self.assertIn(field, source)
+
+    def test_builders_hash_complete_cc_and_header_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "nested").mkdir()
+            (root / "a.cc").write_text("a\n", encoding="utf-8")
+            (root / "nested" / "b.h").write_text("b\n", encoding="utf-8")
+            (root / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+            expected = {"a.cc", "nested/b.h"}
+            for builder in (
+                self.builder, self.baseline_builder, self.cira_builder
+            ):
+                self.assertEqual(
+                    set(builder.sha256_tree(root, (".cc", ".h"))), expected
+                )
+
+    def test_cira_pgo_profile_resolution_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(SystemExit, "Missing usable CIRA PGO"):
+                self.cira_builder.resolve_profile(Path(tmp), "bfs", 0)
+
+    def test_cira_override_does_not_claim_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profile_results" / "gapbs" / "bfs"
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "bfs_twopass_profile.json").write_text(
+                '{"regions": [{"optimal_prefetch_depth": 99}]}',
+                encoding="utf-8",
+            )
+            distance, profiles, override = self.cira_builder.resolve_profile(
+                Path(tmp), "bfs", 7
+            )
+            self.assertEqual((distance, profiles, override), (7, [], 7))
+            self.assertIn(
+                '"profile_mode": "override-non-pgo"',
+                CIRA_BUILDER_PATH.read_text(encoding="utf-8"),
+            )
+
     def test_verify_mode_makes_invalid_summary_nonzero(self):
         runner_source = RUNNER_PATH.read_text(encoding="utf-8")
         self.assertIn('row["status"] != "ok"', runner_source)

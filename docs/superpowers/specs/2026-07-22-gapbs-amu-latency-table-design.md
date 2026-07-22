@@ -14,7 +14,13 @@ execution, and the existing CIRA profile-guided static rewrite at 200 ns,
 - Simulation: gem5 timing CPU, one core, ROI work events enabled.
 - Compared configurations: CXL baseline, AMU, and CIRA PGO/static rewrite,
   built from the same CXLMemUring/GAPBS commits and current gem5 source. There
-  is no CIRA-no-PGO configuration.
+  is no CIRA-no-PGO configuration. CIRA PGO builds fail closed when any
+  selected workload lacks a usable profile; explicit prefetch-distance
+  override builds are labeled non-PGO and are excluded from this experiment.
+- Build provenance: each manifest hashes every `.cc` and `.h` file in the
+  transformed copied GAPBS tree, the builder script, `libm5.a`, gem5 m5ops
+  headers, configuration-specific AMU/CIRA headers, profiles actually used,
+  and emitted binaries. Override builds claim no profile inputs.
 - Latencies: `200ns`, `500ns`, `1us`, and `2us`.
 - Correctness: run GAPBS verification after the timed ROI. Every baseline, AMU,
   and CIRA run must report `status=ok` and `verification=pass` (bit-exact PASS).
