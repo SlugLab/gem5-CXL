@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the Overleaf GAPBS table with validated baseline-versus-AMU speedups at 200 ns, 500 ns, 1 us, and 2 us CXL latency.
+**Goal:** Replace the Overleaf GAPBS table with validated baseline-versus-AMU and baseline-versus-CIRA speedups at 200 ns, 500 ns, 1 us, and 2 us CXL latency.
 
-**Architecture:** Rebuild matched binaries once, run the existing comparison driver once per latency, validate every run directory, combine the four summaries, and generate a compact LaTeX table from the combined CSV. Keep experimental artifacts in gem5 `m5out`; only the generated table and a provenance CSV enter the Overleaf repository.
+**Architecture:** Rebuild matched baseline, AMU, and CIRA PGO/static binaries once, run the existing comparison driver once per latency, validate every run directory, combine the four summaries, and generate a compact LaTeX table from the combined CSV. Do not add CIRA-no-PGO. Keep experimental artifacts in gem5 `m5out`; only the generated table and a provenance CSV enter the Overleaf repository.
 
 **Tech Stack:** Python 3, gem5 X86 timing model, GAPBS/CXLMemUring, CSV, LaTeX/USENIX template.
 
@@ -15,6 +15,7 @@
 **Files:**
 - Generated: `m5out/gapbs_baseline_bins_latency_20260722/`
 - Generated: `m5out/gapbs_amu_bins_latency_20260722/`
+- Generated: `m5out/gapbs_cira_bins_latency_20260722/`
 
 - [ ] **Step 1: Run the focused builder tests**
 
@@ -48,9 +49,27 @@ python3 scripts/build_gapbs_amu_cxlmemuring.py \
 
 Expected: four binaries and `manifest.json`.
 
-- [ ] **Step 4: Compare source manifests**
+- [ ] **Step 4: Build CIRA PGO/static binaries**
 
-Run a Python assertion requiring equal `cxlmemuring_commit` fields and the exact binary stem set `{bfs,bc,pr,sssp}`.
+Run:
+
+```bash
+python3 scripts/build_gapbs_cira_cxlmemuring.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --benchmarks bfs,bc,pr,sssp --roi-work-markers \
+  --outdir m5out/gapbs_cira_bins_latency_20260722
+```
+
+Expected: four binaries and `manifest.json`; the manifest records GAPBS
+commit/dirty state, transformed-source and binary SHA-256 values, and every
+profile input and its SHA-256.
+
+- [ ] **Step 5: Compare source manifests**
+
+Run a Python assertion requiring equal `cxlmemuring_commit`, `gapbs_commit`,
+and recorded `gapbs_dirty` fields across all three manifests, recomputed
+source, profile, and binary hashes, and the exact binary stem set
+`{bfs,bc,pr,sssp}`.
 
 Expected: exit 0.
 
@@ -68,21 +87,24 @@ python3 scripts/compare_gapbs_cxl_amu_cira.py \
   --gem5 build/X86/gem5.opt \
   --baseline-bin-dir m5out/gapbs_baseline_bins_latency_20260722/bin \
   --amu-bin-dir m5out/gapbs_amu_bins_latency_20260722/bin \
+  --cira-bin-dir cira=m5out/gapbs_cira_bins_latency_20260722/bin \
   --benchmarks bfs,bc,pr,sssp --scale 4 --iterations 1 \
   --cpu timing --cores 1 --cxl-link-delay LATENCY \
   --roi-work-events --verify --timeout 600 \
   --outdir m5out/gapbs_cxl_amu_cira/latency_table_20260722/LATENCY
 ```
 
-Expected: each invocation exits 0 and writes eight rows.
+Expected: each invocation exits 0 and writes twelve rows.
 
 - [ ] **Step 2: Enforce the run invariants**
 
-Read every summary and run directory; require 32 rows total, `status=ok`,
+Read every summary and run directory; require 48 rows total, `status=ok`,
 `verification=pass`, the expected delay in `config.ini`, and equal
-`board.asmc.issuedLoads`/`board.asmc.completedLoads` for AMU rows.
+`board.asmc.issuedLoads`/`board.asmc.completedLoads` for AMU rows. For each
+CIRA row, require the sum of issued CIRA prefetch counters to be nonzero and
+equal `board.cira.completedPrefetches`.
 
-Expected: a single `PASS: 32/32` message.
+Expected: a single `PASS: 48/48` message.
 
 ### Task 3: Generate the paper table
 
@@ -103,9 +125,11 @@ Expected: fail because the generator does not exist.
 
 - [ ] **Step 2: Implement the generator**
 
-The generator accepts four `LATENCY=summary.csv` inputs, validates row pairs,
+The generator accepts four `LATENCY=summary.csv` inputs, validates baseline,
+AMU, and CIRA row groups,
 writes a provenance CSV containing raw ticks and verification status, and emits
-a `table*` with four latency groups containing speedup and PASS marker columns.
+a `table*` with four latency groups containing AMU speedup, CIRA speedup, and
+PASS marker columns.
 
 - [ ] **Step 3: Run generator tests and create artifacts**
 

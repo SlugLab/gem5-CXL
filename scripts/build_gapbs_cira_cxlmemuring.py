@@ -3,6 +3,7 @@
 # Build GAPBS binaries with CIRA m5ops driven by CXLMemUring GAPBS profiles.
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -394,6 +395,18 @@ def patch_benchmark_roi_markers(src_dir):
         "    m5_work_end(iter, 0);\n",
         path,
     )
+    data = replace_once(
+        data,
+        '      PrintLabel("Verification",\n'
+        '                 verify(std::ref(g), std::ref(result)) ? "PASS" : "FAIL");\n',
+        "      bool verification_passed =\n"
+        "          verify(std::ref(g), std::ref(result));\n"
+        '      PrintLabel("Verification",\n'
+        '                 verification_passed ? "PASS" : "FAIL");\n'
+        "      if (!verification_passed)\n"
+        "        m5_fail(0, 1);\n",
+        path,
+    )
     write_text(path, data)
 
 
@@ -479,6 +492,47 @@ def profile_distance(cxlmemuring, benchmark):
         for region in data.get("regions", [])
     ]
     return max(distances) if distances else 16
+
+
+def profile_for(cxlmemuring, benchmark):
+    profile = (
+        cxlmemuring / "profile_results" / "gapbs" / benchmark /
+        f"{benchmark}_twopass_profile.json"
+    )
+    return [str(profile)] if profile.exists() else []
+
+
+def cxl_commit(cxlmemuring):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(cxlmemuring), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_repository_state(repo):
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            text=True,
+        )
+        return {"commit": commit, "dirty": bool(status)}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": "unknown", "dirty": None}
 
 
 def patch_bfs(src_dir):
@@ -878,17 +932,43 @@ def main():
             args.cxlmemuring, benchmark
         )
         distances[benchmark] = distance
-        binaries.append(str(build_benchmark(
+        binaries.append(build_benchmark(
             src_dir, out_bin_dir, benchmark, args.cxx, extra_cxxflags,
             distance, args.range_limit, args.max_outstanding,
             args.node_distance, not args.no_csr_region, args.csr_block_rows
-        )))
+        ))
+
+    gapbs_source = args.cxlmemuring / "bench" / "gapbs"
+    gapbs_state = git_repository_state(gapbs_source)
+    profiles_used = {
+        benchmark: profile_for(args.cxlmemuring, benchmark)
+        for benchmark in benchmarks
+    }
 
     manifest = {
         "cxlmemuring": str(args.cxlmemuring),
-        "gapbs_source": str(args.cxlmemuring / "bench" / "gapbs"),
+        "cxlmemuring_commit": cxl_commit(args.cxlmemuring),
+        "gapbs_source": str(gapbs_source),
+        "gapbs_commit": gapbs_state["commit"],
+        "gapbs_dirty": gapbs_state["dirty"],
         "source_copy": str(src_dir),
-        "binaries": binaries,
+        "binaries": [str(path) for path in binaries],
+        "benchmark_source_sha256": {
+            benchmark: sha256_file(src_dir / "src" / f"{benchmark}.cc")
+            for benchmark in benchmarks
+        },
+        "binary_sha256": {
+            benchmark: sha256_file(binary)
+            for benchmark, binary in zip(benchmarks, binaries)
+        },
+        "profiles_used": profiles_used,
+        "profile_sha256": {
+            benchmark: {
+                profile: sha256_file(profile)
+                for profile in profiles
+            }
+            for benchmark, profiles in profiles_used.items()
+        },
         "prefetch_distances": distances,
         "range_limit": args.range_limit,
         "max_outstanding": args.max_outstanding,

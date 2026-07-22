@@ -13,6 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 BUILDER_PATH = REPO / "scripts" / "build_gapbs_amu_cxlmemuring.py"
 BASELINE_BUILDER_PATH = REPO / "scripts" / "build_gapbs_baseline_cxlmemuring.py"
+CIRA_BUILDER_PATH = REPO / "scripts" / "build_gapbs_cira_cxlmemuring.py"
 RUNNER_PATH = REPO / "scripts" / "compare_gapbs_cxl_amu_cira.py"
 CONFIG_PATH = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
@@ -35,6 +36,7 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         cls.baseline_builder = load_module(
             "gapbs_baseline_builder", BASELINE_BUILDER_PATH
         )
+        cls.cira_builder = load_module("gapbs_cira_builder", CIRA_BUILDER_PATH)
         cls.runner = load_module("gapbs_amu_runner", RUNNER_PATH)
 
     def test_load_window_issues_before_waiting(self):
@@ -208,6 +210,18 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         self.assertIn("bool verification_passed", transformed)
         self.assertIn("m5_fail(0, 1)", transformed)
 
+    def test_cira_roi_patch_turns_verifier_failure_into_m5_fail(self):
+        source = CXLMEMURING / "bench" / "gapbs" / "src" / "benchmark.h"
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp)
+            (src_dir / "src").mkdir()
+            target = src_dir / "src" / "benchmark.h"
+            shutil.copy2(source, target)
+            self.cira_builder.patch_benchmark_roi_markers(src_dir)
+            transformed = target.read_text(encoding="utf-8")
+        self.assertIn("bool verification_passed", transformed)
+        self.assertIn("m5_fail(0, 1)", transformed)
+
     def test_builders_hash_exact_file_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "artifact"
@@ -217,6 +231,7 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             self.assertEqual(
                 self.baseline_builder.sha256_file(artifact), expected
             )
+            self.assertEqual(self.cira_builder.sha256_file(artifact), expected)
 
     def test_builders_report_nested_repo_commit_and_dirty_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,18 +254,23 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             expected_commit = subprocess.check_output(
                 ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
             ).strip()
-            for builder in (self.builder, self.baseline_builder):
+            for builder in (
+                self.builder, self.baseline_builder, self.cira_builder
+            ):
                 self.assertEqual(
                     builder.git_repository_state(repo),
                     {"commit": expected_commit, "dirty": False},
                 )
             tracked.write_text("dirty\n", encoding="utf-8")
-            for builder in (self.builder, self.baseline_builder):
+            for builder in (
+                self.builder, self.baseline_builder, self.cira_builder
+            ):
                 self.assertTrue(builder.git_repository_state(repo)["dirty"])
 
     def test_manifest_sources_include_required_provenance_fields(self):
         baseline_source = BASELINE_BUILDER_PATH.read_text(encoding="utf-8")
         amu_source = BUILDER_PATH.read_text(encoding="utf-8")
+        cira_source = CIRA_BUILDER_PATH.read_text(encoding="utf-8")
         common_fields = (
             '"gapbs_commit"',
             '"gapbs_dirty"',
@@ -260,7 +280,9 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         for field in common_fields:
             self.assertIn(field, baseline_source)
             self.assertIn(field, amu_source)
+            self.assertIn(field, cira_source)
         self.assertIn('"profile_sha256"', amu_source)
+        self.assertIn('"profile_sha256"', cira_source)
 
     def test_verify_mode_makes_invalid_summary_nonzero(self):
         runner_source = RUNNER_PATH.read_text(encoding="utf-8")
