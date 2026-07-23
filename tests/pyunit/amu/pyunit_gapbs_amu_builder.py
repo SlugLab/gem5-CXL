@@ -332,6 +332,122 @@ class GapbsAmuBuilderTest(unittest.TestCase):
                 CIRA_BUILDER_PATH.read_text(encoding="utf-8"),
             )
 
+    def test_cira_future_row_helper_uses_bounded_profile_distance(self):
+        header = self.cira_builder.CIRA_HEADER
+        self.assertIn("static inline bool future_node", header)
+        self.assertIn("GAPBS_CIRA_NODE_DISTANCE", header)
+        self.assertIn("candidate < static_cast<int64_t>(g.num_nodes())", header)
+        self.assertNotIn("future = current", header)
+        self.assertEqual(
+            self.cira_builder.resolve_future_row_distance(16, 0), 16
+        )
+        self.assertEqual(
+            self.cira_builder.resolve_future_row_distance(16, 7), 7
+        )
+
+    def test_cira_bfs_prefetches_bounded_future_rows(self):
+        transformed = self.transform_source(
+            "bfs", self.cira_builder.patch_bfs
+        )
+        self.assertEqual(
+            transformed.count("GAPBS_CIRA_FUTURE_NODE(g, u, pf_u)"), 2
+        )
+        bottom_future = transformed.index("auto pf_neigh = g.in_neigh(pf_u)")
+        bottom_prefetch = transformed.index(
+            "GAPBS_CIRA_PREFETCH_IN_CSR_RECORDS_ROW(g, pf_u)",
+            bottom_future,
+        )
+        bottom_current = transformed.index("auto neigh = g.in_neigh(u)")
+        self.assertLess(bottom_future, bottom_prefetch)
+        self.assertLess(bottom_prefetch, bottom_current)
+        top_future = transformed.index("auto pf_neigh = g.out_neigh(pf_u)")
+        top_prefetch = transformed.index(
+            "GAPBS_CIRA_PREFETCH_OUT_CSR_INDEXED_ROW(g, pf_u, parent)",
+            top_future,
+        )
+        top_current = transformed.index("auto neigh = g.out_neigh(u)")
+        self.assertLess(top_future, top_prefetch)
+        self.assertLess(top_prefetch, top_current)
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_RANGE(neigh.begin(), neigh.end())",
+            transformed,
+        )
+
+    def test_cira_bc_prefetches_bounded_future_rows_in_both_phases(self):
+        transformed = self.transform_source("bc", self.cira_builder.patch_bc)
+        self.assertEqual(
+            transformed.count("GAPBS_CIRA_FUTURE_NODE(g, u, pf_u)"), 2
+        )
+        forward = transformed.index(
+            "GAPBS_CIRA_PREFETCH_OUT_CSR_INDEXED_ROW(g, pf_u, depths)"
+        )
+        forward_current = transformed.index("auto neigh = g.out_neigh(u)")
+        self.assertLess(forward, forward_current)
+        reverse = transformed.index(
+            "GAPBS_CIRA_PREFETCH_OUT_CSR_INDEXED_ROW(g, pf_u, deltas)"
+        )
+        reverse_current = transformed.index(
+            "auto neigh = g.out_neigh(u)", forward_current + 1
+        )
+        self.assertLess(reverse, reverse_current)
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_OUT_CSR_INDEXED(g,", transformed
+        )
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_RANGE(neigh.begin(), neigh.end())",
+            transformed,
+        )
+
+    def test_cira_pr_prefetches_bounded_future_row(self):
+        transformed = self.transform_source(
+            "pr",
+            lambda src_dir: self.cira_builder.patch_pr_like(src_dir, "pr.cc"),
+        )
+        future = transformed.index("GAPBS_CIRA_FUTURE_NODE(g, u, pf_u)")
+        future_row = transformed.index("auto pf_neigh = g.in_neigh(pf_u)")
+        prefetch = transformed.index(
+            "GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROW("
+            "g, pf_u, outgoing_contrib)"
+        )
+        current = transformed.index("auto neigh = g.in_neigh(u)")
+        self.assertLess(future, future_row)
+        self.assertLess(future_row, prefetch)
+        self.assertLess(prefetch, current)
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED(g,", transformed
+        )
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_RANGE(neigh.begin(), neigh.end())",
+            transformed,
+        )
+
+    def test_cira_sssp_prefetches_bounded_future_row(self):
+        transformed = self.transform_source(
+            "sssp", self.cira_builder.patch_sssp
+        )
+        future = transformed.index("GAPBS_CIRA_FUTURE_NODE(g, u, pf_u)")
+        future_row = transformed.index("auto pf_neigh = g.out_neigh(pf_u)")
+        prefetch = transformed.index(
+            "GAPBS_CIRA_PREFETCH_OUT_CSR_INDEXED_FIELD_ROW("
+            "g, pf_u, v, dist)"
+        )
+        current = transformed.index("auto neigh = g.out_neigh(u)")
+        self.assertLess(future, future_row)
+        self.assertLess(future_row, prefetch)
+        self.assertLess(prefetch, current)
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_OUT_CSR_INDEXED_FIELD(g,", transformed
+        )
+        self.assertNotIn(
+            "GAPBS_CIRA_PREFETCH_RANGE(neigh.begin(), neigh.end())",
+            transformed,
+        )
+
+    def test_cira_manifest_records_future_row_policy(self):
+        source = CIRA_BUILDER_PATH.read_text(encoding="utf-8")
+        self.assertIn('"future_row_policy": "node-id-ahead-v1"', source)
+        self.assertIn('"future_row_distances": future_row_distances', source)
+
     def test_verify_mode_makes_invalid_summary_nonzero(self):
         runner_source = RUNNER_PATH.read_text(encoding="utf-8")
         self.assertIn('row["status"] != "ok"', runner_source)
