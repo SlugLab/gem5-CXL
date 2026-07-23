@@ -4,12 +4,14 @@
 import csv
 import importlib.util
 import math
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -255,6 +257,26 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             ):
                 self.generate(root, paths)
 
+    def test_duplicate_summary_header_is_rejected_before_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_summaries(root)
+            path = paths["200ns"]
+            with path.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.reader(stream))
+            verification_index = rows[0].index("verification")
+            rows[0].append("verification")
+            for row in rows[1:]:
+                row[verification_index] = "fail"
+                row.append("pass")
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                csv.writer(stream).writerows(rows)
+            with self.assertRaisesRegex(
+                self.generator.ValidationError,
+                "duplicate columns: verification",
+            ):
+                self.generate(root, paths)
+
     def test_caption_describes_canonical_g20_methodology(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -412,6 +434,119 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             self.assertEqual(
                 expected, (second_latex.read_bytes(), second_csv.read_bytes())
             )
+
+    def test_outputs_reject_equivalent_paths_before_io(self):
+        for alias_kind in (
+            "exact",
+            "relative",
+            "symlink-parent",
+            "symlink-file",
+            "hardlink",
+        ):
+            with (
+                self.subTest(alias_kind=alias_kind),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                paths = self.make_summaries(root)
+                real = root / "real"
+                real.mkdir()
+                latex = real / "publication.out"
+                latex.write_text("old publication\n", encoding="utf-8")
+                if alias_kind == "exact":
+                    provenance = latex
+                elif alias_kind == "relative":
+                    provenance = Path(
+                        os.path.relpath(latex, Path.cwd())
+                    )
+                elif alias_kind == "symlink-parent":
+                    alias = root / "alias"
+                    alias.symlink_to(real, target_is_directory=True)
+                    provenance = alias / latex.name
+                elif alias_kind == "symlink-file":
+                    provenance = root / "alias.out"
+                    provenance.symlink_to(latex)
+                else:
+                    provenance = root / "hardlink.out"
+                    os.link(latex, provenance)
+                with (
+                    mock.patch.object(
+                        self.generator.tempfile,
+                        "mkstemp",
+                        wraps=self.generator.tempfile.mkstemp,
+                    ) as make_temp,
+                    mock.patch.object(
+                        self.generator.os,
+                        "replace",
+                        wraps=self.generator.os.replace,
+                    ) as replace,
+                ):
+                    with self.assertRaisesRegex(
+                        self.generator.ValidationError,
+                        "distinct paths",
+                    ):
+                        self.generator.generate_outputs(
+                            paths, latex, provenance
+                        )
+                make_temp.assert_not_called()
+                replace.assert_not_called()
+                self.assertEqual(
+                    latex.read_text(encoding="utf-8"),
+                    "old publication\n",
+                )
+                self.assertEqual(list(root.rglob(".*.tmp-*")), [])
+
+    def test_paired_outputs_roll_back_second_replace_failure(self):
+        for existing in (False, True):
+            with (
+                self.subTest(existing=existing),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                paths = self.make_summaries(root)
+                latex = root / "table.tex"
+                provenance = root / "provenance.csv"
+                if existing:
+                    latex.write_text("old latex\n", encoding="utf-8")
+                    provenance.write_text(
+                        "old provenance\n", encoding="utf-8"
+                    )
+                original = self.generator.os.replace
+                replace_calls = 0
+
+                def fail_second_new_output(source, destination):
+                    nonlocal replace_calls
+                    destination = Path(destination)
+                    if destination in (latex, provenance):
+                        replace_calls += 1
+                        if replace_calls == 2:
+                            raise OSError("forced second output failure")
+                    return original(source, destination)
+
+                with mock.patch.object(
+                    self.generator.os,
+                    "replace",
+                    side_effect=fail_second_new_output,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "forced second output failure"
+                    ):
+                        self.generator.generate_outputs(
+                            paths, latex, provenance
+                        )
+                if existing:
+                    self.assertEqual(
+                        latex.read_text(encoding="utf-8"),
+                        "old latex\n",
+                    )
+                    self.assertEqual(
+                        provenance.read_text(encoding="utf-8"),
+                        "old provenance\n",
+                    )
+                else:
+                    self.assertFalse(latex.exists())
+                    self.assertFalse(provenance.exists())
+                self.assertEqual(list(root.rglob(".*.tmp-*")), [])
 
     def test_cli_requires_exactly_four_canonical_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:

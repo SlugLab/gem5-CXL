@@ -719,6 +719,13 @@ def read_summary(path):
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         fields = list(reader.fieldnames or ())
+        duplicates = sorted(
+            {field for field in fields if fields.count(field) > 1}
+        )
+        if duplicates:
+            raise ValidationError(
+                f"{path}: duplicate columns: {', '.join(duplicates)}"
+            )
         missing = sorted(REQUIRED_SUMMARY_FIELDS - set(fields))
         if missing:
             raise ValidationError(

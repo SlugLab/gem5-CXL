@@ -170,6 +170,13 @@ def read_summary(latency, path):
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         fields = reader.fieldnames or []
+        duplicates = sorted(
+            {field for field in fields if fields.count(field) > 1}
+        )
+        if duplicates:
+            raise ValidationError(
+                f"{path}: duplicate columns: {', '.join(duplicates)}"
+            )
         missing = sorted(REQUIRED_FIELDS - set(fields))
         if missing:
             raise ValidationError(
@@ -357,24 +364,96 @@ def render_latex(data):
     return "\n".join(lines) + "\n"
 
 
-def atomic_write(path, content, newline=None):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
+def require_distinct_output_paths(latex_output, provenance_output):
+    latex = Path(latex_output)
+    provenance = Path(provenance_output)
     try:
-        with os.fdopen(
-            descriptor, "w", encoding="utf-8", newline=newline
-        ) as stream:
-            stream.write(content)
-        os.replace(temporary, path)
-    except BaseException:
+        latex_resolved = latex.resolve(strict=False)
+        provenance_resolved = provenance.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValidationError(
+            "LaTeX and provenance outputs must use distinct paths; "
+            f"could not resolve paths safely: {error}"
+        ) from error
+    equivalent = latex_resolved == provenance_resolved
+    if not equivalent and latex.exists() and provenance.exists():
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+            equivalent = os.path.samefile(latex, provenance)
+        except OSError as error:
+            raise ValidationError(
+                "LaTeX and provenance outputs must use distinct paths; "
+                f"could not compare existing paths safely: {error}"
+            ) from error
+    if equivalent:
+        raise ValidationError(
+            "LaTeX and provenance outputs must use distinct paths: "
+            f"{latex} and {provenance}"
+        )
+
+
+def transactional_write(outputs):
+    staged = {}
+    backups = {}
+    installed = set()
+    committed = False
+    try:
+        for path, content, newline in outputs:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.tmp-", dir=path.parent
+            )
+            staged[path] = Path(temporary)
+            with os.fdopen(
+                descriptor, "w", encoding="utf-8", newline=newline
+            ) as stream:
+                stream.write(content)
+
+        for path in staged:
+            if not path.exists():
+                backups[path] = None
+                continue
+            descriptor, backup = tempfile.mkstemp(
+                prefix=f".{path.name}.tmp-backup-", dir=path.parent
+            )
+            os.close(descriptor)
+            os.unlink(backup)
+            os.replace(path, backup)
+            backups[path] = Path(backup)
+
+        for path, temporary in staged.items():
+            os.replace(temporary, path)
+            installed.add(path)
+            staged[path] = None
+        committed = True
+    except BaseException:
+        for path, backup in backups.items():
+            if backup is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                    os.replace(backup, path)
+                    backups[path] = None
+                except OSError:
+                    pass
+            elif path in installed:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         raise
+    finally:
+        for temporary in staged.values():
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        for backup in backups.values():
+            if backup is not None and committed:
+                try:
+                    backup.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def generate_outputs(inputs, latex_output, provenance_output):
@@ -383,6 +462,7 @@ def generate_outputs(inputs, latex_output, provenance_output):
             "expected exactly four canonical latency inputs: "
             + ", ".join(LATENCIES)
         )
+    require_distinct_output_paths(latex_output, provenance_output)
     data = {}
     source_fields = []
     for latency in LATENCIES:
@@ -413,8 +493,12 @@ def generate_outputs(inputs, latex_output, provenance_output):
     writer.writeheader()
     writer.writerows(rows)
     latex = render_latex(data)
-    atomic_write(provenance_output, buffer.getvalue(), newline="")
-    atomic_write(latex_output, latex)
+    transactional_write(
+        (
+            (latex_output, latex, None),
+            (provenance_output, buffer.getvalue(), ""),
+        )
+    )
 
 
 def parse_inputs(values):

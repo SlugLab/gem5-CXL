@@ -389,6 +389,50 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             )
             self.assertEqual(self.runner.parse_cpu_switches(log), 1)
 
+    def test_parse_stats_rejects_incomplete_or_empty_first_section(self):
+        cases = (
+            ("missing Begin marker", "simTicks 100\n"),
+            (
+                "missing End marker",
+                "---------- Begin Simulation Statistics ----------\n"
+                "simTicks 100\n",
+            ),
+            (
+                "missing Begin marker",
+                "---------- End Simulation Statistics   ----------\n",
+            ),
+            (
+                "empty first ROI stats section",
+                "---------- Begin Simulation Statistics ----------\n"
+                "---------- End Simulation Statistics   ----------\n",
+            ),
+        )
+        for message, content in cases:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                path = Path(tmp) / "stats.txt"
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    self.runner.StatsError, message
+                ):
+                    self.runner.parse_stats(path)
+
+    def test_parse_stats_rejects_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "missing-stats.txt"
+            with self.assertRaisesRegex(
+                self.runner.StatsError, "missing stats file"
+            ):
+                self.runner.parse_stats(path)
+
+    def test_summary_schema_has_no_duplicate_fields(self):
+        self.assertEqual(
+            len(self.runner.SUMMARY_FIELDS),
+            len(set(self.runner.SUMMARY_FIELDS)),
+        )
+
     def test_rejects_missing_exact_cxl_packet_or_byte_stat(self):
         for key in (
             (

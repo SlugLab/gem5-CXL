@@ -403,6 +403,26 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ):
                 self.validator.validate_sweep(root)
 
+    def test_rejects_duplicate_summary_header_before_value_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.reader(stream))
+            status_index = rows[0].index("status")
+            rows[0].append("status")
+            for row in rows[1:]:
+                row[status_index] = "fail"
+                row.append("ok")
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                csv.writer(stream).writerows(rows)
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "duplicate columns: status",
+            ):
+                self.validator.validate_sweep(root)
+
     def test_rejects_missing_exact_raw_cxl_packet_stat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

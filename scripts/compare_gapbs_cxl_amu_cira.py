@@ -161,19 +161,29 @@ def parse_label_path(value):
 
 def parse_stats(path):
     stats = {}
-    if not path.exists():
-        return stats
+    if not path.is_file():
+        raise StatsError(f"missing stats file: {path}")
     in_first_section = False
+    saw_begin = False
+    saw_end = False
     for line in path.read_text(errors="replace").splitlines():
         if line.startswith("---------- Begin Simulation Statistics"):
             if in_first_section:
                 break
+            saw_begin = True
             in_first_section = True
             continue
-        if in_first_section and line.startswith(
-            "---------- End Simulation Statistics"
-        ):
+        if line.startswith("---------- End Simulation Statistics"):
+            if not saw_begin:
+                raise StatsError(
+                    f"{path}: missing Begin marker before End marker"
+                )
+            if not in_first_section:
+                break
+            saw_end = True
             break
+        if not in_first_section:
+            continue
         if not line or line.startswith("#") or line.startswith("---"):
             continue
         parts = line.split()
@@ -183,6 +193,12 @@ def parse_stats(path):
             stats[parts[0]] = Decimal(parts[1])
         except InvalidOperation:
             pass
+    if not saw_begin:
+        raise StatsError(f"{path}: missing Begin marker")
+    if not saw_end:
+        raise StatsError(f"{path}: missing End marker")
+    if not stats:
+        raise StatsError(f"{path}: empty first ROI stats section")
     return stats
 
 
