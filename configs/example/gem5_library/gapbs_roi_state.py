@@ -8,6 +8,62 @@ class RoiSequenceError(RuntimeError):
     """Raised when GAPBS emits an incomplete or malformed ROI sequence."""
 
 
+def _workload_integer_option(arguments, name):
+    positions = [
+        index for index, argument in enumerate(arguments) if argument == name
+    ]
+    if not positions:
+        return None
+    if len(positions) != 1:
+        raise ValueError(f"workload arguments contain duplicate {name}")
+    try:
+        return int(arguments[positions[0] + 1])
+    except (ValueError, IndexError):
+        raise ValueError(f"{name} must be followed by an integer") from None
+
+
+def resolve_workload_shape(
+    arguments,
+    configured_scale,
+    configured_iterations,
+    fast_forward,
+):
+    workload_scale = _workload_integer_option(arguments, "-g")
+    workload_iterations = _workload_integer_option(arguments, "-n")
+
+    if fast_forward:
+        if (
+            configured_scale != 20
+            or configured_iterations != 2
+            or workload_scale != 20
+            or workload_iterations != 2
+        ):
+            raise ValueError(
+                "fast-forward requires matching -g 20 -n 2"
+            )
+        return configured_scale, configured_iterations
+
+    scale = (
+        configured_scale
+        if configured_scale is not None
+        else workload_scale
+    )
+    iterations = (
+        configured_iterations
+        if configured_iterations is not None
+        else workload_iterations
+    )
+    return scale, iterations if iterations is not None else 1
+
+
+def classify_final_exit(exit_cause):
+    if exit_cause == "m5_fail instruction encountered":
+        return "fail", 2
+    if exit_cause == "exiting with last active thread context":
+        return "pass", 0
+    return "missing", 3
+
+
 class GapbsRoiState:
     def __init__(self, iterations, measure_trial, switch_at_trial_zero):
         if iterations <= 0:

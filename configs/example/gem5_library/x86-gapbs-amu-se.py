@@ -17,7 +17,12 @@ from pathlib import Path
 import m5
 from m5.objects import ASMC, CIRA, NULL, SerialLink
 
-from gapbs_roi_state import GapbsRoiState, RoiSequenceError
+from gapbs_roi_state import (
+    GapbsRoiState,
+    RoiSequenceError,
+    classify_final_exit,
+    resolve_workload_shape,
+)
 from gem5.components.boards.simple_board import SimpleBoard
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierarchy import (
     PrivateL1PrivateL2CacheHierarchy,
@@ -140,8 +145,8 @@ parser.add_argument(
     choices=["atomic"],
     help="CPU used before trial 0 begins; switch to --cpu at trial 0 begin.",
 )
-parser.add_argument("--scale", type=int, default=10)
-parser.add_argument("--iterations", type=int, default=1)
+parser.add_argument("--scale", type=int)
+parser.add_argument("--iterations", type=int)
 parser.add_argument("--measure-trial", type=int, default=0)
 parser.add_argument("--mem-size", default="4GiB")
 parser.add_argument("--clk", default="3GHz")
@@ -196,17 +201,11 @@ parser.add_argument("--continue-after-roi", action="store_true")
 
 args = parser.parse_args()
 
-if args.iterations <= 0:
-    parser.error("--iterations must be positive")
-if args.measure_trial < 0 or args.measure_trial >= args.iterations:
-    parser.error("--measure-trial must be less than iterations")
 if args.fast_forward_cpu and not args.roi_work_events:
     parser.error("--fast-forward-cpu requires --roi-work-events")
 if args.fast_forward_cpu and args.cpu != "timing":
     parser.error("--fast-forward-cpu requires --cpu timing")
-if args.fast_forward_cpu and (
-    args.iterations != 2 or args.measure_trial != 1
-):
+if args.fast_forward_cpu and args.measure_trial != 1:
     parser.error(
         "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
     )
@@ -217,19 +216,19 @@ if not binary.exists():
 
 workload_arguments = shlex.split(args.arguments)
 
-
-def workload_integer_option(name):
-    try:
-        index = workload_arguments.index(name)
-        return int(workload_arguments[index + 1])
-    except (ValueError, IndexError):
-        raise ValueError(f"--arguments must contain {name} INTEGER") from None
-
-
-if workload_integer_option("-g") != args.scale:
-    raise ValueError("--scale does not match -g in --arguments")
-if workload_integer_option("-n") != args.iterations:
-    raise ValueError("--iterations does not match -n in --arguments")
+try:
+    args.scale, args.iterations = resolve_workload_shape(
+        arguments=workload_arguments,
+        configured_scale=args.scale,
+        configured_iterations=args.iterations,
+        fast_forward=bool(args.fast_forward_cpu),
+    )
+except ValueError as error:
+    parser.error(str(error))
+if args.iterations <= 0:
+    parser.error("--iterations must be positive")
+if args.measure_trial < 0 or args.measure_trial >= args.iterations:
+    parser.error("--measure-trial must be less than iterations")
 
 cpu_type = {
     "atomic": CPUTypes.ATOMIC,
@@ -376,15 +375,17 @@ if roi_state is not None:
     except RoiSequenceError as error:
         print(f"Verification: MISSING ({error})")
         raise SystemExit(3)
-if args.continue_after_roi:
+if args.fast_forward_cpu or args.continue_after_roi:
     exit_cause = simulator.get_last_exit_event_cause()
-    if exit_cause == "m5_fail instruction encountered":
+    verification, exit_code = classify_final_exit(exit_cause)
+    if verification == "fail":
         print("Verification: FAIL")
-        raise SystemExit(2)
-    if exit_cause != "exiting with last active thread context":
+        raise SystemExit(exit_code)
+    if verification == "missing":
         print(f"Verification: MISSING ({exit_cause})")
-        raise SystemExit(3)
-    print("Verification: PASS")
+        raise SystemExit(exit_code)
+    if args.continue_after_roi:
+        print("Verification: PASS")
 if not args.roi_work_events:
     m5.stats.dump()
 

@@ -282,6 +282,95 @@ class GapbsAmuBuilderTest(unittest.TestCase):
                 switch_at_trial_zero=False,
             )
 
+    def test_fast_forward_exit_cause_is_always_classified(self):
+        self.assertTrue(
+            hasattr(self.roi_state, "classify_final_exit"),
+            "missing final-exit classifier",
+        )
+        self.assertEqual(
+            self.roi_state.classify_final_exit(
+                "m5_fail instruction encountered"
+            ),
+            ("fail", 2),
+        )
+        self.assertEqual(
+            self.roi_state.classify_final_exit(
+                "exiting with last active thread context"
+            ),
+            ("pass", 0),
+        )
+        self.assertEqual(
+            self.roi_state.classify_final_exit("simulate() limit reached"),
+            ("missing", 3),
+        )
+        config = CONFIG_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "if args.fast_forward_cpu or args.continue_after_roi:", config
+        )
+
+    def test_non_gapbs_arguments_preserve_legacy_config_reuse(self):
+        self.assertTrue(
+            hasattr(self.roi_state, "resolve_workload_shape"),
+            "missing workload-shape resolver",
+        )
+        arguments = [
+            "--mode",
+            "chase",
+            "--nodes",
+            "32768",
+            "--accesses",
+            "1024",
+            "--streams",
+            "1",
+        ]
+        shape = self.roi_state.resolve_workload_shape(
+            arguments=arguments,
+            configured_scale=None,
+            configured_iterations=None,
+            fast_forward=False,
+        )
+        self.assertEqual(shape, (None, 1))
+        self.assertEqual(arguments[0:2], ["--mode", "chase"])
+
+    def test_legacy_gapbs_arguments_infer_scale_and_iterations(self):
+        shape = self.roi_state.resolve_workload_shape(
+            arguments=["-g", "4", "-n", "2"],
+            configured_scale=None,
+            configured_iterations=None,
+            fast_forward=False,
+        )
+        self.assertEqual(shape, (4, 2))
+
+    def test_fast_forward_workload_shape_requires_matching_g20_n2(self):
+        self.assertTrue(
+            hasattr(self.roi_state, "resolve_workload_shape"),
+            "missing workload-shape resolver",
+        )
+        self.assertEqual(
+            self.roi_state.resolve_workload_shape(
+                arguments=["-g", "20", "-n", "2", "-v"],
+                configured_scale=20,
+                configured_iterations=2,
+                fast_forward=True,
+            ),
+            (20, 2),
+        )
+        for arguments, scale, iterations in (
+            (["-g", "4", "-n", "2"], 4, 2),
+            (["-g", "20", "-n", "1"], 20, 1),
+            (["--mode", "chase"], 20, 2),
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(
+                    ValueError, "fast-forward requires matching -g 20 -n 2"
+                ):
+                    self.roi_state.resolve_workload_shape(
+                        arguments=arguments,
+                        configured_scale=scale,
+                        configured_iterations=iterations,
+                        fast_forward=True,
+                    )
+
     def test_verify_dry_run_builds_atomic_to_timing_second_trial_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -367,6 +456,22 @@ class GapbsAmuBuilderTest(unittest.TestCase):
                         "timing",
                     ],
                     "requires --iterations 2 and --measure-trial 1",
+                ),
+                (
+                    [
+                        "--fast-forward-cpu",
+                        "atomic",
+                        "--roi-work-events",
+                        "--cpu",
+                        "timing",
+                        "--scale",
+                        "4",
+                        "--iterations",
+                        "2",
+                        "--measure-trial",
+                        "1",
+                    ],
+                    "requires --scale 20",
                 ),
                 (
                     ["--iterations", "1", "--measure-trial", "1"],

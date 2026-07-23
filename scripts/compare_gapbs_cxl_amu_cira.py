@@ -486,7 +486,8 @@ def main():
         parser.error(
             "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
         )
-
+    if args.fast_forward_cpu and args.scale != 20:
+        parser.error("--fast-forward-cpu requires --scale 20")
     if not args.gem5.exists() and not args.dry_run:
         sys.exit(f"gem5 binary not found: {args.gem5}")
     if not args.config.exists():
