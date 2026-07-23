@@ -43,15 +43,15 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
                 // Addresses are attributed at cacheline granularity.
                 tracker.issue(0x1003);
                 tracker.fill(0x103f, true);
-                assert(tracker.demand(0x1010) == Attribution::Useful);
-                assert(tracker.demand(0x1018) == Attribution::None);
+                assert(tracker.demand(0x1010, true) == Attribution::Useful);
+                assert(tracker.demand(0x1018, true) == Attribution::None);
 
                 // A demand before fill is late and suppresses the later fill.
                 tracker.issue(0x2000);
-                assert(tracker.demand(0x203f) == Attribution::Late);
-                assert(tracker.demand(0x2008) == Attribution::None);
+                assert(tracker.demand(0x203f, false) == Attribution::Late);
+                assert(tracker.demand(0x2008, false) == Attribution::None);
                 tracker.fill(0x2010, true);
-                assert(tracker.demand(0x2020) == Attribution::None);
+                assert(tracker.demand(0x2020, true) == Attribution::None);
 
                 // Duplicate issues collapse to one physical-fill token.
                 tracker.issue(0x3000);
@@ -59,22 +59,22 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
                 assert(tracker.outstandingRefs(0x3001) == 2);
                 tracker.fill(0x3008, true);
                 assert(tracker.outstandingRefs(0x3038) == 0);
-                assert(tracker.demand(0x3018) == Attribution::Useful);
-                assert(tracker.demand(0x3028) == Attribution::None);
+                assert(tracker.demand(0x3018, true) == Attribution::Useful);
+                assert(tracker.demand(0x3028, true) == Attribution::None);
 
                 // One late demand consumes all duplicate outstanding refs.
                 tracker.issue(0x4000);
                 tracker.issue(0x4038);
-                assert(tracker.demand(0x4010) == Attribution::Late);
+                assert(tracker.demand(0x4010, false) == Attribution::Late);
                 assert(tracker.outstandingRefs(0x4020) == 0);
                 tracker.fill(0x4000, true);
-                assert(tracker.demand(0x4030) == Attribution::None);
+                assert(tracker.demand(0x4030, true) == Attribution::None);
 
                 // A fill owned by another requestor resolves but cannot credit
                 // an outstanding CIRA issue.
                 tracker.issue(0x5000);
                 tracker.fill(0x5030, false);
-                assert(tracker.demand(0x5010) == Attribution::None);
+                assert(tracker.demand(0x5010, true) == Attribution::None);
 
                 // A CIRA access that hits a resident line retires only its
                 // corresponding issue and never creates a completed token.
@@ -84,17 +84,17 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
                 assert(tracker.outstandingRefs(0x6020) == 1);
                 tracker.prefetchHit(0x6038);
                 assert(tracker.outstandingRefs(0x6008) == 0);
-                assert(tracker.demand(0x6000) == Attribution::None);
+                assert(tracker.demand(0x6000, true) == Attribution::None);
 
                 // A late demand may install the line before the delayed CIRA
                 // access reaches L2. Its later Hit resolves the suppressed
                 // generation and must not poison a future issue/fill.
                 tracker.issue(0x6800);
-                assert(tracker.demand(0x6810) == Attribution::Late);
+                assert(tracker.demand(0x6810, false) == Attribution::Late);
                 tracker.prefetchHit(0x6820);
                 tracker.issue(0x6830);
                 tracker.fill(0x6808, true);
-                assert(tracker.demand(0x6818) == Attribution::Useful);
+                assert(tracker.demand(0x6818, true) == Attribution::Useful);
 
                 // If completed and outstanding state coexist, the demand is
                 // useful only. It also clears stale same-line outstanding
@@ -102,14 +102,40 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
                 tracker.issue(0x7000);
                 tracker.fill(0x7000, true);
                 tracker.issue(0x7010);
-                assert(tracker.demand(0x7020) == Attribution::Useful);
+                assert(tracker.demand(0x7020, true) == Attribution::Useful);
                 assert(tracker.outstandingRefs(0x7030) == 0);
-                assert(tracker.demand(0x7008) == Attribution::None);
+                assert(tracker.demand(0x7008, true) == Attribution::None);
 
+                // A completed token is stale when the CPU misses: the line
+                // filled by CIRA is no longer serving this demand.
+                tracker.issue(0x7800);
+                tracker.fill(0x7800, true);
+                assert(tracker.demand(0x7810, false) == Attribution::None);
+                assert(tracker.demand(0x7820, true) == Attribution::None);
+
+                // An outstanding issue is unnecessary rather than late when
+                // the CPU already hits the resident line.
+                tracker.issue(0x7c00);
+                assert(tracker.demand(0x7c10, true) == Attribution::None);
+                assert(tracker.outstandingRefs(0x7c20) == 0);
+                tracker.fill(0x7c30, true);
+                assert(tracker.demand(0x7c08, true) == Attribution::None);
+
+                // On a CPU miss, a stale completed token cannot hide a newer
+                // outstanding CIRA generation: count one Late and suppress
+                // the later CIRA fill.
                 tracker.issue(0x8000);
+                tracker.fill(0x8000, true);
+                tracker.issue(0x8010);
+                assert(tracker.demand(0x8020, false) == Attribution::Late);
+                assert(tracker.outstandingRefs(0x8030) == 0);
+                tracker.fill(0x8008, true);
+                assert(tracker.demand(0x8018, true) == Attribution::None);
+
+                tracker.issue(0x8800);
                 tracker.clear();
-                assert(tracker.outstandingRefs(0x8000) == 0);
-                assert(tracker.demand(0x8000) == Attribution::None);
+                assert(tracker.outstandingRefs(0x8800) == 0);
+                assert(tracker.demand(0x8800, false) == Attribution::None);
                 return 0;
             }
             """
@@ -161,6 +187,12 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn('"Hit"', cira_cc)
         self.assertIn('"Miss"', cira_cc)
         self.assertIn('"Fill"', cira_cc)
+        self.assertIn(
+            "event == CacheProbeEvent::Hit", cira_cc[
+                cira_cc.index("lineTracker.demand") - 160:
+                cira_cc.index("lineTracker.demand") + 160
+            ]
+        )
         self.assertIn("resetStats()", cira_hh)
         self.assertIn("lineTracker.clear()", cira_cc)
         self.assertIn(

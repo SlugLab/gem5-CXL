@@ -843,7 +843,8 @@ CIRA::handleCacheProbe(CacheProbeEvent event,
     if (!isCpuDataDemand(pkt))
         return;
 
-    const auto attribution = lineTracker.demand(pkt->getAddr());
+    const auto attribution = lineTracker.demand(
+        pkt->getAddr(), event == CacheProbeEvent::Hit);
     if (attribution ==
         CiraLineUsefulnessTracker::DemandAttribution::Useful) {
         ++stats.usefulPrefetches;

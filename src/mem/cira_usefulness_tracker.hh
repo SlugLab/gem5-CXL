@@ -75,24 +75,33 @@ class CiraLineUsefulnessTracker
     }
 
     DemandAttribution
-    demand(uint64_t addr)
+    demand(uint64_t addr, bool hit)
     {
         const auto it = lines.find(lineAddress(addr));
         if (it == lines.end())
             return DemandAttribution::None;
 
         LineState &state = it->second;
-        if (state.completed) {
-            lines.erase(it);
-            return DemandAttribution::Useful;
+        if (hit) {
+            if (state.completed) {
+                lines.erase(it);
+                return DemandAttribution::Useful;
+            }
+
+            if (state.outstandingRefs != 0)
+                lines.erase(it);
+            return DemandAttribution::None;
         }
 
         if (state.outstandingRefs != 0) {
             state.outstandingRefs = 0;
+            state.completed = false;
             state.suppressFill = true;
             return DemandAttribution::Late;
         }
 
+        if (state.completed)
+            lines.erase(it);
         return DemandAttribution::None;
     }
 
