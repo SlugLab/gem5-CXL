@@ -35,7 +35,26 @@ REQUIRED_FIELDS = {
     "status",
     "verification",
     "sim_ticks",
+    "sim_insts",
     "speedup_vs_cxl",
+    "scale",
+    "iterations",
+    "measured_trial",
+    "fast_forward_cpu",
+    "roi_cpu",
+    "cpu_switches",
+    "cxl_link_delay",
+    "all_memory_cxl",
+    "asmc_loads",
+    "asmc_completed",
+    "cira_prefetches",
+    "cira_completed",
+    "cira_indexed_prefetches",
+    "cira_csr_prefetches",
+    "cira_useful",
+    "cira_late",
+    "cira_read_packets",
+    "cira_read_bytes",
     "cxl_packets",
     "cxl_bytes",
     "l1d_demand_misses",
@@ -47,7 +66,8 @@ REQUIRED_FIELDS = {
     "cira_avg_latency",
     "run_dir",
 }
-DIAGNOSTIC_COUNT_FIELDS = (
+COMMON_COUNT_FIELDS = (
+    "sim_insts",
     "cxl_packets",
     "cxl_bytes",
     "l1d_demand_misses",
@@ -56,6 +76,17 @@ DIAGNOSTIC_COUNT_FIELDS = (
     "l2i_demand_hits",
     "l2i_demand_misses",
 )
+CIRA_COUNT_FIELDS = (
+    "cira_prefetches",
+    "cira_completed",
+    "cira_indexed_prefetches",
+    "cira_csr_prefetches",
+    "cira_useful",
+    "cira_late",
+    "cira_read_packets",
+    "cira_read_bytes",
+)
+AMU_COUNT_FIELDS = ("asmc_loads", "asmc_completed")
 CIRA_LATENCY_FIELDS = ("cira_total_latency", "cira_avg_latency")
 PROVENANCE_FIRST = (
     "latency",
@@ -69,8 +100,15 @@ PROVENANCE_FIRST = (
     "run_dir",
     "source_summary_path",
 )
-# Summary speedups are decimal serializations of baseline_ticks/config_ticks.
-SPEEDUP_REL_TOLERANCE = 1e-9
+CANONICAL_METADATA = {
+    "scale": "20",
+    "iterations": "2",
+    "measured_trial": "1",
+    "fast_forward_cpu": "atomic",
+    "roi_cpu": "timing",
+    "cpu_switches": "1",
+    "all_memory_cxl": "true",
+}
 
 
 class ValidationError(RuntimeError):
@@ -95,14 +133,9 @@ def latex_escape(value):
     )
 
 
-def positive_finite(row, field, context):
-    try:
-        value = float(row[field])
-    except (KeyError, ValueError) as error:
-        raise ValidationError(
-            f"{context}: invalid {field}={row.get(field)!r}"
-        ) from error
-    if not math.isfinite(value) or value <= 0:
+def positive_finite_decimal(row, field, context):
+    value = nonnegative_finite_decimal(row, field, context)
+    if value <= 0:
         raise ValidationError(
             f"{context}: {field} must be finite and positive, got {value}"
         )
@@ -163,19 +196,76 @@ def read_summary(latency, path):
                 f"{context}: status={row['status']!r}, "
                 f"verification={row['verification']!r}"
             )
-        positive_finite(row, "sim_ticks", context)
-        positive_finite(row, "speedup_vs_cxl", context)
-        for field in DIAGNOSTIC_COUNT_FIELDS:
+        for field, expected_value in CANONICAL_METADATA.items():
+            actual = row[field].strip().lower()
+            if actual != expected_value:
+                raise ValidationError(
+                    f"{context}: {field}={row[field]!r}, "
+                    f"expected {expected_value!r}"
+                )
+        if row["cxl_link_delay"] != latency:
+            raise ValidationError(
+                f"{context}: cxl_link_delay={row['cxl_link_delay']!r}, "
+                f"expected {latency!r}"
+            )
+        sim_ticks = positive_finite_decimal(row, "sim_ticks", context)
+        if sim_ticks != sim_ticks.to_integral_value():
+            raise ValidationError(
+                f"{context}: sim_ticks must be integral, got {sim_ticks}"
+            )
+        positive_finite_decimal(row, "speedup_vs_cxl", context)
+        for field in COMMON_COUNT_FIELDS:
             nonnegative_integral_decimal(row, field, context)
+        if row["kind"] == "amu":
+            for field in AMU_COUNT_FIELDS:
+                nonnegative_integral_decimal(row, field, context)
+            issued = nonnegative_integral_decimal(
+                row, "asmc_loads", context
+            )
+            completed = nonnegative_integral_decimal(
+                row, "asmc_completed", context
+            )
+            if issued <= 0 or issued != completed:
+                raise ValidationError(
+                    f"{context}: AMU load counts must be positive and balanced"
+                )
+        else:
+            for field in AMU_COUNT_FIELDS:
+                value = row[field]
+                if value != "" and nonnegative_integral_decimal(
+                    row, field, context
+                ) != 0:
+                    raise ValidationError(
+                        f"{context}: non-AMU {field} must be blank or zero"
+                    )
         if row["kind"] == "cira":
+            for field in CIRA_COUNT_FIELDS:
+                nonnegative_integral_decimal(row, field, context)
+            issued = nonnegative_integral_decimal(
+                row, "cira_prefetches", context
+            )
+            completed = nonnegative_integral_decimal(
+                row, "cira_completed", context
+            )
+            csr = nonnegative_integral_decimal(
+                row, "cira_csr_prefetches", context
+            )
+            if issued <= 0 or issued != completed:
+                raise ValidationError(
+                    f"{context}: CIRA leaf counts must be positive and balanced"
+                )
+            if csr <= 0:
+                raise ValidationError(
+                    f"{context}: cira_csr_prefetches must be positive"
+                )
             nonnegative_integral_decimal(row, "cira_total_latency", context)
             nonnegative_finite_decimal(row, "cira_avg_latency", context)
         else:
-            for field in CIRA_LATENCY_FIELDS:
+            for field in (*CIRA_COUNT_FIELDS, *CIRA_LATENCY_FIELDS):
                 value = row[field]
                 if value == "":
                     continue
-                if field == "cira_total_latency":
+                if field != "cira_avg_latency":
                     parsed = nonnegative_integral_decimal(row, field, context)
                 else:
                     parsed = nonnegative_finite_decimal(row, field, context)
@@ -187,21 +277,15 @@ def read_summary(latency, path):
 
     for benchmark in BENCHMARKS:
         baseline = indexed[(benchmark, "cxl_vanilla", "baseline")]
-        baseline_ticks = float(baseline["sim_ticks"])
+        baseline_ticks = Decimal(baseline["sim_ticks"])
         for label, kind in LABEL_KINDS:
             row = indexed[(benchmark, label, kind)]
-            reported = float(row["speedup_vs_cxl"])
-            recomputed = baseline_ticks / float(row["sim_ticks"])
-            if not math.isclose(
-                reported,
-                recomputed,
-                rel_tol=SPEEDUP_REL_TOLERANCE,
-                abs_tol=0.0,
-            ):
+            reported = Decimal(row["speedup_vs_cxl"])
+            recomputed = baseline_ticks / Decimal(row["sim_ticks"])
+            if reported != recomputed:
                 raise ValidationError(
                     f"{latency}/{benchmark}/{label}: speedup mismatch: "
-                    f"reported {reported:.17g}, recomputed {recomputed:.17g} "
-                    f"(relative tolerance {SPEEDUP_REL_TOLERANCE:g})"
+                    f"reported {reported}, recomputed {recomputed}"
                 )
     return fields, indexed
 
@@ -225,9 +309,9 @@ def render_latex(data):
         r"\centering",
         r"\caption{GAPBS speedup over the CXL baseline across link latencies. "
         r"Speedup is baseline ROI ticks divided by configuration ROI ticks. "
-        r"All runs use scale 4 and one timing core; verification executes "
-        r"outside "
-        r"the ROI, and all 48 runs PASS.}",
+        r"All runs use scale 20, Atomic pre-ROI graph generation, Timing "
+        r"trial 0 warmup, measured trial 1 ROI, and bit-exact verification "
+        r"PASS.}",
         r"\label{tab:gapbs_vtune_cxl}",
         r"\resizebox{\textwidth}{!}{%",
         r"\begin{tabular}{@{}l*{4}{rr}@{}}",

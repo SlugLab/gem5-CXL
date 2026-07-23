@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -17,8 +18,11 @@ LATENCIES = ("200ns", "500ns", "1us", "2us")
 BENCHMARKS = ("bfs", "bc", "pr", "sssp")
 FIELDS = (
     "benchmark,label,kind,status,verification,sim_ticks,sim_insts,"
-    "speedup_vs_cxl,asmc_loads,cira_prefetches,cira_indexed_prefetches,"
-    "cira_csr_prefetches,cira_completed,cxl_packets,cxl_bytes,"
+    "speedup_vs_cxl,scale,iterations,measured_trial,fast_forward_cpu,roi_cpu,"
+    "cpu_switches,cxl_link_delay,all_memory_cxl,asmc_loads,asmc_completed,"
+    "cira_prefetches,cira_indexed_prefetches,cira_csr_prefetches,"
+    "cira_completed,cira_useful,cira_late,cira_read_packets,cira_read_bytes,"
+    "cxl_packets,cxl_bytes,"
     "l1d_demand_misses,l2d_demand_hits,l2d_demand_misses,l2i_demand_hits,"
     "l2i_demand_misses,cira_total_latency,cira_avg_latency,run_dir"
 ).split(",")
@@ -45,16 +49,22 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             paths[latency] = summary
             rows = []
             for benchmark_index, benchmark in enumerate(BENCHMARKS):
-                baseline_ticks = (
-                    1000.0 + latency_index * 100 + benchmark_index * 10
+                baseline_ticks = Decimal(3603600) * Decimal(
+                    (latency_index + 1) * (benchmark_index + 1)
                 )
                 for label, kind, speedup in (
-                    ("cxl_vanilla", "baseline", 1.0),
-                    ("amu", "amu", 2.0 + latency_index + benchmark_index),
+                    ("cxl_vanilla", "baseline", Decimal(1)),
+                    (
+                        "amu",
+                        "amu",
+                        Decimal(2 + latency_index + benchmark_index),
+                    ),
                     (
                         "cira_pgo",
                         "cira",
-                        1.5 + latency_index + benchmark_index,
+                        Decimal("1.5")
+                        + latency_index
+                        + benchmark_index,
                     ),
                 ):
                     ticks = baseline_ticks / speedup
@@ -65,18 +75,37 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
                             "kind": kind,
                             "status": "ok",
                             "verification": "pass",
-                            "sim_ticks": repr(ticks),
+                            "sim_ticks": str(ticks),
                             "sim_insts": "123",
-                            "speedup_vs_cxl": repr(speedup),
+                            "speedup_vs_cxl": str(speedup),
+                            "scale": "20",
+                            "iterations": "2",
+                            "measured_trial": "1",
+                            "fast_forward_cpu": "atomic",
+                            "roi_cpu": "timing",
+                            "cpu_switches": "1",
+                            "cxl_link_delay": latency,
+                            "all_memory_cxl": "true",
                             "asmc_loads": "7" if kind == "amu" else "0",
+                            "asmc_completed": "7" if kind == "amu" else "0",
                             "cira_prefetches": (
                                 "8" if kind == "cira" else "0"
                             ),
                             "cira_indexed_prefetches": (
-                                "1" if kind == "cira" else "0"
+                                "3" if kind == "cira" else "0"
                             ),
-                            "cira_csr_prefetches": "0",
+                            "cira_csr_prefetches": (
+                                "5" if kind == "cira" else "0"
+                            ),
                             "cira_completed": "8" if kind == "cira" else "0",
+                            "cira_useful": "4" if kind == "cira" else "0",
+                            "cira_late": "0",
+                            "cira_read_packets": (
+                                "16" if kind == "cira" else "0"
+                            ),
+                            "cira_read_bytes": (
+                                "1024" if kind == "cira" else "0"
+                            ),
                             "cxl_packets": "99",
                             "cxl_bytes": "4096",
                             "l1d_demand_misses": "10",
@@ -158,7 +187,8 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
     def test_provenance_preserves_diagnostic_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            _, provenance = self.generate(root)
+            paths = self.make_summaries(root)
+            _, provenance = self.generate(root, paths)
             with provenance.open(newline="", encoding="utf-8") as stream:
                 rows = list(csv.DictReader(stream))
             bc_cira = next(
@@ -177,6 +207,90 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             self.assertEqual(bc_cira["l2i_demand_misses"], "14")
             self.assertEqual(bc_cira["cira_total_latency"], "800")
             self.assertEqual(bc_cira["cira_avg_latency"], "100")
+            self.assertEqual(bc_cira["scale"], "20")
+            self.assertEqual(bc_cira["iterations"], "2")
+            self.assertEqual(bc_cira["measured_trial"], "1")
+            self.assertEqual(bc_cira["fast_forward_cpu"], "atomic")
+            self.assertEqual(bc_cira["roi_cpu"], "timing")
+            self.assertEqual(bc_cira["cpu_switches"], "1")
+            self.assertEqual(bc_cira["all_memory_cxl"], "true")
+            self.assertEqual(bc_cira["cira_useful"], "4")
+            self.assertEqual(bc_cira["cira_late"], "0")
+            self.assertEqual(bc_cira["cira_read_packets"], "16")
+            self.assertEqual(bc_cira["cira_read_bytes"], "1024")
+            with paths["200ns"].open(newline="", encoding="utf-8") as stream:
+                source = next(
+                    row
+                    for row in csv.DictReader(stream)
+                    if row["benchmark"] == "bc"
+                    and row["label"] == "cira_pgo"
+                )
+            for field in FIELDS:
+                self.assertEqual(
+                    bc_cira[field], source[field], f"provenance lost {field}"
+                )
+
+    def test_missing_new_schema_field_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_summaries(root)
+            path = paths["200ns"]
+            with path.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                rows = list(reader)
+                fields = [
+                    field
+                    for field in reader.fieldnames
+                    if field != "cira_useful"
+                ]
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    {field: row[field] for field in fields} for row in rows
+                )
+            with self.assertRaisesRegex(
+                self.generator.ValidationError,
+                "missing columns: cira_useful",
+            ):
+                self.generate(root, paths)
+
+    def test_caption_describes_canonical_g20_methodology(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latex, _ = self.generate(root)
+            text = latex.read_text(encoding="utf-8")
+            self.assertIn("scale 20", text)
+            self.assertIn("Atomic pre-ROI graph generation", text)
+            self.assertIn("Timing trial 0 warmup", text)
+            self.assertIn("measured trial 1 ROI", text)
+            self.assertIn("bit-exact verification PASS", text)
+            self.assertNotIn("scale 4", text)
+
+    def test_rejects_noncanonical_metadata(self):
+        for field, value in (
+            ("scale", "4"),
+            ("iterations", "1"),
+            ("measured_trial", "0"),
+            ("fast_forward_cpu", "timing"),
+            ("roi_cpu", "atomic"),
+            ("cpu_switches", "2"),
+            ("cxl_link_delay", "2us"),
+            ("all_memory_cxl", "false"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                paths = self.make_summaries(root)
+                self.mutate(
+                    paths["200ns"],
+                    lambda row: row["benchmark"] == "bfs"
+                    and row["kind"] == "baseline",
+                    **{field: value},
+                )
+                with self.assertRaisesRegex(
+                    self.generator.ValidationError, field
+                ):
+                    self.generate(root, paths)
 
     def test_latex_escape(self):
         self.assertEqual(
@@ -239,7 +353,10 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             ("cira_pgo", "cira_avg_latency", "inf"),
             ("cira_pgo", "cira_total_latency", ""),
             ("cira_pgo", "cira_total_latency", "1.5"),
+            ("cira_pgo", "cira_useful", ""),
+            ("cira_pgo", "cira_read_packets", "1.5"),
             ("cxl_vanilla", "cira_total_latency", "1"),
+            ("amu", "cira_useful", "1"),
         ):
             with (
                 self.subTest(label=label, field=field),

@@ -43,6 +43,27 @@ DIAGNOSTIC_STATS = {
         "processor.cores.core.inst"
     ),
 }
+SWITCH_DIAGNOSTIC_STATS = {
+    "l1d_demand_misses": (
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+    ),
+    "l2d_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::"
+        "processor.switch.core.data"
+    ),
+    "l2d_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::"
+        "processor.switch.core.data"
+    ),
+    "l2i_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::"
+        "processor.switch.core.inst"
+    ),
+    "l2i_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::"
+        "processor.switch.core.inst"
+    ),
+}
 DIAGNOSTIC_FAMILY_TOTALS = {
     "l1d_demand_misses": (
         "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
@@ -64,6 +85,60 @@ CIRA_LATENCY_STATS = {
     "cira_total_latency": "board.cira.totalLatency",
     "cira_avg_latency": "board.cira.avgLatency",
 }
+OWNED_COUNTER_STATS = {
+    "asmc_loads": ("amu", "board.asmc.issuedLoads"),
+    "asmc_completed": ("amu", "board.asmc.completedLoads"),
+    "cira_prefetches": ("cira", "board.cira.issuedPrefetches"),
+    "cira_completed": ("cira", "board.cira.completedPrefetches"),
+    "cira_indexed_prefetches": (
+        "cira",
+        "board.cira.issuedIndexedPrefetches",
+    ),
+    "cira_csr_prefetches": ("cira", "board.cira.issuedCsrPrefetches"),
+    "cira_useful": ("cira", "board.cira.usefulPrefetches"),
+    "cira_late": ("cira", "board.cira.latePrefetches"),
+    "cira_read_packets": ("cira", "board.cira.readPackets"),
+    "cira_read_bytes": ("cira", "board.cira.readBytes"),
+}
+CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
+SUMMARY_FIELDS = (
+    "benchmark",
+    "label",
+    "kind",
+    "status",
+    "verification",
+    "scale",
+    "iterations",
+    "measured_trial",
+    "fast_forward_cpu",
+    "roi_cpu",
+    "cpu_switches",
+    "cxl_link_delay",
+    "all_memory_cxl",
+    "sim_ticks",
+    "sim_insts",
+    "speedup_vs_cxl",
+    "asmc_loads",
+    "asmc_completed",
+    "cira_prefetches",
+    "cira_completed",
+    "cira_indexed_prefetches",
+    "cira_csr_prefetches",
+    "cira_useful",
+    "cira_late",
+    "cira_read_packets",
+    "cira_read_bytes",
+    "cxl_packets",
+    "cxl_bytes",
+    "l1d_demand_misses",
+    "l2d_demand_hits",
+    "l2d_demand_misses",
+    "l2i_demand_hits",
+    "l2i_demand_misses",
+    "cira_total_latency",
+    "cira_avg_latency",
+    "run_dir",
+)
 
 
 class StatsError(RuntimeError):
@@ -147,14 +222,28 @@ def directional_stat_pair(stats):
     return packets, byte_count
 
 
-def cache_diagnostic(stats, field):
+def cache_diagnostic(stats, field, fast_forward=False):
     family_total = DIAGNOSTIC_FAMILY_TOTALS[field]
     if family_total not in stats:
         raise StatsError(f"missing required ROI statistic: {family_total}")
-    return stats.get(DIAGNOSTIC_STATS[field], 0)
+    stat_name = (
+        SWITCH_DIAGNOSTIC_STATS[field]
+        if fast_forward
+        else DIAGNOSTIC_STATS[field]
+    )
+    if fast_forward and field != "l1d_demand_misses":
+        candidates = [
+            name for name in stats if name.startswith(stat_name)
+        ]
+        if len(candidates) > 1:
+            raise StatsError(
+                f"ambiguous timing switch requestor for {field}: "
+                + ", ".join(sorted(candidates))
+            )
+    return stats.get(stat_name, 0)
 
 
-def extract_diagnostic_metrics(stats, kind):
+def extract_diagnostic_metrics(stats, kind, fast_forward=False):
     if kind == "cira":
         for name in CIRA_LATENCY_STATS.values():
             if name not in stats:
@@ -163,7 +252,7 @@ def extract_diagnostic_metrics(stats, kind):
     metrics = {"cxl_packets": packets, "cxl_bytes": byte_count}
     metrics.update(
         {
-            field: cache_diagnostic(stats, field)
+            field: cache_diagnostic(stats, field, fast_forward)
             for field in DIAGNOSTIC_STATS
         }
     )
@@ -174,6 +263,27 @@ def extract_diagnostic_metrics(stats, kind):
         }
     )
     return metrics
+
+
+def extract_owned_metrics(stats, kind):
+    metrics = {}
+    for field, (owner, stat_name) in OWNED_COUNTER_STATS.items():
+        if kind != owner:
+            metrics[field] = 0
+            continue
+        if stat_name not in stats:
+            raise StatsError(f"missing required ROI statistic: {stat_name}")
+        metrics[field] = stats[stat_name]
+    return metrics
+
+
+def parse_cpu_switches(path):
+    if not path.exists():
+        return 0
+    return sum(
+        line == CPU_SWITCH_MARKER
+        for line in path.read_text(errors="replace").splitlines()
+    )
 
 
 def add_optional(cmd, name, value):
@@ -323,16 +433,16 @@ def run_one(args, benchmark, label, binary_dir, kind):
             status = "verification-failed"
         elif verification == "missing":
             status = "verification-missing"
-    cira_prefetches = stats.get("board.cira.issuedPrefetches", 0)
-    cira_indexed_prefetches = stats.get("board.cira.issuedIndexedPrefetches", 0)
-    cira_csr_prefetches = stats.get("board.cira.issuedCsrPrefetches", 0)
-    diagnostic_metrics = extract_diagnostic_metrics(stats, kind)
+    owned_metrics = extract_owned_metrics(stats, kind)
+    diagnostic_metrics = extract_diagnostic_metrics(
+        stats, kind, fast_forward=bool(args.fast_forward_cpu)
+    )
     if (
         kind == "cira"
         and proc.returncode == 0
-        and cira_prefetches == 0
-        and cira_indexed_prefetches == 0
-        and cira_csr_prefetches == 0
+        and owned_metrics["cira_prefetches"] == 0
+        and owned_metrics["cira_indexed_prefetches"] == 0
+        and owned_metrics["cira_csr_prefetches"] == 0
         and not env_flag_enabled(args.env, "CIRA_GAPBS_DEVICE_OFFLOAD")
         and not args.allow_zero_cira
     ):
@@ -344,13 +454,17 @@ def run_one(args, benchmark, label, binary_dir, kind):
         "kind": kind,
         "status": status,
         "verification": verification,
+        "scale": args.scale,
+        "iterations": args.iterations,
+        "measured_trial": args.measure_trial,
+        "fast_forward_cpu": args.fast_forward_cpu or "",
+        "roi_cpu": args.cpu,
+        "cpu_switches": parse_cpu_switches(log_path),
+        "cxl_link_delay": args.cxl_link_delay,
+        "all_memory_cxl": True,
         "sim_ticks": stats.get("simTicks", ""),
         "sim_insts": stats.get("simInsts", ""),
-        "asmc_loads": stats.get("board.asmc.issuedLoads", 0),
-        "cira_prefetches": cira_prefetches,
-        "cira_indexed_prefetches": cira_indexed_prefetches,
-        "cira_csr_prefetches": cira_csr_prefetches,
-        "cira_completed": stats.get("board.cira.completedPrefetches", 0),
+        **owned_metrics,
         **diagnostic_metrics,
         "run_dir": str(run_dir),
     }
@@ -362,36 +476,11 @@ def write_summary(path, rows):
         for row in rows
         if row.get("kind") == "baseline" and row.get("sim_ticks")
     }
-    fields = [
-        "benchmark",
-        "label",
-        "kind",
-        "status",
-        "verification",
-        "sim_ticks",
-        "sim_insts",
-        "speedup_vs_cxl",
-        "asmc_loads",
-        "cira_prefetches",
-        "cira_indexed_prefetches",
-        "cira_csr_prefetches",
-        "cira_completed",
-        "cxl_packets",
-        "cxl_bytes",
-        "l1d_demand_misses",
-        "l2d_demand_hits",
-        "l2d_demand_misses",
-        "l2i_demand_hits",
-        "l2i_demand_misses",
-        "cira_total_latency",
-        "cira_avg_latency",
-        "run_dir",
-    ]
     with path.open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer = csv.DictWriter(fh, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
         for row in rows:
-            out = {field: row.get(field, "") for field in fields}
+            out = {field: row.get(field, "") for field in SUMMARY_FIELDS}
             base = baseline_ticks.get(row["benchmark"])
             ticks = row.get("sim_ticks")
             if base and ticks:
