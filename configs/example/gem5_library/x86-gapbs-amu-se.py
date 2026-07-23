@@ -110,6 +110,9 @@ class CXLSimpleBoard(SimpleBoard):
             return
 
         if self._cira_to_l2 and hasattr(self.cache_hierarchy, "l2buses"):
+            cira.demand_probe_target = getattr(
+                self.cache_hierarchy, "l2-cache-0"
+            )
             cira.mem_side_port = self.cache_hierarchy.l2buses[0].cpu_side_ports
         else:
             cira.mem_side_port = self.cache_hierarchy.get_cpu_side_port()

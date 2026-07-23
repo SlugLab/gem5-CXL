@@ -16,11 +16,14 @@
 #include "arch/generic/mmu.hh"
 #include "base/statistics.hh"
 #include "base/types.hh"
+#include "mem/cache/cache_probe_arg.hh"
+#include "mem/cira_usefulness_tracker.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
 #include "mem/request.hh"
 #include "params/CIRA.hh"
 #include "sim/clocked_object.hh"
+#include "sim/probe/probe.hh"
 
 namespace gem5
 {
@@ -37,6 +40,8 @@ class CIRA : public ClockedObject
     ~CIRA() override;
 
     void init() override;
+    void regProbeListeners() override;
+    void resetStats() override;
     Port &getPort(const std::string &if_name,
                   PortID idx = InvalidPortID) override;
 
@@ -143,6 +148,30 @@ class CIRA : public ClockedObject
         CIRA &owner;
     };
 
+    enum class CacheProbeEvent
+    {
+        Hit,
+        Miss,
+        Fill
+    };
+
+    class CacheProbeListener :
+        public ProbeListenerArgBase<CacheAccessProbeArg>
+    {
+      public:
+        CacheProbeListener(CIRA &owner, ProbeManager *manager,
+                           const std::string &name, CacheProbeEvent event)
+            : ProbeListenerArgBase(manager, name),
+              owner(owner), event(event)
+        {}
+
+        void notify(const CacheAccessProbeArg &arg) override;
+
+      private:
+        CIRA &owner;
+        const CacheProbeEvent event;
+    };
+
     struct CIRAStats : public statistics::Group
     {
         CIRAStats(statistics::Group *parent);
@@ -152,6 +181,8 @@ class CIRA : public ClockedObject
         statistics::Scalar issuedCsrPrefetches;
         statistics::Scalar csrRowsVisited;
         statistics::Scalar completedPrefetches;
+        statistics::Scalar usefulPrefetches;
+        statistics::Scalar latePrefetches;
         statistics::Scalar rejectedDisabled;
         statistics::Scalar rejectedQueueFull;
         statistics::Scalar translationFaults;
@@ -176,6 +207,9 @@ class CIRA : public ClockedObject
     bool recvTimingResp(PacketPtr pkt);
     void recvReqRetry();
     void completeRequest(uint64_t id);
+    void handleCacheProbe(CacheProbeEvent event,
+                          const CacheAccessProbeArg &arg);
+    bool isCpuDataDemand(const PacketPtr pkt) const;
     void reset();
     void deleteQueuedPacket(PacketPtr pkt);
 
@@ -184,8 +218,10 @@ class CIRA : public ClockedObject
     System *system;
     MemoryPort memSidePort;
     const RequestorID requestorId;
+    SimObject *const demandProbeTarget;
 
     const uint64_t cacheLineSize;
+    CiraLineUsefulnessTracker lineTracker;
     const uint64_t maxSendQueue;
     const Tick issueLatency;
     const Tick completionLatency;
@@ -201,6 +237,7 @@ class CIRA : public ClockedObject
     EventFunctionWrapper sendEvent;
     std::deque<CsrWalkState> csrWalkQueue;
     EventFunctionWrapper csrWalkEvent;
+    std::vector<std::unique_ptr<CacheProbeListener>> probeListeners;
 
     CIRAStats stats;
 };

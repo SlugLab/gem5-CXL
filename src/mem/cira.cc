@@ -62,6 +62,10 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent)
                "CSR rows visited by CIRA region prefetch descriptors"),
       ADD_STAT(completedPrefetches, statistics::units::Count::get(),
                "CIRA cacheline install/prefetch requests completed"),
+      ADD_STAT(usefulPrefetches, statistics::units::Count::get(),
+               "CPU data demands served after a CIRA-origin L2 fill"),
+      ADD_STAT(latePrefetches, statistics::units::Count::get(),
+               "CPU data demands arriving before a CIRA-origin L2 fill"),
       ADD_STAT(rejectedDisabled, statistics::units::Count::get(),
                "CIRA requests rejected because the model is disabled"),
       ADD_STAT(rejectedQueueFull, statistics::units::Count::get(),
@@ -84,7 +88,9 @@ CIRA::CIRA(const Params &p)
       system(p.system),
       memSidePort(name() + ".mem_side_port", *this),
       requestorId(system->getRequestorId(this)),
+      demandProbeTarget(p.demand_probe_target),
       cacheLineSize(p.cache_line_size),
+      lineTracker(cacheLineSize),
       maxSendQueue(p.max_send_queue),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
@@ -97,6 +103,7 @@ CIRA::CIRA(const Params &p)
 
 CIRA::~CIRA()
 {
+    probeListeners.clear();
     if (registry[system] == this)
         registry.erase(system);
     reset();
@@ -111,6 +118,36 @@ CIRA::init()
              "Only one CIRA instance per System is currently supported");
     registry[system] = this;
     ClockedObject::init();
+}
+
+void
+CIRA::CacheProbeListener::notify(const CacheAccessProbeArg &arg)
+{
+    owner.handleCacheProbe(event, arg);
+}
+
+void
+CIRA::regProbeListeners()
+{
+    ClockedObject::regProbeListeners();
+    probeListeners.clear();
+    if (!demandProbeTarget)
+        return;
+
+    ProbeManager *manager = demandProbeTarget->getProbeManager();
+    probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
+        *this, manager, "Hit", CacheProbeEvent::Hit));
+    probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
+        *this, manager, "Miss", CacheProbeEvent::Miss));
+    probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
+        *this, manager, "Fill", CacheProbeEvent::Fill));
+}
+
+void
+CIRA::resetStats()
+{
+    ClockedObject::resetStats();
+    lineTracker.clear();
 }
 
 Port &
@@ -354,6 +391,7 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
                 chunk.paddr + chunkOffset, pktSize, chunk.flags,
                 requestorId);
             req->taskId(context_switch_task_id::Prefetcher);
+            lineTracker.issue(req->getPaddr());
 
             PacketPtr pkt = new Packet(req, MemCmd::SoftPFReq);
             pkt->allocate();
@@ -750,6 +788,71 @@ CIRA::recvReqRetry()
     scheduleSend(curTick(), true);
 }
 
+bool
+CIRA::isCpuDataDemand(const PacketPtr pkt) const
+{
+    if (!pkt || !pkt->req || !pkt->req->hasPaddr())
+        return false;
+
+    const bool demandTask =
+        pkt->req->taskId() != context_switch_task_id::Prefetcher;
+    if (pkt->req->requestorId() == requestorId ||
+        !pkt->isDemand() || pkt->req->isInstFetch() ||
+        pkt->req->isCacheMaintenance() || pkt->req->isPrefetch() ||
+        pkt->cmd.isSWPrefetch() || pkt->cmd.isHWPrefetch() ||
+        pkt->isEviction() || pkt->isWriteback() ||
+        !demandTask) {
+        return false;
+    }
+
+    const RequestorID id = pkt->req->requestorId();
+    if (id >= system->maxRequestors())
+        return false;
+
+    const std::string requestorName = system->getRequestorName(id);
+    static constexpr char CpuDataSuffix[] = ".data";
+    static constexpr size_t CpuDataSuffixLength =
+        sizeof(CpuDataSuffix) - 1;
+    return requestorName.size() >= CpuDataSuffixLength &&
+           requestorName.compare(
+               requestorName.size() - CpuDataSuffixLength,
+               CpuDataSuffixLength, CpuDataSuffix) == 0;
+}
+
+void
+CIRA::handleCacheProbe(CacheProbeEvent event,
+                       const CacheAccessProbeArg &arg)
+{
+    PacketPtr pkt = arg.pkt;
+    if (!pkt || !pkt->req || !pkt->req->hasPaddr())
+        return;
+
+    const bool ciraOrigin = pkt->req->requestorId() == requestorId;
+
+    if (event == CacheProbeEvent::Fill) {
+        lineTracker.fill(pkt->getAddr(), ciraOrigin);
+        return;
+    }
+
+    if (ciraOrigin) {
+        if (event == CacheProbeEvent::Hit)
+            lineTracker.prefetchHit(pkt->getAddr());
+        return;
+    }
+
+    if (!isCpuDataDemand(pkt))
+        return;
+
+    const auto attribution = lineTracker.demand(pkt->getAddr());
+    if (attribution ==
+        CiraLineUsefulnessTracker::DemandAttribution::Useful) {
+        ++stats.usefulPrefetches;
+    } else if (attribution ==
+               CiraLineUsefulnessTracker::DemandAttribution::Late) {
+        ++stats.latePrefetches;
+    }
+}
+
 void
 CIRA::completeRequest(uint64_t id)
 {
@@ -849,6 +952,7 @@ CIRA::reset()
     csrWalkQueue.clear();
     outstanding.clear();
     finished.clear();
+    lineTracker.clear();
     nextId = 1;
 }
 

@@ -13,6 +13,9 @@ class CIRA(ClockedObject):
 
     system = Param.System(Parent.any, "System this CIRA model belongs to")
     mem_side_port = RequestPort("Timing prefetch port toward cache/memory")
+    demand_probe_target = Param.SimObject(
+        NULL, "First private L2 used for CIRA usefulness attribution"
+    )
 
     cache_line_size = Param.Unsigned(
         Parent.cache_line_size, "Cacheline size used for CIRA installs"
