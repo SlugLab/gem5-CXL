@@ -35,6 +35,15 @@ REQUIRED_FIELDS = {
     "verification",
     "sim_ticks",
     "speedup_vs_cxl",
+    "cxl_packets",
+    "cxl_bytes",
+    "l1d_demand_misses",
+    "l2d_demand_hits",
+    "l2d_demand_misses",
+    "l2i_demand_hits",
+    "l2i_demand_misses",
+    "cira_total_latency",
+    "cira_avg_latency",
     "run_dir",
 }
 PROVENANCE_FIRST = (

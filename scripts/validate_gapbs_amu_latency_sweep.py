@@ -24,6 +24,31 @@ EXPECTED_LABEL_KINDS = (
     ("amu", "amu"),
     ("cira_pgo", "cira"),
 )
+REQUIRED_SUMMARY_FIELDS = {
+    "benchmark",
+    "label",
+    "kind",
+    "status",
+    "verification",
+    "sim_ticks",
+    "sim_insts",
+    "speedup_vs_cxl",
+    "asmc_loads",
+    "cira_prefetches",
+    "cira_indexed_prefetches",
+    "cira_csr_prefetches",
+    "cira_completed",
+    "cxl_packets",
+    "cxl_bytes",
+    "l1d_demand_misses",
+    "l2d_demand_hits",
+    "l2d_demand_misses",
+    "l2i_demand_hits",
+    "l2i_demand_misses",
+    "cira_total_latency",
+    "cira_avg_latency",
+    "run_dir",
+}
 ValidationResult = namedtuple(
     "ValidationResult", "row_count amu_rows cira_rows"
 )
@@ -73,6 +98,20 @@ def require_counter(stats, name, path):
     return int(value)
 
 
+def require_summary_counter(row, name, context):
+    try:
+        value = float(row[name])
+    except (KeyError, ValueError) as error:
+        raise ValidationError(
+            f"{context}: invalid {name}={row.get(name)!r}"
+        ) from error
+    if not math.isfinite(value) or not value.is_integer() or value < 0:
+        raise ValidationError(
+            f"{context}: {name} is not a nonnegative integer: {value}"
+        )
+    return int(value)
+
+
 def configured_delay(path):
     text = path.read_text(encoding="utf-8")
     match = re.search(
@@ -95,7 +134,14 @@ def validate_sweep(sweep_root):
         if not summary.is_file():
             raise ValidationError(f"{summary}: missing summary")
         with summary.open(newline="", encoding="utf-8") as stream:
-            rows = list(csv.DictReader(stream))
+            reader = csv.DictReader(stream)
+            fields = set(reader.fieldnames or ())
+            missing = sorted(REQUIRED_SUMMARY_FIELDS - fields)
+            if missing:
+                raise ValidationError(
+                    f"{summary}: missing columns: {', '.join(missing)}"
+                )
+            rows = list(reader)
         if len(rows) != 12:
             raise ValidationError(f"{summary}: expected 12 rows, found {len(rows)}")
 
@@ -138,6 +184,25 @@ def validate_sweep(sweep_root):
                 )
             stats_path = run_dir / "stats.txt"
             stats = parse_first_stats_section(stats_path)
+            for field, stat_name, unit_name in (
+                (
+                    "cxl_packets",
+                    "board.cache_hierarchy.membus.pktCount::total",
+                    "packet count",
+                ),
+                (
+                    "cxl_bytes",
+                    "board.cache_hierarchy.membus.pktSize::total",
+                    "byte count",
+                ),
+            ):
+                reported = require_summary_counter(row, field, context)
+                exact = require_counter(stats, stat_name, stats_path)
+                if reported != exact:
+                    raise ValidationError(
+                        f"{context}: {field}={reported} != exact first-ROI "
+                        f"{unit_name} {exact}"
+                    )
 
             if row["kind"] == "amu":
                 amu_rows += 1

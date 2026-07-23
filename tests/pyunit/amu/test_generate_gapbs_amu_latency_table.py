@@ -18,7 +18,9 @@ BENCHMARKS = ("bfs", "bc", "pr", "sssp")
 FIELDS = (
     "benchmark,label,kind,status,verification,sim_ticks,sim_insts,"
     "speedup_vs_cxl,asmc_loads,cira_prefetches,cira_indexed_prefetches,"
-    "cira_csr_prefetches,cira_completed,cxl_packets,run_dir"
+    "cira_csr_prefetches,cira_completed,cxl_packets,cxl_bytes,"
+    "l1d_demand_misses,l2d_demand_hits,l2d_demand_misses,l2i_demand_hits,"
+    "l2i_demand_misses,cira_total_latency,cira_avg_latency,run_dir"
 ).split(",")
 
 
@@ -76,6 +78,18 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
                             "cira_csr_prefetches": "0",
                             "cira_completed": "8" if kind == "cira" else "0",
                             "cxl_packets": "99",
+                            "cxl_bytes": "4096",
+                            "l1d_demand_misses": "10",
+                            "l2d_demand_hits": "11",
+                            "l2d_demand_misses": "12",
+                            "l2i_demand_hits": "13",
+                            "l2i_demand_misses": "14",
+                            "cira_total_latency": (
+                                "800" if kind == "cira" else "0"
+                            ),
+                            "cira_avg_latency": (
+                                "100" if kind == "cira" else "0"
+                            ),
                             "run_dir": f"runs/{latency}/{benchmark}/{label}",
                         }
                     )
@@ -140,6 +154,29 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             self.assertIn(
                 f"Geo. & {amu:.2f}$\\times$ & {cira:.2f}$\\times$", text
             )
+
+    def test_provenance_preserves_diagnostic_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, provenance = self.generate(root)
+            with provenance.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            bc_cira = next(
+                row
+                for row in rows
+                if row["latency"] == "200ns"
+                and row["benchmark"] == "bc"
+                and row["label"] == "cira_pgo"
+            )
+            self.assertEqual(bc_cira["cxl_packets"], "99")
+            self.assertEqual(bc_cira["cxl_bytes"], "4096")
+            self.assertEqual(bc_cira["l1d_demand_misses"], "10")
+            self.assertEqual(bc_cira["l2d_demand_hits"], "11")
+            self.assertEqual(bc_cira["l2d_demand_misses"], "12")
+            self.assertEqual(bc_cira["l2i_demand_hits"], "13")
+            self.assertEqual(bc_cira["l2i_demand_misses"], "14")
+            self.assertEqual(bc_cira["cira_total_latency"], "800")
+            self.assertEqual(bc_cira["cira_avg_latency"], "100")
 
     def test_latex_escape(self):
         self.assertEqual(

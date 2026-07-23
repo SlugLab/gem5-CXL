@@ -29,7 +29,9 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "benchmark,label,kind,status,verification,sim_ticks,sim_insts,"
             "speedup_vs_cxl,asmc_loads,cira_prefetches,"
             "cira_indexed_prefetches,cira_csr_prefetches,cira_completed,"
-            "cxl_packets,run_dir"
+            "cxl_packets,cxl_bytes,l1d_demand_misses,l2d_demand_hits,"
+            "l2d_demand_misses,l2i_demand_hits,l2i_demand_misses,"
+            "cira_total_latency,cira_avg_latency,run_dir"
         ).split(",")
         for latency, delay in self.validator.EXPECTED_LATENCIES.items():
             rows = []
@@ -50,6 +52,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     stats = [
                         "---------- Begin Simulation Statistics ----------",
                         "simTicks 100",
+                        "board.cache_hierarchy.membus.pktCount::total 99",
+                        "board.cache_hierarchy.membus.pktSize::total 4096",
                     ]
                     if kind == "amu":
                         stats += [
@@ -87,7 +91,15 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                             "cira_indexed_prefetches": "1" if kind == "cira" else "0",
                             "cira_csr_prefetches": "0",
                             "cira_completed": "8" if kind == "cira" else "0",
-                            "cxl_packets": "0",
+                            "cxl_packets": "99",
+                            "cxl_bytes": "4096",
+                            "l1d_demand_misses": "10",
+                            "l2d_demand_hits": "11",
+                            "l2d_demand_misses": "12",
+                            "l2i_demand_hits": "13",
+                            "l2i_demand_misses": "14",
+                            "cira_total_latency": "800" if kind == "cira" else "0",
+                            "cira_avg_latency": "100" if kind == "cira" else "0",
                             "run_dir": str(run_dir),
                         }
                     )
@@ -137,6 +149,61 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
                 "missing End marker for first ROI stats section",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_summary_missing_new_diagnostic_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                rows = list(reader)
+                fields = [field for field in reader.fieldnames if field != "cxl_bytes"]
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    {field: row[field] for field in fields} for row in rows
+                )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError, "missing columns: cxl_bytes"
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_missing_exact_raw_cxl_packet_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cache_hierarchy.membus.pktCount::total 99\n", ""
+            )
+            stats.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "missing board.cache_hierarchy.membus.pktCount::total",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_summary_cxl_packets_that_do_not_match_exact_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            rows[0]["cxl_packets"] = "4195"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "cxl_packets=4195 != exact first-ROI packet count 99",
             ):
                 self.validator.validate_sweep(root)
 

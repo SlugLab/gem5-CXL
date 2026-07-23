@@ -18,6 +18,38 @@ DEFAULT_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
 )
 
+CXL_PACKET_STAT = "board.cache_hierarchy.membus.pktCount::total"
+CXL_BYTE_STAT = "board.cache_hierarchy.membus.pktSize::total"
+DIAGNOSTIC_STATS = {
+    "l1d_demand_misses": (
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+    ),
+    "l2d_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::"
+        "processor.cores.core.data"
+    ),
+    "l2d_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::"
+        "processor.cores.core.data"
+    ),
+    "l2i_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::"
+        "processor.cores.core.inst"
+    ),
+    "l2i_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::"
+        "processor.cores.core.inst"
+    ),
+}
+CIRA_LATENCY_STATS = {
+    "cira_total_latency": "board.cira.totalLatency",
+    "cira_avg_latency": "board.cira.avgLatency",
+}
+
+
+class StatsError(RuntimeError):
+    pass
+
 
 def parse_label_path(value):
     if "=" not in value:
@@ -67,8 +99,31 @@ def parse_verification(path):
     return verification
 
 
-def sum_matching(stats, needle):
-    return sum(value for key, value in stats.items() if needle in key)
+def extract_diagnostic_metrics(stats, kind):
+    for name in (CXL_PACKET_STAT, CXL_BYTE_STAT):
+        if name not in stats:
+            raise StatsError(f"missing required ROI statistic: {name}")
+    if kind == "cira":
+        for name in CIRA_LATENCY_STATS.values():
+            if name not in stats:
+                raise StatsError(f"missing required ROI statistic: {name}")
+    metrics = {
+        "cxl_packets": stats[CXL_PACKET_STAT],
+        "cxl_bytes": stats[CXL_BYTE_STAT],
+    }
+    metrics.update(
+        {
+            field: stats.get(stat_name, 0)
+            for field, stat_name in DIAGNOSTIC_STATS.items()
+        }
+    )
+    metrics.update(
+        {
+            field: stats.get(stat_name, 0)
+            for field, stat_name in CIRA_LATENCY_STATS.items()
+        }
+    )
+    return metrics
 
 
 def add_optional(cmd, name, value):
@@ -213,6 +268,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
     cira_prefetches = stats.get("board.cira.issuedPrefetches", 0)
     cira_indexed_prefetches = stats.get("board.cira.issuedIndexedPrefetches", 0)
     cira_csr_prefetches = stats.get("board.cira.issuedCsrPrefetches", 0)
+    diagnostic_metrics = extract_diagnostic_metrics(stats, kind)
     if (
         kind == "cira"
         and proc.returncode == 0
@@ -237,7 +293,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         "cira_indexed_prefetches": cira_indexed_prefetches,
         "cira_csr_prefetches": cira_csr_prefetches,
         "cira_completed": stats.get("board.cira.completedPrefetches", 0),
-        "cxl_packets": sum_matching(stats, "cxl_mem_link0.cpu_side_port"),
+        **diagnostic_metrics,
         "run_dir": str(run_dir),
     }
 
@@ -263,6 +319,14 @@ def write_summary(path, rows):
         "cira_csr_prefetches",
         "cira_completed",
         "cxl_packets",
+        "cxl_bytes",
+        "l1d_demand_misses",
+        "l2d_demand_hits",
+        "l2d_demand_misses",
+        "l2i_demand_hits",
+        "l2i_demand_misses",
+        "cira_total_latency",
+        "cira_avg_latency",
         "run_dir",
     ]
     with path.open("w", newline="") as fh:
