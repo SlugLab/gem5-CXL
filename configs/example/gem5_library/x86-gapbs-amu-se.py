@@ -10,12 +10,14 @@ full-system GAPBS resource's KVM requirement.
 """
 
 import argparse
+import shlex
 import time
 from pathlib import Path
 
 import m5
 from m5.objects import ASMC, CIRA, NULL, SerialLink
 
+from gapbs_roi_state import GapbsRoiState, RoiSequenceError
 from gem5.components.boards.simple_board import SimpleBoard
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierarchy import (
     PrivateL1PrivateL2CacheHierarchy,
@@ -23,6 +25,9 @@ from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierar
 from gem5.components.memory import SingleChannelDDR4_2400
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_processor import SimpleProcessor
+from gem5.components.processors.simple_switchable_processor import (
+    SimpleSwitchableProcessor,
+)
 from gem5.isas import ISA
 from gem5.resources.resource import BinaryResource
 from gem5.simulate.exit_event import ExitEvent
@@ -130,6 +135,14 @@ parser.add_argument("--cores", type=int, default=1)
 parser.add_argument(
     "--cpu", choices=["atomic", "timing", "o3", "minor"], default="timing"
 )
+parser.add_argument(
+    "--fast-forward-cpu",
+    choices=["atomic"],
+    help="CPU used before trial 0 begins; switch to --cpu at trial 0 begin.",
+)
+parser.add_argument("--scale", type=int, default=10)
+parser.add_argument("--iterations", type=int, default=1)
+parser.add_argument("--measure-trial", type=int, default=0)
 parser.add_argument("--mem-size", default="4GiB")
 parser.add_argument("--clk", default="3GHz")
 parser.add_argument("--l1d-size", default="32KiB")
@@ -183,9 +196,40 @@ parser.add_argument("--continue-after-roi", action="store_true")
 
 args = parser.parse_args()
 
+if args.iterations <= 0:
+    parser.error("--iterations must be positive")
+if args.measure_trial < 0 or args.measure_trial >= args.iterations:
+    parser.error("--measure-trial must be less than iterations")
+if args.fast_forward_cpu and not args.roi_work_events:
+    parser.error("--fast-forward-cpu requires --roi-work-events")
+if args.fast_forward_cpu and args.cpu != "timing":
+    parser.error("--fast-forward-cpu requires --cpu timing")
+if args.fast_forward_cpu and (
+    args.iterations != 2 or args.measure_trial != 1
+):
+    parser.error(
+        "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
+    )
+
 binary = Path(args.binary).resolve()
 if not binary.exists():
     raise FileNotFoundError(binary)
+
+workload_arguments = shlex.split(args.arguments)
+
+
+def workload_integer_option(name):
+    try:
+        index = workload_arguments.index(name)
+        return int(workload_arguments[index + 1])
+    except (ValueError, IndexError):
+        raise ValueError(f"--arguments must contain {name} INTEGER") from None
+
+
+if workload_integer_option("-g") != args.scale:
+    raise ValueError("--scale does not match -g in --arguments")
+if workload_integer_option("-n") != args.iterations:
+    raise ValueError("--iterations does not match -n in --arguments")
 
 cpu_type = {
     "atomic": CPUTypes.ATOMIC,
@@ -205,7 +249,20 @@ cache_hierarchy = TunablePrivateL1PrivateL2CacheHierarchy(
     l2_tgts_per_mshr=args.l2_tgts_per_mshr,
 )
 memory = SingleChannelDDR4_2400(size=args.mem_size)
-processor = SimpleProcessor(cpu_type=cpu_type, isa=ISA.X86, num_cores=args.cores)
+if args.fast_forward_cpu:
+    starting_cpu_type = {
+        "atomic": CPUTypes.ATOMIC,
+    }[args.fast_forward_cpu]
+    processor = SimpleSwitchableProcessor(
+        starting_core_type=starting_cpu_type,
+        switch_core_type=cpu_type,
+        isa=ISA.X86,
+        num_cores=args.cores,
+    )
+else:
+    processor = SimpleProcessor(
+        cpu_type=cpu_type, isa=ISA.X86, num_cores=args.cores
+    )
 
 board = CXLSimpleBoard(
     clk_freq=args.clk,
@@ -257,25 +314,46 @@ if args.cira:
 
 board.set_se_binary_workload(
     BinaryResource(local_path=str(binary)),
-    arguments=args.arguments.split(),
+    arguments=workload_arguments,
     env_list=[f"OMP_NUM_THREADS={args.cores}", *args.env],
 )
 
 start_tick = None
+roi_state = None
+if args.roi_work_events:
+    roi_state = GapbsRoiState(
+        iterations=args.iterations,
+        measure_trial=args.measure_trial,
+        switch_at_trial_zero=bool(args.fast_forward_cpu),
+    )
 
 
 def handle_workbegin():
-    print("Resetting stats at the start of ROI!")
-    m5.stats.reset()
-    global start_tick
-    start_tick = m5.curTick()
-    yield False
+    while True:
+        actions = roi_state.work_begin()
+        for action in actions:
+            if action == "switch":
+                print("Switching from fast-forward CPU to timing CPU!")
+                processor.switch()
+            elif action == "reset":
+                print("Resetting stats at the start of measured ROI!")
+                m5.stats.reset()
+            elif action == "record_start_tick":
+                global start_tick
+                start_tick = m5.curTick()
+        yield False
 
 
 def handle_workend():
-    print("Dump stats at the end of the ROI!")
-    m5.stats.dump()
-    yield not args.continue_after_roi
+    while True:
+        actions = roi_state.work_end()
+        if "dump" in actions:
+            print("Dump stats at the end of the measured ROI!")
+            m5.stats.dump()
+        if args.fast_forward_cpu:
+            yield False
+        else:
+            yield "dump" in actions and not args.continue_after_roi
 
 
 if args.roi_work_events:
@@ -292,6 +370,12 @@ else:
 start_wall = time.time()
 print(f"Running {binary} {' '.join(args.arguments.split())}")
 simulator.run()
+if roi_state is not None:
+    try:
+        roi_state.finish()
+    except RoiSequenceError as error:
+        print(f"Verification: MISSING ({error})")
+        raise SystemExit(3)
 if args.continue_after_roi:
     exit_cause = simulator.get_last_exit_event_cause()
     if exit_cause == "m5_fail instruction encountered":

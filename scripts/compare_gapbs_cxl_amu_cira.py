@@ -224,12 +224,20 @@ def run_one(args, benchmark, label, binary_dir, kind):
         workload_args,
         "--cpu",
         args.cpu,
+        "--scale",
+        str(args.scale),
+        "--iterations",
+        str(args.iterations),
+        "--measure-trial",
+        str(args.measure_trial),
         "--cores",
         str(args.cores),
         "--cxl-memory",
         "--cxl-link-delay",
         args.cxl_link_delay,
     ]
+    if args.fast_forward_cpu is not None:
+        cmd += ["--fast-forward-cpu", args.fast_forward_cpu]
 
     if args.disable_hw_prefetchers:
         cmd.append("--disable-hw-prefetchers")
@@ -412,6 +420,12 @@ def main():
     parser.add_argument(
         "--cpu", choices=["atomic", "timing", "o3", "minor"], default="timing"
     )
+    parser.add_argument(
+        "--fast-forward-cpu",
+        choices=["atomic"],
+        help="Use this CPU before switching to --cpu at trial 0 begin.",
+    )
+    parser.add_argument("--measure-trial", type=int, default=0)
     parser.add_argument("--cores", type=int, default=1)
     parser.add_argument("--cxl-link-delay", default="1us")
     parser.add_argument("--disable-hw-prefetchers", action="store_true")
@@ -458,6 +472,21 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
+    if args.measure_trial < 0 or args.measure_trial >= args.iterations:
+        parser.error("--measure-trial must be less than iterations")
+    if args.fast_forward_cpu and not args.roi_work_events:
+        parser.error("--fast-forward-cpu requires --roi-work-events")
+    if args.fast_forward_cpu and args.cpu != "timing":
+        parser.error("--fast-forward-cpu requires --cpu timing")
+    if args.fast_forward_cpu and (
+        args.iterations != 2 or args.measure_trial != 1
+    ):
+        parser.error(
+            "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
+        )
+
     if not args.gem5.exists() and not args.dry_run:
         sys.exit(f"gem5 binary not found: {args.gem5}")
     if not args.config.exists():
@@ -479,7 +508,7 @@ def main():
     summary = args.outdir / "summary.csv"
     write_summary(summary, rows)
     print(f"Wrote {summary}")
-    if args.verify and any(
+    if args.verify and not args.dry_run and any(
         row["status"] != "ok" or row["verification"] != "pass"
         for row in rows
     ):

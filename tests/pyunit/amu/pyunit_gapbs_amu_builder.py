@@ -5,6 +5,7 @@ import importlib.util
 import hashlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,9 @@ CIRA_BUILDER_PATH = REPO / "scripts" / "build_gapbs_cira_cxlmemuring.py"
 RUNNER_PATH = REPO / "scripts" / "compare_gapbs_cxl_amu_cira.py"
 CONFIG_PATH = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
+)
+ROI_STATE_PATH = (
+    REPO / "configs" / "example" / "gem5_library" / "gapbs_roi_state.py"
 )
 MAIN_REPO = REPO.parent.parent if REPO.parent.name == ".worktrees" else REPO
 CXLMEMURING = MAIN_REPO.parent / "CXLMemUring"
@@ -38,6 +42,10 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         )
         cls.cira_builder = load_module("gapbs_cira_builder", CIRA_BUILDER_PATH)
         cls.runner = load_module("gapbs_amu_runner", RUNNER_PATH)
+        cls.roi_state = load_module("gapbs_roi_state", ROI_STATE_PATH)
+
+    def make_roi_state(self, **kwargs):
+        return self.roi_state, self.roi_state.GapbsRoiState(**kwargs)
 
     def test_load_window_issues_before_waiting(self):
         header = self.builder.AMU_HEADER
@@ -171,7 +179,209 @@ class GapbsAmuBuilderTest(unittest.TestCase):
     def test_config_can_continue_after_roi_for_verification(self):
         config = CONFIG_PATH.read_text(encoding="utf-8")
         self.assertIn('parser.add_argument("--continue-after-roi"', config)
-        self.assertIn("yield not args.continue_after_roi", config)
+        self.assertIn("and not args.continue_after_roi", config)
+        self.assertIn("if args.fast_forward_cpu:\n            yield False", config)
+
+    def test_second_trial_roi_switches_once_and_measures_only_trial_one(self):
+        _, roi = self.make_roi_state(
+            iterations=2,
+            measure_trial=1,
+            switch_at_trial_zero=True,
+        )
+        self.assertEqual(roi.work_begin(), ("switch",))
+        self.assertEqual(roi.work_end(), ())
+        self.assertEqual(roi.work_begin(), ("reset", "record_start_tick"))
+        self.assertEqual(roi.work_end(), ("dump",))
+        self.assertEqual(roi.finish(), ("verify",))
+        self.assertEqual(roi.switch_count, 1)
+        self.assertEqual(roi.reset_count, 1)
+        self.assertEqual(roi.dump_count, 1)
+
+    def test_roi_state_rejects_missing_measured_trial_or_end(self):
+        roi_state, missing_trial = self.make_roi_state(
+            iterations=2,
+            measure_trial=1,
+            switch_at_trial_zero=True,
+        )
+        missing_trial.work_begin()
+        missing_trial.work_end()
+        with self.assertRaisesRegex(
+            roi_state.RoiSequenceError, "missing trial 1 begin"
+        ):
+            missing_trial.finish()
+
+        _, missing_end = self.make_roi_state(
+            iterations=2,
+            measure_trial=1,
+            switch_at_trial_zero=True,
+        )
+        missing_end.work_begin()
+        missing_end.work_end()
+        missing_end.work_begin()
+        with self.assertRaisesRegex(
+            roi_state.RoiSequenceError, "missing trial 1 end"
+        ):
+            missing_end.finish()
+
+    def test_roi_state_requires_every_configured_trial_to_finish(self):
+        roi_state, roi = self.make_roi_state(
+            iterations=2,
+            measure_trial=0,
+            switch_at_trial_zero=False,
+        )
+        roi.work_begin()
+        roi.work_end()
+        with self.assertRaisesRegex(
+            roi_state.RoiSequenceError, "missing trial 1 begin"
+        ):
+            roi.finish()
+
+    def test_roi_state_rejects_third_trial_and_malformed_order(self):
+        roi_state, third_trial = self.make_roi_state(
+            iterations=2,
+            measure_trial=1,
+            switch_at_trial_zero=True,
+        )
+        third_trial.work_begin()
+        third_trial.work_end()
+        third_trial.work_begin()
+        third_trial.work_end()
+        with self.assertRaisesRegex(
+            roi_state.RoiSequenceError, "unexpected trial 2 begin"
+        ):
+            third_trial.work_begin()
+
+        _, end_first = self.make_roi_state(
+            iterations=2,
+            measure_trial=1,
+            switch_at_trial_zero=True,
+        )
+        with self.assertRaisesRegex(
+            roi_state.RoiSequenceError, "end without begin"
+        ):
+            end_first.work_end()
+
+        _, duplicate_begin = self.make_roi_state(
+            iterations=2,
+            measure_trial=1,
+            switch_at_trial_zero=True,
+        )
+        duplicate_begin.work_begin()
+        with self.assertRaisesRegex(
+            roi_state.RoiSequenceError, "begin before trial 0 end"
+        ):
+            duplicate_begin.work_begin()
+
+    def test_roi_state_rejects_measure_trial_outside_iterations(self):
+        with self.assertRaisesRegex(
+            ValueError, "measure_trial must be less than iterations"
+        ):
+            self.roi_state.GapbsRoiState(
+                iterations=1,
+                measure_trial=1,
+                switch_at_trial_zero=False,
+            )
+
+    def test_verify_dry_run_builds_atomic_to_timing_second_trial_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "baseline"
+            bin_dir.mkdir()
+            (bin_dir / "bc").touch()
+            outdir = root / "out"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(RUNNER_PATH),
+                    "--baseline-bin-dir",
+                    str(bin_dir),
+                    "--benchmarks",
+                    "bc",
+                    "--scale",
+                    "20",
+                    "--iterations",
+                    "2",
+                    "--fast-forward-cpu",
+                    "atomic",
+                    "--cpu",
+                    "timing",
+                    "--measure-trial",
+                    "1",
+                    "--roi-work-events",
+                    "--verify",
+                    "--dry-run",
+                    "--outdir",
+                    str(outdir),
+                ],
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--fast-forward-cpu atomic", proc.stdout)
+        self.assertIn("--cpu timing", proc.stdout)
+        self.assertIn("--scale 20", proc.stdout)
+        self.assertIn("--iterations 2", proc.stdout)
+        self.assertIn("--measure-trial 1", proc.stdout)
+        self.assertIn("--arguments -g 20 -n 2 -v", proc.stdout)
+        self.assertIn("--cxl-memory", proc.stdout)
+        self.assertNotIn("CIRA_GAPBS_DEVICE_OFFLOAD", proc.stdout)
+
+    def test_runner_rejects_invalid_fast_forward_and_trial_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "baseline"
+            bin_dir.mkdir()
+            (bin_dir / "bc").touch()
+            common = [
+                sys.executable,
+                str(RUNNER_PATH),
+                "--baseline-bin-dir",
+                str(bin_dir),
+                "--benchmarks",
+                "bc",
+                "--dry-run",
+                "--outdir",
+                str(root / "out"),
+            ]
+            cases = (
+                (
+                    ["--fast-forward-cpu", "atomic"],
+                    "requires --roi-work-events",
+                ),
+                (
+                    [
+                        "--fast-forward-cpu",
+                        "atomic",
+                        "--roi-work-events",
+                        "--cpu",
+                        "o3",
+                    ],
+                    "requires --cpu timing",
+                ),
+                (
+                    [
+                        "--fast-forward-cpu",
+                        "atomic",
+                        "--roi-work-events",
+                        "--cpu",
+                        "timing",
+                    ],
+                    "requires --iterations 2 and --measure-trial 1",
+                ),
+                (
+                    ["--iterations", "1", "--measure-trial", "1"],
+                    "measure-trial must be less than iterations",
+                ),
+            )
+            for options, expected in cases:
+                with self.subTest(options=options):
+                    proc = subprocess.run(
+                        [*common, *options],
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn(expected, proc.stdout + proc.stderr)
 
     def test_parse_stats_uses_first_roi_section(self):
         with tempfile.TemporaryDirectory() as tmp:
