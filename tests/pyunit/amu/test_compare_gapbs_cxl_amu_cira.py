@@ -82,6 +82,17 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 ):
                     self.runner.extract_diagnostic_metrics(stats, "baseline")
 
+    def test_rejects_missing_exact_cache_stat(self):
+        for key in self.runner.DIAGNOSTIC_STATS.values():
+            with self.subTest(key=key):
+                stats = self.stats()
+                del stats[key]
+                with self.assertRaisesRegex(
+                    self.runner.StatsError,
+                    f"missing required ROI statistic: {key}",
+                ):
+                    self.runner.extract_diagnostic_metrics(stats, "baseline")
+
     def test_baseline_may_omit_cira_latency_stats(self):
         stats = self.stats()
         del stats["board.cira.totalLatency"]

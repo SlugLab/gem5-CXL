@@ -54,6 +54,26 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         "simTicks 100",
                         "board.cache_hierarchy.membus.pktCount::total 99",
                         "board.cache_hierarchy.membus.pktSize::total 4096",
+                        (
+                            "board.cache_hierarchy.l1d-cache-0."
+                            "demandMisses::total 10"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0.demandHits::"
+                            "processor.cores.core.data 11"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                            "processor.cores.core.data 12"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0.demandHits::"
+                            "processor.cores.core.inst 13"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                            "processor.cores.core.inst 14"
+                        ),
                     ]
                     if kind == "amu":
                         stats += [
@@ -66,6 +86,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                             "board.cira.issuedIndexedPrefetches 1",
                             "board.cira.issuedCsrPrefetches 0",
                             f"board.cira.completedPrefetches {completed_prefetches}",
+                            "board.cira.totalLatency 800",
+                            "board.cira.avgLatency 100",
                         ]
                     stats += [
                         "---------- End Simulation Statistics   ----------",
@@ -204,6 +226,120 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
                 "cxl_packets=4195 != exact first-ROI packet count 99",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_missing_exact_raw_cache_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                "processor.cores.core.data 12\n",
+                "",
+            )
+            stats.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "missing board.cache_hierarchy.l2-cache-0.demandMisses::"
+                "processor.cores.core.data",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_summary_cache_field_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            rows[0]["l2d_demand_misses"] = "999"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "l2d_demand_misses=999 != exact first-ROI value 12",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_cira_missing_raw_latency_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cira_pgo" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cira.avgLatency 100\n", ""
+            )
+            stats.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "missing board.cira.avgLatency",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_cira_summary_latency_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            cira = next(row for row in rows if row["kind"] == "cira")
+            cira["cira_avg_latency"] = "101"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "cira_avg_latency=101.0 != exact first-ROI value 100.0",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_accepts_zero_or_blank_non_cira_latency_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            baseline = next(row for row in rows if row["kind"] == "baseline")
+            baseline["cira_total_latency"] = ""
+            baseline["cira_avg_latency"] = "0.0"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            result = self.validator.validate_sweep(root)
+            self.assertEqual(result.row_count, 48)
+
+    def test_rejects_nonzero_cira_latency_on_non_cira_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            baseline = next(row for row in rows if row["kind"] == "baseline")
+            baseline["cira_total_latency"] = "1"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "non-CIRA row must leave cira_total_latency blank or zero",
             ):
                 self.validator.validate_sweep(root)
 

@@ -100,7 +100,8 @@ def parse_verification(path):
 
 
 def extract_diagnostic_metrics(stats, kind):
-    for name in (CXL_PACKET_STAT, CXL_BYTE_STAT):
+    required = (CXL_PACKET_STAT, CXL_BYTE_STAT, *DIAGNOSTIC_STATS.values())
+    for name in required:
         if name not in stats:
             raise StatsError(f"missing required ROI statistic: {name}")
     if kind == "cira":
@@ -113,7 +114,7 @@ def extract_diagnostic_metrics(stats, kind):
     }
     metrics.update(
         {
-            field: stats.get(stat_name, 0)
+            field: stats[stat_name]
             for field, stat_name in DIAGNOSTIC_STATS.items()
         }
     )

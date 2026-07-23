@@ -24,6 +24,31 @@ EXPECTED_LABEL_KINDS = (
     ("amu", "amu"),
     ("cira_pgo", "cira"),
 )
+CACHE_SUMMARY_STATS = {
+    "l1d_demand_misses": (
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+    ),
+    "l2d_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::"
+        "processor.cores.core.data"
+    ),
+    "l2d_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::"
+        "processor.cores.core.data"
+    ),
+    "l2i_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::"
+        "processor.cores.core.inst"
+    ),
+    "l2i_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::"
+        "processor.cores.core.inst"
+    ),
+}
+CIRA_LATENCY_SUMMARY_STATS = {
+    "cira_total_latency": "board.cira.totalLatency",
+    "cira_avg_latency": "board.cira.avgLatency",
+}
 REQUIRED_SUMMARY_FIELDS = {
     "benchmark",
     "label",
@@ -110,6 +135,31 @@ def require_summary_counter(row, name, context):
             f"{context}: {name} is not a nonnegative integer: {value}"
         )
     return int(value)
+
+
+def require_stat_number(stats, name, path):
+    if name not in stats:
+        raise ValidationError(f"{path}: missing {name} in first ROI stats section")
+    value = stats[name]
+    if not math.isfinite(value) or value < 0:
+        raise ValidationError(
+            f"{path}: {name} is not finite and nonnegative: {value}"
+        )
+    return value
+
+
+def require_summary_number(row, name, context):
+    try:
+        value = float(row[name])
+    except (KeyError, ValueError) as error:
+        raise ValidationError(
+            f"{context}: invalid {name}={row.get(name)!r}"
+        ) from error
+    if not math.isfinite(value) or value < 0:
+        raise ValidationError(
+            f"{context}: {name} is not finite and nonnegative: {value}"
+        )
+    return value
 
 
 def configured_delay(path):
@@ -203,6 +253,14 @@ def validate_sweep(sweep_root):
                         f"{context}: {field}={reported} != exact first-ROI "
                         f"{unit_name} {exact}"
                     )
+            for field, stat_name in CACHE_SUMMARY_STATS.items():
+                reported = require_summary_counter(row, field, context)
+                exact = require_counter(stats, stat_name, stats_path)
+                if reported != exact:
+                    raise ValidationError(
+                        f"{context}: {field}={reported} != exact first-ROI "
+                        f"value {exact}"
+                    )
 
             if row["kind"] == "amu":
                 amu_rows += 1
@@ -239,6 +297,31 @@ def validate_sweep(sweep_root):
                         f"{context}: issuedIndexedPrefetches + "
                         f"issuedCsrPrefetches = {indexed + csr}, expected > 0"
                     )
+                for field, stat_name in CIRA_LATENCY_SUMMARY_STATS.items():
+                    reported = require_summary_number(row, field, context)
+                    exact = require_stat_number(stats, stat_name, stats_path)
+                    if reported != exact:
+                        raise ValidationError(
+                            f"{context}: {field}={reported} != exact "
+                            f"first-ROI value {exact}"
+                        )
+            else:
+                for field in CIRA_LATENCY_SUMMARY_STATS:
+                    value = row[field]
+                    if value == "":
+                        continue
+                    try:
+                        parsed = float(value)
+                    except ValueError as error:
+                        raise ValidationError(
+                            f"{context}: non-CIRA row must leave {field} "
+                            "blank or zero"
+                        ) from error
+                    if not math.isfinite(parsed) or parsed != 0:
+                        raise ValidationError(
+                            f"{context}: non-CIRA row must leave {field} "
+                            "blank or zero"
+                        )
 
     if row_count != 48 or amu_rows != 16 or cira_rows != 16:
         raise ValidationError(
