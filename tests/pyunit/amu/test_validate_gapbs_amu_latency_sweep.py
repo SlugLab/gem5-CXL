@@ -4,6 +4,7 @@
 import csv
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -127,11 +128,27 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         "board.cache_hierarchy.membus.pktSize::total 99999",
                         (
                             "board.cache_hierarchy.l1d-cache-0."
+                            "demandHits::processor.switch.core.data 90"
+                        ),
+                        (
+                            "board.cache_hierarchy.l1d-cache-0."
+                            "demandHits::total 90"
+                        ),
+                        (
+                            "board.cache_hierarchy.l1d-cache-0."
                             "demandMisses::processor.switch.core.data 10"
                         ),
                         (
                             "board.cache_hierarchy.l1d-cache-0."
                             "demandMisses::total 10"
+                        ),
+                        (
+                            "board.cache_hierarchy.l1d-cache-0."
+                            "demandAccesses::processor.switch.core.data 100"
+                        ),
+                        (
+                            "board.cache_hierarchy.l1d-cache-0."
+                            "demandAccesses::total 100"
                         ),
                         (
                             "board.cache_hierarchy.l2-cache-0.demandHits::"
@@ -156,6 +173,18 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         (
                             "board.cache_hierarchy.l2-cache-0."
                             "demandMisses::total 5014"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                            "processor.switch.core.data 5011"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                            "processor.switch.core.inst 27"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0."
+                            "demandAccesses::total 5038"
                         ),
                     ]
                     if kind == "amu":
@@ -292,6 +321,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             .replace(
                 "demandMisses::total 5014",
                 "demandMisses::total 4014",
+            )
+            .replace(
+                "demandAccesses::processor.switch.core.data 5011",
+                "demandAccesses::processor.switch.core.data 4011",
+            )
+            .replace(
+                "demandAccesses::total 5038",
+                "demandAccesses::total 4038",
             ),
             encoding="utf-8",
         )
@@ -470,6 +507,16 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ).replace(
                 "board.cache_hierarchy.l2-cache-0.demandHits::total 24\n",
                 "board.cache_hierarchy.l2-cache-0.demandHits::total 13\n",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                "processor.switch.core.data 5011\n",
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                "processor.switch.core.data 5000\n",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-0."
+                "demandAccesses::total 5038\n",
+                "board.cache_hierarchy.l2-cache-0."
+                "demandAccesses::total 5027\n",
             )
             stats.write_text(text, encoding="utf-8")
             summary = root / "200ns" / "summary.csv"
@@ -505,6 +552,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cache_hierarchy.l2-cache-0.demandMisses::"
                 "processor.switch.core.inst 14\n",
                 "board.cache_hierarchy.l2-cache-0.demandMisses::total 5014\n",
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                "processor.switch.core.data 5011\n",
             ):
                 text = text.replace(line, "")
             text = text.replace(
@@ -519,17 +568,40 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     "board.cache_hierarchy.l1d-cache-0.demandHits::"
                     "processor.switch.core.data 99\n"
                     "board.cache_hierarchy.l1d-cache-0.demandHits::total 99\n"
+                    "board.cache_hierarchy.l1d-cache-0.demandAccesses::"
+                    "processor.switch.core.data 99\n"
+                    "board.cache_hierarchy.l1d-cache-0."
+                    "demandAccesses::total 99\n"
                     "board.cache_hierarchy.l2-cache-0.demandHits::"
                     "processor.switch.core.inst 13\n"
                 ),
             )
             text = text.replace(
+                "board.cache_hierarchy.l1d-cache-0.demandHits::"
+                "processor.switch.core.data 90\n"
+                "board.cache_hierarchy.l1d-cache-0.demandHits::total 90\n"
+                "board.cache_hierarchy.l1d-cache-0.demandAccesses::"
+                "processor.switch.core.data 100\n"
+                "board.cache_hierarchy.l1d-cache-0."
+                "demandAccesses::total 100\n",
+                "",
+            )
+            text = text.replace(
                 "board.cache_hierarchy.l2-cache-0.demandHits::total 24\n",
                 (
                     "board.cache_hierarchy.l2-cache-0.demandHits::total 13\n"
-                    "board.cache_hierarchy.l2-cache-0.tags.occupancies::"
-                    "processor.switch.core.data 7\n"
+                    "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                    "processor.switch.core.inst 13\n"
+                    "board.cache_hierarchy.l2-cache-0."
+                    "demandAccesses::total 13\n"
                 ),
+            )
+            text = text.replace(
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+                "processor.switch.core.inst 27\n"
+                "board.cache_hierarchy.l2-cache-0."
+                "demandAccesses::total 5038\n",
+                "",
             )
             stats.write_text(text, encoding="utf-8")
             self.mutate_summary(
@@ -544,6 +616,35 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             )
             result = self.validator.validate_sweep(root)
             self.assertEqual(result.row_count, 48)
+
+    def test_rejects_deleted_nonzero_demand_family_reported_as_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "500ns" / "bc" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8")
+            for line in (
+                "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                "processor.switch.core.data 5000\n",
+                "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                "processor.switch.core.inst 14\n",
+                "board.cache_hierarchy.l2-cache-0.demandMisses::total 5014\n",
+            ):
+                text = text.replace(line, "")
+            stats.write_text(text, encoding="utf-8")
+            self.mutate_summary(
+                root,
+                "500ns",
+                lambda row: row["benchmark"] == "bc"
+                and row["kind"] == "baseline",
+                l2d_demand_misses="0",
+                l2i_demand_misses="0",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "omitted nonzero demandMisses",
+            ):
+                self.validator.validate_sweep(root)
 
     def test_full_matrix_rejects_legacy_cache_requestor_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -975,6 +1076,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         .replace(
                             "demandMisses::total 5014",
                             "demandMisses::total 4110",
+                        )
+                        .replace(
+                            "demandAccesses::processor.switch.core.data 5011",
+                            "demandAccesses::processor.switch.core.data 4107",
+                        )
+                        .replace(
+                            "demandAccesses::total 5038",
+                            "demandAccesses::total 4134",
                         ),
                         encoding="utf-8",
                     )
@@ -990,6 +1099,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         .replace(
                             "demandMisses::total 4014",
                             "demandMisses::total 5014",
+                        )
+                        .replace(
+                            "demandAccesses::processor.switch.core.data 4011",
+                            "demandAccesses::processor.switch.core.data 5011",
+                        )
+                        .replace(
+                            "demandAccesses::total 4038",
+                            "demandAccesses::total 5038",
                         ),
                         encoding="utf-8",
                     )
@@ -1134,6 +1251,100 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     [],
                     "transaction left staging or backup files",
                 )
+
+    def test_paired_outputs_reject_resolve_equivalent_paths_before_io(self):
+        result = self.validator.ValidationResult(
+            1,
+            0,
+            0,
+            [{"latency": "1us", "status": "ok"}],
+            "full",
+        )
+        for alias_kind in (
+            "exact",
+            "relative",
+            "symlink-parent",
+            "symlink-file",
+        ):
+            with (
+                self.subTest(alias_kind=alias_kind),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                real = root / "real"
+                real.mkdir()
+                combined = real / "evidence.out"
+                combined.write_text("old evidence\n", encoding="utf-8")
+                if alias_kind == "exact":
+                    validation = combined
+                elif alias_kind == "relative":
+                    validation = Path(
+                        os.path.relpath(combined, Path.cwd())
+                    )
+                elif alias_kind == "symlink-parent":
+                    alias = root / "alias"
+                    alias.symlink_to(real, target_is_directory=True)
+                    validation = alias / combined.name
+                else:
+                    validation = root / "alias.out"
+                    validation.symlink_to(combined)
+                with (
+                    mock.patch.object(
+                        self.validator.tempfile,
+                        "mkstemp",
+                        wraps=self.validator.tempfile.mkstemp,
+                    ) as make_temp,
+                    mock.patch.object(
+                        self.validator.os,
+                        "replace",
+                        wraps=self.validator.os.replace,
+                    ) as replace,
+                ):
+                    with self.assertRaisesRegex(
+                        self.validator.ValidationError,
+                        "distinct paths",
+                    ):
+                        self.validator.write_outputs(
+                            result,
+                            combined_output=combined,
+                            validation_output=validation,
+                        )
+                make_temp.assert_not_called()
+                replace.assert_not_called()
+                self.assertEqual(
+                    combined.read_text(encoding="utf-8"),
+                    "old evidence\n",
+                )
+                self.assertEqual(list(root.rglob(".*.tmp-*")), [])
+
+    def test_cli_rejects_same_output_path_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sweep = root / "sweep"
+            self.make_sweep(sweep)
+            output = root / "evidence.out"
+            output.write_text("old evidence\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(VALIDATOR_PATH),
+                    str(sweep),
+                    "--combined-output",
+                    str(output),
+                    "--validation-output",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("distinct paths", result.stderr)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "old evidence\n",
+            )
+            self.assertEqual(list(root.rglob(".*.tmp-*")), [])
 
     def test_pr_gate_cli_prints_exact_pass_text(self):
         with tempfile.TemporaryDirectory() as tmp:

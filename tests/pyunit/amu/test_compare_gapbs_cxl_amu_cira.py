@@ -103,11 +103,32 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "processor.switch.core.data"
         ] = Decimal(1)
         stats[
+            "board.cache_hierarchy.l1d-cache-0.demandHits::total"
+        ] = Decimal(1)
+        stats[
+            "board.cache_hierarchy.l1d-cache-0.demandAccesses::"
+            "processor.switch.core.data"
+        ] = Decimal(12)
+        stats[
+            "board.cache_hierarchy.l1d-cache-0.demandAccesses::total"
+        ] = Decimal(12)
+        stats[
             "board.cache_hierarchy.l2-cache-0.demandHits::total"
         ] = Decimal(226)
         stats[
             "board.cache_hierarchy.l2-cache-0.demandMisses::total"
         ] = Decimal(228)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+            "processor.switch.core.data"
+        ] = Decimal(225)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+            "processor.switch.core.inst"
+        ] = Decimal(229)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandAccesses::total"
+        ] = Decimal(454)
         return stats
 
     def test_extracts_exact_first_roi_metrics_without_mixed_unit_sums(self):
@@ -193,6 +214,13 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         stats[
             "board.cache_hierarchy.l2-cache-0.demandHits::total"
         ] = Decimal(114)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandAccesses::"
+            "processor.switch.core.data"
+        ] = Decimal(113)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandAccesses::total"
+        ] = Decimal(342)
         metrics = self.runner.extract_diagnostic_metrics(
             stats, "baseline", fast_forward=True
         )
@@ -211,11 +239,26 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 stats, "baseline", fast_forward=True
             )
 
+    def test_fast_forward_rejects_deleted_nonzero_demand_family(self):
+        stats = self.fast_forward_stats()
+        for name in (
+            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+            "processor.switch.core.data",
+            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+            "processor.switch.core.inst",
+            "board.cache_hierarchy.l2-cache-0.demandMisses::total",
+        ):
+            del stats[name]
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "omitted nonzero demandMisses"
+        ):
+            self.runner.cache_diagnostic(
+                stats, "l2d_demand_misses", fast_forward=True
+            )
+
     def test_real_nozero_shape_accepts_wholly_omitted_zero_families(self):
-        # Minimal first-ROI excerpt preserving the all-zero family shape in
-        # /tmp/gapbs-atomic-timing.XM6cQC/smoke/stats.txt: gem5 omits both
-        # requestor cells and ::total while sibling families/occupancy retain
-        # the exact switch requestor identity.
+        # Minimal first-ROI excerpt from the real smoke stats. The omitted
+        # cells/families are proven zero only by demandAccesses=hits+misses.
         stats = {
             (
                 "board.cache_hierarchy.l1d-cache-0.demandHits::"
@@ -225,6 +268,13 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 "board.cache_hierarchy.l1d-cache-0.demandHits::total"
             ): Decimal(8834),
             (
+                "board.cache_hierarchy.l1d-cache-0.demandAccesses::"
+                "processor.switch.core.data"
+            ): Decimal(8834),
+            (
+                "board.cache_hierarchy.l1d-cache-0.demandAccesses::total"
+            ): Decimal(8834),
+            (
                 "board.cache_hierarchy.l2-cache-0.demandHits::"
                 "processor.switch.core.inst"
             ): Decimal(57),
@@ -232,13 +282,12 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 "board.cache_hierarchy.l2-cache-0.demandHits::total"
             ): Decimal(57),
             (
-                "board.cache_hierarchy.l2-cache-0.tags.occupancies::"
-                "processor.switch.core.data"
-            ): Decimal(7),
-            (
-                "board.cache_hierarchy.l2-cache-0.tags.occupancies::"
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
                 "processor.switch.core.inst"
-            ): Decimal(190),
+            ): Decimal(57),
+            (
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::total"
+            ): Decimal(57),
         }
         self.assertEqual(
             {

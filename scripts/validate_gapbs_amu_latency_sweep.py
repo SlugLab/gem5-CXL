@@ -56,23 +56,10 @@ CACHE_SUMMARY_STATS = {
         "processor.switch.core.inst"
     ),
 }
-CACHE_FAMILY_TOTALS = {
-    "l1d_demand_misses": (
-        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
-    ),
-    "l2d_demand_hits": (
-        "board.cache_hierarchy.l2-cache-0.demandHits::total"
-    ),
-    "l2d_demand_misses": (
-        "board.cache_hierarchy.l2-cache-0.demandMisses::total"
-    ),
-    "l2i_demand_hits": (
-        "board.cache_hierarchy.l2-cache-0.demandHits::total"
-    ),
-    "l2i_demand_misses": (
-        "board.cache_hierarchy.l2-cache-0.demandMisses::total"
-    ),
-}
+SWITCH_CACHE_REQUESTORS = (
+    "processor.switch.core.data",
+    "processor.switch.core.inst",
+)
 AMU_COUNTER_STATS = {
     "asmc_loads": "board.asmc.issuedLoads",
     "asmc_completed": "board.asmc.completedLoads",
@@ -232,13 +219,105 @@ def require_directional_pair(stats, path):
     return packets, byte_count
 
 
+def require_cache_demand_vector(stats, cache_root, family, field, path):
+    prefix = f"{cache_root}.{family}"
+    total_name = f"{prefix}::total"
+    cell_names = {
+        name.split("::", 1)[1]: name
+        for name in stats
+        if name.startswith(f"{prefix}::") and name != total_name
+    }
+    unknown = sorted(
+        requestor
+        for requestor in cell_names
+        if requestor not in SWITCH_CACHE_REQUESTORS
+    )
+    if unknown:
+        if any(
+            requestor.startswith(f"{allowed}.")
+            for requestor in unknown
+            for allowed in SWITCH_CACHE_REQUESTORS
+        ):
+            raise ValidationError(
+                f"{path}: ambiguous timing switch requestor for {field}: "
+                + ", ".join(unknown)
+            )
+        raise ValidationError(
+            f"{path}: unknown cache requestor for {field}: "
+            + ", ".join(unknown)
+        )
+    cells = {
+        requestor: require_counter(stats, name, path)
+        for requestor, name in cell_names.items()
+    }
+    total = (
+        require_counter(stats, total_name, path)
+        if total_name in stats
+        else None
+    )
+    if total is None and cells:
+        raise ValidationError(f"{path}: missing {total_name}")
+    if total is not None:
+        cell_sum = sum(cells.values())
+        if cell_sum != total:
+            raise ValidationError(
+                f"{path}: {family} family total {total} does not match "
+                f"requestor cells {cell_sum}"
+            )
+    return {"family": family, "cells": cells, "total": total}
+
+
+def resolve_demand_identity(accesses, hits, misses, context):
+    if accesses is None:
+        raise ValidationError(
+            f"{context}: missing exact switch requestor identity or "
+            "demandAccesses proof"
+        )
+    if hits is None and misses is None:
+        if accesses != 0:
+            raise ValidationError(
+                f"{context}: omitted nonzero demandHits/demandMisses; "
+                f"demandAccesses={accesses}"
+            )
+        hits = misses = 0
+    elif hits is None:
+        inferred = accesses - misses
+        if inferred < 0:
+            raise ValidationError(
+                f"{context}: demandAccesses identity mismatch: "
+                f"{accesses} < demandMisses {misses}"
+            )
+        if inferred > 0:
+            raise ValidationError(
+                f"{context}: omitted nonzero demandHits={inferred}"
+            )
+        hits = 0
+    elif misses is None:
+        inferred = accesses - hits
+        if inferred < 0:
+            raise ValidationError(
+                f"{context}: demandAccesses identity mismatch: "
+                f"{accesses} < demandHits {hits}"
+            )
+        if inferred > 0:
+            raise ValidationError(
+                f"{context}: omitted nonzero demandMisses={inferred}"
+            )
+        misses = 0
+    if accesses != hits + misses:
+        raise ValidationError(
+            f"{context}: demandAccesses identity mismatch: "
+            f"{accesses} != {hits} + {misses}"
+        )
+    return accesses, hits, misses
+
+
 def require_cache_counter(stats, field, path):
     requestor_stat = CACHE_SUMMARY_STATS[field]
-    family_total = CACHE_FAMILY_TOTALS[field]
     family_prefix, expected_requestor = requestor_stat.split("::", 1)
-    cache_prefix = family_prefix.rsplit(".", 1)[0] + "."
+    cache_root, target_family = family_prefix.rsplit(".", 1)
     cache_stats = [
-        name for name in stats if name.startswith(cache_prefix)
+        name for name in stats if name.startswith(f"{cache_root}.")
     ]
     legacy = [
         name
@@ -250,57 +329,49 @@ def require_cache_counter(stats, field, path):
             f"{path}: legacy cache requestor for {field}: "
             + ", ".join(sorted(legacy))
         )
-
-    family_cell_prefix = family_prefix + "::"
-    family_cells = {
-        name: value
-        for name, value in stats.items()
-        if name.startswith(family_cell_prefix) and name != family_total
-    }
-    allowed_requestors = {
-        "processor.switch.core.data",
-        "processor.switch.core.inst",
-    }
-    unknown = [
-        name
-        for name in family_cells
-        if name.split("::", 1)[1] not in allowed_requestors
-    ]
-    if unknown:
-        if any(name.startswith(requestor_stat) for name in unknown):
-            raise ValidationError(
-                f"{path}: ambiguous timing switch requestor for {field}: "
-                + ", ".join(sorted(unknown))
-            )
-        raise ValidationError(
-            f"{path}: unknown cache requestor for {field}: "
-            + ", ".join(sorted(unknown))
+    vectors = {
+        family: require_cache_demand_vector(
+            stats, cache_root, family, field, path
         )
-
-    if family_total in stats:
-        total = require_counter(stats, family_total, path)
+        for family in ("demandAccesses", "demandHits", "demandMisses")
+    }
+    resolved = {}
+    resolved["total"] = resolve_demand_identity(
+        vectors["demandAccesses"]["total"],
+        vectors["demandHits"]["total"],
+        vectors["demandMisses"]["total"],
+        f"{path}: {cache_root} totals",
+    )
+    for requestor in SWITCH_CACHE_REQUESTORS:
+        values = [
+            vector["cells"].get(
+                requestor, 0 if vector["total"] is not None else None
+            )
+            for vector in (
+                vectors["demandAccesses"],
+                vectors["demandHits"],
+                vectors["demandMisses"],
+            )
+        ]
+        resolved[requestor] = resolve_demand_identity(
+            *values, f"{path}: {cache_root}::{requestor}"
+        )
+    family_index = {
+        "demandAccesses": 0,
+        "demandHits": 1,
+        "demandMisses": 2,
+    }
+    for family, index in family_index.items():
         cell_sum = sum(
-            require_counter(stats, name, path) for name in family_cells
+            resolved[requestor][index]
+            for requestor in SWITCH_CACHE_REQUESTORS
         )
-        if cell_sum != total:
-            family_name = family_prefix.rsplit(".", 1)[1]
+        if cell_sum != resolved["total"][index]:
             raise ValidationError(
-                f"{path}: {family_name} family total {total} does not match "
-                f"requestor cells {cell_sum}"
+                f"{path}: {family} requestor/total identity mismatch for "
+                f"{cache_root}: {cell_sum} != {resolved['total'][index]}"
             )
-        if requestor_stat not in stats:
-            return 0
-        return require_counter(stats, requestor_stat, path)
-
-    if family_cells:
-        raise ValidationError(f"{path}: missing {family_total}")
-    requestor_suffix = f"::{expected_requestor}"
-    if not any(name.endswith(requestor_suffix) for name in cache_stats):
-        raise ValidationError(
-            f"{path}: missing exact switch requestor identity for "
-            f"{field}: {expected_requestor}"
-        )
-    return 0
+    return resolved[expected_requestor][family_index[target_family]]
 
 
 def parse_config(path):
@@ -900,7 +971,38 @@ def transactional_write(outputs):
                     pass
 
 
+def require_distinct_output_paths(combined_output, validation_output):
+    combined = Path(combined_output)
+    validation = Path(validation_output)
+    try:
+        combined_resolved = combined.resolve(strict=False)
+        validation_resolved = validation.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValidationError(
+            "combined and validation outputs must use distinct paths; "
+            f"could not resolve paths safely: {error}"
+        ) from error
+    equivalent = combined_resolved == validation_resolved
+    if not equivalent and combined.exists() and validation.exists():
+        try:
+            equivalent = os.path.samefile(combined, validation)
+        except OSError as error:
+            raise ValidationError(
+                "combined and validation outputs must use distinct paths; "
+                f"could not compare existing paths safely: {error}"
+            ) from error
+    if equivalent:
+        raise ValidationError(
+            "combined and validation outputs must use distinct paths: "
+            f"{combined} and {validation}"
+        )
+
+
 def write_outputs(result, combined_output=None, validation_output=None):
+    if combined_output and validation_output:
+        require_distinct_output_paths(
+            combined_output, validation_output
+        )
     combined = render_combined_csv(result) if combined_output else None
     evidence = (
         render_validation_json(result) if validation_output else None

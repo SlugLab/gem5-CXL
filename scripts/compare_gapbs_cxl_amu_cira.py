@@ -82,6 +82,10 @@ DIAGNOSTIC_FAMILY_TOTALS = {
         "board.cache_hierarchy.l2-cache-0.demandMisses::total"
     ),
 }
+SWITCH_CACHE_REQUESTORS = (
+    "processor.switch.core.data",
+    "processor.switch.core.inst",
+)
 CIRA_LATENCY_STATS = {
     "cira_total_latency": "board.cira.totalLatency",
     "cira_avg_latency": "board.cira.avgLatency",
@@ -223,6 +227,159 @@ def directional_stat_pair(stats):
     return packets, byte_count
 
 
+def cache_demand_vector(stats, cache_root, family, field):
+    prefix = f"{cache_root}.{family}"
+    total_name = f"{prefix}::total"
+    cells = {
+        name.split("::", 1)[1]: Decimal(str(value))
+        for name, value in stats.items()
+        if name.startswith(f"{prefix}::") and name != total_name
+    }
+    unknown = sorted(
+        requestor
+        for requestor in cells
+        if requestor not in SWITCH_CACHE_REQUESTORS
+    )
+    if unknown:
+        if any(
+            requestor.startswith(f"{allowed}.")
+            for requestor in unknown
+            for allowed in SWITCH_CACHE_REQUESTORS
+        ):
+            raise StatsError(
+                f"ambiguous timing switch requestor for {field}: "
+                + ", ".join(unknown)
+            )
+        raise StatsError(
+            f"unknown cache requestor for {field}: "
+            + ", ".join(unknown)
+        )
+    total = (
+        Decimal(str(stats[total_name]))
+        if total_name in stats
+        else None
+    )
+    if total is None and cells:
+        raise StatsError(f"missing required ROI statistic: {total_name}")
+    if total is not None:
+        cell_sum = sum(cells.values(), Decimal(0))
+        if cell_sum != total:
+            raise StatsError(
+                f"{family} family total {total} does not match "
+                f"requestor cells {cell_sum}"
+            )
+    return {"family": family, "cells": cells, "total": total}
+
+
+def resolve_demand_identity(accesses, hits, misses, context):
+    if accesses is None:
+        raise StatsError(
+            f"missing exact switch requestor identity or demandAccesses "
+            f"proof for {context}"
+        )
+    if hits is None and misses is None:
+        if accesses != 0:
+            raise StatsError(
+                f"omitted nonzero demandHits/demandMisses for {context}: "
+                f"demandAccesses={accesses}"
+            )
+        hits = misses = Decimal(0)
+    elif hits is None:
+        inferred = accesses - misses
+        if inferred < 0:
+            raise StatsError(
+                f"demandAccesses identity mismatch for {context}: "
+                f"{accesses} < demandMisses {misses}"
+            )
+        if inferred > 0:
+            raise StatsError(
+                f"omitted nonzero demandHits for {context}: {inferred}"
+            )
+        hits = Decimal(0)
+    elif misses is None:
+        inferred = accesses - hits
+        if inferred < 0:
+            raise StatsError(
+                f"demandAccesses identity mismatch for {context}: "
+                f"{accesses} < demandHits {hits}"
+            )
+        if inferred > 0:
+            raise StatsError(
+                f"omitted nonzero demandMisses for {context}: {inferred}"
+            )
+        misses = Decimal(0)
+    if accesses != hits + misses:
+        raise StatsError(
+            f"demandAccesses identity mismatch for {context}: "
+            f"{accesses} != {hits} + {misses}"
+        )
+    return accesses, hits, misses
+
+
+def semantic_cache_diagnostic(stats, stat_name, field):
+    family_prefix, expected_requestor = stat_name.split("::", 1)
+    cache_root, target_family = family_prefix.rsplit(".", 1)
+    cache_stats = [
+        name for name in stats if name.startswith(f"{cache_root}.")
+    ]
+    legacy = [
+        name
+        for name in cache_stats
+        if "::processor.cores.core." in name
+    ]
+    if legacy:
+        raise StatsError(
+            f"legacy cache requestor for {field}: "
+            + ", ".join(sorted(legacy))
+        )
+    vectors = {
+        family: cache_demand_vector(stats, cache_root, family, field)
+        for family in ("demandAccesses", "demandHits", "demandMisses")
+    }
+    resolved = {}
+    resolved["total"] = resolve_demand_identity(
+        vectors["demandAccesses"]["total"],
+        vectors["demandHits"]["total"],
+        vectors["demandMisses"]["total"],
+        f"{cache_root} totals",
+    )
+    for requestor in SWITCH_CACHE_REQUESTORS:
+        values = [
+            vector["cells"].get(
+                requestor,
+                Decimal(0) if vector["total"] is not None else None,
+            )
+            for vector in (
+                vectors["demandAccesses"],
+                vectors["demandHits"],
+                vectors["demandMisses"],
+            )
+        ]
+        resolved[requestor] = resolve_demand_identity(
+            *values, f"{cache_root}::{requestor}"
+        )
+    family_index = {
+        "demandAccesses": 0,
+        "demandHits": 1,
+        "demandMisses": 2,
+    }
+    for family, index in family_index.items():
+        cell_sum = sum(
+            (
+                resolved[requestor][index]
+                for requestor in SWITCH_CACHE_REQUESTORS
+            ),
+            Decimal(0),
+        )
+        if cell_sum != resolved["total"][index]:
+            raise StatsError(
+                f"{family} requestor/total identity mismatch for "
+                f"{cache_root}: {cell_sum} != "
+                f"{resolved['total'][index]}"
+            )
+    return resolved[expected_requestor][family_index[target_family]]
+
+
 def cache_diagnostic(stats, field, fast_forward=False):
     family_total = DIAGNOSTIC_FAMILY_TOTALS[field]
     stat_name = (
@@ -237,72 +394,7 @@ def cache_diagnostic(stats, field, fast_forward=False):
             )
         return stats.get(stat_name, 0)
 
-    family_prefix, expected_requestor = stat_name.split("::", 1)
-    cache_prefix = family_prefix.rsplit(".", 1)[0] + "."
-    cache_stats = [
-        name for name in stats if name.startswith(cache_prefix)
-    ]
-    legacy = [
-        name
-        for name in cache_stats
-        if "::processor.cores.core." in name
-    ]
-    if legacy:
-        raise StatsError(
-            f"legacy cache requestor for {field}: "
-            + ", ".join(sorted(legacy))
-        )
-
-    family_cell_prefix = family_prefix + "::"
-    family_cells = {
-        name: value
-        for name, value in stats.items()
-        if name.startswith(family_cell_prefix) and name != family_total
-    }
-    allowed_requestors = {
-        "processor.switch.core.data",
-        "processor.switch.core.inst",
-    }
-    unknown = [
-        name
-        for name in family_cells
-        if name.split("::", 1)[1] not in allowed_requestors
-    ]
-    if unknown:
-        if any(name.startswith(stat_name) for name in unknown):
-            raise StatsError(
-                f"ambiguous timing switch requestor for {field}: "
-                + ", ".join(sorted(unknown))
-            )
-        raise StatsError(
-            f"unknown cache requestor for {field}: "
-            + ", ".join(sorted(unknown))
-        )
-
-    if family_total in stats:
-        cell_sum = sum(
-            (Decimal(str(value)) for value in family_cells.values()),
-            Decimal(0),
-        )
-        total = Decimal(str(stats[family_total]))
-        if cell_sum != total:
-            raise StatsError(
-                f"{field} family total {total} does not "
-                f"match requestor cells {cell_sum}"
-            )
-        return stats.get(stat_name, 0)
-
-    if family_cells:
-        raise StatsError(
-            f"missing required ROI statistic: {family_total}"
-        )
-    requestor_suffix = f"::{expected_requestor}"
-    if not any(name.endswith(requestor_suffix) for name in cache_stats):
-        raise StatsError(
-            f"missing exact switch requestor identity for {field}: "
-            f"{expected_requestor}"
-        )
-    return stats.get(stat_name, 0)
+    return semantic_cache_diagnostic(stats, stat_name, field)
 
 
 def extract_diagnostic_metrics(stats, kind, fast_forward=False):
