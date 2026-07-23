@@ -52,8 +52,16 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     stats = [
                         "---------- Begin Simulation Statistics ----------",
                         "simTicks 100",
-                        "board.cache_hierarchy.membus.pktCount::total 99",
-                        "board.cache_hierarchy.membus.pktSize::total 4096",
+                        (
+                            "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
+                            "board.cxl_mem_link0.cpu_side_port 99"
+                        ),
+                        (
+                            "board.cache_hierarchy.membus.pktSize_l2.mem_side_port::"
+                            "board.cxl_mem_link0.cpu_side_port 4096"
+                        ),
+                        "board.cache_hierarchy.membus.pktCount::total 9999",
+                        "board.cache_hierarchy.membus.pktSize::total 99999",
                         (
                             "board.cache_hierarchy.l1d-cache-0."
                             "demandMisses::total 10"
@@ -73,6 +81,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         (
                             "board.cache_hierarchy.l2-cache-0.demandMisses::"
                             "processor.cores.core.inst 14"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0."
+                            "demandHits::total 24"
+                        ),
+                        (
+                            "board.cache_hierarchy.l2-cache-0."
+                            "demandMisses::total 26"
                         ),
                     ]
                     if kind == "amu":
@@ -200,12 +216,15 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
-                "board.cache_hierarchy.membus.pktCount::total 99\n", ""
+                "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port 99\n",
+                "",
             )
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "missing board.cache_hierarchy.membus.pktCount::total",
+                "expected exactly one first-ROI statistic matching .*"
+                "pktCount_.*found 0",
             ):
                 self.validator.validate_sweep(root)
 
@@ -229,6 +248,27 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ):
                 self.validator.validate_sweep(root)
 
+    def test_rejects_multiple_directional_cxl_packet_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cache_hierarchy.membus.pktCount::total 9999\n",
+                (
+                    "board.cache_hierarchy.membus.pktCount_other::"
+                    "board.cxl_mem_link0.cpu_side_port 1\n"
+                    "board.cache_hierarchy.membus.pktCount::total 9999\n"
+                ),
+            )
+            stats.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "expected exactly one first-ROI statistic matching .*"
+                "pktCount_.*found 2",
+            ):
+                self.validator.validate_sweep(root)
+
     def test_rejects_missing_exact_raw_cache_stat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -238,12 +278,72 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cache_hierarchy.l2-cache-0.demandMisses::"
                 "processor.cores.core.data 12\n",
                 "",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-0.demandMisses::total 26\n",
+                "",
             )
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "missing board.cache_hierarchy.l2-cache-0.demandMisses::"
-                "processor.cores.core.data",
+                "missing board.cache_hierarchy.l2-cache-0."
+                "demandMisses::total",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_accepts_nozero_requestor_stat_as_zero_with_family_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "pr" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cache_hierarchy.l2-cache-0.demandHits::"
+                "processor.cores.core.data 11\n",
+                "",
+            )
+            stats.write_text(text, encoding="utf-8")
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            row = next(
+                row
+                for row in rows
+                if row["benchmark"] == "pr" and row["kind"] == "baseline"
+            )
+            row["l2d_demand_hits"] = "0"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            result = self.validator.validate_sweep(root)
+            self.assertEqual(result.row_count, 48)
+
+    def test_rejects_adjacent_large_integer_counter_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cxl_mem_link0.cpu_side_port 99\n",
+                "board.cxl_mem_link0.cpu_side_port 9007199254740993\n",
+                1,
+            )
+            stats.write_text(text, encoding="utf-8")
+            summary = root / "200ns" / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames
+                rows = list(reader)
+            rows[0]["cxl_packets"] = "9007199254740992"
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "9007199254740992 != exact first-ROI packet count "
+                "9007199254740993",
             ):
                 self.validator.validate_sweep(root)
 
@@ -299,7 +399,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 writer.writerows(rows)
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "cira_avg_latency=101.0 != exact first-ROI value 100.0",
+                "cira_avg_latency=101 != exact first-ROI value 100",
             ):
                 self.validator.validate_sweep(root)
 

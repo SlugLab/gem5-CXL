@@ -26,8 +26,16 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
 
     def stats(self):
         return {
-            "board.cache_hierarchy.membus.pktCount::total": 406.0,
-            "board.cache_hierarchy.membus.pktSize::total": 8576.0,
+            (
+                "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ): 406.0,
+            (
+                "board.cache_hierarchy.membus.pktSize_l2.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ): 8576.0,
+            "board.cache_hierarchy.membus.pktCount::total": 9999.0,
+            "board.cache_hierarchy.membus.pktSize::total": 99999.0,
             # These used to be accidentally added to one mixed-unit value.
             "board.cxl_mem_link0.cpu_side_port.pktCount": 406.0,
             "board.cxl_mem_link0.cpu_side_port.pktSize": 8576.0,
@@ -48,6 +56,8 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 "board.cache_hierarchy.l2-cache-0.demandMisses::"
                 "processor.cores.core.inst"
             ): 15.0,
+            "board.cache_hierarchy.l2-cache-0.demandHits::total": 26.0,
+            "board.cache_hierarchy.l2-cache-0.demandMisses::total": 28.0,
             "board.cira.totalLatency": 1600.0,
             "board.cira.avgLatency": 100.0,
         }
@@ -71,27 +81,54 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
 
     def test_rejects_missing_exact_cxl_packet_or_byte_stat(self):
         for key in (
-            "board.cache_hierarchy.membus.pktCount::total",
-            "board.cache_hierarchy.membus.pktSize::total",
+            (
+                "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ),
+            (
+                "board.cache_hierarchy.membus.pktSize_l2.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ),
         ):
             with self.subTest(key=key):
                 stats = self.stats()
                 del stats[key]
                 with self.assertRaisesRegex(
-                    self.runner.StatsError, f"missing required ROI statistic: {key}"
+                    self.runner.StatsError, "expected exactly one ROI statistic"
                 ):
                     self.runner.extract_diagnostic_metrics(stats, "baseline")
 
+    def test_rejects_multiple_directional_packet_candidates(self):
+        stats = self.stats()
+        stats[
+            "board.cache_hierarchy.membus.pktCount_other.mem_side_port::"
+            "board.cxl_mem_link0.cpu_side_port"
+        ] = 1.0
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "expected exactly one ROI statistic.*found 2"
+        ):
+            self.runner.extract_diagnostic_metrics(stats, "baseline")
+
     def test_rejects_missing_exact_cache_stat(self):
-        for key in self.runner.DIAGNOSTIC_STATS.values():
-            with self.subTest(key=key):
+        for field, key in self.runner.DIAGNOSTIC_STATS.items():
+            with self.subTest(field=field):
                 stats = self.stats()
                 del stats[key]
+                family = self.runner.DIAGNOSTIC_FAMILY_TOTALS[field]
+                if family in stats:
+                    del stats[family]
                 with self.assertRaisesRegex(
                     self.runner.StatsError,
-                    f"missing required ROI statistic: {key}",
+                    "missing required ROI statistic",
                 ):
                     self.runner.extract_diagnostic_metrics(stats, "baseline")
+
+    def test_nozero_cache_requestor_stat_is_zero_when_family_total_exists(self):
+        stats = self.stats()
+        key = self.runner.DIAGNOSTIC_STATS["l2d_demand_hits"]
+        del stats[key]
+        metrics = self.runner.extract_diagnostic_metrics(stats, "baseline")
+        self.assertEqual(metrics["l2d_demand_hits"], 0)
 
     def test_baseline_may_omit_cira_latency_stats(self):
         stats = self.stats()

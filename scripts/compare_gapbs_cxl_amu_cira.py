@@ -18,8 +18,9 @@ DEFAULT_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
 )
 
-CXL_PACKET_STAT = "board.cache_hierarchy.membus.pktCount::total"
-CXL_BYTE_STAT = "board.cache_hierarchy.membus.pktSize::total"
+CXL_PACKET_STAT_PREFIX = "board.cache_hierarchy.membus.pktCount_"
+CXL_BYTE_STAT_PREFIX = "board.cache_hierarchy.membus.pktSize_"
+CXL_STAT_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
 DIAGNOSTIC_STATS = {
     "l1d_demand_misses": (
         "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
@@ -39,6 +40,23 @@ DIAGNOSTIC_STATS = {
     "l2i_demand_misses": (
         "board.cache_hierarchy.l2-cache-0.demandMisses::"
         "processor.cores.core.inst"
+    ),
+}
+DIAGNOSTIC_FAMILY_TOTALS = {
+    "l1d_demand_misses": (
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+    ),
+    "l2d_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::total"
+    ),
+    "l2d_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::total"
+    ),
+    "l2i_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::total"
+    ),
+    "l2i_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::total"
     ),
 }
 CIRA_LATENCY_STATS = {
@@ -99,23 +117,40 @@ def parse_verification(path):
     return verification
 
 
+def unique_directional_stat(stats, prefix):
+    candidates = [
+        (name, value)
+        for name, value in stats.items()
+        if name.startswith(prefix) and name.endswith(CXL_STAT_SUFFIX)
+    ]
+    if len(candidates) != 1:
+        raise StatsError(
+            f"expected exactly one ROI statistic matching {prefix}*"
+            f"{CXL_STAT_SUFFIX}; found {len(candidates)}"
+        )
+    return candidates[0][1]
+
+
+def cache_diagnostic(stats, field):
+    family_total = DIAGNOSTIC_FAMILY_TOTALS[field]
+    if family_total not in stats:
+        raise StatsError(f"missing required ROI statistic: {family_total}")
+    return stats.get(DIAGNOSTIC_STATS[field], 0)
+
+
 def extract_diagnostic_metrics(stats, kind):
-    required = (CXL_PACKET_STAT, CXL_BYTE_STAT, *DIAGNOSTIC_STATS.values())
-    for name in required:
-        if name not in stats:
-            raise StatsError(f"missing required ROI statistic: {name}")
     if kind == "cira":
         for name in CIRA_LATENCY_STATS.values():
             if name not in stats:
                 raise StatsError(f"missing required ROI statistic: {name}")
     metrics = {
-        "cxl_packets": stats[CXL_PACKET_STAT],
-        "cxl_bytes": stats[CXL_BYTE_STAT],
+        "cxl_packets": unique_directional_stat(stats, CXL_PACKET_STAT_PREFIX),
+        "cxl_bytes": unique_directional_stat(stats, CXL_BYTE_STAT_PREFIX),
     }
     metrics.update(
         {
-            field: stats[stat_name]
-            for field, stat_name in DIAGNOSTIC_STATS.items()
+            field: cache_diagnostic(stats, field)
+            for field in DIAGNOSTIC_STATS
         }
     )
     metrics.update(

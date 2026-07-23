@@ -9,6 +9,7 @@ import csv
 import math
 import re
 from collections import namedtuple
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -24,6 +25,9 @@ EXPECTED_LABEL_KINDS = (
     ("amu", "amu"),
     ("cira_pgo", "cira"),
 )
+CXL_PACKET_STAT_PREFIX = "board.cache_hierarchy.membus.pktCount_"
+CXL_BYTE_STAT_PREFIX = "board.cache_hierarchy.membus.pktSize_"
+CXL_STAT_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
 CACHE_SUMMARY_STATS = {
     "l1d_demand_misses": (
         "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
@@ -43,6 +47,23 @@ CACHE_SUMMARY_STATS = {
     "l2i_demand_misses": (
         "board.cache_hierarchy.l2-cache-0.demandMisses::"
         "processor.cores.core.inst"
+    ),
+}
+CACHE_FAMILY_TOTALS = {
+    "l1d_demand_misses": (
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+    ),
+    "l2d_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::total"
+    ),
+    "l2d_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::total"
+    ),
+    "l2i_demand_hits": (
+        "board.cache_hierarchy.l2-cache-0.demandHits::total"
+    ),
+    "l2i_demand_misses": (
+        "board.cache_hierarchy.l2-cache-0.demandMisses::total"
     ),
 }
 CIRA_LATENCY_SUMMARY_STATS = {
@@ -102,8 +123,8 @@ def parse_first_stats_section(path):
         if len(fields) < 2:
             continue
         try:
-            stats[fields[0]] = float(fields[1])
-        except ValueError:
+            stats[fields[0]] = Decimal(fields[1])
+        except InvalidOperation:
             continue
     if not in_section:
         raise ValidationError(f"{path}: missing simulation statistics section")
@@ -118,19 +139,19 @@ def require_counter(stats, name, path):
     if name not in stats:
         raise ValidationError(f"{path}: missing {name} in first ROI stats section")
     value = stats[name]
-    if not value.is_integer():
+    if not value.is_finite() or value != value.to_integral_value():
         raise ValidationError(f"{path}: {name} is not an integer: {value}")
     return int(value)
 
 
 def require_summary_counter(row, name, context):
     try:
-        value = float(row[name])
-    except (KeyError, ValueError) as error:
+        value = Decimal(row[name])
+    except (KeyError, InvalidOperation) as error:
         raise ValidationError(
             f"{context}: invalid {name}={row.get(name)!r}"
         ) from error
-    if not math.isfinite(value) or not value.is_integer() or value < 0:
+    if not value.is_finite() or value != value.to_integral_value() or value < 0:
         raise ValidationError(
             f"{context}: {name} is not a nonnegative integer: {value}"
         )
@@ -141,7 +162,7 @@ def require_stat_number(stats, name, path):
     if name not in stats:
         raise ValidationError(f"{path}: missing {name} in first ROI stats section")
     value = stats[name]
-    if not math.isfinite(value) or value < 0:
+    if not value.is_finite() or value < 0:
         raise ValidationError(
             f"{path}: {name} is not finite and nonnegative: {value}"
         )
@@ -150,16 +171,40 @@ def require_stat_number(stats, name, path):
 
 def require_summary_number(row, name, context):
     try:
-        value = float(row[name])
-    except (KeyError, ValueError) as error:
+        value = Decimal(row[name])
+    except (KeyError, InvalidOperation) as error:
         raise ValidationError(
             f"{context}: invalid {name}={row.get(name)!r}"
         ) from error
-    if not math.isfinite(value) or value < 0:
+    if not value.is_finite() or value < 0:
         raise ValidationError(
             f"{context}: {name} is not finite and nonnegative: {value}"
         )
     return value
+
+
+def require_directional_counter(stats, prefix, path):
+    candidates = [
+        (name, value)
+        for name, value in stats.items()
+        if name.startswith(prefix) and name.endswith(CXL_STAT_SUFFIX)
+    ]
+    if len(candidates) != 1:
+        raise ValidationError(
+            f"{path}: expected exactly one first-ROI statistic matching "
+            f"{prefix}*{CXL_STAT_SUFFIX}; found {len(candidates)}"
+        )
+    name, _ = candidates[0]
+    return require_counter(stats, name, path)
+
+
+def require_cache_counter(stats, field, path):
+    family_total = CACHE_FAMILY_TOTALS[field]
+    require_counter(stats, family_total, path)
+    requestor_stat = CACHE_SUMMARY_STATS[field]
+    if requestor_stat not in stats:
+        return 0
+    return require_counter(stats, requestor_stat, path)
 
 
 def configured_delay(path):
@@ -234,28 +279,28 @@ def validate_sweep(sweep_root):
                 )
             stats_path = run_dir / "stats.txt"
             stats = parse_first_stats_section(stats_path)
-            for field, stat_name, unit_name in (
+            for field, stat_prefix, unit_name in (
                 (
                     "cxl_packets",
-                    "board.cache_hierarchy.membus.pktCount::total",
+                    CXL_PACKET_STAT_PREFIX,
                     "packet count",
                 ),
                 (
                     "cxl_bytes",
-                    "board.cache_hierarchy.membus.pktSize::total",
+                    CXL_BYTE_STAT_PREFIX,
                     "byte count",
                 ),
             ):
                 reported = require_summary_counter(row, field, context)
-                exact = require_counter(stats, stat_name, stats_path)
+                exact = require_directional_counter(stats, stat_prefix, stats_path)
                 if reported != exact:
                     raise ValidationError(
                         f"{context}: {field}={reported} != exact first-ROI "
                         f"{unit_name} {exact}"
                     )
-            for field, stat_name in CACHE_SUMMARY_STATS.items():
+            for field in CACHE_SUMMARY_STATS:
                 reported = require_summary_counter(row, field, context)
-                exact = require_counter(stats, stat_name, stats_path)
+                exact = require_cache_counter(stats, field, stats_path)
                 if reported != exact:
                     raise ValidationError(
                         f"{context}: {field}={reported} != exact first-ROI "
@@ -268,13 +313,13 @@ def validate_sweep(sweep_root):
                     if value == "":
                         continue
                     try:
-                        parsed = float(value)
-                    except ValueError as error:
+                        parsed = Decimal(value)
+                    except InvalidOperation as error:
                         raise ValidationError(
                             f"{context}: non-CIRA row must leave {field} "
                             "blank or zero"
                         ) from error
-                    if not math.isfinite(parsed) or parsed != 0:
+                    if not parsed.is_finite() or parsed != 0:
                         raise ValidationError(
                             f"{context}: non-CIRA row must leave {field} "
                             "blank or zero"

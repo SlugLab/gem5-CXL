@@ -231,6 +231,44 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
             ):
                 self.generate(root, paths)
 
+    def test_invalid_applicable_diagnostic_value_is_rejected(self):
+        for label, field, value in (
+            ("cxl_vanilla", "cxl_packets", "not-a-number"),
+            ("amu", "l2d_demand_misses", "nan"),
+            ("cira_pgo", "cira_avg_latency", "inf"),
+            ("cira_pgo", "cira_total_latency", ""),
+            ("cxl_vanilla", "cira_total_latency", "1"),
+        ):
+            with (
+                self.subTest(label=label, field=field),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                paths = self.make_summaries(root)
+                self.mutate(
+                    paths["200ns"],
+                    lambda row: row["benchmark"] == "bfs"
+                    and row["label"] == label,
+                    **{field: value},
+                )
+                with self.assertRaisesRegex(
+                    self.generator.ValidationError, field
+                ):
+                    self.generate(root, paths)
+
+    def test_non_cira_latency_may_be_blank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_summaries(root)
+            self.mutate(
+                paths["200ns"],
+                lambda row: row["benchmark"] == "bfs"
+                and row["label"] == "amu",
+                cira_total_latency="",
+                cira_avg_latency="",
+            )
+            self.generate(root, paths)
+
     def test_output_is_deterministic(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

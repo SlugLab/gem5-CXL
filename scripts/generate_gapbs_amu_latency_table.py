@@ -9,6 +9,7 @@ import csv
 import math
 import os
 import tempfile
+from decimal import Decimal, InvalidOperation
 from io import StringIO
 from pathlib import Path
 
@@ -46,6 +47,16 @@ REQUIRED_FIELDS = {
     "cira_avg_latency",
     "run_dir",
 }
+DIAGNOSTIC_COUNT_FIELDS = (
+    "cxl_packets",
+    "cxl_bytes",
+    "l1d_demand_misses",
+    "l2d_demand_hits",
+    "l2d_demand_misses",
+    "l2i_demand_hits",
+    "l2i_demand_misses",
+)
+CIRA_LATENCY_FIELDS = ("cira_total_latency", "cira_avg_latency")
 PROVENANCE_FIRST = (
     "latency",
     "benchmark",
@@ -98,6 +109,20 @@ def positive_finite(row, field, context):
     return value
 
 
+def nonnegative_finite_decimal(row, field, context):
+    try:
+        value = Decimal(row[field])
+    except (KeyError, InvalidOperation) as error:
+        raise ValidationError(
+            f"{context}: invalid {field}={row.get(field)!r}"
+        ) from error
+    if not value.is_finite() or value < 0:
+        raise ValidationError(
+            f"{context}: {field} must be finite and nonnegative, got {value}"
+        )
+    return value
+
+
 def read_summary(latency, path):
     path = Path(path)
     with path.open(newline="", encoding="utf-8") as stream:
@@ -131,6 +156,21 @@ def read_summary(latency, path):
             )
         positive_finite(row, "sim_ticks", context)
         positive_finite(row, "speedup_vs_cxl", context)
+        for field in DIAGNOSTIC_COUNT_FIELDS:
+            nonnegative_finite_decimal(row, field, context)
+        if row["kind"] == "cira":
+            for field in CIRA_LATENCY_FIELDS:
+                nonnegative_finite_decimal(row, field, context)
+        else:
+            for field in CIRA_LATENCY_FIELDS:
+                value = row[field]
+                if value == "":
+                    continue
+                parsed = nonnegative_finite_decimal(row, field, context)
+                if parsed != 0:
+                    raise ValidationError(
+                        f"{context}: non-CIRA {field} must be blank or zero"
+                    )
         indexed[identity] = row
 
     for benchmark in BENCHMARKS:
