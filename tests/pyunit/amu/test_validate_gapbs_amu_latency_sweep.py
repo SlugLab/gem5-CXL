@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -53,8 +54,12 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         "[board]\n"
                         "mem_ranges=0:4294967296\n"
                         "[board.cxl_mem_link0]\n"
+                        "type=SerialLink\n"
                         f"delay={delay}\n"
                         "ranges=0:4294967296\n"
+                        "cpu_side_port="
+                        "board.cache_hierarchy.membus.mem_side_ports[0]\n"
+                        "mem_side_port=board.memory.mem_ctrl.port\n"
                         "[board.memory.mem_ctrl]\n"
                         "port=board.cxl_mem_link0.mem_side_port\n"
                         "[board.memory.mem_ctrl.dram]\n"
@@ -62,6 +67,20 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         "[board.cache_hierarchy.membus]\n"
                         "mem_side_ports=board.cxl_mem_link0.cpu_side_port "
                         "board.processor.switch.core.interrupts.pio\n"
+                        "[board.cache_hierarchy.l2buses]\n"
+                        + (
+                            "cpu_side_ports="
+                            "board.cache_hierarchy.l1i-cache-0.mem_side "
+                            "board.cache_hierarchy.l1d-cache-0.mem_side "
+                            "board.cira.mem_side_port\n"
+                            if kind == "cira"
+                            else
+                            "cpu_side_ports="
+                            "board.cache_hierarchy.l1i-cache-0.mem_side "
+                            "board.cache_hierarchy.l1d-cache-0.mem_side\n"
+                        )
+                        + "mem_side_ports="
+                        "board.cache_hierarchy.l2-cache-0.cpu_side\n"
                         "[board.processor.start.core]\n"
                         "type=BaseAtomicSimpleCPU\n"
                         "[board.processor.switch.core]\n"
@@ -106,6 +125,10 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         ),
                         "board.cache_hierarchy.membus.pktCount::total 9999",
                         "board.cache_hierarchy.membus.pktSize::total 99999",
+                        (
+                            "board.cache_hierarchy.l1d-cache-0."
+                            "demandMisses::processor.switch.core.data 10"
+                        ),
                         (
                             "board.cache_hierarchy.l1d-cache-0."
                             "demandMisses::total 10"
@@ -261,9 +284,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
         )
         cira_stats = gate / "pr" / "cira_pgo" / "stats.txt"
         cira_stats.write_text(
-            cira_stats.read_text(encoding="utf-8").replace(
+            cira_stats.read_text(encoding="utf-8")
+            .replace(
                 "processor.switch.core.data 5000",
                 "processor.switch.core.data 4000",
+            )
+            .replace(
+                "demandMisses::total 5014",
+                "demandMisses::total 4014",
             ),
             encoding="utf-8",
         )
@@ -422,15 +450,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cache_hierarchy.l2-cache-0.demandMisses::"
                 "processor.switch.core.data 5000\n",
                 "",
-            ).replace(
-                "board.cache_hierarchy.l2-cache-0.demandMisses::total 5014\n",
-                "",
             )
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "missing board.cache_hierarchy.l2-cache-0."
-                "demandMisses::total",
+                "demandMisses family total",
             ):
                 self.validator.validate_sweep(root)
 
@@ -443,6 +467,9 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cache_hierarchy.l2-cache-0.demandHits::"
                 "processor.switch.core.data 11\n",
                 "",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-0.demandHits::total 24\n",
+                "board.cache_hierarchy.l2-cache-0.demandHits::total 13\n",
             )
             stats.write_text(text, encoding="utf-8")
             summary = root / "200ns" / "summary.csv"
@@ -462,6 +489,97 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 writer.writerows(rows)
             result = self.validator.validate_sweep(root)
             self.assertEqual(result.row_count, 48)
+
+    def test_accepts_real_nozero_shape_with_wholly_omitted_zero_families(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "pr" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8")
+            for line in (
+                "board.cache_hierarchy.l1d-cache-0."
+                "demandMisses::processor.switch.core.data 10\n",
+                "board.cache_hierarchy.l1d-cache-0.demandMisses::total 10\n",
+                "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                "processor.switch.core.data 5000\n",
+                "board.cache_hierarchy.l2-cache-0.demandMisses::"
+                "processor.switch.core.inst 14\n",
+                "board.cache_hierarchy.l2-cache-0.demandMisses::total 5014\n",
+            ):
+                text = text.replace(line, "")
+            text = text.replace(
+                "board.cache_hierarchy.l2-cache-0.demandHits::"
+                "processor.switch.core.data 11\n",
+                "",
+            )
+            text = text.replace(
+                "board.cache_hierarchy.l2-cache-0.demandHits::"
+                "processor.switch.core.inst 13\n",
+                (
+                    "board.cache_hierarchy.l1d-cache-0.demandHits::"
+                    "processor.switch.core.data 99\n"
+                    "board.cache_hierarchy.l1d-cache-0.demandHits::total 99\n"
+                    "board.cache_hierarchy.l2-cache-0.demandHits::"
+                    "processor.switch.core.inst 13\n"
+                ),
+            )
+            text = text.replace(
+                "board.cache_hierarchy.l2-cache-0.demandHits::total 24\n",
+                (
+                    "board.cache_hierarchy.l2-cache-0.demandHits::total 13\n"
+                    "board.cache_hierarchy.l2-cache-0.tags.occupancies::"
+                    "processor.switch.core.data 7\n"
+                ),
+            )
+            stats.write_text(text, encoding="utf-8")
+            self.mutate_summary(
+                root,
+                "200ns",
+                lambda row: row["benchmark"] == "pr"
+                and row["kind"] == "baseline",
+                l1d_demand_misses="0",
+                l2d_demand_hits="0",
+                l2d_demand_misses="0",
+                l2i_demand_misses="0",
+            )
+            result = self.validator.validate_sweep(root)
+            self.assertEqual(result.row_count, 48)
+
+    def test_full_matrix_rejects_legacy_cache_requestor_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "2us" / "sssp" / "cxl_vanilla" / "stats.txt"
+            stats.write_text(
+                stats.read_text(encoding="utf-8").replace(
+                    "processor.switch.core.data 5000",
+                    "processor.cores.core.data 5000",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError, "legacy cache requestor"
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_full_matrix_rejects_unknown_cache_requestor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "2us" / "sssp" / "cxl_vanilla" / "stats.txt"
+            stats.write_text(
+                stats.read_text(encoding="utf-8").replace(
+                    "processor.switch.core.data 5000",
+                    "procesor.swotch.core.data 5000",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError, "unknown cache requestor"
+            ):
+                self.validator.validate_sweep(root)
 
     def test_rejects_adjacent_large_integer_counter_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -673,6 +791,21 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "type=BaseTimingSimpleCPU",
                 "type=BaseAtomicSimpleCPU",
             ),
+            (
+                "SerialLink",
+                "type=SerialLink",
+                "type=Bridge",
+            ),
+            (
+                "cpu_side_port binding",
+                "cpu_side_port=board.cache_hierarchy.membus.mem_side_ports[0]",
+                "cpu_side_port=board.cache_hierarchy.membus.mem_side_ports[1]",
+            ),
+            (
+                "mem_side_port binding",
+                "mem_side_port=board.memory.mem_ctrl.port",
+                "mem_side_port=board.cache_hierarchy.membus.cpu_side_ports[0]",
+            ),
         )
         for message, old, new in mutations:
             with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
@@ -698,16 +831,23 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "mem_side_port",
                 "mem_side_port=board.memory.mem_ctrl.port",
             ),
+            (
+                "mem_side_port",
+                "mem_side_port="
+                "board.cache_hierarchy.l2buses.mem_side_ports[0]",
+            ),
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 self.make_sweep(root)
                 config = root / "200ns" / "bfs" / "cira_pgo" / "config.ini"
                 text = config.read_text(encoding="utf-8")
-                line = next(
-                    line
-                    for line in text.splitlines()
-                    if line.startswith(field)
+                line = (
+                    "demand_probe_target=board.cache_hierarchy.l2-cache-0"
+                    if field == "demand_probe_target"
+                    else
+                    "mem_side_port="
+                    "board.cache_hierarchy.l2buses.cpu_side_ports[2]"
                 )
                 config.write_text(
                     text.replace(line, replacement, 1), encoding="utf-8"
@@ -716,6 +856,24 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     self.validator.ValidationError, field
                 ):
                     self.validator.validate_sweep(root)
+
+    def test_rejects_cira_l2bus_index_without_reciprocal_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            config = root / "200ns" / "bfs" / "cira_pgo" / "config.ini"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "board.cira.mem_side_port\n",
+                    "board.other.mem_side_port\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError, "CIRA endpoint binding"
+            ):
+                self.validator.validate_sweep(root)
 
     def test_rejects_summary_amu_and_cira_balance_mismatches(self):
         for kind, field, value in (
@@ -809,9 +967,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     baseline["l2d_demand_misses"] = "4096"
                     path = gate / "pr" / "cxl_vanilla" / "stats.txt"
                     path.write_text(
-                        path.read_text(encoding="utf-8").replace(
+                        path.read_text(encoding="utf-8")
+                        .replace(
                             "processor.switch.core.data 5000",
                             "processor.switch.core.data 4096",
+                        )
+                        .replace(
+                            "demandMisses::total 5014",
+                            "demandMisses::total 4110",
                         ),
                         encoding="utf-8",
                     )
@@ -819,9 +982,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     cira["l2d_demand_misses"] = "5000"
                     path = gate / "pr" / "cira_pgo" / "stats.txt"
                     path.write_text(
-                        path.read_text(encoding="utf-8").replace(
+                        path.read_text(encoding="utf-8")
+                        .replace(
                             "processor.switch.core.data 4000",
                             "processor.switch.core.data 5000",
+                        )
+                        .replace(
+                            "demandMisses::total 4014",
+                            "demandMisses::total 5014",
                         ),
                         encoding="utf-8",
                     )
@@ -904,6 +1072,68 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.assertNotEqual(failure.returncode, 0)
             self.assertFalse(failed_combined.exists())
             self.assertFalse(failed_evidence.exists())
+
+    def test_paired_output_second_replace_failure_is_rolled_back(self):
+        result = self.validator.ValidationResult(
+            1,
+            0,
+            0,
+            [{"latency": "1us", "status": "ok"}],
+            "full",
+        )
+        for existing in (False, True):
+            with (
+                self.subTest(existing=existing),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                combined = root / "combined.csv"
+                evidence = root / "evidence.json"
+                if existing:
+                    combined.write_text("old combined\n", encoding="utf-8")
+                    evidence.write_text("old evidence\n", encoding="utf-8")
+                original = self.validator.os.replace
+                replace_calls = 0
+
+                def fail_second_new_output(source, destination):
+                    nonlocal replace_calls
+                    destination = Path(destination)
+                    if destination in (combined, evidence):
+                        replace_calls += 1
+                        if replace_calls == 2:
+                            raise OSError("forced second output failure")
+                    return original(source, destination)
+
+                with mock.patch.object(
+                    self.validator.os,
+                    "replace",
+                    side_effect=fail_second_new_output,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "forced second output failure"
+                    ):
+                        self.validator.write_outputs(
+                            result,
+                            combined_output=combined,
+                            validation_output=evidence,
+                        )
+                if existing:
+                    self.assertEqual(
+                        combined.read_text(encoding="utf-8"),
+                        "old combined\n",
+                    )
+                    self.assertEqual(
+                        evidence.read_text(encoding="utf-8"),
+                        "old evidence\n",
+                    )
+                else:
+                    self.assertFalse(combined.exists())
+                    self.assertFalse(evidence.exists())
+                self.assertEqual(
+                    list(root.glob(".*.tmp-*")),
+                    [],
+                    "transaction left staging or backup files",
+                )
 
     def test_pr_gate_cli_prints_exact_pass_text(self):
         with tempfile.TemporaryDirectory() as tmp:

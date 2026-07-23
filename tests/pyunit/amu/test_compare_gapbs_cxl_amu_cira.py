@@ -87,6 +87,29 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "board.cira.avgLatency": 100.0,
         }
 
+    def fast_forward_stats(self):
+        stats = self.stats()
+        for name in tuple(stats):
+            if "processor.cores.core." in name:
+                del stats[name]
+        stats[
+            "board.cache_hierarchy.l1d-cache-0.demandMisses::"
+            "processor.switch.core.data"
+        ] = stats[
+            "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+        ]
+        stats[
+            "board.cache_hierarchy.l1d-cache-0.demandHits::"
+            "processor.switch.core.data"
+        ] = Decimal(1)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandHits::total"
+        ] = Decimal(226)
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandMisses::total"
+        ] = Decimal(228)
+        return stats
+
     def test_extracts_exact_first_roi_metrics_without_mixed_unit_sums(self):
         metrics = self.runner.extract_diagnostic_metrics(self.stats(), "cira")
         self.assertEqual(
@@ -106,15 +129,16 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
 
     def test_fast_forward_selects_only_timing_switch_requestor(self):
         metrics = self.runner.extract_diagnostic_metrics(
-            self.stats(), "baseline", fast_forward=True
+            self.fast_forward_stats(), "baseline", fast_forward=True
         )
+        self.assertEqual(metrics["l1d_demand_misses"], Decimal(11))
         self.assertEqual(metrics["l2d_demand_hits"], Decimal(112))
         self.assertEqual(metrics["l2d_demand_misses"], Decimal(113))
         self.assertEqual(metrics["l2i_demand_hits"], Decimal(114))
         self.assertEqual(metrics["l2i_demand_misses"], Decimal(115))
 
     def test_fast_forward_rejects_ambiguous_timing_switch_requestors(self):
-        stats = self.stats()
+        stats = self.fast_forward_stats()
         stats[
             "board.cache_hierarchy.l2-cache-0.demandHits::"
             "processor.switch.core.data.extra"
@@ -126,24 +150,123 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 stats, "baseline", fast_forward=True
             )
 
-    def test_fast_forward_nozero_is_zero_only_when_family_total_exists(self):
-        stats = self.stats()
+    def test_fast_forward_rejects_legacy_requestor(self):
+        stats = self.fast_forward_stats()
+        del stats[
+            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+            "processor.switch.core.data"
+        ]
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+            "processor.cores.core.data"
+        ] = Decimal(13)
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "legacy cache requestor"
+        ):
+            self.runner.extract_diagnostic_metrics(
+                stats, "baseline", fast_forward=True
+            )
+
+    def test_fast_forward_rejects_unknown_processor_requestor(self):
+        stats = self.fast_forward_stats()
+        del stats[
+            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+            "processor.switch.core.data"
+        ]
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandMisses::"
+            "procesor.swotch.core.data"
+        ] = Decimal(13)
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "unknown cache requestor"
+        ):
+            self.runner.extract_diagnostic_metrics(
+                stats, "baseline", fast_forward=True
+            )
+
+    def test_fast_forward_nozero_cell_is_zero_when_family_total_exists(self):
+        stats = self.fast_forward_stats()
         del stats[
             "board.cache_hierarchy.l2-cache-0.demandHits::"
             "processor.switch.core.data"
         ]
+        stats[
+            "board.cache_hierarchy.l2-cache-0.demandHits::total"
+        ] = Decimal(114)
         metrics = self.runner.extract_diagnostic_metrics(
             stats, "baseline", fast_forward=True
         )
         self.assertEqual(metrics["l2d_demand_hits"], 0)
+
+    def test_fast_forward_rejects_missing_nonzero_cell_with_family_total(self):
+        stats = self.fast_forward_stats()
         del stats[
-            "board.cache_hierarchy.l2-cache-0.demandHits::total"
+            "board.cache_hierarchy.l2-cache-0.demandHits::"
+            "processor.switch.core.data"
         ]
         with self.assertRaisesRegex(
-            self.runner.StatsError, "missing required ROI statistic"
+            self.runner.StatsError, "family total"
         ):
             self.runner.extract_diagnostic_metrics(
                 stats, "baseline", fast_forward=True
+            )
+
+    def test_real_nozero_shape_accepts_wholly_omitted_zero_families(self):
+        # Minimal first-ROI excerpt preserving the all-zero family shape in
+        # /tmp/gapbs-atomic-timing.XM6cQC/smoke/stats.txt: gem5 omits both
+        # requestor cells and ::total while sibling families/occupancy retain
+        # the exact switch requestor identity.
+        stats = {
+            (
+                "board.cache_hierarchy.l1d-cache-0.demandHits::"
+                "processor.switch.core.data"
+            ): Decimal(8834),
+            (
+                "board.cache_hierarchy.l1d-cache-0.demandHits::total"
+            ): Decimal(8834),
+            (
+                "board.cache_hierarchy.l2-cache-0.demandHits::"
+                "processor.switch.core.inst"
+            ): Decimal(57),
+            (
+                "board.cache_hierarchy.l2-cache-0.demandHits::total"
+            ): Decimal(57),
+            (
+                "board.cache_hierarchy.l2-cache-0.tags.occupancies::"
+                "processor.switch.core.data"
+            ): Decimal(7),
+            (
+                "board.cache_hierarchy.l2-cache-0.tags.occupancies::"
+                "processor.switch.core.inst"
+            ): Decimal(190),
+        }
+        self.assertEqual(
+            {
+                field: self.runner.cache_diagnostic(
+                    stats, field, fast_forward=True
+                )
+                for field in self.runner.DIAGNOSTIC_STATS
+            },
+            {
+                "l1d_demand_misses": 0,
+                "l2d_demand_hits": 0,
+                "l2d_demand_misses": 0,
+                "l2i_demand_hits": Decimal(57),
+                "l2i_demand_misses": 0,
+            },
+        )
+
+    def test_wholly_missing_family_rejects_absent_requestor_identity(self):
+        stats = {
+            (
+                "board.cache_hierarchy.l2-cache-0.replacements"
+            ): Decimal(0)
+        }
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "missing exact switch requestor identity"
+        ):
+            self.runner.cache_diagnostic(
+                stats, "l2d_demand_misses", fast_forward=True
             )
 
     def test_extracts_owner_evidence_and_blanks_nonowners(self):

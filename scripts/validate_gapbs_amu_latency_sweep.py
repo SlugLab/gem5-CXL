@@ -9,6 +9,7 @@ import configparser
 import csv
 import json
 import os
+import re
 import shlex
 import tempfile
 from collections import namedtuple
@@ -35,7 +36,8 @@ CXL_STAT_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
 CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
 CACHE_SUMMARY_STATS = {
     "l1d_demand_misses": (
-        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::"
+        "processor.switch.core.data"
     ),
     "l2d_demand_hits": (
         "board.cache_hierarchy.l2-cache-0.demandHits::"
@@ -231,19 +233,74 @@ def require_directional_pair(stats, path):
 
 
 def require_cache_counter(stats, field, path):
-    require_counter(stats, CACHE_FAMILY_TOTALS[field], path)
     requestor_stat = CACHE_SUMMARY_STATS[field]
-    if field != "l1d_demand_misses":
-        candidates = [
-            name for name in stats if name.startswith(requestor_stat)
-        ]
-        if len(candidates) > 1:
+    family_total = CACHE_FAMILY_TOTALS[field]
+    family_prefix, expected_requestor = requestor_stat.split("::", 1)
+    cache_prefix = family_prefix.rsplit(".", 1)[0] + "."
+    cache_stats = [
+        name for name in stats if name.startswith(cache_prefix)
+    ]
+    legacy = [
+        name
+        for name in cache_stats
+        if "::processor.cores.core." in name
+    ]
+    if legacy:
+        raise ValidationError(
+            f"{path}: legacy cache requestor for {field}: "
+            + ", ".join(sorted(legacy))
+        )
+
+    family_cell_prefix = family_prefix + "::"
+    family_cells = {
+        name: value
+        for name, value in stats.items()
+        if name.startswith(family_cell_prefix) and name != family_total
+    }
+    allowed_requestors = {
+        "processor.switch.core.data",
+        "processor.switch.core.inst",
+    }
+    unknown = [
+        name
+        for name in family_cells
+        if name.split("::", 1)[1] not in allowed_requestors
+    ]
+    if unknown:
+        if any(name.startswith(requestor_stat) for name in unknown):
             raise ValidationError(
-                f"{path}: ambiguous timing switch requestor for {field}"
+                f"{path}: ambiguous timing switch requestor for {field}: "
+                + ", ".join(sorted(unknown))
             )
-    if requestor_stat not in stats:
-        return 0
-    return require_counter(stats, requestor_stat, path)
+        raise ValidationError(
+            f"{path}: unknown cache requestor for {field}: "
+            + ", ".join(sorted(unknown))
+        )
+
+    if family_total in stats:
+        total = require_counter(stats, family_total, path)
+        cell_sum = sum(
+            require_counter(stats, name, path) for name in family_cells
+        )
+        if cell_sum != total:
+            family_name = family_prefix.rsplit(".", 1)[1]
+            raise ValidationError(
+                f"{path}: {family_name} family total {total} does not match "
+                f"requestor cells {cell_sum}"
+            )
+        if requestor_stat not in stats:
+            return 0
+        return require_counter(stats, requestor_stat, path)
+
+    if family_cells:
+        raise ValidationError(f"{path}: missing {family_total}")
+    requestor_suffix = f"::{expected_requestor}"
+    if not any(name.endswith(requestor_suffix) for name in cache_stats):
+        raise ValidationError(
+            f"{path}: missing exact switch requestor identity for "
+            f"{field}: {expected_requestor}"
+        )
+    return 0
 
 
 def parse_config(path):
@@ -285,6 +342,31 @@ def validate_config(path, expected_delay, kind):
         raise ValidationError(
             f"{path}: delay={delay}, expected {expected_delay}"
         )
+    link_type = config_value(
+        config, "board.cxl_mem_link0", "type", path
+    )
+    if link_type != "SerialLink":
+        raise ValidationError(
+            f"{path}: CXL link type={link_type!r}, expected SerialLink"
+        )
+    link_cpu_port = config_value(
+        config, "board.cxl_mem_link0", "cpu_side_port", path
+    )
+    cpu_binding = re.fullmatch(
+        r"board\.cache_hierarchy\.membus\.mem_side_ports\[(\d+)\]",
+        link_cpu_port,
+    )
+    if cpu_binding is None:
+        raise ValidationError(
+            f"{path}: invalid CXL cpu_side_port binding: {link_cpu_port}"
+        )
+    link_mem_port = config_value(
+        config, "board.cxl_mem_link0", "mem_side_port", path
+    )
+    if link_mem_port != "board.memory.mem_ctrl.port":
+        raise ValidationError(
+            f"{path}: invalid CXL mem_side_port binding: {link_mem_port}"
+        )
     controller_port = config_value(
         config, "board.memory.mem_ctrl", "port", path
     )
@@ -296,16 +378,22 @@ def validate_config(path, expected_delay, kind):
     membus_ports = config_value(
         config, "board.cache_hierarchy.membus", "mem_side_ports", path
     ).split()
-    if "board.cxl_mem_link0.cpu_side_port" not in membus_ports:
-        raise ValidationError(
-            f"{path}: membus missing board.cxl_mem_link0.cpu_side_port"
-        )
+    cpu_index = int(cpu_binding.group(1))
     if any(
         "memory.mem_ctrl" in port or port == controller_port
         for port in membus_ports
     ):
         raise ValidationError(
             f"{path}: direct memory controller port on membus"
+        )
+    if (
+        cpu_index >= len(membus_ports)
+        or membus_ports[cpu_index]
+        != "board.cxl_mem_link0.cpu_side_port"
+    ):
+        raise ValidationError(
+            f"{path}: CXL cpu_side_port binding does not match "
+            f"membus.mem_side_ports[{cpu_index}]"
         )
     start_type = config_value(
         config, "board.processor.start.core", "type", path
@@ -361,12 +449,29 @@ def validate_config(path, expected_delay, kind):
         cira_port = config_value(
             config, "board.cira", "mem_side_port", path
         )
-        if not cira_port.startswith(
-            "board.cache_hierarchy.l2buses."
-        ) or "memory.mem_ctrl" in cira_port:
+        cira_binding = re.fullmatch(
+            r"board\.cache_hierarchy\.l2buses\.cpu_side_ports\[(\d+)\]",
+            cira_port,
+        )
+        if cira_binding is None:
             raise ValidationError(
                 f"{path}: CIRA mem_side_port={cira_port!r} "
-                "does not traverse l2bus"
+                "must bind an l2buses.cpu_side_ports endpoint"
+            )
+        l2_cpu_ports = config_value(
+            config,
+            "board.cache_hierarchy.l2buses",
+            "cpu_side_ports",
+            path,
+        ).split()
+        cira_index = int(cira_binding.group(1))
+        if (
+            cira_index >= len(l2_cpu_ports)
+            or l2_cpu_ports[cira_index] != "board.cira.mem_side_port"
+        ):
+            raise ValidationError(
+                f"{path}: CIRA endpoint binding does not match "
+                f"l2buses.cpu_side_ports[{cira_index}]"
             )
     return board_range
 
@@ -714,7 +819,7 @@ def atomic_write(path, content, newline=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
+        prefix=f".{path.name}.tmp-", dir=path.parent
     )
     try:
         with os.fdopen(
@@ -730,14 +835,86 @@ def atomic_write(path, content, newline=None):
         raise
 
 
+def transactional_write(outputs):
+    staged = {}
+    backups = {}
+    installed = set()
+    committed = False
+    try:
+        for path, content, newline in outputs:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.tmp-", dir=path.parent
+            )
+            staged[path] = Path(temporary)
+            with os.fdopen(
+                descriptor, "w", encoding="utf-8", newline=newline
+            ) as stream:
+                stream.write(content)
+
+        for path in staged:
+            if not path.exists():
+                backups[path] = None
+                continue
+            descriptor, backup = tempfile.mkstemp(
+                prefix=f".{path.name}.tmp-backup-", dir=path.parent
+            )
+            os.close(descriptor)
+            os.unlink(backup)
+            os.replace(path, backup)
+            backups[path] = Path(backup)
+
+        for path, temporary in staged.items():
+            os.replace(temporary, path)
+            installed.add(path)
+            staged[path] = None
+        committed = True
+    except BaseException:
+        for path, backup in backups.items():
+            if backup is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                    os.replace(backup, path)
+                    backups[path] = None
+                except OSError:
+                    pass
+            elif path in installed:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise
+    finally:
+        for temporary in staged.values():
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        for backup in backups.values():
+            if backup is not None and committed:
+                try:
+                    backup.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def write_outputs(result, combined_output=None, validation_output=None):
     combined = render_combined_csv(result) if combined_output else None
     evidence = (
         render_validation_json(result) if validation_output else None
     )
-    if combined_output:
+    if combined_output and validation_output:
+        transactional_write(
+            (
+                (combined_output, combined, ""),
+                (validation_output, evidence, None),
+            )
+        )
+    elif combined_output:
         atomic_write(combined_output, combined, newline="")
-    if validation_output:
+    elif validation_output:
         atomic_write(validation_output, evidence)
 
 

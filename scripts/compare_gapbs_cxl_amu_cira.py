@@ -45,7 +45,8 @@ DIAGNOSTIC_STATS = {
 }
 SWITCH_DIAGNOSTIC_STATS = {
     "l1d_demand_misses": (
-        "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
+        "board.cache_hierarchy.l1d-cache-0.demandMisses::"
+        "processor.switch.core.data"
     ),
     "l2d_demand_hits": (
         "board.cache_hierarchy.l2-cache-0.demandHits::"
@@ -224,22 +225,83 @@ def directional_stat_pair(stats):
 
 def cache_diagnostic(stats, field, fast_forward=False):
     family_total = DIAGNOSTIC_FAMILY_TOTALS[field]
-    if family_total not in stats:
-        raise StatsError(f"missing required ROI statistic: {family_total}")
     stat_name = (
         SWITCH_DIAGNOSTIC_STATS[field]
         if fast_forward
         else DIAGNOSTIC_STATS[field]
     )
-    if fast_forward and field != "l1d_demand_misses":
-        candidates = [
-            name for name in stats if name.startswith(stat_name)
-        ]
-        if len(candidates) > 1:
+    if not fast_forward:
+        if family_total not in stats:
+            raise StatsError(
+                f"missing required ROI statistic: {family_total}"
+            )
+        return stats.get(stat_name, 0)
+
+    family_prefix, expected_requestor = stat_name.split("::", 1)
+    cache_prefix = family_prefix.rsplit(".", 1)[0] + "."
+    cache_stats = [
+        name for name in stats if name.startswith(cache_prefix)
+    ]
+    legacy = [
+        name
+        for name in cache_stats
+        if "::processor.cores.core." in name
+    ]
+    if legacy:
+        raise StatsError(
+            f"legacy cache requestor for {field}: "
+            + ", ".join(sorted(legacy))
+        )
+
+    family_cell_prefix = family_prefix + "::"
+    family_cells = {
+        name: value
+        for name, value in stats.items()
+        if name.startswith(family_cell_prefix) and name != family_total
+    }
+    allowed_requestors = {
+        "processor.switch.core.data",
+        "processor.switch.core.inst",
+    }
+    unknown = [
+        name
+        for name in family_cells
+        if name.split("::", 1)[1] not in allowed_requestors
+    ]
+    if unknown:
+        if any(name.startswith(stat_name) for name in unknown):
             raise StatsError(
                 f"ambiguous timing switch requestor for {field}: "
-                + ", ".join(sorted(candidates))
+                + ", ".join(sorted(unknown))
             )
+        raise StatsError(
+            f"unknown cache requestor for {field}: "
+            + ", ".join(sorted(unknown))
+        )
+
+    if family_total in stats:
+        cell_sum = sum(
+            (Decimal(str(value)) for value in family_cells.values()),
+            Decimal(0),
+        )
+        total = Decimal(str(stats[family_total]))
+        if cell_sum != total:
+            raise StatsError(
+                f"{field} family total {total} does not "
+                f"match requestor cells {cell_sum}"
+            )
+        return stats.get(stat_name, 0)
+
+    if family_cells:
+        raise StatsError(
+            f"missing required ROI statistic: {family_total}"
+        )
+    requestor_suffix = f"::{expected_requestor}"
+    if not any(name.endswith(requestor_suffix) for name in cache_stats):
+        raise StatsError(
+            f"missing exact switch requestor identity for {field}: "
+            f"{expected_requestor}"
+        )
     return stats.get(stat_name, 0)
 
 
