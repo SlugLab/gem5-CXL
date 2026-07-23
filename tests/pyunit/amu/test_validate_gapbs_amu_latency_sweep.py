@@ -269,6 +269,22 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ):
                 self.validator.validate_sweep(root)
 
+    def test_rejects_packet_and_byte_directional_cell_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
+            text = stats.read_text(encoding="utf-8").replace(
+                "board.cache_hierarchy.membus.pktSize_l2.mem_side_port::",
+                "board.cache_hierarchy.membus.pktSize_other.mem_side_port::",
+                1,
+            )
+            stats.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.validator.ValidationError, "directional identity mismatch"
+            ):
+                self.validator.validate_sweep(root)
+
     def test_rejects_missing_exact_raw_cache_stat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -109,6 +109,55 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         ):
             self.runner.extract_diagnostic_metrics(stats, "baseline")
 
+    def test_rejects_packet_and_byte_directional_cell_mismatch(self):
+        stats = self.stats()
+        old_key = (
+            "board.cache_hierarchy.membus.pktSize_l2.mem_side_port::"
+            "board.cxl_mem_link0.cpu_side_port"
+        )
+        value = stats.pop(old_key)
+        stats[
+            "board.cache_hierarchy.membus.pktSize_other.mem_side_port::"
+            "board.cxl_mem_link0.cpu_side_port"
+        ] = value
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "directional identity mismatch"
+        ):
+            self.runner.extract_diagnostic_metrics(stats, "baseline")
+
+    def test_large_integer_counter_survives_stats_to_summary_exactly(self):
+        stats = self.stats()
+        packet_key = (
+            "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
+            "board.cxl_mem_link0.cpu_side_port"
+        )
+        stats[packet_key] = 9007199254740993
+        stats["simTicks"] = 100
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stats_path = root / "stats.txt"
+            stats_path.write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                + "\n".join(f"{key} {value}" for key, value in stats.items())
+                + "\n---------- End Simulation Statistics   ----------\n",
+                encoding="utf-8",
+            )
+            parsed = self.runner.parse_stats(stats_path)
+            row = {
+                "benchmark": "bc",
+                "label": "cxl_vanilla",
+                "kind": "baseline",
+                "status": "ok",
+                "verification": "pass",
+                "sim_ticks": parsed["simTicks"],
+                **self.runner.extract_diagnostic_metrics(parsed, "baseline"),
+            }
+            summary = root / "summary.csv"
+            self.runner.write_summary(summary, [row])
+            with summary.open(newline="", encoding="utf-8") as stream:
+                written = next(csv.DictReader(stream))
+        self.assertEqual(written["cxl_packets"], "9007199254740993")
+
     def test_rejects_missing_exact_cache_stat(self):
         for field, key in self.runner.DIAGNOSTIC_STATS.items():
             with self.subTest(field=field):

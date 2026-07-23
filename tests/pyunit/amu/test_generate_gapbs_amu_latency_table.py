@@ -234,9 +234,11 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
     def test_invalid_applicable_diagnostic_value_is_rejected(self):
         for label, field, value in (
             ("cxl_vanilla", "cxl_packets", "not-a-number"),
+            ("amu", "cxl_packets", "1.5"),
             ("amu", "l2d_demand_misses", "nan"),
             ("cira_pgo", "cira_avg_latency", "inf"),
             ("cira_pgo", "cira_total_latency", ""),
+            ("cira_pgo", "cira_total_latency", "1.5"),
             ("cxl_vanilla", "cira_total_latency", "1"),
         ):
             with (
@@ -266,6 +268,18 @@ class GapbsAmuLatencyTableGeneratorTest(unittest.TestCase):
                 and row["label"] == "amu",
                 cira_total_latency="",
                 cira_avg_latency="",
+            )
+            self.generate(root, paths)
+
+    def test_cira_average_latency_may_be_fractional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_summaries(root)
+            self.mutate(
+                paths["200ns"],
+                lambda row: row["benchmark"] == "bfs"
+                and row["label"] == "cira_pgo",
+                cira_avg_latency="100.25",
             )
             self.generate(root, paths)
 

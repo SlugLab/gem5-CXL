@@ -195,7 +195,23 @@ def require_directional_counter(stats, prefix, path):
             f"{prefix}*{CXL_STAT_SUFFIX}; found {len(candidates)}"
         )
     name, _ = candidates[0]
-    return require_counter(stats, name, path)
+    cell = name[len(prefix) : -len(CXL_STAT_SUFFIX)]
+    return cell, require_counter(stats, name, path)
+
+
+def require_directional_pair(stats, path):
+    packet_cell, packets = require_directional_counter(
+        stats, CXL_PACKET_STAT_PREFIX, path
+    )
+    byte_cell, byte_count = require_directional_counter(
+        stats, CXL_BYTE_STAT_PREFIX, path
+    )
+    if packet_cell != byte_cell:
+        raise ValidationError(
+            f"{path}: CXL packet/byte directional identity mismatch: "
+            f"{packet_cell!r} != {byte_cell!r}"
+        )
+    return packets, byte_count
 
 
 def require_cache_counter(stats, field, path):
@@ -279,20 +295,12 @@ def validate_sweep(sweep_root):
                 )
             stats_path = run_dir / "stats.txt"
             stats = parse_first_stats_section(stats_path)
-            for field, stat_prefix, unit_name in (
-                (
-                    "cxl_packets",
-                    CXL_PACKET_STAT_PREFIX,
-                    "packet count",
-                ),
-                (
-                    "cxl_bytes",
-                    CXL_BYTE_STAT_PREFIX,
-                    "byte count",
-                ),
+            packets, byte_count = require_directional_pair(stats, stats_path)
+            for field, exact, unit_name in (
+                ("cxl_packets", packets, "packet count"),
+                ("cxl_bytes", byte_count, "byte count"),
             ):
                 reported = require_summary_counter(row, field, context)
-                exact = require_directional_counter(stats, stat_prefix, stats_path)
                 if reported != exact:
                     raise ValidationError(
                         f"{context}: {field}={reported} != exact first-ROI "
@@ -361,8 +369,12 @@ def validate_sweep(sweep_root):
                         f"issuedCsrPrefetches = {indexed + csr}, expected > 0"
                     )
                 for field, stat_name in CIRA_LATENCY_SUMMARY_STATS.items():
-                    reported = require_summary_number(row, field, context)
-                    exact = require_stat_number(stats, stat_name, stats_path)
+                    if field == "cira_total_latency":
+                        reported = require_summary_counter(row, field, context)
+                        exact = require_counter(stats, stat_name, stats_path)
+                    else:
+                        reported = require_summary_number(row, field, context)
+                        exact = require_stat_number(stats, stat_name, stats_path)
                     if reported != exact:
                         raise ValidationError(
                             f"{context}: {field}={reported} != exact "

@@ -9,6 +9,7 @@ import datetime as dt
 import os
 import subprocess
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -99,8 +100,8 @@ def parse_stats(path):
         if len(parts) < 2:
             continue
         try:
-            stats[parts[0]] = float(parts[1])
-        except ValueError:
+            stats[parts[0]] = Decimal(parts[1])
+        except InvalidOperation:
             pass
     return stats
 
@@ -128,7 +129,22 @@ def unique_directional_stat(stats, prefix):
             f"expected exactly one ROI statistic matching {prefix}*"
             f"{CXL_STAT_SUFFIX}; found {len(candidates)}"
         )
-    return candidates[0][1]
+    name, value = candidates[0]
+    cell = name[len(prefix) : -len(CXL_STAT_SUFFIX)]
+    return cell, value
+
+
+def directional_stat_pair(stats):
+    packet_cell, packets = unique_directional_stat(
+        stats, CXL_PACKET_STAT_PREFIX
+    )
+    byte_cell, byte_count = unique_directional_stat(stats, CXL_BYTE_STAT_PREFIX)
+    if packet_cell != byte_cell:
+        raise StatsError(
+            "CXL packet/byte directional identity mismatch: "
+            f"{packet_cell!r} != {byte_cell!r}"
+        )
+    return packets, byte_count
 
 
 def cache_diagnostic(stats, field):
@@ -143,10 +159,8 @@ def extract_diagnostic_metrics(stats, kind):
         for name in CIRA_LATENCY_STATS.values():
             if name not in stats:
                 raise StatsError(f"missing required ROI statistic: {name}")
-    metrics = {
-        "cxl_packets": unique_directional_stat(stats, CXL_PACKET_STAT_PREFIX),
-        "cxl_bytes": unique_directional_stat(stats, CXL_BYTE_STAT_PREFIX),
-    }
+    packets, byte_count = directional_stat_pair(stats)
+    metrics = {"cxl_packets": packets, "cxl_bytes": byte_count}
     metrics.update(
         {
             field: cache_diagnostic(stats, field)

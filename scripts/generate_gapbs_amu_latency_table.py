@@ -123,6 +123,15 @@ def nonnegative_finite_decimal(row, field, context):
     return value
 
 
+def nonnegative_integral_decimal(row, field, context):
+    value = nonnegative_finite_decimal(row, field, context)
+    if value != value.to_integral_value():
+        raise ValidationError(
+            f"{context}: {field} must be integral, got {value}"
+        )
+    return value
+
+
 def read_summary(latency, path):
     path = Path(path)
     with path.open(newline="", encoding="utf-8") as stream:
@@ -157,16 +166,19 @@ def read_summary(latency, path):
         positive_finite(row, "sim_ticks", context)
         positive_finite(row, "speedup_vs_cxl", context)
         for field in DIAGNOSTIC_COUNT_FIELDS:
-            nonnegative_finite_decimal(row, field, context)
+            nonnegative_integral_decimal(row, field, context)
         if row["kind"] == "cira":
-            for field in CIRA_LATENCY_FIELDS:
-                nonnegative_finite_decimal(row, field, context)
+            nonnegative_integral_decimal(row, "cira_total_latency", context)
+            nonnegative_finite_decimal(row, "cira_avg_latency", context)
         else:
             for field in CIRA_LATENCY_FIELDS:
                 value = row[field]
                 if value == "":
                     continue
-                parsed = nonnegative_finite_decimal(row, field, context)
+                if field == "cira_total_latency":
+                    parsed = nonnegative_integral_decimal(row, field, context)
+                else:
+                    parsed = nonnegative_finite_decimal(row, field, context)
                 if parsed != 0:
                     raise ValidationError(
                         f"{context}: non-CIRA {field} must be blank or zero"
