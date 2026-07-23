@@ -262,6 +262,24 @@ def validate_sweep(sweep_root):
                         f"value {exact}"
                     )
 
+            if row["kind"] != "cira":
+                for field in CIRA_LATENCY_SUMMARY_STATS:
+                    value = row[field]
+                    if value == "":
+                        continue
+                    try:
+                        parsed = float(value)
+                    except ValueError as error:
+                        raise ValidationError(
+                            f"{context}: non-CIRA row must leave {field} "
+                            "blank or zero"
+                        ) from error
+                    if not math.isfinite(parsed) or parsed != 0:
+                        raise ValidationError(
+                            f"{context}: non-CIRA row must leave {field} "
+                            "blank or zero"
+                        )
+
             if row["kind"] == "amu":
                 amu_rows += 1
                 issued = require_counter(stats, "board.asmc.issuedLoads", stats_path)
@@ -305,24 +323,6 @@ def validate_sweep(sweep_root):
                             f"{context}: {field}={reported} != exact "
                             f"first-ROI value {exact}"
                         )
-            else:
-                for field in CIRA_LATENCY_SUMMARY_STATS:
-                    value = row[field]
-                    if value == "":
-                        continue
-                    try:
-                        parsed = float(value)
-                    except ValueError as error:
-                        raise ValidationError(
-                            f"{context}: non-CIRA row must leave {field} "
-                            "blank or zero"
-                        ) from error
-                    if not math.isfinite(parsed) or parsed != 0:
-                        raise ValidationError(
-                            f"{context}: non-CIRA row must leave {field} "
-                            "blank or zero"
-                        )
-
     if row_count != 48 or amu_rows != 16 or cira_rows != 16:
         raise ValidationError(
             f"expected 48 rows, 16 AMU rows, and 16 CIRA rows; got "

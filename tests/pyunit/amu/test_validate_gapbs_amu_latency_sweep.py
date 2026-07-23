@@ -323,25 +323,26 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.assertEqual(result.row_count, 48)
 
     def test_rejects_nonzero_cira_latency_on_non_cira_row(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.make_sweep(root)
-            summary = root / "200ns" / "summary.csv"
-            with summary.open(newline="", encoding="utf-8") as stream:
-                reader = csv.DictReader(stream)
-                fields = reader.fieldnames
-                rows = list(reader)
-            baseline = next(row for row in rows if row["kind"] == "baseline")
-            baseline["cira_total_latency"] = "1"
-            with summary.open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=fields)
-                writer.writeheader()
-                writer.writerows(rows)
-            with self.assertRaisesRegex(
-                self.validator.ValidationError,
-                "non-CIRA row must leave cira_total_latency blank or zero",
-            ):
-                self.validator.validate_sweep(root)
+        for kind in ("baseline", "amu"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                summary = root / "200ns" / "summary.csv"
+                with summary.open(newline="", encoding="utf-8") as stream:
+                    reader = csv.DictReader(stream)
+                    fields = reader.fieldnames
+                    rows = list(reader)
+                row = next(row for row in rows if row["kind"] == kind)
+                row["cira_total_latency"] = "999"
+                with summary.open("w", newline="", encoding="utf-8") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError,
+                    "non-CIRA row must leave cira_total_latency blank or zero",
+                ):
+                    self.validator.validate_sweep(root)
 
 
 if __name__ == "__main__":
