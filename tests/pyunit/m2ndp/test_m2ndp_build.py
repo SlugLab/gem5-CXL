@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import struct
+import importlib
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts import m2ndp_artifacts as artifacts
+
+
+REPO = Path(__file__).resolve().parents[3]
 
 
 def write_words(path, fmt, values):
@@ -125,6 +129,54 @@ class GraphBundleTest(unittest.TestCase):
                 artifacts.EvidenceError, "exactly one"
             ):
                 artifacts.finalize_graph_meta(root, graph, marker + marker)
+
+
+class MatchedPageRankSourceTest(unittest.TestCase):
+    def test_fixed_source_has_matched_roi_contract(self):
+        source = (
+            REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
+        ).read_text()
+        self.assertIn("constexpr int kPageRankIterations = 20;", source)
+        self.assertLess(
+            source.index("pvector<ScoreT> scores(g.num_nodes())"),
+            source.index("m5_work_begin(trial, 0)"),
+        )
+        self.assertLess(
+            source.index("m5_work_end(trial, 0)"),
+            source.rindex("WriteScoreBits("),
+        )
+        self.assertNotIn("reduction(+ : error)", source)
+        self.assertNotIn("if (error <", source)
+        self.assertIn("const ScoreT product = kDamp * incoming_total;", source)
+        self.assertIn("scores[u] = base_score + product;", source)
+        self.assertIn("PRVerifier", source)
+        self.assertIn("Verification: PASS", source)
+
+    def test_builder_manifest_and_float_flags_are_fixed(self):
+        builder = importlib.import_module(
+            "scripts.build_gapbs_m2ndp_pr_spmv"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = builder.page_rank_compile_command(
+                cxx="g++",
+                gapbs_root=root / "gapbs",
+                generated_dir=root / "generated",
+                output=root / "bin/pr_spmv",
+                m5_library=root / "libm5.a",
+            )
+            manifest = builder.build_manifest(
+                reference_raw=root / "reference/scores.u32",
+                compiler="g++ 13",
+                flags=command[1:],
+            )
+        self.assertIn("-ffp-contract=off", command)
+        self.assertIn("-fno-fast-math", command)
+        self.assertEqual(manifest["page_rank_iterations"], 20)
+        self.assertTrue(manifest["fixed_iterations"])
+        self.assertFalse(manifest["convergence_reduction"])
+        self.assertFalse(manifest["fp_contract"])
+        self.assertTrue(Path(manifest["reference_raw_path"]).is_absolute())
 
 
 if __name__ == "__main__":
