@@ -279,8 +279,31 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
         cira_port = (
             " board.cira.mem_side_port" if kind == "cira" else ""
         )
+        asmc_membus_port = (
+            "cpu_side_ports=board.asmc.mem_side_port\n"
+            if kind == "amu"
+            else ""
+        )
+        asmc = (
+            "[board.asmc]\n"
+            "asmc_latency=0\n"
+            "completion_latency=0\n"
+            "default_granularity=8\n"
+            "issue_latency=1000\n"
+            "max_outstanding=256\n"
+            "max_send_queue=512\n"
+            "spm_size=262144\n"
+            "mem_side_port="
+            "board.cache_hierarchy.membus.cpu_side_ports[0]\n"
+            if kind == "amu"
+            else ""
+        )
         cira = (
             "[board.cira]\n"
+            "completion_latency=0\n"
+            "issue_latency=1000\n"
+            "max_outstanding=256\n"
+            "max_send_queue=1024\n"
             "demand_probe_target=board.cache_hierarchy.l2-cache-0\n"
             "mem_side_port="
             "board.cache_hierarchy.l2buses0.cpu_side_ports[2]\n"
@@ -302,6 +325,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "[board.memory.mem_ctrl.dram]\n"
             "range=0:4294967296\n"
             "[board.cache_hierarchy.membus]\n"
+            + asmc_membus_port
+            +
             "mem_side_ports=board.cxl_mem_link0.cpu_side_port "
             "board.processor.cores0.core.interrupts.pio "
             "board.processor.cores1.core.interrupts.pio\n"
@@ -319,6 +344,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "type=BaseTimingSimpleCPU\n"
             "[board.processor.cores0.core.workload]\n"
             f"cmd={binary} -f {graph} -n 2 -v\n"
+            "env=OMP_NUM_THREADS=2\n"
+            + asmc
             + cira
         )
 
@@ -431,6 +458,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
         gem5.write_bytes(b"gem5")
         config_source = artifacts / "x86-gapbs-amu-se.py"
         config_source.write_bytes(b"config")
+        config_dependency = artifacts / "gapbs_roi_state.py"
+        config_dependency.write_bytes(b"state")
         graph_sha = self.validator.EXPECTED_GRAPH_SHA256
 
         checkpoint_fields = [
@@ -463,8 +492,33 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     f"{row['kind']}-{row['benchmark']}".encode()
                 )
                 arguments = ["-f", str(graph.resolve()), "-n", "2", "-v"]
+                model_parameters = {
+                    "kind": row["kind"],
+                    "env": "",
+                }
+                if row["kind"] == "amu":
+                    model_parameters.update(
+                        {
+                            "asmc_spm_size": "256KiB",
+                            "asmc_granularity": "8",
+                            "asmc_max_outstanding": "256",
+                            "asmc_max_send_queue": "512",
+                            "asmc_issue_latency": "1ns",
+                            "asmc_completion_latency": "0ns",
+                            "asmc_latency": "0ns",
+                        }
+                    )
+                elif row["kind"] == "cira":
+                    model_parameters.update(
+                        {
+                            "cira_max_outstanding": "256",
+                            "cira_max_send_queue": "1024",
+                            "cira_issue_latency": "1ns",
+                            "cira_completion_latency": "0ns",
+                        }
+                    )
                 identity = {
-                    "schema": 1,
+                    "schema": 2,
                     "kind": row["kind"],
                     "binary_path": str(binary.resolve()),
                     "binary_sha256": self.checkpoint.sha256_file(binary),
@@ -480,10 +534,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     "config_sha256": self.checkpoint.sha256_file(
                         config_source
                     ),
-                    "model_parameters": {
-                        "kind": row["kind"],
-                        "env": "",
+                    "config_dependencies": {
+                        str(config_dependency.resolve()):
+                        self.checkpoint.sha256_file(config_dependency),
                     },
+                    "model_parameters": model_parameters,
                 }
                 checkpoint_id = self.checkpoint.identity_key(identity)
                 checkpoint_root = artifacts / "checkpoints" / checkpoint_id
@@ -505,6 +560,8 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 (run_dir / "gem5.log").write_text(
                     f"GAPBS_CHECKPOINT_RESTORED path={checkpoint_root}\n"
                     "Dump stats at the end of the measured ROI!\n"
+                    "GAPBS_VERIFICATION_EXIT_CAUSE "
+                    "cause=m5_exit instruction encountered\n"
                     "Verification: PASS\n",
                     encoding="utf-8",
                 )
@@ -1146,6 +1203,63 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 ):
                     self.validator.validate_sweep(root)
 
+    def test_rejects_checkpoint_directory_name_or_dependency_hash(self):
+        for case in ("directory", "dependency"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                summary = root / "200ns" / "summary.csv"
+                with summary.open(newline="", encoding="utf-8") as stream:
+                    reader = csv.DictReader(stream)
+                    fields = reader.fieldnames
+                    rows = list(reader)
+                row = rows[0]
+                manifest = Path(row["checkpoint_manifest"])
+                if case == "directory":
+                    wrong_root = manifest.parent.parent / "wrong-id"
+                    wrong_root.mkdir()
+                    for name in ("manifest.json", "m5.cpt"):
+                        (wrong_root / name).write_bytes(
+                            (manifest.parent / name).read_bytes()
+                        )
+                    row["checkpoint_manifest"] = str(
+                        wrong_root / "manifest.json"
+                    )
+                    log = Path(row["run_dir"]) / "gem5.log"
+                    log.write_text(
+                        log.read_text(encoding="utf-8").replace(
+                            str(manifest.parent), str(wrong_root), 1
+                        ),
+                        encoding="utf-8",
+                    )
+                    expected = "directory name"
+                else:
+                    payload = json.loads(
+                        manifest.read_text(encoding="utf-8")
+                    )
+                    dependency = Path(
+                        next(
+                            iter(
+                                payload["identity"][
+                                    "config_dependencies"
+                                ]
+                            )
+                        )
+                    )
+                    dependency.write_bytes(b"changed-state")
+                    expected = "config dependency hash mismatch"
+                if case == "directory":
+                    with summary.open(
+                        "w", newline="", encoding="utf-8"
+                    ) as stream:
+                        writer = csv.DictWriter(stream, fieldnames=fields)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, expected
+                ):
+                    self.validator.validate_sweep(root)
+
     def test_rejects_zero_or_duplicate_restore_marker(self):
         for count in (0, 2):
             with self.subTest(count=count), tempfile.TemporaryDirectory() as tmp:
@@ -1166,6 +1280,51 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     self.validator.ValidationError, "restore marker count"
                 ):
                     self.validator.validate_sweep(root)
+
+    def test_rejects_restore_marker_for_different_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            log = root / "200ns" / "bfs" / "cxl_vanilla" / "gem5.log"
+            text = log.read_text(encoding="utf-8")
+            marker = next(
+                line
+                for line in text.splitlines()
+                if line.startswith("GAPBS_CHECKPOINT_RESTORED path=")
+            )
+            log.write_text(
+                text.replace(
+                    marker,
+                    f"GAPBS_CHECKPOINT_RESTORED path={root / 'other'}",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "restore marker path",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_missing_strict_m5_exit_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            log = root / "200ns" / "bfs" / "cxl_vanilla" / "gem5.log"
+            log.write_text(
+                log.read_text(encoding="utf-8").replace(
+                    "GAPBS_VERIFICATION_EXIT_CAUSE "
+                    "cause=m5_exit instruction encountered\n",
+                    "",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "strict m5_exit marker",
+            ):
+                self.validator.validate_sweep(root)
 
     def test_rejects_missing_or_different_serialized_graph_argument(self):
         for case in ("missing", "different"):
@@ -1188,7 +1347,129 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(
-                    self.validator.ValidationError, "config workload graph"
+                    self.validator.ValidationError, "exact argv"
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_missing_verify_or_extra_workload_argument(self):
+        for old, new in (
+            (" -v", ""),
+            (" -v", " -v --extra"),
+        ):
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                config = (
+                    root
+                    / "200ns"
+                    / "bfs"
+                    / "cxl_vanilla"
+                    / "config.ini"
+                )
+                config.write_text(
+                    config.read_text(encoding="utf-8").replace(old, new, 1),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError,
+                    "exact argv",
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_extra_core_or_wrong_openmp_thread_count(self):
+        mutations = (
+            (
+                "\n[board.processor.cores2.core]\n"
+                "type=BaseTimingSimpleCPU\n",
+                "exact two-core",
+            ),
+            (
+                "env=OMP_NUM_THREADS=1\n",
+                "OMP_NUM_THREADS=2",
+            ),
+        )
+        for addition, expected in mutations:
+            with (
+                self.subTest(addition=addition),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                self.make_sweep(root)
+                config = (
+                    root
+                    / "200ns"
+                    / "bfs"
+                    / "cxl_vanilla"
+                    / "config.ini"
+                )
+                text = config.read_text(encoding="utf-8")
+                if addition.startswith("env="):
+                    text = text.replace(
+                        "env=OMP_NUM_THREADS=2\n", addition, 1
+                    )
+                else:
+                    text += addition
+                config.write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, expected
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_wrong_kind_specific_accelerator_topology(self):
+        cases = (
+            ("amu", "[board.asmc]", "[board.missing_asmc]", "ASMC"),
+            (
+                "baseline",
+                "",
+                "[board.asmc]\n"
+                "mem_side_port="
+                "board.cache_hierarchy.membus.cpu_side_ports[0]\n",
+                "must not contain ASMC",
+            ),
+            ("cira", "[board.cira]", "[board.missing_cira]", "CIRA"),
+        )
+        for label, old, new, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                config = root / "200ns" / "bfs" / (
+                    {
+                        "baseline": "cxl_vanilla",
+                        "amu": "amu",
+                        "cira": "cira_pgo",
+                    }[label]
+                ) / "config.ini"
+                text = config.read_text(encoding="utf-8")
+                config.write_text(
+                    text.replace(old, new, 1) if old else text + new,
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, expected
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_accelerator_parameter_mismatch(self):
+        cases = (
+            ("amu", "max_outstanding=256", "max_outstanding=255", "ASMC"),
+            (
+                "cira_pgo",
+                "max_send_queue=1024",
+                "max_send_queue=1000",
+                "CIRA",
+            ),
+        )
+        for label, old, new, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                config = root / "200ns" / "bfs" / label / "config.ini"
+                config.write_text(
+                    config.read_text(encoding="utf-8").replace(old, new, 1),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, expected
                 ):
                     self.validator.validate_sweep(root)
 
@@ -1254,11 +1535,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     self.validator.ValidationError,
-                    (
-                        "must not use -g"
-                        if option == "graph"
-                        else f"config workload {option}"
-                    ),
+                    "exact argv",
                 ):
                     self.validator.validate_sweep(root)
 

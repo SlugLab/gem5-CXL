@@ -259,6 +259,7 @@ try:
         fast_forward_cpu=args.fast_forward_cpu,
         iterations=args.iterations,
         measure_trial=args.measure_trial,
+        require_m5_verification_exit=args.require_m5_verification_exit,
     )
 except ValueError as error:
     parser.error(str(error))
@@ -474,7 +475,10 @@ if (
 ):
     if not args.checkpoint_save:
         exit_cause = simulator.get_last_exit_event_cause()
-        verification, exit_code = classify_final_exit(exit_cause)
+        verification, exit_code = classify_final_exit(
+            exit_cause,
+            require_m5_exit=args.require_m5_verification_exit,
+        )
         if verification == "fail":
             print("Verification: FAIL")
             raise SystemExit(exit_code)
@@ -482,6 +486,11 @@ if (
             print(f"Verification: MISSING ({exit_cause})")
             raise SystemExit(exit_code)
         if args.continue_after_roi or args.require_m5_verification_exit:
+            if args.require_m5_verification_exit:
+                print(
+                    "GAPBS_VERIFICATION_EXIT_CAUSE "
+                    f"cause={exit_cause}"
+                )
             print("Verification: PASS")
 if not args.roi_work_events:
     m5.stats.dump()

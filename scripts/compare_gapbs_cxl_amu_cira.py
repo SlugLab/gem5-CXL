@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,9 @@ from gapbs_checkpoint import (  # noqa: E402
 DEFAULT_GEM5 = REPO / "build" / "X86" / "gem5.opt"
 DEFAULT_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
+)
+CHECKPOINT_CONFIG_DEPENDENCIES = (
+    REPO / "configs" / "example" / "gem5_library" / "gapbs_roi_state.py",
 )
 
 CXL_PACKET_STAT_PREFIX = "board.cache_hierarchy.membus.pktCount_"
@@ -641,6 +645,16 @@ def parse_marker_count(path, marker):
     )
 
 
+def parse_marker_values(path, marker):
+    if not path.exists():
+        return []
+    return [
+        line[len(marker) :]
+        for line in path.read_text(errors="replace").splitlines()
+        if line.startswith(marker)
+    ]
+
+
 def add_optional(cmd, name, value):
     if value is not None:
         cmd += [name, str(value)]
@@ -761,7 +775,7 @@ def checkpoint_common_command(
         "--binary",
         str(binary),
         "--arguments",
-        " ".join(workload_arguments),
+        shlex.join(workload_arguments),
         "--cpu",
         cpu,
         "--scale",
@@ -790,6 +804,7 @@ def checkpoint_identity(args, binary, kind, workload_arguments):
         memory_size=args.mem_size,
         gem5=args.gem5,
         config=args.config,
+        config_dependencies=CHECKPOINT_CONFIG_DEPENDENCIES,
         kind=kind,
         model_parameters=checkpoint_model_parameters(args, kind),
     )
@@ -948,6 +963,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
     cmd += [
         "--cxl-memory",
         "--continue-after-roi",
+        "--require-m5-verification-exit",
         "--checkpoint-restore",
         str(checkpoint_dir),
     ]
@@ -984,25 +1000,51 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
             "run_dir": str(run_dir),
         }
 
-    with log_path.open("w") as log:
-        proc = subprocess.run(
-            cmd,
-            cwd=REPO,
-            env=os.environ.copy(),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=None if args.timeout == 0 else args.timeout,
-        )
+    try:
+        with log_path.open("w") as log:
+            proc = subprocess.run(
+                cmd,
+                cwd=REPO,
+                env=os.environ.copy(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=None if args.timeout == 0 else args.timeout,
+            )
+    except (subprocess.TimeoutExpired, OSError) as error:
+        return {
+            "benchmark": benchmark,
+            "label": label,
+            "kind": kind,
+            "status": (
+                "restore-timeout"
+                if isinstance(error, subprocess.TimeoutExpired)
+                else "restore-launch-failed"
+            ),
+            "verification": "missing",
+            "cpu_switches": parse_cpu_switches(log_path),
+            "checkpoint_restores": parse_marker_count(
+                log_path, CHECKPOINT_RESTORE_MARKER
+            ),
+            **provenance,
+            "error": str(error),
+            "run_dir": str(run_dir),
+        }
 
     verification = parse_verification(log_path)
     status = "ok" if proc.returncode == 0 else f"exit-{proc.returncode}"
-    checkpoint_restores = parse_marker_count(
+    restore_paths = parse_marker_values(
         log_path, CHECKPOINT_RESTORE_MARKER
     )
+    checkpoint_restores = len(restore_paths)
     cpu_switches = parse_cpu_switches(log_path)
     if proc.returncode == 0 and checkpoint_restores != 1:
         status = "checkpoint-restore-marker-invalid"
+    elif (
+        proc.returncode == 0
+        and Path(restore_paths[0]).resolve() != checkpoint_dir.resolve()
+    ):
+        status = "checkpoint-restore-path-invalid"
     if proc.returncode == 0 and cpu_switches != 0:
         status = "unexpected-cpu-switch"
     if proc.returncode == 0 and args.verify:

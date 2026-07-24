@@ -92,6 +92,7 @@ class GapbsCheckpointConfigContractTest(unittest.TestCase):
             "fast_forward_cpu": None,
             "iterations": 2,
             "measure_trial": 1,
+            "require_m5_verification_exit": False,
         }
         options.update(overrides)
         with self.assertRaisesRegex(ValueError, message):
@@ -142,6 +143,14 @@ class GapbsCheckpointConfigContractTest(unittest.TestCase):
             ),
             (
                 {
+                    "checkpoint_restore": Path("restore"),
+                    "cxl_memory": True,
+                    "require_m5_verification_exit": False,
+                },
+                "restore requires --require-m5-verification-exit",
+            ),
+            (
+                {
                     "checkpoint_save": Path("save"),
                     "fast_forward_cpu": "atomic",
                 },
@@ -170,6 +179,7 @@ class GapbsCheckpointConfigContractTest(unittest.TestCase):
             fast_forward_cpu=None,
             iterations=2,
             measure_trial=1,
+            require_m5_verification_exit=False,
         )
         roi.validate_checkpoint_options(
             checkpoint_save=None,
@@ -181,6 +191,7 @@ class GapbsCheckpointConfigContractTest(unittest.TestCase):
             fast_forward_cpu=None,
             iterations=2,
             measure_trial=1,
+            require_m5_verification_exit=True,
         )
 
 
@@ -255,6 +266,7 @@ class GapbsCheckpointRunnerContractTest(unittest.TestCase):
         self.assertIn("--cpu atomic", output)
         self.assertIn("--cxl-link-delay 0ns", output)
         self.assertIn("--checkpoint-restore", output)
+        self.assertIn("--require-m5-verification-exit", output)
         self.assertIn("--cpu timing", output)
         self.assertIn("--cxl-memory", output)
         self.assertIn("--cxl-link-delay 1us", output)
@@ -281,6 +293,7 @@ class GapbsCheckpointManifestTest(unittest.TestCase):
         self.graph = temporary / "g20.sg"
         self.gem5 = temporary / "gem5.opt"
         self.config = temporary / "config.py"
+        self.config_dependency = temporary / "gapbs_roi_state.py"
         self.root = temporary / "checkpoint"
         self.root.mkdir()
         (self.root / "m5.cpt").write_text("checkpoint")
@@ -289,6 +302,7 @@ class GapbsCheckpointManifestTest(unittest.TestCase):
             (self.graph, b"graph"),
             (self.gem5, b"gem5"),
             (self.config, b"config"),
+            (self.config_dependency, b"state-v1"),
         ):
             path.write_bytes(payload)
         self.identity = self.checkpoint.build_identity(
@@ -300,6 +314,7 @@ class GapbsCheckpointManifestTest(unittest.TestCase):
             memory_size="4GiB",
             gem5=self.gem5,
             config=self.config,
+            config_dependencies=[self.config_dependency],
             kind="baseline",
             model_parameters={"cxl_link_delay": "0ns"},
         )
@@ -313,14 +328,40 @@ class GapbsCheckpointManifestTest(unittest.TestCase):
 
     def test_identity_covers_every_portability_input(self):
         identity = self.identity
-        self.assertEqual(identity["schema"], 1)
+        self.assertEqual(identity["schema"], 2)
         self.assertEqual(identity["graph_scale"], 20)
         self.assertEqual(identity["graph_sha256"], self.sha256(self.graph))
         self.assertEqual(
             identity["binary_sha256"], self.sha256(self.binary)
         )
         self.assertEqual(identity["arguments"][0], "-f")
+        self.assertEqual(
+            identity["config_dependencies"],
+            {
+                str(self.config_dependency.resolve()): self.sha256(
+                    self.config_dependency
+                )
+            },
+        )
         self.assertEqual(len(self.checkpoint.identity_key(identity)), 64)
+
+    def test_identity_changes_with_config_dependency(self):
+        original = self.checkpoint.identity_key(self.identity)
+        self.config_dependency.write_bytes(b"state-v2")
+        changed = self.checkpoint.build_identity(
+            binary=self.binary,
+            graph=self.graph,
+            graph_scale=20,
+            arguments=["-f", str(self.graph), "-n", "2", "-v"],
+            cores=2,
+            memory_size="4GiB",
+            gem5=self.gem5,
+            config=self.config,
+            config_dependencies=[self.config_dependency],
+            kind="baseline",
+            model_parameters={"cxl_link_delay": "0ns"},
+        )
+        self.assertNotEqual(original, self.checkpoint.identity_key(changed))
 
     def test_reuse_rejects_changed_graph_or_incomplete_checkpoint(self):
         self.checkpoint.write_manifest(self.root, self.identity)

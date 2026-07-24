@@ -50,6 +50,10 @@ CXL_STAT_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
 CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
 CHECKPOINT_RESTORE_MARKER = "GAPBS_CHECKPOINT_RESTORED path="
 ROI_DUMP_MARKER = "Dump stats at the end of the measured ROI!"
+STRICT_VERIFICATION_MARKER = (
+    "GAPBS_VERIFICATION_EXIT_CAUSE "
+    "cause=m5_exit instruction encountered"
+)
 EXPECTED_GRAPH_SHA256 = (
     "ce900a7147a073835a7450e8f1afedf9f13db6833652bf2f9647819be26bedb3"
 )
@@ -453,8 +457,146 @@ def config_value(config, section, key, path):
         raise ValidationError(f"{path}: missing [{section}] {key}") from error
 
 
+def parse_binary_quantity(value, units, description, path):
+    match = re.fullmatch(r"(\d+)([A-Za-z]+)", str(value))
+    if match is None or match.group(2) not in units:
+        raise ValidationError(
+            f"{path}: invalid {description} quantity {value!r}"
+        )
+    return int(match.group(1)) * units[match.group(2)]
+
+
+def validate_parameter(
+    config, section, key, expected, description, path
+):
+    actual = config_value(config, section, key, path)
+    if actual != str(expected):
+        raise ValidationError(
+            f"{path}: {description} {key}={actual}, expected {expected}"
+        )
+
+
+def validate_accelerator_config(config, path, kind, model_parameters):
+    has_asmc = config.has_section("board.asmc")
+    has_cira = config.has_section("board.cira")
+    if kind == "baseline":
+        if has_asmc:
+            raise ValidationError(f"{path}: baseline must not contain ASMC")
+        if has_cira:
+            raise ValidationError(f"{path}: baseline must not contain CIRA")
+        return
+    if kind == "amu":
+        if not has_asmc:
+            raise ValidationError(f"{path}: AMU config is missing ASMC")
+        if has_cira:
+            raise ValidationError(f"{path}: AMU config must not contain CIRA")
+        port = config_value(config, "board.asmc", "mem_side_port", path)
+        binding = re.fullmatch(
+            r"board\.cache_hierarchy\.membus\.cpu_side_ports\[(\d+)\]",
+            port,
+        )
+        if binding is None:
+            raise ValidationError(
+                f"{path}: invalid ASMC mem_side_port binding: {port}"
+            )
+        cpu_ports = config_value(
+            config,
+            "board.cache_hierarchy.membus",
+            "cpu_side_ports",
+            path,
+        ).split()
+        index = int(binding.group(1))
+        if (
+            index >= len(cpu_ports)
+            or cpu_ports[index] != "board.asmc.mem_side_port"
+        ):
+            raise ValidationError(
+                f"{path}: ASMC reciprocal membus binding is missing"
+            )
+        size = parse_binary_quantity(
+            model_parameters.get("asmc_spm_size"),
+            {"B": 1, "KiB": 1024, "MiB": 1024**2},
+            "ASMC SPM",
+            path,
+        )
+        times = {
+            "ps": 1,
+            "ns": 1_000,
+            "us": 1_000_000,
+            "ms": 1_000_000_000,
+            "s": 1_000_000_000_000,
+        }
+        expected = {
+            "spm_size": size,
+            "default_granularity": model_parameters.get(
+                "asmc_granularity"
+            ),
+            "max_outstanding": model_parameters.get(
+                "asmc_max_outstanding"
+            ),
+            "max_send_queue": model_parameters.get(
+                "asmc_max_send_queue"
+            ),
+            "issue_latency": parse_binary_quantity(
+                model_parameters.get("asmc_issue_latency"),
+                times,
+                "ASMC issue latency",
+                path,
+            ),
+            "completion_latency": parse_binary_quantity(
+                model_parameters.get("asmc_completion_latency"),
+                times,
+                "ASMC completion latency",
+                path,
+            ),
+            "asmc_latency": parse_binary_quantity(
+                model_parameters.get("asmc_latency"),
+                times,
+                "ASMC latency",
+                path,
+            ),
+        }
+        for key, value in expected.items():
+            validate_parameter(
+                config, "board.asmc", key, value, "ASMC", path
+            )
+        return
+    if kind != "cira":
+        raise ValidationError(f"{path}: unsupported kind {kind!r}")
+    if has_asmc:
+        raise ValidationError(f"{path}: CIRA config must not contain ASMC")
+    if not has_cira:
+        raise ValidationError(f"{path}: CIRA config is missing CIRA")
+    times = {
+        "ps": 1,
+        "ns": 1_000,
+        "us": 1_000_000,
+        "ms": 1_000_000_000,
+        "s": 1_000_000_000_000,
+    }
+    expected = {
+        "max_outstanding": model_parameters.get("cira_max_outstanding"),
+        "max_send_queue": model_parameters.get("cira_max_send_queue"),
+        "issue_latency": parse_binary_quantity(
+            model_parameters.get("cira_issue_latency"),
+            times,
+            "CIRA issue latency",
+            path,
+        ),
+        "completion_latency": parse_binary_quantity(
+            model_parameters.get("cira_completion_latency"),
+            times,
+            "CIRA completion latency",
+            path,
+        ),
+    }
+    for key, value in expected.items():
+        validate_parameter(config, "board.cira", key, value, "CIRA", path)
+
+
 def validate_config(
-    path, expected_delay, kind, expected_graph, expected_binary
+    path, expected_delay, kind, expected_graph, expected_binary,
+    model_parameters
 ):
     config = parse_config(path)
     board_range = config_value(config, "board", "mem_ranges", path)
@@ -541,7 +683,7 @@ def validate_config(
     core_sections = sorted(
         section
         for section in config.sections()
-        if re.fullmatch(r"board\.processor\.cores[01]\.core", section)
+        if re.fullmatch(r"board\.processor\.cores\d+\.core", section)
     )
     if core_sections != [
         "board.processor.cores0.core",
@@ -557,19 +699,18 @@ def validate_config(
             raise ValidationError(
                 f"{path}: [{section}] type={cpu_type}, expected Timing"
             )
-    workload_commands = [
-        section["cmd"]
-        for section in config.values()
-        if "cmd" in section
+    workload_sections = [
+        section for section in config.values() if "cmd" in section
     ]
-    if not workload_commands:
+    if not workload_sections:
         raise ValidationError(f"{path}: missing config workload command")
-    if len(workload_commands) != 1:
+    if len(workload_sections) != 1:
         raise ValidationError(
             f"{path}: expected one workload command; "
-            f"found {len(workload_commands)}"
+            f"found {len(workload_sections)}"
         )
-    for command in workload_commands:
+    for workload in workload_sections:
+        command = workload["cmd"]
         arguments = shlex.split(command)
         if not arguments:
             raise ValidationError(f"{path}: empty config workload command")
@@ -578,29 +719,33 @@ def validate_config(
                 f"{path}: workload binary {arguments[0]!r} does not match "
                 f"checkpoint binary {str(expected_binary)!r}"
             )
-        if "-g" in arguments:
+        expected_arguments = [
+            str(Path(expected_binary).resolve()),
+            "-f",
+            str(Path(expected_graph).resolve()),
+            "-n",
+            "2",
+            "-v",
+        ]
+        if arguments != expected_arguments:
             raise ValidationError(
-                f"{path}: checkpoint workload must not use -g: {command!r}"
+                f"{path}: config workload must use exact argv "
+                f"{expected_arguments!r}; found {arguments!r}"
             )
-        for option, expected, description in (
-            ("-f", str(Path(expected_graph).resolve()), "graph"),
-            ("-n", "2", "iterations"),
-        ):
-            positions = [
-                index
-                for index, argument in enumerate(arguments)
-                if argument == option
-            ]
-            values = [
-                arguments[index + 1]
-                for index in positions
-                if index + 1 < len(arguments)
-            ]
-            if len(positions) != 1 or values != [expected]:
-                raise ValidationError(
-                    f"{path}: config workload {description} must be "
-                    f"{option} {expected}: {command!r}"
-                )
+        environment = shlex.split(workload.get("env", ""))
+        omp_entries = [
+            entry
+            for entry in environment
+            if entry.startswith("OMP_NUM_THREADS=")
+        ]
+        if omp_entries != ["OMP_NUM_THREADS=2"]:
+            raise ValidationError(
+                f"{path}: workload must contain exactly "
+                f"OMP_NUM_THREADS=2; found {omp_entries!r}"
+            )
+    validate_accelerator_config(
+        config, path, kind, model_parameters
+    )
     if kind == "cira":
         target = config_value(
             config, "board.cira", "demand_probe_target", path
@@ -643,10 +788,15 @@ def validate_config(
 def parse_log(path):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     switches = sum(line == CPU_SWITCH_MARKER for line in lines)
-    restores = sum(
-        line.startswith(CHECKPOINT_RESTORE_MARKER) for line in lines
-    )
+    restore_paths = [
+        line[len(CHECKPOINT_RESTORE_MARKER) :]
+        for line in lines
+        if line.startswith(CHECKPOINT_RESTORE_MARKER)
+    ]
     roi_dumps = sum(line == ROI_DUMP_MARKER for line in lines)
+    strict_exits = sum(
+        line == STRICT_VERIFICATION_MARKER for line in lines
+    )
     verification = "missing"
     for line in lines:
         if "Verification: FAIL" in line:
@@ -654,7 +804,7 @@ def parse_log(path):
             break
         if "Verification: PASS" in line:
             verification = "pass"
-    return switches, restores, roi_dumps, verification
+    return switches, restore_paths, roi_dumps, strict_exits, verification
 
 
 def zero_or_blank(row, field, context):
@@ -723,10 +873,15 @@ def validate_checkpoint_manifest(row, context):
         raise ValidationError(f"{context}: manifest checkpoint id mismatch")
     if row["checkpoint_id"] != expected_id:
         raise ValidationError(f"{context}: summary checkpoint id mismatch")
+    if checkpoint_root.name != expected_id:
+        raise ValidationError(
+            f"{context}: checkpoint directory name "
+            f"{checkpoint_root.name!r} != {expected_id!r}"
+        )
 
     expected_arguments = ["-f", str(graph), "-n", "2", "-v"]
     exact = {
-        "schema": 1,
+        "schema": 2,
         "kind": row["kind"],
         "graph_path": str(graph),
         "graph_sha256": graph_sha,
@@ -764,6 +919,26 @@ def validate_checkpoint_manifest(row, context):
             raise ValidationError(
                 f"{context}: checkpoint {prefix} hash mismatch"
             )
+    config_source = Path(identity["config_path"]).resolve()
+    expected_dependency = (
+        config_source.parent / "gapbs_roi_state.py"
+    ).resolve()
+    dependencies = identity.get("config_dependencies")
+    if not isinstance(dependencies, dict):
+        raise ValidationError(
+            f"{context}: invalid checkpoint config dependencies"
+        )
+    expected_dependencies = {
+        str(expected_dependency): (
+            verified_sha256(expected_dependency)
+            if expected_dependency.is_file()
+            else None
+        )
+    }
+    if dependencies != expected_dependencies:
+        raise ValidationError(
+            f"{context}: checkpoint config dependency hash mismatch"
+        )
     return identity
 
 
@@ -787,10 +962,15 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
         row["kind"],
         identity["graph_path"],
         identity["binary_path"],
+        identity["model_parameters"],
     )
-    switches, restores, roi_dumps, raw_verification = parse_log(
-        run_dir / "gem5.log"
-    )
+    (
+        switches,
+        restore_paths,
+        roi_dumps,
+        strict_exits,
+        raw_verification,
+    ) = parse_log(run_dir / "gem5.log")
     reported_switches = require_summary_counter(row, "cpu_switches", context)
     if switches != reported_switches:
         raise ValidationError(
@@ -800,10 +980,17 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
     reported_restores = require_summary_counter(
         row, "checkpoint_restores", context
     )
+    restores = len(restore_paths)
     if restores != 1 or reported_restores != restores:
         raise ValidationError(
             f"{context}: checkpoint_restores={reported_restores} != exact "
             f"restore marker count {restores}"
+        )
+    expected_checkpoint = Path(row["checkpoint_manifest"]).parent.resolve()
+    if Path(restore_paths[0]).resolve() != expected_checkpoint:
+        raise ValidationError(
+            f"{context}: restore marker path "
+            f"{restore_paths[0]!r} != {str(expected_checkpoint)!r}"
         )
     if roi_dumps != 1:
         raise ValidationError(
@@ -814,6 +1001,11 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
         raise ValidationError(
             f"{context}: verification={row['verification']} != raw "
             f"{raw_verification}"
+        )
+    if strict_exits != 1:
+        raise ValidationError(
+            f"{context}: expected exactly one strict m5_exit marker; "
+            f"found {strict_exits}"
         )
 
     stats_path = run_dir / "stats.txt"

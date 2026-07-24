@@ -3,10 +3,13 @@
 
 import csv
 import importlib.util
+import subprocess
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -767,6 +770,71 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "cira_avg_latency",
         }
         self.assertTrue(expected <= set(self.runner.SUMMARY_FIELDS))
+
+    def test_checkpoint_restore_timeout_returns_failure_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary_dir = root / "bin"
+            binary_dir.mkdir()
+            binary = binary_dir / "pr"
+            binary.write_bytes(b"binary")
+            graph = root / "g20.sg"
+            graph.write_bytes(b"graph")
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            manifest = checkpoint / "manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            args = SimpleNamespace(
+                outdir=root / "out",
+                graph=graph,
+                graph_scale=20,
+                iterations=2,
+                measure_trial=1,
+                cxl_link_delay="1us",
+                timeout=1,
+                verify=True,
+                dry_run=False,
+                env=[],
+                allow_zero_cira=False,
+            )
+            identity = {
+                "graph_sha256": "a" * 64,
+                "binary_sha256": "b" * 64,
+            }
+            with (
+                mock.patch.object(
+                    self.runner,
+                    "ensure_checkpoint",
+                    return_value=(
+                        checkpoint,
+                        manifest,
+                        identity,
+                        "c" * 64,
+                    ),
+                ),
+                mock.patch.object(
+                    self.runner,
+                    "checkpoint_common_command",
+                    return_value=["gem5"],
+                ),
+                mock.patch.object(self.runner, "append_cache_args"),
+                mock.patch.object(self.runner, "append_kind_args"),
+                mock.patch.object(
+                    self.runner.subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(["gem5"], 1),
+                ),
+            ):
+                row = self.runner.run_one_checkpoint(
+                    args,
+                    "pr",
+                    "cxl_vanilla",
+                    binary_dir,
+                    "baseline",
+                )
+        self.assertEqual(row["status"], "restore-timeout")
+        self.assertEqual(row["verification"], "missing")
+        self.assertIn("timed out", row["error"])
 
 
 if __name__ == "__main__":

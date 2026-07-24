@@ -92,9 +92,27 @@ AMU and CIRA issued/completed counters must balance even when both are zero.
 
 For an independent local-memory reference, rebuild with
 `--verification-exit` instead of `--roi-work-markers`, run the same serialized
-graphs with `--cpu atomic --cxl-link-delay 0ns
---require-m5-verification-exit`, and require `Verification: PASS` in all 12
-logs. This reference does not produce publication timing.
+graphs with `--cpu atomic --cxl-link-delay 0ns` and
+`--require-m5-verification-exit`, and require both the strict m5-exit marker
+and `Verification: PASS` in all 12 logs. For example, the exact baseline PR
+reference command and artifact path are:
+
+```sh
+python3 scripts/build_gapbs_baseline_cxlmemuring.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --benchmarks pr --verification-exit \
+  --outdir m5out/gapbs_baseline_bins_reference_g20_20260724
+
+build/X86/gem5.opt \
+  --outdir=m5out/gapbs_reference_atomic_g20_20260724/pr/cxl_vanilla \
+  configs/example/gem5_library/x86-gapbs-amu-se.py \
+  --binary m5out/gapbs_baseline_bins_reference_g20_20260724/bin/pr \
+  --arguments "-f $(pwd)/m5out/gapbs_graphs/g20.sg -n 2 -v" \
+  --cpu atomic --cores 2 --scale 20 --iterations 2 \
+  --cxl-link-delay 0ns --no-asmc --require-m5-verification-exit
+```
+
+This reference does not produce publication timing.
 
 ## Scale-20 PR gate at CXL 1 us
 
@@ -142,7 +160,7 @@ sudo systemd-run \
   --unit=gapbs-g20-pr-1us-20260724 \
   --property=WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table \
   --property=StandardOutput=append:/home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/background/gapbs-g20-pr-1us-20260724.log \
-  --property=StandardError=inherit \
+  --property=StandardError=append:/home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/background/gapbs-g20-pr-1us-20260724.log \
   /usr/bin/python3 scripts/compare_gapbs_cxl_amu_cira.py \
   --baseline-bin-dir m5out/gapbs_baseline_bins_checkpoint_g20_20260724/bin \
   --cira-bin-dir cira_pgo=m5out/gapbs_cira_bins_checkpoint_g20_20260724/bin \
@@ -175,8 +193,10 @@ python3 scripts/validate_gapbs_amu_latency_sweep.py --pr-gate \
 Only `PASS: PR@1us scale-20 CIRA discriminator` authorizes a speedup claim.
 The validator recomputes graph, binary, gem5, and config hashes; checks the
 checkpoint manifest and payload; proves the complete-range CXL topology and
-exact link delay; aggregates both cores' cache/CXL counters; and rechecks
-verification and ROI evidence.
+exact link delay; requires exact two-core plus `OMP_NUM_THREADS=2` execution;
+binds the restore marker to the manifest checkpoint; validates kind-specific
+ASMC/CIRA topology; aggregates both cores' cache/CXL counters; and requires
+the strict verifier-triggered m5-exit marker.
 
 ## Model limitation
 

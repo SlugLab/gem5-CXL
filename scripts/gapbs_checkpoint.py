@@ -36,6 +36,7 @@ def build_identity(
     memory_size,
     gem5,
     config,
+    config_dependencies,
     kind,
     model_parameters,
 ):
@@ -43,8 +44,11 @@ def build_identity(
     graph = Path(graph).resolve()
     gem5 = Path(gem5).resolve()
     config = Path(config).resolve()
+    config_dependencies = sorted(
+        Path(dependency).resolve() for dependency in config_dependencies
+    )
     return {
-        "schema": 1,
+        "schema": 2,
         "kind": str(kind),
         "binary_path": str(binary),
         "binary_sha256": sha256_file(binary),
@@ -58,6 +62,10 @@ def build_identity(
         "gem5_sha256": sha256_file(gem5),
         "config_path": str(config),
         "config_sha256": sha256_file(config),
+        "config_dependencies": {
+            str(dependency): sha256_file(dependency)
+            for dependency in config_dependencies
+        },
         "model_parameters": {
             str(key): str(value)
             for key, value in sorted(model_parameters.items())

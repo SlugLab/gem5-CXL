@@ -56,12 +56,14 @@ def resolve_workload_shape(
     return scale, iterations if iterations is not None else 1
 
 
-def classify_final_exit(exit_cause):
+def classify_final_exit(exit_cause, *, require_m5_exit=False):
     if exit_cause == "m5_fail instruction encountered":
         return "fail", 2
-    if exit_cause in (
-        "exiting with last active thread context",
-        "m5_exit instruction encountered",
+    if exit_cause == "m5_exit instruction encountered":
+        return "pass", 0
+    if (
+        not require_m5_exit
+        and exit_cause == "exiting with last active thread context"
     ):
         return "pass", 0
     return "missing", 3
@@ -78,6 +80,7 @@ def validate_checkpoint_options(
     fast_forward_cpu,
     iterations,
     measure_trial,
+    require_m5_verification_exit,
 ):
     if checkpoint_save and checkpoint_restore:
         raise ValueError(
@@ -107,6 +110,11 @@ def validate_checkpoint_options(
         if not continue_after_roi:
             raise ValueError(
                 "checkpoint restore requires --continue-after-roi"
+            )
+        if not require_m5_verification_exit:
+            raise ValueError(
+                "checkpoint restore requires "
+                "--require-m5-verification-exit"
             )
 
 

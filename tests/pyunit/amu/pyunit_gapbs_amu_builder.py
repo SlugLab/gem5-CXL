@@ -301,7 +301,15 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         )
         self.assertEqual(
             self.roi_state.classify_final_exit(
-                "m5_exit instruction encountered"
+                "exiting with last active thread context",
+                require_m5_exit=True,
+            ),
+            ("missing", 3),
+        )
+        self.assertEqual(
+            self.roi_state.classify_final_exit(
+                "m5_exit instruction encountered",
+                require_m5_exit=True,
             ),
             ("pass", 0),
         )
@@ -317,8 +325,9 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             "exit_cause = simulator.get_last_exit_event_cause()", config
         )
         self.assertIn(
-            "verification, exit_code = classify_final_exit(exit_cause)", config
+            "require_m5_exit=args.require_m5_verification_exit", config
         )
+        self.assertIn("GAPBS_VERIFICATION_EXIT_CAUSE", config)
 
     def test_non_gapbs_arguments_preserve_legacy_config_reuse(self):
         self.assertTrue(
