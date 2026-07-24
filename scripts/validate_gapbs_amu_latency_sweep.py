@@ -594,6 +594,36 @@ def validate_accelerator_config(config, path, kind, model_parameters):
         validate_parameter(config, "board.cira", key, value, "CIRA", path)
 
 
+def expected_workload_environment(kind, model_parameters, path):
+    encoded = model_parameters.get("env")
+    if not isinstance(encoded, str):
+        raise ValidationError(
+            f"{path}: checkpoint identity has invalid environment"
+        )
+    user_environment = [] if encoded == "" else encoded.split("\0")
+    forbidden = {
+        "OMP_NUM_THREADS",
+        "OMP_THREAD_LIMIT",
+        "OMP_DYNAMIC",
+        "CIRA_GAPBS_DEVICE_OFFLOAD",
+    }
+    for entry in user_environment:
+        key = entry.split("=", 1)[0]
+        if key in forbidden:
+            raise ValidationError(
+                f"{path}: publication environment forbids {key}"
+            )
+    expected = ["OMP_NUM_THREADS=2"]
+    if kind == "cira" and not any(
+        entry.split("=", 1)[0]
+        in ("CIRA_GEM5_M5OPS", "CIRA_GAPBS_GEM5_M5OPS")
+        for entry in user_environment
+    ):
+        expected.append("CIRA_GEM5_M5OPS=1")
+    expected.extend(user_environment)
+    return expected
+
+
 def validate_config(
     path, expected_delay, kind, expected_graph, expected_binary,
     model_parameters
@@ -733,15 +763,13 @@ def validate_config(
                 f"{expected_arguments!r}; found {arguments!r}"
             )
         environment = shlex.split(workload.get("env", ""))
-        omp_entries = [
-            entry
-            for entry in environment
-            if entry.startswith("OMP_NUM_THREADS=")
-        ]
-        if omp_entries != ["OMP_NUM_THREADS=2"]:
+        expected_environment = expected_workload_environment(
+            kind, model_parameters, path
+        )
+        if environment != expected_environment:
             raise ValidationError(
-                f"{path}: workload must contain exactly "
-                f"OMP_NUM_THREADS=2; found {omp_entries!r}"
+                f"{path}: expected exact workload environment "
+                f"{expected_environment!r}; found {environment!r}"
             )
     validate_accelerator_config(
         config, path, kind, model_parameters

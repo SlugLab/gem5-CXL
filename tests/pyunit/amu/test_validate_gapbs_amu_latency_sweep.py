@@ -344,7 +344,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "type=BaseTimingSimpleCPU\n"
             "[board.processor.cores0.core.workload]\n"
             f"cmd={binary} -f {graph} -n 2 -v\n"
-            "env=OMP_NUM_THREADS=2\n"
+            + (
+                "env=OMP_NUM_THREADS=2 CIRA_GEM5_M5OPS=1\n"
+                if kind == "cira"
+                else "env=OMP_NUM_THREADS=2\n"
+            )
             + asmc
             + cira
         )
@@ -1412,6 +1416,30 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 config.write_text(text, encoding="utf-8")
                 with self.assertRaisesRegex(
                     self.validator.ValidationError, expected
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_unproven_workload_environment(self):
+        for label, extra in (
+            ("cxl_vanilla", "OMP_THREAD_LIMIT=1"),
+            ("cxl_vanilla", "OMP_DYNAMIC=TRUE"),
+            ("cira_pgo", "CIRA_GAPBS_DEVICE_OFFLOAD=1"),
+        ):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                config = root / "200ns" / "bfs" / label / "config.ini"
+                config.write_text(
+                    config.read_text(encoding="utf-8").replace(
+                        "env=OMP_NUM_THREADS=2",
+                        f"env=OMP_NUM_THREADS=2 {extra}",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError,
+                    "exact workload environment",
                 ):
                     self.validator.validate_sweep(root)
 
