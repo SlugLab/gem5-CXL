@@ -74,9 +74,11 @@ class GapbsCheckpointConfigContractTest(unittest.TestCase):
         self.assertIn("CheckpointResource", config)
         self.assertIn('"--checkpoint-save"', config)
         self.assertIn('"--checkpoint-restore"', config)
+        self.assertIn('"--require-m5-verification-exit"', config)
         self.assertIn("GAPBS_CHECKPOINT_SAVED", config)
         self.assertIn("GAPBS_CHECKPOINT_RESTORED", config)
         self.assertIn("simulator.save_checkpoint", config)
+        self.assertIn("args.require_m5_verification_exit", config)
         self.assertIn("validate_checkpoint_options(", config)
 
     def assert_checkpoint_options_rejected(self, message, **overrides):

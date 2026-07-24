@@ -201,6 +201,11 @@ parser.add_argument(
     help="Reset stats at m5_work_begin and stop after m5_work_end.",
 )
 parser.add_argument("--continue-after-roi", action="store_true")
+parser.add_argument(
+    "--require-m5-verification-exit",
+    action="store_true",
+    help="Require the workload to finish through m5_exit or m5_fail.",
+)
 checkpoint_group = parser.add_mutually_exclusive_group()
 checkpoint_group.add_argument(
     "--checkpoint-save",
@@ -462,7 +467,11 @@ elif roi_state is not None:
     except RoiSequenceError as error:
         print(f"Verification: MISSING ({error})")
         raise SystemExit(3)
-if args.fast_forward_cpu or args.continue_after_roi:
+if (
+    args.fast_forward_cpu
+    or args.continue_after_roi
+    or args.require_m5_verification_exit
+):
     if not args.checkpoint_save:
         exit_cause = simulator.get_last_exit_event_cause()
         verification, exit_code = classify_final_exit(exit_cause)
@@ -472,7 +481,7 @@ if args.fast_forward_cpu or args.continue_after_roi:
         if verification == "missing":
             print(f"Verification: MISSING ({exit_cause})")
             raise SystemExit(exit_code)
-        if args.continue_after_roi:
+        if args.continue_after_roi or args.require_m5_verification_exit:
             print("Verification: PASS")
 if not args.roi_work_events:
     m5.stats.dump()

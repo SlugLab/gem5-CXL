@@ -282,7 +282,7 @@ class GapbsAmuBuilderTest(unittest.TestCase):
                 switch_at_trial_zero=False,
             )
 
-    def test_fast_forward_exit_cause_is_always_classified(self):
+    def test_verification_modes_always_classify_final_exit(self):
         self.assertTrue(
             hasattr(self.roi_state, "classify_final_exit"),
             "missing final-exit classifier",
@@ -310,8 +310,14 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             ("missing", 3),
         )
         config = CONFIG_PATH.read_text(encoding="utf-8")
+        self.assertIn("args.fast_forward_cpu", config)
+        self.assertIn("or args.continue_after_roi", config)
+        self.assertIn("or args.require_m5_verification_exit", config)
         self.assertIn(
-            "if args.fast_forward_cpu or args.continue_after_roi:", config
+            "exit_cause = simulator.get_last_exit_event_cause()", config
+        )
+        self.assertIn(
+            "verification, exit_code = classify_final_exit(exit_cause)", config
         )
 
     def test_non_gapbs_arguments_preserve_legacy_config_reuse(self):
@@ -557,6 +563,29 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             transformed.index("m5_fail(0, 1)"),
             transformed.index("m5_exit(0)"),
         )
+
+    def test_verification_exit_patch_flushes_without_roi_markers(self):
+        source = CXLMEMURING / "bench" / "gapbs" / "src" / "benchmark.h"
+        for name, builder in (
+            ("amu", self.builder),
+            ("baseline", self.baseline_builder),
+            ("cira", self.cira_builder),
+        ):
+            with self.subTest(builder=name), tempfile.TemporaryDirectory() as tmp:
+                src_dir = Path(tmp)
+                (src_dir / "src").mkdir()
+                target = src_dir / "src" / "benchmark.h"
+                shutil.copy2(source, target)
+                builder.patch_benchmark_verification_exit(src_dir)
+                transformed = target.read_text(encoding="utf-8")
+                self.assertIn("write(2, verification_passed", transformed)
+                self.assertIn("m5_fail(0, 1)", transformed)
+                self.assertIn("m5_exit(0)", transformed)
+                self.assertNotIn("m5_work_begin", transformed)
+                self.assertLess(
+                    transformed.index("write(2, verification_passed"),
+                    transformed.index("m5_fail(0, 1)"),
+                )
 
     def test_builders_hash_exact_file_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -256,12 +256,14 @@ def unique_directional_stat(stats, prefix):
     return cell, value
 
 
-def directional_stat_pair(stats, num_cores=1):
+def directional_stat_pair(stats, num_cores=1, kind="baseline"):
     if num_cores > 1:
         expected_cells = {
             f"board.cache_hierarchy.l2-cache-{core}.mem_side_port"
             for core in range(num_cores)
         }
+        if kind == "amu":
+            expected_cells.add("board.asmc.mem_side_port")
         directional = {}
         for label, prefix in (
             ("packet", CXL_PACKET_STAT_PREFIX),
@@ -273,13 +275,16 @@ def directional_stat_pair(stats, num_cores=1):
                 if name.startswith(prefix) and name.endswith(CXL_STAT_SUFFIX)
             }
             actual_cells = set(directional[label])
-            if actual_cells != expected_cells:
+            valid = (
+                actual_cells == expected_cells
+                if label == "packet"
+                else actual_cells <= expected_cells
+            )
+            if not valid:
                 raise StatsError(
                     f"expected directional CXL cells {sorted(expected_cells)} "
                     f"for {label} statistics; found {sorted(actual_cells)}"
                 )
-        if set(directional["packet"]) != set(directional["byte"]):
-            raise StatsError("CXL packet/byte directional identity mismatch")
         return (
             sum(directional["packet"].values(), Decimal(0)),
             sum(directional["byte"].values(), Decimal(0)),
@@ -483,13 +488,23 @@ def validate_core_requestor_identities(stats, num_cores):
             ("l2-cache", "data"),
             ("l2-cache", "inst"),
         ):
-            name = (
+            prefix = (
                 f"board.cache_hierarchy.{cache_name}-{core}."
-                f"demandAccesses::processor.cores{core}.core.{role}"
             )
-            if name not in stats:
+            requestor = f"processor.cores{core}.core.{role}"
+            names = [
+                f"{prefix}{family}::{requestor}"
+                for family in (
+                    "demandAccesses",
+                    "demandHits",
+                    "demandMisses",
+                )
+            ]
+            if names[0] not in stats and any(
+                name in stats for name in names[1:]
+            ):
                 raise StatsError(
-                    "missing exact core requestor identity: " + name
+                    "missing exact core requestor identity: " + names[0]
                 )
 
 
@@ -526,11 +541,6 @@ def core_cache_diagnostic(stats, field, num_cores):
         cache_root = f"board.cache_hierarchy.{cache_name}-{core}"
         requestor = f"processor.cores{core}.core.{role}"
         accesses_name = f"{cache_root}.demandAccesses::{requestor}"
-        if accesses_name not in stats:
-            raise StatsError(
-                f"missing exact core requestor identity for {field}: "
-                f"{accesses_name}"
-            )
         for family in ("demandAccesses", "demandHits", "demandMisses"):
             validate_cache_family_total(stats, cache_root, family)
             ambiguous = [
@@ -543,6 +553,17 @@ def core_cache_diagnostic(stats, field, num_cores):
                     f"ambiguous core requestor for {field}: "
                     + ", ".join(sorted(ambiguous))
                 )
+        if accesses_name not in stats:
+            target_cells = [
+                f"{cache_root}.{family}::{requestor}"
+                for family in ("demandHits", "demandMisses")
+            ]
+            if any(name in stats for name in target_cells):
+                raise StatsError(
+                    f"missing exact core requestor identity for {field}: "
+                    f"{accesses_name}"
+                )
+            continue
         values = []
         for family in ("demandAccesses", "demandHits", "demandMisses"):
             name = f"{cache_root}.{family}::{requestor}"
@@ -569,7 +590,7 @@ def extract_diagnostic_metrics(
         for name in CIRA_LATENCY_STATS.values():
             if name not in stats:
                 raise StatsError(f"missing required ROI statistic: {name}")
-    packets, byte_count = directional_stat_pair(stats, num_cores)
+    packets, byte_count = directional_stat_pair(stats, num_cores, kind)
     metrics = {"cxl_packets": packets, "cxl_bytes": byte_count}
     metrics.update(
         {

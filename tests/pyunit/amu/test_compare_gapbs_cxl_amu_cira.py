@@ -566,7 +566,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
     def test_two_core_rejects_missing_directional_core_cell(self):
         stats = self.two_core_stats()
         del stats[
-            "board.cache_hierarchy.membus.pktSize_"
+            "board.cache_hierarchy.membus.pktCount_"
             "board.cache_hierarchy.l2-cache-1.mem_side_port::"
             "board.cxl_mem_link0.cpu_side_port"
         ]
@@ -576,6 +576,19 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             self.runner.extract_diagnostic_metrics(
                 stats, "baseline", num_cores=2
             )
+
+    def test_two_core_nozero_byte_cell_contributes_zero(self):
+        stats = self.two_core_stats()
+        del stats[
+            "board.cache_hierarchy.membus.pktSize_"
+            "board.cache_hierarchy.l2-cache-1.mem_side_port::"
+            "board.cxl_mem_link0.cpu_side_port"
+        ]
+        metrics = self.runner.extract_diagnostic_metrics(
+            stats, "baseline", num_cores=2
+        )
+        self.assertEqual(metrics["cxl_packets"], Decimal(70))
+        self.assertEqual(metrics["cxl_bytes"], Decimal(64))
 
     def test_two_core_rejects_missing_requestor_identity(self):
         stats = self.two_core_stats()
@@ -589,6 +602,45 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             self.runner.extract_diagnostic_metrics(
                 stats, "baseline", num_cores=2
             )
+
+    def test_two_core_accepts_wholly_omitted_zero_requestor(self):
+        stats = self.two_core_stats()
+        for family, value in (
+            ("demandAccesses", 5),
+            ("demandHits", None),
+            ("demandMisses", 5),
+        ):
+            if value is not None:
+                del stats[
+                    f"board.cache_hierarchy.l2-cache-1.{family}::"
+                    "processor.cores1.core.inst"
+                ]
+            total = (
+                "board.cache_hierarchy.l2-cache-1."
+                f"{family}::total"
+            )
+            stats[total] -= Decimal(value or 0)
+        metrics = self.runner.extract_diagnostic_metrics(
+            stats, "baseline", num_cores=2
+        )
+        self.assertEqual(metrics["l2i_demand_hits"], Decimal(6))
+        self.assertEqual(metrics["l2i_demand_misses"], Decimal(1))
+
+    def test_two_core_amu_includes_exact_asmc_directional_cell(self):
+        stats = self.two_core_stats()
+        stats[
+            "board.cache_hierarchy.membus.pktCount_"
+            "board.asmc.mem_side_port::board.cxl_mem_link0.cpu_side_port"
+        ] = Decimal(9)
+        stats[
+            "board.cache_hierarchy.membus.pktSize_"
+            "board.asmc.mem_side_port::board.cxl_mem_link0.cpu_side_port"
+        ] = Decimal(256)
+        metrics = self.runner.extract_diagnostic_metrics(
+            stats, "amu", num_cores=2
+        )
+        self.assertEqual(metrics["cxl_packets"], Decimal(79))
+        self.assertEqual(metrics["cxl_bytes"], Decimal(448))
 
     def test_large_integer_counter_survives_stats_to_summary_exactly(self):
         stats = self.stats()

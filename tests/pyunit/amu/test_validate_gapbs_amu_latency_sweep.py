@@ -348,6 +348,19 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cxl_mem_link0.cpu_side_port 1880"
             ),
         ]
+        if kind == "amu":
+            lines += [
+                (
+                    "board.cache_hierarchy.membus.pktCount_"
+                    "board.asmc.mem_side_port::"
+                    "board.cxl_mem_link0.cpu_side_port 7"
+                ),
+                (
+                    "board.cache_hierarchy.membus.pktSize_"
+                    "board.asmc.mem_side_port::"
+                    "board.cxl_mem_link0.cpu_side_port 64"
+                ),
+            ]
         for core, hits, misses in ((0, 46, 4), (1, 44, 6)):
             root = f"board.cache_hierarchy.l1d-cache-{core}"
             requestor = f"processor.cores{core}.core.data"
@@ -515,6 +528,9 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                         "checkpoint_restores": "1",
                     }
                 )
+                if row["kind"] == "amu":
+                    row["cxl_packets"] = "144"
+                    row["cxl_bytes"] = "2944"
             with summary.open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.DictWriter(stream, fieldnames=fields)
                 writer.writeheader()

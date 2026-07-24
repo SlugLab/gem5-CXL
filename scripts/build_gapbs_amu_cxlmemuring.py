@@ -210,25 +210,15 @@ def replace_once(data, old, new, path):
     return data.replace(old, new, 1)
 
 
-def patch_benchmark_roi_markers(src_dir):
+def patch_benchmark_verification_exit(src_dir):
     path = src_dir / "src" / "benchmark.h"
     data = read_text(path)
     data = replace_once(
         data,
         '#include "writer.h"\n',
-        '#include "writer.h"\n\n#include <gem5/m5ops.h>\n',
-        path,
-    )
-    data = replace_once(
-        data,
-        "    trial_timer.Start();\n"
-        "    auto result = kernel(g);\n"
-        "    trial_timer.Stop();\n",
-        "    m5_work_begin(iter, 0);\n"
-        "    trial_timer.Start();\n"
-        "    auto result = kernel(g);\n"
-        "    trial_timer.Stop();\n"
-        "    m5_work_end(iter, 0);\n",
+        '#include "writer.h"\n\n'
+        "#include <gem5/m5ops.h>\n"
+        "#include <unistd.h>\n",
         path,
     )
     data = replace_once(
@@ -239,6 +229,8 @@ def patch_benchmark_roi_markers(src_dir):
         "          verify(std::ref(g), std::ref(result));\n"
         '      PrintLabel("Verification",\n'
         '                 verification_passed ? "PASS" : "FAIL");\n'
+        '      write(2, verification_passed ? "Verification: PASS\\n" :\n'
+        '                                      "Verification: FAIL\\n", 19);\n'
         "      if (!verification_passed)\n"
         "        m5_fail(0, 1);\n",
         path,
@@ -252,6 +244,25 @@ def patch_benchmark_roi_markers(src_dir):
         path,
     )
     write_text(path, data)
+
+
+def patch_benchmark_roi_markers(src_dir):
+    path = src_dir / "src" / "benchmark.h"
+    data = read_text(path)
+    data = replace_once(
+        data,
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n",
+        "    m5_work_begin(iter, 0);\n"
+        "    trial_timer.Start();\n"
+        "    auto result = kernel(g);\n"
+        "    trial_timer.Stop();\n"
+        "    m5_work_end(iter, 0);\n",
+        path,
+    )
+    write_text(path, data)
+    patch_benchmark_verification_exit(src_dir)
 
 
 def copy_gapbs_source(cxlmemuring, outdir):
@@ -657,6 +668,11 @@ def main():
         action="store_true",
         help="Add m5_work_begin/end around each GAPBS kernel trial.",
     )
+    parser.add_argument(
+        "--verification-exit",
+        action="store_true",
+        help="Flush verification and exit through m5ops without ROI markers.",
+    )
     args = parser.parse_args()
 
     if not M5_LIB.exists():
@@ -681,6 +697,8 @@ def main():
     src_dir = copy_gapbs_source(args.cxlmemuring, args.outdir)
     if args.roi_work_markers:
         patch_benchmark_roi_markers(src_dir)
+    elif args.verification_exit:
+        patch_benchmark_verification_exit(src_dir)
     patched = patch_sources(src_dir, benchmarks)
 
     out_bin_dir = args.outdir / "bin"
@@ -727,6 +745,9 @@ def main():
         "amu_rewritten_benchmarks": patched,
         "amu_batch_size": args.amu_batch_size,
         "roi_work_markers": args.roi_work_markers,
+        "verification_exit": (
+            args.roi_work_markers or args.verification_exit
+        ),
         "benchmarks_built_without_amu_rewrites": unsupported,
         "profiles_used": profiles_used,
         "profile_sha256": {
