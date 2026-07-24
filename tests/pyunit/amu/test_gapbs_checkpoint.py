@@ -26,37 +26,157 @@ roi = load_module("gapbs_checkpoint_roi_state", ROI_STATE_PATH)
 
 
 class GapbsCheckpointStateTest(unittest.TestCase):
-    def test_save_stops_at_measured_begin(self):
+    def test_save_stops_at_trial_zero_begin(self):
         state = roi.GapbsCheckpointState(
             mode="save", iterations=2, measure_trial=1
         )
-        self.assertEqual(state.work_begin(), ())
-        self.assertEqual(state.work_end(), ())
         self.assertEqual(state.work_begin(), ("checkpoint",))
         self.assertEqual(state.checkpoint_saved(), ("stop",))
         self.assertEqual(state.finish(), ())
 
-    def test_restore_resets_before_first_resumed_instruction(self):
+    def test_restore_warms_trial_zero_then_measures_trial_one(self):
         state = roi.GapbsCheckpointState(
             mode="restore", iterations=2, measure_trial=1
         )
+        self.assertEqual(state.resume_actions(), ())
+        self.assertEqual(state.work_end(), ())
         self.assertEqual(
-            state.resume_actions(), ("reset", "record_start_tick")
+            state.work_begin(), ("reset", "record_start_tick")
         )
         self.assertEqual(state.work_end(), ("dump",))
         self.assertEqual(state.finish(), ("verify",))
 
-    def test_restore_rejects_work_begin_and_missing_end(self):
+    def test_restore_rejects_trial_one_begin_before_trial_zero_end(self):
         state = roi.GapbsCheckpointState(
             mode="restore", iterations=2, measure_trial=1
         )
         state.resume_actions()
-        with self.assertRaisesRegex(roi.RoiSequenceError, "unexpected begin"):
+        with self.assertRaisesRegex(roi.RoiSequenceError, "begin before"):
             state.work_begin()
         with self.assertRaisesRegex(
-            roi.RoiSequenceError, "missing measured trial 1 end"
+            roi.RoiSequenceError, "missing trial 0 end"
         ):
             state.finish()
+
+
+class GapbsCheckpointConfigContractTest(unittest.TestCase):
+    def test_config_declares_checkpoint_contract(self):
+        config = (
+            REPO
+            / "configs"
+            / "example"
+            / "gem5_library"
+            / "x86-gapbs-amu-se.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("CheckpointResource", config)
+        self.assertIn('"--checkpoint-save"', config)
+        self.assertIn('"--checkpoint-restore"', config)
+        self.assertIn("GAPBS_CHECKPOINT_SAVED", config)
+        self.assertIn("GAPBS_CHECKPOINT_RESTORED", config)
+        self.assertIn("simulator.save_checkpoint", config)
+        self.assertIn("validate_checkpoint_options(", config)
+
+    def assert_checkpoint_options_rejected(self, message, **overrides):
+        options = {
+            "checkpoint_save": None,
+            "checkpoint_restore": None,
+            "cxl_memory": False,
+            "cpu": "timing",
+            "roi_work_events": True,
+            "continue_after_roi": True,
+            "fast_forward_cpu": None,
+            "iterations": 2,
+            "measure_trial": 1,
+        }
+        options.update(overrides)
+        with self.assertRaisesRegex(ValueError, message):
+            roi.validate_checkpoint_options(**options)
+
+    def test_checkpoint_option_exclusion_rules(self):
+        self.assert_checkpoint_options_rejected(
+            "mutually exclusive",
+            checkpoint_save=Path("save"),
+            checkpoint_restore=Path("restore"),
+        )
+        self.assert_checkpoint_options_rejected(
+            "save requires local memory",
+            checkpoint_save=Path("save"),
+            cxl_memory=True,
+        )
+        for overrides, message in (
+            (
+                {
+                    "checkpoint_restore": Path("restore"),
+                    "cxl_memory": False,
+                },
+                "restore requires --cxl-memory",
+            ),
+            (
+                {
+                    "checkpoint_restore": Path("restore"),
+                    "cpu": "atomic",
+                    "cxl_memory": True,
+                },
+                "restore requires --cpu timing",
+            ),
+            (
+                {
+                    "checkpoint_restore": Path("restore"),
+                    "roi_work_events": False,
+                    "cxl_memory": True,
+                },
+                "checkpoint mode requires --roi-work-events",
+            ),
+            (
+                {
+                    "checkpoint_restore": Path("restore"),
+                    "continue_after_roi": False,
+                    "cxl_memory": True,
+                },
+                "restore requires --continue-after-roi",
+            ),
+            (
+                {
+                    "checkpoint_save": Path("save"),
+                    "fast_forward_cpu": "atomic",
+                },
+                "checkpoint mode rejects --fast-forward-cpu",
+            ),
+            (
+                {
+                    "checkpoint_save": Path("save"),
+                    "iterations": 1,
+                    "measure_trial": 0,
+                },
+                "checkpoint mode requires iterations=2 and measure_trial=1",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                self.assert_checkpoint_options_rejected(message, **overrides)
+
+    def test_valid_save_and_restore_options(self):
+        roi.validate_checkpoint_options(
+            checkpoint_save=Path("save"),
+            checkpoint_restore=None,
+            cxl_memory=False,
+            cpu="atomic",
+            roi_work_events=True,
+            continue_after_roi=False,
+            fast_forward_cpu=None,
+            iterations=2,
+            measure_trial=1,
+        )
+        roi.validate_checkpoint_options(
+            checkpoint_save=None,
+            checkpoint_restore=Path("restore"),
+            cxl_memory=True,
+            cpu="timing",
+            roi_work_events=True,
+            continue_after_roi=True,
+            fast_forward_cpu=None,
+            iterations=2,
+            measure_trial=1,
+        )
 
 
 class GapbsCheckpointManifestTest(unittest.TestCase):

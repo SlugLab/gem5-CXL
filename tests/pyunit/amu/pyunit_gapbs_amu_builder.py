@@ -300,6 +300,12 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             ("pass", 0),
         )
         self.assertEqual(
+            self.roi_state.classify_final_exit(
+                "m5_exit instruction encountered"
+            ),
+            ("pass", 0),
+        )
+        self.assertEqual(
             self.roi_state.classify_final_exit("simulate() limit reached"),
             ("missing", 3),
         )
@@ -512,6 +518,11 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             transformed = target.read_text(encoding="utf-8")
         self.assertIn("bool verification_passed", transformed)
         self.assertIn("m5_fail(0, 1)", transformed)
+        self.assertIn("m5_exit(0)", transformed)
+        self.assertLess(
+            transformed.index("m5_fail(0, 1)"),
+            transformed.index("m5_exit(0)"),
+        )
 
     def test_baseline_roi_patch_turns_verifier_failure_into_m5_fail(self):
         source = CXLMEMURING / "bench" / "gapbs" / "src" / "benchmark.h"
@@ -524,6 +535,11 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             transformed = target.read_text(encoding="utf-8")
         self.assertIn("bool verification_passed", transformed)
         self.assertIn("m5_fail(0, 1)", transformed)
+        self.assertIn("m5_exit(0)", transformed)
+        self.assertLess(
+            transformed.index("m5_fail(0, 1)"),
+            transformed.index("m5_exit(0)"),
+        )
 
     def test_cira_roi_patch_turns_verifier_failure_into_m5_fail(self):
         source = CXLMEMURING / "bench" / "gapbs" / "src" / "benchmark.h"
@@ -536,6 +552,11 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             transformed = target.read_text(encoding="utf-8")
         self.assertIn("bool verification_passed", transformed)
         self.assertIn("m5_fail(0, 1)", transformed)
+        self.assertIn("m5_exit(0)", transformed)
+        self.assertLess(
+            transformed.index("m5_fail(0, 1)"),
+            transformed.index("m5_exit(0)"),
+        )
 
     def test_builders_hash_exact_file_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:

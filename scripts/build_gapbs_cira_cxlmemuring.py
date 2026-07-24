@@ -521,6 +521,14 @@ def patch_benchmark_roi_markers(src_dir):
         "        m5_fail(0, 1);\n",
         path,
     )
+    data = replace_once(
+        data,
+        '  PrintTime("Average Time", total_seconds / cli.num_trials());\n',
+        "  if (cli.do_verify())\n"
+        "    m5_exit(0);\n"
+        '  PrintTime("Average Time", total_seconds / cli.num_trials());\n',
+        path,
+    )
     write_text(path, data)
 
 

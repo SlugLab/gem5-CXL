@@ -59,9 +59,55 @@ def resolve_workload_shape(
 def classify_final_exit(exit_cause):
     if exit_cause == "m5_fail instruction encountered":
         return "fail", 2
-    if exit_cause == "exiting with last active thread context":
+    if exit_cause in (
+        "exiting with last active thread context",
+        "m5_exit instruction encountered",
+    ):
         return "pass", 0
     return "missing", 3
+
+
+def validate_checkpoint_options(
+    *,
+    checkpoint_save,
+    checkpoint_restore,
+    cxl_memory,
+    cpu,
+    roi_work_events,
+    continue_after_roi,
+    fast_forward_cpu,
+    iterations,
+    measure_trial,
+):
+    if checkpoint_save and checkpoint_restore:
+        raise ValueError(
+            "checkpoint save and restore are mutually exclusive"
+        )
+    checkpoint_mode = bool(checkpoint_save or checkpoint_restore)
+    if not checkpoint_mode:
+        return
+    if not roi_work_events:
+        raise ValueError("checkpoint mode requires --roi-work-events")
+    if fast_forward_cpu:
+        raise ValueError("checkpoint mode rejects --fast-forward-cpu")
+    if (iterations, measure_trial) != (2, 1):
+        raise ValueError(
+            "checkpoint mode requires iterations=2 and measure_trial=1"
+        )
+    if checkpoint_save:
+        if cxl_memory:
+            raise ValueError("checkpoint save requires local memory")
+        if cpu != "atomic":
+            raise ValueError("checkpoint save requires --cpu atomic")
+    if checkpoint_restore:
+        if not cxl_memory:
+            raise ValueError("checkpoint restore requires --cxl-memory")
+        if cpu != "timing":
+            raise ValueError("checkpoint restore requires --cpu timing")
+        if not continue_after_roi:
+            raise ValueError(
+                "checkpoint restore requires --continue-after-roi"
+            )
 
 
 class GapbsRoiState:
@@ -154,8 +200,8 @@ class GapbsCheckpointState:
             )
 
         self.mode = mode
-        self.next_trial = 0 if mode == "save" else 2
-        self.active_trial = None if mode == "save" else 1
+        self.next_trial = 0 if mode == "save" else 1
+        self.active_trial = None if mode == "save" else 0
         self.resumed = False
         self.saved = False
         self.ended = False
@@ -168,23 +214,21 @@ class GapbsCheckpointState:
         if self.ended:
             raise RoiSequenceError("cannot resume after measured trial end")
         self.resumed = True
-        return ("reset", "record_start_tick")
+        return ()
 
     def work_begin(self):
-        if self.mode == "restore":
-            raise RoiSequenceError("unexpected begin after checkpoint restore")
         if self.saved:
             raise RoiSequenceError("unexpected begin after checkpoint save")
         if self.active_trial is not None:
             raise RoiSequenceError(
                 f"begin before trial {self.active_trial} end"
             )
-        if self.next_trial == 0:
+        if self.mode == "save" and self.next_trial == 0:
             self.active_trial = 0
-            return ()
-        if self.next_trial == 1:
-            self.active_trial = 1
             return ("checkpoint",)
+        if self.mode == "restore" and self.next_trial == 1:
+            self.active_trial = 1
+            return ("reset", "record_start_tick")
         raise RoiSequenceError(
             f"unexpected trial {self.next_trial} begin"
         )
@@ -193,34 +237,35 @@ class GapbsCheckpointState:
         if self.mode == "restore":
             if not self.resumed:
                 raise RoiSequenceError("work end before checkpoint resume")
-            if self.ended or self.active_trial is None:
-                raise RoiSequenceError("duplicate measured trial end")
+            if self.active_trial is None:
+                raise RoiSequenceError("end without begin")
+            if self.active_trial == 0:
+                self.active_trial = None
+                self.next_trial = 1
+                return ()
             self.active_trial = None
+            self.next_trial = 2
             self.ended = True
             return ("dump",)
 
         if self.active_trial is None:
             raise RoiSequenceError("end without begin")
-        if self.active_trial == 1:
-            raise RoiSequenceError(
-                "measured trial ran instead of being checkpointed"
-            )
-        self.active_trial = None
-        self.next_trial = 1
-        return ()
+        raise RoiSequenceError(
+            "trial 0 ran instead of being checkpointed"
+        )
 
     def checkpoint_saved(self):
         if self.mode != "save":
             raise RoiSequenceError("cannot save after checkpoint restore")
         if self.saved:
             raise RoiSequenceError("duplicate checkpoint save")
-        if self.active_trial != 1 or self.next_trial != 1:
+        if self.active_trial != 0 or self.next_trial != 0:
             raise RoiSequenceError(
-                "checkpoint save is not at measured trial begin"
+                "checkpoint save is not at trial 0 begin"
             )
         self.saved = True
         self.active_trial = None
-        self.next_trial = 2
+        self.next_trial = 1
         return ("stop",)
 
     def finish(self):
@@ -230,6 +275,12 @@ class GapbsCheckpointState:
             return ()
         if not self.resumed:
             raise RoiSequenceError("checkpoint was not resumed")
+        if self.active_trial == 0:
+            raise RoiSequenceError("missing trial 0 end")
+        if self.active_trial == 1:
+            raise RoiSequenceError("missing measured trial 1 end")
+        if self.next_trial == 1:
+            raise RoiSequenceError("missing trial 1 begin")
         if not self.ended:
             raise RoiSequenceError("missing measured trial 1 end")
         return ("verify",)

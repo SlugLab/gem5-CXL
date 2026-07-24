@@ -18,12 +18,15 @@ import m5
 from m5.objects import ASMC, CIRA, NULL, SerialLink
 
 from gapbs_roi_state import (
+    GapbsCheckpointState,
     GapbsRoiState,
     RoiSequenceError,
     classify_final_exit,
     resolve_workload_shape,
+    validate_checkpoint_options,
 )
 from gem5.components.boards.simple_board import SimpleBoard
+from gem5.components.cachehierarchies.classic.no_cache import NoCache
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierarchy import (
     PrivateL1PrivateL2CacheHierarchy,
 )
@@ -34,7 +37,7 @@ from gem5.components.processors.simple_switchable_processor import (
     SimpleSwitchableProcessor,
 )
 from gem5.isas import ISA
-from gem5.resources.resource import BinaryResource
+from gem5.resources.resource import BinaryResource, CheckpointResource
 from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 from gem5.utils.requires import requires
@@ -198,6 +201,17 @@ parser.add_argument(
     help="Reset stats at m5_work_begin and stop after m5_work_end.",
 )
 parser.add_argument("--continue-after-roi", action="store_true")
+checkpoint_group = parser.add_mutually_exclusive_group()
+checkpoint_group.add_argument(
+    "--checkpoint-save",
+    type=Path,
+    help="Save state at trial 0's work-begin event.",
+)
+checkpoint_group.add_argument(
+    "--checkpoint-restore",
+    type=Path,
+    help="Restore state saved at the measured trial's work-begin event.",
+)
 
 args = parser.parse_args()
 
@@ -229,6 +243,20 @@ if args.iterations <= 0:
     parser.error("--iterations must be positive")
 if args.measure_trial < 0 or args.measure_trial >= args.iterations:
     parser.error("--measure-trial must be less than iterations")
+try:
+    validate_checkpoint_options(
+        checkpoint_save=args.checkpoint_save,
+        checkpoint_restore=args.checkpoint_restore,
+        cxl_memory=args.cxl_memory,
+        cpu=args.cpu,
+        roi_work_events=args.roi_work_events,
+        continue_after_roi=args.continue_after_roi,
+        fast_forward_cpu=args.fast_forward_cpu,
+        iterations=args.iterations,
+        measure_trial=args.measure_trial,
+    )
+except ValueError as error:
+    parser.error(str(error))
 
 cpu_type = {
     "atomic": CPUTypes.ATOMIC,
@@ -237,16 +265,19 @@ cpu_type = {
     "minor": CPUTypes.MINOR,
 }[args.cpu]
 
-cache_hierarchy = TunablePrivateL1PrivateL2CacheHierarchy(
-    l1d_size=args.l1d_size,
-    l1i_size=args.l1i_size,
-    l2_size=args.l2_size,
-    disable_hw_prefetchers=args.disable_hw_prefetchers,
-    l1_mshrs=args.l1_mshrs,
-    l1_tgts_per_mshr=args.l1_tgts_per_mshr,
-    l2_mshrs=args.l2_mshrs,
-    l2_tgts_per_mshr=args.l2_tgts_per_mshr,
-)
+if args.checkpoint_save:
+    cache_hierarchy = NoCache()
+else:
+    cache_hierarchy = TunablePrivateL1PrivateL2CacheHierarchy(
+        l1d_size=args.l1d_size,
+        l1i_size=args.l1i_size,
+        l2_size=args.l2_size,
+        disable_hw_prefetchers=args.disable_hw_prefetchers,
+        l1_mshrs=args.l1_mshrs,
+        l1_tgts_per_mshr=args.l1_tgts_per_mshr,
+        l2_mshrs=args.l2_mshrs,
+        l2_tgts_per_mshr=args.l2_tgts_per_mshr,
+    )
 memory = SingleChannelDDR4_2400(size=args.mem_size)
 if args.fast_forward_cpu:
     starting_cpu_type = {
@@ -311,15 +342,36 @@ if args.cira:
         completion_latency=args.cira_completion_latency,
     )
 
+checkpoint = (
+    CheckpointResource(
+        local_path=str(args.checkpoint_restore.resolve())
+    )
+    if args.checkpoint_restore
+    else None
+)
 board.set_se_binary_workload(
     BinaryResource(local_path=str(binary)),
     arguments=workload_arguments,
     env_list=[f"OMP_NUM_THREADS={args.cores}", *args.env],
+    checkpoint=checkpoint,
 )
 
 start_tick = None
 roi_state = None
-if args.roi_work_events:
+checkpoint_state = None
+if args.checkpoint_save:
+    checkpoint_state = GapbsCheckpointState(
+        mode="save",
+        iterations=args.iterations,
+        measure_trial=args.measure_trial,
+    )
+elif args.checkpoint_restore:
+    checkpoint_state = GapbsCheckpointState(
+        mode="restore",
+        iterations=args.iterations,
+        measure_trial=args.measure_trial,
+    )
+elif args.roi_work_events:
     roi_state = GapbsRoiState(
         iterations=args.iterations,
         measure_trial=args.measure_trial,
@@ -329,7 +381,11 @@ if args.roi_work_events:
 
 def handle_workbegin():
     while True:
-        actions = roi_state.work_begin()
+        actions = (
+            checkpoint_state.work_begin()
+            if checkpoint_state is not None
+            else roi_state.work_begin()
+        )
         for action in actions:
             if action == "switch":
                 print("Switching from fast-forward CPU to timing CPU!")
@@ -340,16 +396,29 @@ def handle_workbegin():
             elif action == "record_start_tick":
                 global start_tick
                 start_tick = m5.curTick()
-        yield False
+            elif action == "checkpoint":
+                simulator.save_checkpoint(args.checkpoint_save)
+                print(
+                    "GAPBS_CHECKPOINT_SAVED "
+                    f"path={args.checkpoint_save.resolve()}"
+                )
+                checkpoint_state.checkpoint_saved()
+        yield "checkpoint" in actions
 
 
 def handle_workend():
     while True:
-        actions = roi_state.work_end()
+        actions = (
+            checkpoint_state.work_end()
+            if checkpoint_state is not None
+            else roi_state.work_end()
+        )
         if "dump" in actions:
             print("Dump stats at the end of the measured ROI!")
             m5.stats.dump()
-        if args.fast_forward_cpu:
+        if args.checkpoint_restore:
+            yield False
+        elif args.fast_forward_cpu:
             yield False
         else:
             yield "dump" in actions and not args.continue_after_roi
@@ -368,24 +437,43 @@ else:
 
 start_wall = time.time()
 print(f"Running {binary} {' '.join(args.arguments.split())}")
+if args.checkpoint_restore:
+    simulator._instantiate()
+    for action in checkpoint_state.resume_actions():
+        if action == "reset":
+            print("Resetting stats at restored measured ROI!")
+            m5.stats.reset()
+        elif action == "record_start_tick":
+            start_tick = m5.curTick()
+    print(
+        "GAPBS_CHECKPOINT_RESTORED "
+        f"path={args.checkpoint_restore.resolve()}"
+    )
 simulator.run()
-if roi_state is not None:
+if checkpoint_state is not None:
+    try:
+        checkpoint_state.finish()
+    except RoiSequenceError as error:
+        print(f"Verification: MISSING ({error})")
+        raise SystemExit(3)
+elif roi_state is not None:
     try:
         roi_state.finish()
     except RoiSequenceError as error:
         print(f"Verification: MISSING ({error})")
         raise SystemExit(3)
 if args.fast_forward_cpu or args.continue_after_roi:
-    exit_cause = simulator.get_last_exit_event_cause()
-    verification, exit_code = classify_final_exit(exit_cause)
-    if verification == "fail":
-        print("Verification: FAIL")
-        raise SystemExit(exit_code)
-    if verification == "missing":
-        print(f"Verification: MISSING ({exit_cause})")
-        raise SystemExit(exit_code)
-    if args.continue_after_roi:
-        print("Verification: PASS")
+    if not args.checkpoint_save:
+        exit_cause = simulator.get_last_exit_event_cause()
+        verification, exit_code = classify_final_exit(exit_cause)
+        if verification == "fail":
+            print("Verification: FAIL")
+            raise SystemExit(exit_code)
+        if verification == "missing":
+            print(f"Verification: MISSING ({exit_cause})")
+            raise SystemExit(exit_code)
+        if args.continue_after_roi:
+            print("Verification: PASS")
 if not args.roi_work_events:
     m5.stats.dump()
 
