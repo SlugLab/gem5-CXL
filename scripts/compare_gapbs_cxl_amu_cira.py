@@ -7,13 +7,30 @@ import argparse
 import csv
 import datetime as dt
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from gapbs_checkpoint import (  # noqa: E402
+    CheckpointError,
+    build_identity,
+    identity_key,
+    load_manifest,
+    sha256_file,
+    validate_reuse,
+    write_manifest,
+)
+
+
 DEFAULT_GEM5 = REPO / "build" / "X86" / "gem5.opt"
 DEFAULT_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
@@ -106,6 +123,8 @@ OWNED_COUNTER_STATS = {
     "cira_read_bytes": ("cira", "board.cira.readBytes"),
 }
 CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
+CHECKPOINT_SAVE_MARKER = "GAPBS_CHECKPOINT_SAVED path="
+CHECKPOINT_RESTORE_MARKER = "GAPBS_CHECKPOINT_RESTORED path="
 SUMMARY_FIELDS = (
     "benchmark",
     "label",
@@ -120,6 +139,13 @@ SUMMARY_FIELDS = (
     "cpu_switches",
     "cxl_link_delay",
     "all_memory_cxl",
+    "graph_path",
+    "graph_scale",
+    "graph_sha256",
+    "checkpoint_id",
+    "checkpoint_manifest",
+    "checkpoint_binary_sha256",
+    "checkpoint_restores",
     "sim_ticks",
     "sim_insts",
     "speedup_vs_cxl",
@@ -230,7 +256,35 @@ def unique_directional_stat(stats, prefix):
     return cell, value
 
 
-def directional_stat_pair(stats):
+def directional_stat_pair(stats, num_cores=1):
+    if num_cores > 1:
+        expected_cells = {
+            f"board.cache_hierarchy.l2-cache-{core}.mem_side_port"
+            for core in range(num_cores)
+        }
+        directional = {}
+        for label, prefix in (
+            ("packet", CXL_PACKET_STAT_PREFIX),
+            ("byte", CXL_BYTE_STAT_PREFIX),
+        ):
+            directional[label] = {
+                name[len(prefix) : -len(CXL_STAT_SUFFIX)]: value
+                for name, value in stats.items()
+                if name.startswith(prefix) and name.endswith(CXL_STAT_SUFFIX)
+            }
+            actual_cells = set(directional[label])
+            if actual_cells != expected_cells:
+                raise StatsError(
+                    f"expected directional CXL cells {sorted(expected_cells)} "
+                    f"for {label} statistics; found {sorted(actual_cells)}"
+                )
+        if set(directional["packet"]) != set(directional["byte"]):
+            raise StatsError("CXL packet/byte directional identity mismatch")
+        return (
+            sum(directional["packet"].values(), Decimal(0)),
+            sum(directional["byte"].values(), Decimal(0)),
+        )
+
     packet_cell, packets = unique_directional_stat(
         stats, CXL_PACKET_STAT_PREFIX
     )
@@ -413,16 +467,117 @@ def cache_diagnostic(stats, field, fast_forward=False):
     return semantic_cache_diagnostic(stats, stat_name, field)
 
 
-def extract_diagnostic_metrics(stats, kind, fast_forward=False):
+CORE_DIAGNOSTIC_LAYOUT = {
+    "l1d_demand_misses": ("l1d-cache", "data", "demandMisses"),
+    "l2d_demand_hits": ("l2-cache", "data", "demandHits"),
+    "l2d_demand_misses": ("l2-cache", "data", "demandMisses"),
+    "l2i_demand_hits": ("l2-cache", "inst", "demandHits"),
+    "l2i_demand_misses": ("l2-cache", "inst", "demandMisses"),
+}
+
+
+def validate_core_requestor_identities(stats, num_cores):
+    for core in range(num_cores):
+        for cache_name, role in (
+            ("l1d-cache", "data"),
+            ("l2-cache", "data"),
+            ("l2-cache", "inst"),
+        ):
+            name = (
+                f"board.cache_hierarchy.{cache_name}-{core}."
+                f"demandAccesses::processor.cores{core}.core.{role}"
+            )
+            if name not in stats:
+                raise StatsError(
+                    "missing exact core requestor identity: " + name
+                )
+
+
+def validate_cache_family_total(stats, cache_root, family):
+    prefix = f"{cache_root}.{family}::"
+    total_name = f"{prefix}total"
+    cells = {
+        name: Decimal(str(value))
+        for name, value in stats.items()
+        if name.startswith(prefix) and name != total_name
+    }
+    if not cells and total_name not in stats:
+        return
+    if total_name not in stats:
+        raise StatsError(f"missing required ROI statistic: {total_name}")
+    cell_sum = sum(cells.values(), Decimal(0))
+    total = Decimal(str(stats[total_name]))
+    if cell_sum != total:
+        raise StatsError(
+            f"{family} family total {total} does not match "
+            f"requestor cells {cell_sum} for {cache_root}"
+        )
+
+
+def core_cache_diagnostic(stats, field, num_cores):
+    cache_name, role, target_family = CORE_DIAGNOSTIC_LAYOUT[field]
+    family_index = {
+        "demandAccesses": 0,
+        "demandHits": 1,
+        "demandMisses": 2,
+    }
+    result = Decimal(0)
+    for core in range(num_cores):
+        cache_root = f"board.cache_hierarchy.{cache_name}-{core}"
+        requestor = f"processor.cores{core}.core.{role}"
+        accesses_name = f"{cache_root}.demandAccesses::{requestor}"
+        if accesses_name not in stats:
+            raise StatsError(
+                f"missing exact core requestor identity for {field}: "
+                f"{accesses_name}"
+            )
+        for family in ("demandAccesses", "demandHits", "demandMisses"):
+            validate_cache_family_total(stats, cache_root, family)
+            ambiguous = [
+                name
+                for name in stats
+                if name.startswith(f"{cache_root}.{family}::{requestor}.")
+            ]
+            if ambiguous:
+                raise StatsError(
+                    f"ambiguous core requestor for {field}: "
+                    + ", ".join(sorted(ambiguous))
+                )
+        values = []
+        for family in ("demandAccesses", "demandHits", "demandMisses"):
+            name = f"{cache_root}.{family}::{requestor}"
+            values.append(
+                Decimal(str(stats[name])) if name in stats else None
+            )
+        resolved = resolve_demand_identity(
+            *values, f"{cache_root}::{requestor}"
+        )
+        result += resolved[family_index[target_family]]
+    return result
+
+
+def extract_diagnostic_metrics(
+    stats, kind, fast_forward=False, num_cores=1
+):
+    if num_cores < 1:
+        raise StatsError(f"num_cores must be positive; got {num_cores}")
+    if num_cores > 1 and fast_forward:
+        raise StatsError("multi-core cache diagnostics do not support switching")
+    if num_cores > 1:
+        validate_core_requestor_identities(stats, num_cores)
     if kind == "cira":
         for name in CIRA_LATENCY_STATS.values():
             if name not in stats:
                 raise StatsError(f"missing required ROI statistic: {name}")
-    packets, byte_count = directional_stat_pair(stats)
+    packets, byte_count = directional_stat_pair(stats, num_cores)
     metrics = {"cxl_packets": packets, "cxl_bytes": byte_count}
     metrics.update(
         {
-            field: cache_diagnostic(stats, field, fast_forward)
+            field: (
+                core_cache_diagnostic(stats, field, num_cores)
+                if num_cores > 1
+                else cache_diagnostic(stats, field, fast_forward)
+            )
             for field in DIAGNOSTIC_STATS
         }
     )
@@ -456,6 +611,15 @@ def parse_cpu_switches(path):
     )
 
 
+def parse_marker_count(path, marker):
+    if not path.exists():
+        return 0
+    return sum(
+        line.startswith(marker)
+        for line in path.read_text(errors="replace").splitlines()
+    )
+
+
 def add_optional(cmd, name, value):
     if value is not None:
         cmd += [name, str(value)]
@@ -476,7 +640,403 @@ def env_flag_enabled(envs, key):
     return False
 
 
+def append_kind_args(cmd, args, kind):
+    if kind == "baseline":
+        cmd.append("--no-asmc")
+    elif kind == "amu":
+        cmd += [
+            "--asmc-spm-size",
+            args.asmc_spm_size,
+            "--asmc-granularity",
+            str(args.asmc_granularity),
+            "--asmc-max-outstanding",
+            str(args.asmc_max_outstanding),
+            "--asmc-max-send-queue",
+            str(args.asmc_max_send_queue),
+            "--asmc-issue-latency",
+            args.asmc_issue_latency,
+            "--asmc-completion-latency",
+            args.asmc_completion_latency,
+            "--asmc-latency",
+            args.asmc_latency,
+        ]
+    elif kind == "cira":
+        cmd += [
+            "--no-asmc",
+            "--cira",
+            "--cira-to-l2",
+            "--cira-max-outstanding",
+            str(args.cira_max_outstanding),
+            "--cira-max-send-queue",
+            str(args.cira_max_send_queue),
+            "--cira-issue-latency",
+            args.cira_issue_latency,
+            "--cira-completion-latency",
+            args.cira_completion_latency,
+        ]
+        if (
+            not has_env(args.env, "CIRA_GEM5_M5OPS")
+            and not has_env(args.env, "CIRA_GAPBS_GEM5_M5OPS")
+        ):
+            cmd += ["--env", "CIRA_GEM5_M5OPS=1"]
+    else:
+        raise ValueError(kind)
+
+
+def checkpoint_model_parameters(args, kind):
+    parameters = {
+        "kind": kind,
+        "env": "\0".join(args.env),
+    }
+    if kind == "amu":
+        parameters.update(
+            {
+                "asmc_spm_size": args.asmc_spm_size,
+                "asmc_granularity": args.asmc_granularity,
+                "asmc_max_outstanding": args.asmc_max_outstanding,
+                "asmc_max_send_queue": args.asmc_max_send_queue,
+                "asmc_issue_latency": args.asmc_issue_latency,
+                "asmc_completion_latency": args.asmc_completion_latency,
+                "asmc_latency": args.asmc_latency,
+            }
+        )
+    elif kind == "cira":
+        parameters.update(
+            {
+                "cira_max_outstanding": args.cira_max_outstanding,
+                "cira_max_send_queue": args.cira_max_send_queue,
+                "cira_issue_latency": args.cira_issue_latency,
+                "cira_completion_latency": args.cira_completion_latency,
+            }
+        )
+    return parameters
+
+
+def checkpoint_workload_arguments(args):
+    arguments = [
+        "-f",
+        str(args.graph.resolve()),
+        "-n",
+        str(args.iterations),
+    ]
+    if args.verify:
+        arguments.append("-v")
+    return arguments
+
+
+def checkpoint_common_command(
+    args,
+    *,
+    binary,
+    workload_arguments,
+    outdir,
+    cpu,
+    link_delay,
+):
+    return [
+        str(args.gem5),
+        f"--outdir={outdir}",
+        str(args.config),
+        "--binary",
+        str(binary),
+        "--arguments",
+        " ".join(workload_arguments),
+        "--cpu",
+        cpu,
+        "--scale",
+        str(args.graph_scale),
+        "--iterations",
+        str(args.iterations),
+        "--measure-trial",
+        str(args.measure_trial),
+        "--cores",
+        str(args.cores),
+        "--mem-size",
+        args.mem_size,
+        "--cxl-link-delay",
+        link_delay,
+        "--roi-work-events",
+    ]
+
+
+def checkpoint_identity(args, binary, kind, workload_arguments):
+    return build_identity(
+        binary=binary,
+        graph=args.graph,
+        graph_scale=args.graph_scale,
+        arguments=workload_arguments,
+        cores=args.cores,
+        memory_size=args.mem_size,
+        gem5=args.gem5,
+        config=args.config,
+        kind=kind,
+        model_parameters=checkpoint_model_parameters(args, kind),
+    )
+
+
+def ensure_checkpoint(args, binary, kind, run_dir, workload_arguments):
+    identity = checkpoint_identity(
+        args, binary, kind, workload_arguments
+    )
+    checkpoint_id = identity_key(identity)
+    checkpoint_dir = args.checkpoint_root / checkpoint_id
+    manifest_path = checkpoint_dir / "manifest.json"
+
+    if args.dry_run:
+        temporary = (
+            args.checkpoint_root / f".{checkpoint_id}.tmp-dry-run"
+        )
+        save_cmd = checkpoint_common_command(
+            args,
+            binary=binary,
+            workload_arguments=workload_arguments,
+            outdir=temporary / "gem5-out",
+            cpu="atomic",
+            link_delay="0ns",
+        )
+        save_cmd += ["--checkpoint-save", str(temporary)]
+        append_kind_args(save_cmd, args, kind)
+        for env in args.env:
+            save_cmd += ["--env", env]
+        print(" ".join(save_cmd), flush=True)
+        return checkpoint_dir, manifest_path, identity, checkpoint_id
+
+    if checkpoint_dir.exists():
+        if not args.reuse_checkpoints:
+            raise CheckpointError(
+                f"checkpoint exists but reuse is disabled: {checkpoint_dir}"
+            )
+        validate_reuse(checkpoint_dir, identity)
+        return checkpoint_dir, manifest_path, identity, checkpoint_id
+
+    args.checkpoint_root.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{checkpoint_id}.tmp-",
+            dir=args.checkpoint_root,
+        )
+    )
+    save_log = temporary / "checkpoint.log"
+    save_cmd = checkpoint_common_command(
+        args,
+        binary=binary,
+        workload_arguments=workload_arguments,
+        outdir=temporary / "gem5-out",
+        cpu="atomic",
+        link_delay="0ns",
+    )
+    save_cmd += ["--checkpoint-save", str(temporary)]
+    append_kind_args(save_cmd, args, kind)
+    for env in args.env:
+        save_cmd += ["--env", env]
+    print(" ".join(save_cmd), flush=True)
+    try:
+        with save_log.open("w") as log:
+            proc = subprocess.run(
+                save_cmd,
+                cwd=REPO,
+                env=os.environ.copy(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=None if args.timeout == 0 else args.timeout,
+            )
+        if proc.returncode != 0:
+            raise CheckpointError(
+                f"checkpoint save exited {proc.returncode}: {save_log}"
+            )
+        marker_count = parse_marker_count(
+            save_log, CHECKPOINT_SAVE_MARKER
+        )
+        if marker_count != 1:
+            raise CheckpointError(
+                f"checkpoint save marker count is {marker_count}, expected 1"
+            )
+        if not (temporary / "m5.cpt").is_file():
+            raise CheckpointError(
+                f"missing checkpoint payload: {temporary / 'm5.cpt'}"
+            )
+        write_manifest(temporary, identity)
+        os.replace(temporary, checkpoint_dir)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    validate_reuse(checkpoint_dir, identity)
+    return checkpoint_dir, manifest_path, identity, checkpoint_id
+
+
+def append_cache_args(cmd, args):
+    if args.disable_hw_prefetchers:
+        cmd.append("--disable-hw-prefetchers")
+    add_optional(cmd, "--l1-mshrs", args.l1_mshrs)
+    add_optional(cmd, "--l1-tgts-per-mshr", args.l1_tgts_per_mshr)
+    add_optional(cmd, "--l2-mshrs", args.l2_mshrs)
+    add_optional(cmd, "--l2-tgts-per-mshr", args.l2_tgts_per_mshr)
+
+
+def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
+    binary = (binary_dir / benchmark).resolve()
+    run_dir = args.outdir / benchmark / label
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "gem5.log"
+
+    if not binary.exists():
+        return {
+            "benchmark": benchmark,
+            "label": label,
+            "kind": kind,
+            "status": "missing-binary",
+            "run_dir": str(run_dir),
+        }
+
+    workload_arguments = checkpoint_workload_arguments(args)
+    try:
+        (
+            checkpoint_dir,
+            manifest_path,
+            identity,
+            checkpoint_id,
+        ) = ensure_checkpoint(
+            args,
+            binary,
+            kind,
+            run_dir,
+            workload_arguments,
+        )
+    except (CheckpointError, OSError, subprocess.SubprocessError) as error:
+        return {
+            "benchmark": benchmark,
+            "label": label,
+            "kind": kind,
+            "status": "checkpoint-failed",
+            "graph_path": str(args.graph),
+            "graph_scale": args.graph_scale,
+            "graph_sha256": sha256_file(args.graph),
+            "run_dir": str(run_dir),
+            "error": str(error),
+        }
+
+    cmd = checkpoint_common_command(
+        args,
+        binary=binary,
+        workload_arguments=workload_arguments,
+        outdir=run_dir,
+        cpu="timing",
+        link_delay=args.cxl_link_delay,
+    )
+    cmd += [
+        "--cxl-memory",
+        "--continue-after-roi",
+        "--checkpoint-restore",
+        str(checkpoint_dir),
+    ]
+    append_cache_args(cmd, args)
+    append_kind_args(cmd, args, kind)
+    for env in args.env:
+        cmd += ["--env", env]
+
+    print(" ".join(cmd), flush=True)
+    provenance = {
+        "scale": args.graph_scale,
+        "iterations": args.iterations,
+        "measured_trial": args.measure_trial,
+        "fast_forward_cpu": "",
+        "roi_cpu": "timing",
+        "cxl_link_delay": args.cxl_link_delay,
+        "all_memory_cxl": True,
+        "graph_path": str(args.graph),
+        "graph_scale": args.graph_scale,
+        "graph_sha256": identity["graph_sha256"],
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_manifest": str(manifest_path),
+        "checkpoint_binary_sha256": identity["binary_sha256"],
+    }
+    if args.dry_run:
+        return {
+            "benchmark": benchmark,
+            "label": label,
+            "kind": kind,
+            "status": "dry-run",
+            "cpu_switches": 0,
+            "checkpoint_restores": 1,
+            **provenance,
+            "run_dir": str(run_dir),
+        }
+
+    with log_path.open("w") as log:
+        proc = subprocess.run(
+            cmd,
+            cwd=REPO,
+            env=os.environ.copy(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=None if args.timeout == 0 else args.timeout,
+        )
+
+    verification = parse_verification(log_path)
+    status = "ok" if proc.returncode == 0 else f"exit-{proc.returncode}"
+    checkpoint_restores = parse_marker_count(
+        log_path, CHECKPOINT_RESTORE_MARKER
+    )
+    cpu_switches = parse_cpu_switches(log_path)
+    if proc.returncode == 0 and checkpoint_restores != 1:
+        status = "checkpoint-restore-marker-invalid"
+    if proc.returncode == 0 and cpu_switches != 0:
+        status = "unexpected-cpu-switch"
+    if proc.returncode == 0 and args.verify:
+        if verification == "fail":
+            status = "verification-failed"
+        elif verification == "missing":
+            status = "verification-missing"
+
+    try:
+        stats = parse_stats(run_dir / "stats.txt")
+        owned_metrics = extract_owned_metrics(stats, kind)
+        diagnostic_metrics = extract_diagnostic_metrics(
+            stats, kind, fast_forward=False, num_cores=args.cores
+        )
+    except StatsError:
+        stats = {}
+        owned_metrics = {}
+        diagnostic_metrics = {}
+        if status == "ok":
+            status = "invalid-stats"
+
+    if (
+        kind == "cira"
+        and status == "ok"
+        and owned_metrics["cira_prefetches"] == 0
+        and owned_metrics["cira_indexed_prefetches"] == 0
+        and owned_metrics["cira_csr_prefetches"] == 0
+        and not env_flag_enabled(args.env, "CIRA_GAPBS_DEVICE_OFFLOAD")
+        and not args.allow_zero_cira
+    ):
+        status = "no-cira-events"
+
+    return {
+        "benchmark": benchmark,
+        "label": label,
+        "kind": kind,
+        "status": status,
+        "verification": verification,
+        "cpu_switches": cpu_switches,
+        "checkpoint_restores": checkpoint_restores,
+        "sim_ticks": stats.get("simTicks", ""),
+        "sim_insts": stats.get("simInsts", ""),
+        **provenance,
+        **owned_metrics,
+        **diagnostic_metrics,
+        "run_dir": str(run_dir),
+    }
+
+
 def run_one(args, benchmark, label, binary_dir, kind):
+    if args.graph is not None:
+        return run_one_checkpoint(
+            args, benchmark, label, binary_dir, kind
+        )
+
     binary = (binary_dir / benchmark).resolve()
     run_dir = args.outdir / benchmark / label
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -532,46 +1092,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
     for env in args.env:
         cmd += ["--env", env]
 
-    if kind == "baseline":
-        cmd.append("--no-asmc")
-    elif kind == "amu":
-        cmd += [
-            "--asmc-spm-size",
-            args.asmc_spm_size,
-            "--asmc-granularity",
-            str(args.asmc_granularity),
-            "--asmc-max-outstanding",
-            str(args.asmc_max_outstanding),
-            "--asmc-max-send-queue",
-            str(args.asmc_max_send_queue),
-            "--asmc-issue-latency",
-            args.asmc_issue_latency,
-            "--asmc-completion-latency",
-            args.asmc_completion_latency,
-            "--asmc-latency",
-            args.asmc_latency,
-        ]
-    elif kind == "cira":
-        cmd += [
-            "--no-asmc",
-            "--cira",
-            "--cira-to-l2",
-            "--cira-max-outstanding",
-            str(args.cira_max_outstanding),
-            "--cira-max-send-queue",
-            str(args.cira_max_send_queue),
-            "--cira-issue-latency",
-            args.cira_issue_latency,
-            "--cira-completion-latency",
-            args.cira_completion_latency,
-        ]
-        if (
-            not has_env(args.env, "CIRA_GEM5_M5OPS")
-            and not has_env(args.env, "CIRA_GAPBS_GEM5_M5OPS")
-        ):
-            cmd += ["--env", "CIRA_GEM5_M5OPS=1"]
-    else:
-        raise ValueError(kind)
+    append_kind_args(cmd, args, kind)
 
     print(" ".join(cmd), flush=True)
     if args.dry_run:
@@ -644,7 +1165,11 @@ def write_summary(path, rows):
     baseline_ticks = {
         row["benchmark"]: row.get("sim_ticks")
         for row in rows
-        if row.get("kind") == "baseline" and row.get("sim_ticks")
+        if (
+            row.get("kind") == "baseline"
+            and row.get("status") == "ok"
+            and row.get("sim_ticks")
+        )
     }
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=SUMMARY_FIELDS)
@@ -653,7 +1178,7 @@ def write_summary(path, rows):
             out = {field: row.get(field, "") for field in SUMMARY_FIELDS}
             base = baseline_ticks.get(row["benchmark"])
             ticks = row.get("sim_ticks")
-            if base and ticks:
+            if row.get("status") == "ok" and base and ticks:
                 out["speedup_vs_cxl"] = base / ticks
             writer.writerow(out)
 
@@ -686,6 +1211,28 @@ def main():
     )
     parser.add_argument("--measure-trial", type=int, default=0)
     parser.add_argument("--cores", type=int, default=1)
+    parser.add_argument("--mem-size", default="4GiB")
+    parser.add_argument(
+        "--graph",
+        type=Path,
+        help="Serialized GAPBS graph loaded with -f in checkpoint mode.",
+    )
+    parser.add_argument("--graph-scale", type=int)
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        help="Content-addressed checkpoint storage root.",
+    )
+    parser.add_argument(
+        "--reuse-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Allow a non-scale-20 graph for validation-only runs.",
+    )
     parser.add_argument("--cxl-link-delay", default="1us")
     parser.add_argument("--disable-hw-prefetchers", action="store_true")
     parser.add_argument("--l1-mshrs", type=int)
@@ -747,6 +1294,37 @@ def main():
         )
     if args.fast_forward_cpu and args.scale != 20:
         parser.error("--fast-forward-cpu requires --scale 20")
+    if args.graph is not None:
+        args.graph = args.graph.resolve()
+        if not args.graph.is_file():
+            parser.error(f"--graph does not exist: {args.graph}")
+        if args.checkpoint_root is None:
+            parser.error("--graph requires --checkpoint-root")
+        args.checkpoint_root = args.checkpoint_root.resolve()
+        if args.fast_forward_cpu:
+            parser.error("checkpoint mode rejects --fast-forward-cpu")
+        if not args.roi_work_events:
+            parser.error("checkpoint mode requires --roi-work-events")
+        if not args.verify:
+            parser.error("checkpoint mode requires --verify")
+        if args.cpu != "timing":
+            parser.error("checkpoint mode requires --cpu timing")
+        if (args.iterations, args.measure_trial) != (2, 1):
+            parser.error(
+                "checkpoint mode requires --iterations 2 "
+                "and --measure-trial 1"
+            )
+        if args.cores != 2:
+            parser.error("checkpoint mode requires --cores 2")
+        if args.graph_scale is None:
+            args.graph_scale = args.scale
+        if args.graph_scale != 20 and not args.smoke_test:
+            parser.error(
+                "publication checkpoint mode requires --graph-scale 20"
+            )
+        args.scale = args.graph_scale
+    elif args.checkpoint_root is not None:
+        parser.error("--checkpoint-root requires --graph")
     if not args.gem5.exists() and not args.dry_run:
         sys.exit(f"gem5 binary not found: {args.gem5}")
     if not args.config.exists():

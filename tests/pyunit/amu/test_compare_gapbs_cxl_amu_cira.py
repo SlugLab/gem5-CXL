@@ -131,6 +131,78 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         ] = Decimal(454)
         return stats
 
+    def two_core_stats(self):
+        stats = {
+            (
+                "board.cache_hierarchy.membus.pktCount_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ): Decimal(30),
+            (
+                "board.cache_hierarchy.membus.pktCount_"
+                "board.cache_hierarchy.l2-cache-1.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ): Decimal(40),
+            (
+                "board.cache_hierarchy.membus.pktSize_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ): Decimal(64),
+            (
+                "board.cache_hierarchy.membus.pktSize_"
+                "board.cache_hierarchy.l2-cache-1.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port"
+            ): Decimal(128),
+        }
+        for core, hits, misses in ((0, 10, 2), (1, 20, 3)):
+            root = f"board.cache_hierarchy.l1d-cache-{core}"
+            requestor = f"processor.cores{core}.core.data"
+            stats[f"{root}.demandHits::{requestor}"] = Decimal(hits)
+            stats[f"{root}.demandHits::total"] = Decimal(hits)
+            stats[f"{root}.demandMisses::{requestor}"] = Decimal(misses)
+            stats[f"{root}.demandMisses::total"] = Decimal(misses)
+            stats[f"{root}.demandAccesses::{requestor}"] = Decimal(
+                hits + misses
+            )
+            stats[f"{root}.demandAccesses::total"] = Decimal(hits + misses)
+
+        l2_cells = {
+            0: {
+                "data": {"accesses": 11, "hits": None, "misses": 11},
+                "inst": {"accesses": 7, "hits": 6, "misses": 1},
+            },
+            1: {
+                "data": {"accesses": 13, "hits": 2, "misses": 11},
+                "inst": {"accesses": 5, "hits": None, "misses": 5},
+                "prefetcher": {"accesses": 4, "hits": 1, "misses": 3},
+            },
+        }
+        for core, requestors in l2_cells.items():
+            root = f"board.cache_hierarchy.l2-cache-{core}"
+            totals = {
+                "demandAccesses": 0,
+                "demandHits": 0,
+                "demandMisses": 0,
+            }
+            for role, values in requestors.items():
+                requestor = (
+                    f"processor.cores{core}.core.{role}"
+                    if role != "prefetcher"
+                    else f"cache_hierarchy.l1d-cache-{core}.prefetcher"
+                )
+                for family, key in (
+                    ("demandAccesses", "accesses"),
+                    ("demandHits", "hits"),
+                    ("demandMisses", "misses"),
+                ):
+                    value = values[key]
+                    if value is not None:
+                        stats[f"{root}.{family}::{requestor}"] = Decimal(value)
+                        totals[family] += value
+            for family, value in totals.items():
+                stats[f"{root}.{family}::total"] = Decimal(value)
+        return stats
+
     def test_extracts_exact_first_roi_metrics_without_mixed_unit_sums(self):
         metrics = self.runner.extract_diagnostic_metrics(self.stats(), "cira")
         self.assertEqual(
@@ -478,6 +550,45 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             self.runner.StatsError, "directional identity mismatch"
         ):
             self.runner.extract_diagnostic_metrics(stats, "baseline")
+
+    def test_two_core_metrics_aggregate_exact_core_owned_cells(self):
+        metrics = self.runner.extract_diagnostic_metrics(
+            self.two_core_stats(), "baseline", num_cores=2
+        )
+        self.assertEqual(metrics["cxl_packets"], Decimal(70))
+        self.assertEqual(metrics["cxl_bytes"], Decimal(192))
+        self.assertEqual(metrics["l1d_demand_misses"], Decimal(5))
+        self.assertEqual(metrics["l2d_demand_hits"], Decimal(2))
+        self.assertEqual(metrics["l2d_demand_misses"], Decimal(22))
+        self.assertEqual(metrics["l2i_demand_hits"], Decimal(6))
+        self.assertEqual(metrics["l2i_demand_misses"], Decimal(6))
+
+    def test_two_core_rejects_missing_directional_core_cell(self):
+        stats = self.two_core_stats()
+        del stats[
+            "board.cache_hierarchy.membus.pktSize_"
+            "board.cache_hierarchy.l2-cache-1.mem_side_port::"
+            "board.cxl_mem_link0.cpu_side_port"
+        ]
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "expected directional CXL cells"
+        ):
+            self.runner.extract_diagnostic_metrics(
+                stats, "baseline", num_cores=2
+            )
+
+    def test_two_core_rejects_missing_requestor_identity(self):
+        stats = self.two_core_stats()
+        del stats[
+            "board.cache_hierarchy.l2-cache-1.demandAccesses::"
+            "processor.cores1.core.inst"
+        ]
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "missing exact core requestor identity"
+        ):
+            self.runner.extract_diagnostic_metrics(
+                stats, "baseline", num_cores=2
+            )
 
     def test_large_integer_counter_survives_stats_to_summary_exactly(self):
         stats = self.stats()

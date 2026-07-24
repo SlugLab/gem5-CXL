@@ -3,6 +3,8 @@
 
 import importlib.util
 import hashlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +15,7 @@ ROI_STATE_PATH = (
     REPO / "configs" / "example" / "gem5_library" / "gapbs_roi_state.py"
 )
 CHECKPOINT_PATH = REPO / "scripts" / "gapbs_checkpoint.py"
+RUNNER_PATH = REPO / "scripts" / "compare_gapbs_cxl_amu_cira.py"
 
 
 def load_module(name, path):
@@ -177,6 +180,89 @@ class GapbsCheckpointConfigContractTest(unittest.TestCase):
             iterations=2,
             measure_trial=1,
         )
+
+
+class GapbsCheckpointRunnerContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.runner = load_module("gapbs_checkpoint_runner", RUNNER_PATH)
+
+    def test_checkpoint_summary_schema_records_provenance(self):
+        expected = {
+            "graph_path",
+            "graph_scale",
+            "graph_sha256",
+            "checkpoint_id",
+            "checkpoint_manifest",
+            "checkpoint_binary_sha256",
+            "checkpoint_restores",
+        }
+        self.assertTrue(expected <= set(self.runner.SUMMARY_FIELDS))
+
+    def test_dry_run_builds_local_save_and_cxl_restore_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary_dir = root / "baseline"
+            binary_dir.mkdir()
+            (binary_dir / "pr").write_bytes(b"binary")
+            graph = root / "g20.sg"
+            graph.write_bytes(b"graph")
+            gem5 = root / "gem5.opt"
+            gem5.write_bytes(b"gem5")
+            checkpoint_root = root / "checkpoints"
+            outdir = root / "out"
+            command = [
+                sys.executable,
+                str(RUNNER_PATH),
+                "--gem5",
+                str(gem5),
+                "--baseline-bin-dir",
+                str(binary_dir),
+                "--benchmarks",
+                "pr",
+                "--graph",
+                str(graph),
+                "--graph-scale",
+                "20",
+                "--iterations",
+                "2",
+                "--measure-trial",
+                "1",
+                "--cpu",
+                "timing",
+                "--cores",
+                "2",
+                "--checkpoint-root",
+                str(checkpoint_root),
+                "--cxl-link-delay",
+                "1us",
+                "--roi-work-events",
+                "--verify",
+                "--dry-run",
+                "--outdir",
+                str(outdir),
+            ]
+            proc = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+            )
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, output)
+        self.assertIn("--checkpoint-save", output)
+        self.assertIn("--cpu atomic", output)
+        self.assertIn("--cxl-link-delay 0ns", output)
+        self.assertIn("--checkpoint-restore", output)
+        self.assertIn("--cpu timing", output)
+        self.assertIn("--cxl-memory", output)
+        self.assertIn("--cxl-link-delay 1us", output)
+        absolute_graph = str(graph.resolve())
+        self.assertIn(
+            f"--arguments -f {absolute_graph} -n 2 -v",
+            output,
+        )
+        self.assertNotIn("--fast-forward-cpu", output)
+        self.assertNotIn("--arguments -g 20", output)
 
 
 class GapbsCheckpointManifestTest(unittest.TestCase):
