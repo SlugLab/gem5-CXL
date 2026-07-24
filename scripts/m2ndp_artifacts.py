@@ -8,7 +8,9 @@ import csv
 import dataclasses
 import hashlib
 import json
+import mmap
 import os
+import re
 import struct
 from collections.abc import Sequence
 from pathlib import Path
@@ -45,6 +47,71 @@ class GraphMeta:
     num_nodes: int
     num_directed_edges: int
     directed: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphBundle:
+    root: Path
+    meta: GraphMeta
+    in_offsets: "BinaryArray"
+    in_neighbors: "BinaryArray"
+    out_degree: "BinaryArray"
+
+
+class BinaryArray(Sequence):
+    """Read-only fixed-width array backed by a component file."""
+
+    def __init__(self, path: Path, fmt: str, count: int):
+        self.path = Path(path)
+        self.fmt = fmt
+        self.count = count
+        self.width = struct.calcsize(fmt)
+        self._stream = None
+        self._mapping = None
+        if count:
+            self._stream = self.path.open("rb")
+            self._mapping = mmap.mmap(
+                self._stream.fileno(), 0, access=mmap.ACCESS_READ
+            )
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[position] for position in range(*index.indices(
+                self.count
+            )))
+        if index < 0:
+            index += self.count
+        if index < 0 or index >= self.count:
+            raise IndexError(index)
+        return struct.unpack_from(
+            self.fmt, self._mapping, index * self.width
+        )[0]
+
+    def __iter__(self):
+        if not self.count:
+            return iter(())
+        return (value[0] for value in struct.iter_unpack(
+            self.fmt, self._mapping
+        ))
+
+    def __eq__(self, other):
+        if not isinstance(other, Sequence) or len(self) != len(other):
+            return False
+        return all(left == right for left, right in zip(self, other))
+
+    def close(self):
+        if self._mapping is not None:
+            self._mapping.close()
+            self._mapping = None
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+
+    def __del__(self):
+        self.close()
 
 
 def sha256_file(path: Path) -> str:
@@ -103,12 +170,140 @@ def validate_publication_graph(meta: GraphMeta, smoke_test: bool) -> None:
         raise EvidenceError("graph must contain at least one node")
     if meta.num_directed_edges < 0:
         raise EvidenceError("graph directed edge count is negative")
-    if not meta.directed:
-        raise EvidenceError("PageRank publication graph must be directed")
     if not smoke_test and meta.graph_sha256 != EXPECTED_G20_SHA256:
         raise EvidenceError(
             "graph SHA-256 does not match the fixed g20 publication graph"
         )
+
+
+def load_graph_meta(path: Path) -> GraphMeta:
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"invalid graph metadata: {error}") from error
+    if not isinstance(value, dict):
+        raise EvidenceError("graph metadata must be a JSON object")
+    if value.get("schema") != 1:
+        raise EvidenceError("graph metadata schema must be 1")
+    try:
+        meta = GraphMeta(
+            graph_sha256=value["graph_sha256"],
+            num_nodes=value["num_nodes"],
+            num_directed_edges=value["num_directed_edges"],
+            directed=value["directed"],
+        )
+    except KeyError as error:
+        raise EvidenceError(
+            f"graph metadata missing {error.args[0]}"
+        ) from error
+    if (
+        not isinstance(meta.graph_sha256, str)
+        or len(meta.graph_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in meta.graph_sha256
+        )
+    ):
+        raise EvidenceError("graph metadata SHA-256 is invalid")
+    if not isinstance(meta.num_nodes, int) or meta.num_nodes < 0:
+        raise EvidenceError("graph metadata node count is invalid")
+    if (
+        not isinstance(meta.num_directed_edges, int)
+        or meta.num_directed_edges < 0
+    ):
+        raise EvidenceError("graph metadata edge count is invalid")
+    if not isinstance(meta.directed, bool):
+        raise EvidenceError("graph metadata directed flag is invalid")
+    return meta
+
+
+_EXPORT_MARKER = re.compile(
+    r"^M2NDP_GRAPH_EXPORT nodes=(\d+) "
+    r"directed_edges=(\d+) directed=([01])$"
+)
+
+
+def finalize_graph_meta(
+    root: Path, graph: Path, exporter_stdout: str
+) -> GraphMeta:
+    markers = []
+    for line in exporter_stdout.splitlines():
+        match = _EXPORT_MARKER.fullmatch(line.strip())
+        if match:
+            markers.append(match)
+    if len(markers) != 1:
+        raise EvidenceError(
+            "exporter output must contain exactly one M2NDP_GRAPH_EXPORT marker"
+        )
+    marker = markers[0]
+    meta = GraphMeta(
+        graph_sha256=sha256_file(Path(graph)),
+        num_nodes=int(marker.group(1)),
+        num_directed_edges=int(marker.group(2)),
+        directed=marker.group(3) == "1",
+    )
+    atomic_write_json(
+        Path(root) / "graph.meta.json",
+        {"schema": 1, **dataclasses.asdict(meta)},
+    )
+    return meta
+
+
+def _read_component(
+    path: Path, *, fmt: str, count: int, label: str
+) -> BinaryArray:
+    path = Path(path)
+    width = struct.calcsize(fmt)
+    expected = count * width
+    try:
+        actual = path.stat().st_size
+    except OSError as error:
+        raise EvidenceError(f"cannot stat {label}: {error}") from error
+    if actual != expected:
+        raise EvidenceError(
+            f"{label} byte size {actual} does not match expected {expected}"
+        )
+    return BinaryArray(path, fmt, count)
+
+
+def load_graph_bundle(root: Path) -> GraphBundle:
+    root = Path(root)
+    meta = load_graph_meta(root / "graph.meta.json")
+    offsets = _read_component(
+        root / "in_offsets.u64",
+        fmt="<Q",
+        count=meta.num_nodes + 1,
+        label="in_offsets.u64",
+    )
+    neighbors = _read_component(
+        root / "in_neighbors.i32",
+        fmt="<i",
+        count=meta.num_directed_edges,
+        label="in_neighbors.i32",
+    )
+    degrees = _read_component(
+        root / "out_degree.u32",
+        fmt="<I",
+        count=meta.num_nodes,
+        label="out_degree.u32",
+    )
+    if not offsets or offsets[0] != 0:
+        raise EvidenceError("first CSR offset must be zero")
+    for index, (left, right) in enumerate(zip(offsets, offsets[1:])):
+        if right < left:
+            raise EvidenceError(
+                f"non-monotonic CSR offsets at vertex {index}"
+            )
+    if offsets[-1] != meta.num_directed_edges:
+        raise EvidenceError(
+            "terminal CSR offset does not equal directed edge count"
+        )
+    for index, neighbor in enumerate(neighbors):
+        if neighbor < 0 or neighbor >= meta.num_nodes:
+            raise EvidenceError(
+                f"neighbor {index} outside vertex range: {neighbor}"
+            )
+    return GraphBundle(root, meta, offsets, neighbors, degrees)
 
 
 def _validate_reference_header(header: dict) -> None:

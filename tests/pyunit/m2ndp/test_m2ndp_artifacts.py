@@ -44,6 +44,15 @@ class M2NDPArtifactTest(unittest.TestCase):
         )
         artifacts.validate_publication_graph(meta, smoke_test=True)
 
+    def test_publication_g20_preserves_undirected_flag(self):
+        meta = artifacts.GraphMeta(
+            graph_sha256=artifacts.EXPECTED_G20_SHA256,
+            num_nodes=1048576,
+            num_directed_edges=31399382,
+            directed=False,
+        )
+        artifacts.validate_publication_graph(meta, smoke_test=False)
+
     def test_reference_container_preserves_float_bits(self):
         words = [0x3F800000, 0x80000000, 0x7FC00001]
         with tempfile.TemporaryDirectory() as tmp:
