@@ -22,15 +22,16 @@ count, and setup configuration:
 
 1. **Checkpoint creation:** run the exact benchmark binary with an Atomic CPU,
    no cache, and local simple memory. Load the serialized graph with
-   `-f <absolute-g20.sg> -n 2 -v`. Trial 0 is an unmeasured warmup. At trial
-   1's work-begin event, save a checkpoint and terminate successfully without
-   executing trial 1.
+   `-f <absolute-g20.sg> -n 2 -v`. At trial 0's work-begin event, before the
+   OpenMP kernel creates or wakes worker threads, save a checkpoint and
+   terminate successfully without executing trial 0.
 2. **Measured restore:** start a separate gem5 process with a Timing CPU,
    private L1/L2 caches, and the complete physical address range reachable
    only through `board.cxl_mem_link0`, a CXL `SerialLink`. Restore the
-   checkpoint, reset statistics before executing the next guest instruction,
-   execute trial 1, dump exactly one ROI statistics section at work-end, then
-   continue only far enough to obtain GAPBS verification.
+   checkpoint, execute trial 0 as an unmeasured two-core cache warmup, reset
+   statistics at trial 1 work-begin, execute trial 1, dump exactly one ROI
+   statistics section at work-end, then continue only far enough to obtain
+   GAPBS verification.
 
 The serialized graph is generated at scale 20 and its manifest records that
 provenance. The measured guest command loads that graph through `-f`; it does
@@ -59,10 +60,17 @@ not part of the measured ROI.
 - Initial measured latency: 1 us. The later table may reuse a compatible
   checkpoint at 200 ns, 500 ns, and 2 us because cache and link state are not
   checkpointed; each restore must still pass the full configuration audit.
-- ROI: trial 1 only. Statistics reset immediately after restore and before the
-  first trial-1 instruction, then dump at trial 1 work-end.
+- ROI: trial 1 only. Restored trial 0 warms the measured CXL/cache system.
+  Statistics reset at trial 1 work-begin before its first kernel instruction,
+  then dump at trial 1 work-end.
 - Correctness: verification must be present and equal to `PASS`. Missing or
   failed verification invalidates the row.
+- Two-core restored SE processes do not reliably complete OpenMP/libc thread
+  teardown. The three ROI-instrumented binary builders therefore emit
+  `m5_exit(0)` only after the complete trial loop and all requested
+  verifications finish. A failed verifier still emits `m5_fail(0, 1)` first.
+  The config treats only that post-verification `m5_exit` as success; it never
+  infers success from buffered guest stdout.
 - Performance: speedup is matched baseline trial-1 `simTicks` divided by the
   candidate's trial-1 `simTicks`. Checkpoint creation time is never included.
 
@@ -73,20 +81,20 @@ not part of the measured ROI.
 Extend `configs/example/gem5_library/x86-gapbs-amu-se.py` with mutually
 exclusive checkpoint modes:
 
-- `--checkpoint-save PATH` creates a checkpoint at the configured measured
-  trial's work-begin and exits with an explicit success marker.
+- `--checkpoint-save PATH` creates a checkpoint at trial 0 work-begin and
+  exits with an explicit success marker.
 - `--checkpoint-restore PATH` restores a checkpoint through a
   `CheckpointResource`, requires a non-Atomic measured CPU and
-  `--roi-work-events`, resets stats at resume, and expects the next relevant
-  event to be the measured trial's work-end.
+  `--roi-work-events`, resumes inside trial 0, and accepts only the exact
+  sequence trial-0 work-end, trial-1 work-begin/reset, and trial-1 work-end.
 
 Save mode rejects CXL memory but retains the target's baseline, AMU, or CIRA
-model and exact model parameters. This lets trial 0 exercise the same binary
-semantics while using low-latency local memory. AMU/CIRA requests must be
-fully drained at trial 0 work-end before checkpointing at trial 1 work-begin;
-their statistics are reset after restore. The checkpoint state machine and
-the normal Atomic-to-Timing state machine remain separate so an event cannot
-be misclassified as both a switch and a checkpoint.
+model and exact model parameters. No AMU/CIRA kernel operation executes before
+the checkpoint boundary. Trial 0 executes only after restore, so worker/futex
+state is created in the measured process instead of being serialized. The
+checkpoint state machine and the normal Atomic-to-Timing state machine remain
+separate so an event cannot be misclassified as both a switch and a
+checkpoint.
 
 ### Comparison runner
 

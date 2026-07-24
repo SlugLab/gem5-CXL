@@ -4,7 +4,7 @@
 
 **Goal:** Add a fail-closed two-phase checkpoint workflow that loads and warms `g20.sg` quickly, then measures trial 1 with a Timing CPU and the entire memory range behind a 1 us CXL link.
 
-**Architecture:** Pure Python helpers own checkpoint event sequencing and content-addressed manifests. The gem5 config saves at trial-1 work-begin or restores immediately after that event; the comparison runner creates/reuses exact checkpoints and launches independent CXL restore runs. The evidence validator accepts a speedup only when checkpoint provenance, `-f g20.sg`, cold restored caches, all-CXL topology, one ROI stats section, and bit-exact verification all pass.
+**Architecture:** Pure Python helpers own checkpoint event sequencing and content-addressed manifests. The gem5 config saves at trial-0 work-begin before OpenMP workers enter the kernel; after restore, the two-core Timing system runs trial 0 over CXL as warmup and measures trial 1. The comparison runner creates/reuses exact checkpoints and the evidence validator accepts a speedup only when checkpoint provenance, `-f g20.sg`, all-CXL topology, one trial-1 ROI stats section, and bit-exact verification all pass.
 
 **Tech Stack:** Python 3 `unittest`, gem5 standard library SE mode, `CheckpointResource`, GAPBS work-begin/work-end m5ops, CSV/JSON/SHA-256 provenance, systemd transient background service.
 
@@ -46,31 +46,31 @@ class GapbsCheckpointStateTest(unittest.TestCase):
         state = roi.GapbsCheckpointState(
             mode="save", iterations=2, measure_trial=1
         )
-        self.assertEqual(state.work_begin(), ())
-        self.assertEqual(state.work_end(), ())
         self.assertEqual(state.work_begin(), ("checkpoint",))
         self.assertEqual(state.checkpoint_saved(), ("stop",))
         self.assertEqual(state.finish(), ())
 
-    def test_restore_resets_before_first_resumed_instruction(self):
+    def test_restore_warms_trial_zero_then_measures_trial_one(self):
         state = roi.GapbsCheckpointState(
             mode="restore", iterations=2, measure_trial=1
         )
+        self.assertEqual(state.resume_actions(), ())
+        self.assertEqual(state.work_end(), ())
         self.assertEqual(
-            state.resume_actions(), ("reset", "record_start_tick")
+            state.work_begin(), ("reset", "record_start_tick")
         )
         self.assertEqual(state.work_end(), ("dump",))
         self.assertEqual(state.finish(), ("verify",))
 
-    def test_restore_rejects_work_begin_and_missing_end(self):
+    def test_restore_rejects_trial_one_begin_before_trial_zero_end(self):
         state = roi.GapbsCheckpointState(
             mode="restore", iterations=2, measure_trial=1
         )
         state.resume_actions()
-        with self.assertRaisesRegex(roi.RoiSequenceError, "unexpected begin"):
+        with self.assertRaisesRegex(roi.RoiSequenceError, "begin before"):
             state.work_begin()
         with self.assertRaisesRegex(
-            roi.RoiSequenceError, "missing measured trial 1 end"
+            roi.RoiSequenceError, "missing trial 0 end"
         ):
             state.finish()
 ```
@@ -91,7 +91,7 @@ Expected: `ERROR`/`FAIL` because `GapbsCheckpointState` is absent.
 
 Add a `GapbsCheckpointState` whose constructor rejects modes outside
 `{"save", "restore"}`, requires `measure_trial == 1` and `iterations == 2`,
-starts save mode before trial 0, and starts restore mode with trial 1 active.
+starts save mode before trial 0, and starts restore mode with trial 0 active.
 Expose only these methods and action strings:
 
 ```python
@@ -104,8 +104,8 @@ class GapbsCheckpointState:
                 "checkpoint mode requires iterations=2 and measure_trial=1"
             )
         self.mode = mode
-        self.next_trial = 0 if mode == "save" else 2
-        self.active_trial = None if mode == "save" else 1
+        self.next_trial = 0 if mode == "save" else 1
+        self.active_trial = None if mode == "save" else 0
         self.resumed = False
         self.saved = False
         self.ended = False
@@ -114,7 +114,7 @@ class GapbsCheckpointState:
         if self.mode != "restore" or self.resumed:
             raise RoiSequenceError("invalid or duplicate checkpoint resume")
         self.resumed = True
-        return ("reset", "record_start_tick")
+        return ()
 ```
 
 Complete `work_begin`, `work_end`, `checkpoint_saved`, and `finish` to produce
@@ -249,6 +249,10 @@ git commit -m "scripts: identify reusable GAPBS checkpoints"
 
 **Files:**
 - Modify: `configs/example/gem5_library/x86-gapbs-amu-se.py`
+- Modify: `scripts/build_gapbs_baseline_cxlmemuring.py`
+- Modify: `scripts/build_gapbs_amu_cxlmemuring.py`
+- Modify: `scripts/build_gapbs_cira_cxlmemuring.py`
+- Modify: `tests/pyunit/amu/pyunit_gapbs_amu_builder.py`
 - Modify: `tests/pyunit/amu/test_gapbs_checkpoint.py`
 
 - [ ] **Step 1: Write failing config-contract tests**
@@ -312,8 +316,7 @@ board.set_se_binary_workload(
 
 For AMU save mode, connect its setup transport with delay `0ns`. For CIRA save
 mode, attach to the setup memory-facing port without the measured L2 demand
-probe; all outstanding trial-0 operations must drain before the work-end
-marker returns.
+probe. No offload operation executes before trial 0 work-begin.
 
 - [ ] **Step 4: Wire save and restore event actions**
 
@@ -326,18 +329,40 @@ checkpoint_state.checkpoint_saved()
 yield True
 ```
 
-Restore mode calls `resume_actions()` immediately before `simulator.run()`,
-executes `m5.stats.reset()`, records `m5.curTick()`, and prints:
+Restore mode calls `resume_actions()` immediately before `simulator.run()` and
+prints:
 
 ```text
 GAPBS_CHECKPOINT_RESTORED path=<absolute-path>
 ```
 
-Its next work-end must dump one ROI stats section. It then continues to final
-GAPBS verification and classifies the final exit exactly as the current
-verification path does. Do not print the legacy CPU-switch marker.
+Its exact event order must be trial-0 work-end with no stats action,
+trial-1 work-begin with reset/start-tick, then trial-1 work-end with one ROI
+dump. It then continues to final GAPBS verification and classifies the final
+exit exactly as the current verification path does. Do not print the legacy
+CPU-switch marker.
 
-- [ ] **Step 5: Run unit tests and a local x86 checkpoint smoke**
+- [ ] **Step 5: Add a post-verification two-core success exit**
+
+First add failing tests requiring every ROI builder to place `m5_exit(0)`
+after the complete `for (int iter...)` loop while preserving `m5_fail(0, 1)`
+inside each failed verification branch. Require `classify_final_exit` to map
+`m5_exit instruction encountered` to `("pass", 0)`.
+
+Then patch each builder's `benchmark.h` rewrite so the generated function ends:
+
+```cpp
+  }
+  if (cli.do_verify())
+    m5_exit(0);
+  PrintTime("Average Time", total_seconds / cli.num_trials());
+```
+
+The guest never reaches the trailing print under gem5. This exit is valid only
+because every enabled verification has already run; any failure exits earlier
+through `m5_fail`.
+
+- [ ] **Step 6: Run unit tests and a local x86 checkpoint smoke**
 
 ```bash
 python3 -m unittest \
@@ -353,11 +378,15 @@ build/X86/gem5.opt \
 
 Expected: Python tests pass and log contains `Done taking checkpoint`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add \
   configs/example/gem5_library/x86-gapbs-amu-se.py \
+  scripts/build_gapbs_baseline_cxlmemuring.py \
+  scripts/build_gapbs_amu_cxlmemuring.py \
+  scripts/build_gapbs_cira_cxlmemuring.py \
+  tests/pyunit/amu/pyunit_gapbs_amu_builder.py \
   tests/pyunit/amu/test_gapbs_checkpoint.py
 git commit -m "configs: save and restore GAPBS measured-trial checkpoints"
 ```
