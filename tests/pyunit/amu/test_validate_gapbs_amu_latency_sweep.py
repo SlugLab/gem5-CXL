@@ -15,6 +15,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 VALIDATOR_PATH = REPO / "scripts" / "validate_gapbs_amu_latency_sweep.py"
+CHECKPOINT_PATH = REPO / "scripts" / "gapbs_checkpoint.py"
 
 
 def load_validator():
@@ -24,10 +25,20 @@ def load_validator():
     return module
 
 
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.validator = load_validator()
+        cls.checkpoint = load_module(
+            "latency_validator_checkpoint", CHECKPOINT_PATH
+        )
 
     def make_sweep(self, root, *, completed_prefetches=8, cira_label="cira_pgo"):
         fields = (
@@ -262,6 +273,252 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 writer = csv.DictWriter(stream, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(rows)
+        self.upgrade_to_checkpoint_evidence(root)
+
+    def checkpoint_config(self, binary, graph, benchmark, kind, delay):
+        cira_port = (
+            " board.cira.mem_side_port" if kind == "cira" else ""
+        )
+        cira = (
+            "[board.cira]\n"
+            "demand_probe_target=board.cache_hierarchy.l2-cache-0\n"
+            "mem_side_port="
+            "board.cache_hierarchy.l2buses0.cpu_side_ports[2]\n"
+            if kind == "cira"
+            else ""
+        )
+        return (
+            "[board]\n"
+            "mem_ranges=0:4294967296\n"
+            "[board.cxl_mem_link0]\n"
+            "type=SerialLink\n"
+            f"delay={delay}\n"
+            "ranges=0:4294967296\n"
+            "cpu_side_port="
+            "board.cache_hierarchy.membus.mem_side_ports[0]\n"
+            "mem_side_port=board.memory.mem_ctrl.port\n"
+            "[board.memory.mem_ctrl]\n"
+            "port=board.cxl_mem_link0.mem_side_port\n"
+            "[board.memory.mem_ctrl.dram]\n"
+            "range=0:4294967296\n"
+            "[board.cache_hierarchy.membus]\n"
+            "mem_side_ports=board.cxl_mem_link0.cpu_side_port "
+            "board.processor.cores0.core.interrupts.pio "
+            "board.processor.cores1.core.interrupts.pio\n"
+            "[board.cache_hierarchy.l2buses0]\n"
+            "cpu_side_ports=board.cache_hierarchy.l1i-cache-0.mem_side "
+            f"board.cache_hierarchy.l1d-cache-0.mem_side{cira_port}\n"
+            "mem_side_ports=board.cache_hierarchy.l2-cache-0.cpu_side\n"
+            "[board.cache_hierarchy.l2buses1]\n"
+            "cpu_side_ports=board.cache_hierarchy.l1i-cache-1.mem_side "
+            "board.cache_hierarchy.l1d-cache-1.mem_side\n"
+            "mem_side_ports=board.cache_hierarchy.l2-cache-1.cpu_side\n"
+            "[board.processor.cores0.core]\n"
+            "type=BaseTimingSimpleCPU\n"
+            "[board.processor.cores1.core]\n"
+            "type=BaseTimingSimpleCPU\n"
+            "[board.processor.cores0.core.workload]\n"
+            f"cmd={binary} -f {graph} -n 2 -v\n"
+            + cira
+        )
+
+    def checkpoint_stats(self, kind, completed_prefetches):
+        lines = [
+            "---------- Begin Simulation Statistics ----------",
+            "simTicks 100",
+            "simInsts 10",
+            (
+                "board.cache_hierarchy.membus.pktCount_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port 60"
+            ),
+            (
+                "board.cache_hierarchy.membus.pktCount_"
+                "board.cache_hierarchy.l2-cache-1.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port 77"
+            ),
+            (
+                "board.cache_hierarchy.membus.pktSize_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port 1000"
+            ),
+            (
+                "board.cache_hierarchy.membus.pktSize_"
+                "board.cache_hierarchy.l2-cache-1.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port 1880"
+            ),
+        ]
+        for core, hits, misses in ((0, 46, 4), (1, 44, 6)):
+            root = f"board.cache_hierarchy.l1d-cache-{core}"
+            requestor = f"processor.cores{core}.core.data"
+            lines += [
+                f"{root}.demandHits::{requestor} {hits}",
+                f"{root}.demandHits::total {hits}",
+                f"{root}.demandMisses::{requestor} {misses}",
+                f"{root}.demandMisses::total {misses}",
+                f"{root}.demandAccesses::{requestor} {hits + misses}",
+                f"{root}.demandAccesses::total {hits + misses}",
+            ]
+        l2_values = {
+            0: {"data": (5, 2500), "inst": (6, 7)},
+            1: {"data": (6, 2500), "inst": (7, 7)},
+        }
+        for core, roles in l2_values.items():
+            root = f"board.cache_hierarchy.l2-cache-{core}"
+            totals = {"hits": 0, "misses": 0, "accesses": 0}
+            for role, (hits, misses) in roles.items():
+                requestor = f"processor.cores{core}.core.{role}"
+                accesses = hits + misses
+                lines += [
+                    f"{root}.demandHits::{requestor} {hits}",
+                    f"{root}.demandMisses::{requestor} {misses}",
+                    f"{root}.demandAccesses::{requestor} {accesses}",
+                ]
+                totals["hits"] += hits
+                totals["misses"] += misses
+                totals["accesses"] += accesses
+            lines += [
+                f"{root}.demandHits::total {totals['hits']}",
+                f"{root}.demandMisses::total {totals['misses']}",
+                f"{root}.demandAccesses::total {totals['accesses']}",
+            ]
+        if kind == "amu":
+            lines += [
+                "board.asmc.issuedLoads 7",
+                "board.asmc.completedLoads 7",
+            ]
+        elif kind == "cira":
+            lines += [
+                "board.cira.issuedPrefetches 8",
+                "board.cira.issuedIndexedPrefetches 3",
+                "board.cira.issuedCsrPrefetches 5",
+                f"board.cira.completedPrefetches {completed_prefetches}",
+                "board.cira.usefulPrefetches 4",
+                "board.cira.latePrefetches 0",
+                "board.cira.readPackets 16",
+                "board.cira.readBytes 1024",
+                "board.cira.totalLatency 800",
+                "board.cira.avgLatency 100",
+            ]
+        lines += [
+            "---------- End Simulation Statistics   ----------",
+            "---------- Begin Simulation Statistics ----------",
+            "simTicks 200",
+            "simInsts 20",
+            "---------- End Simulation Statistics   ----------",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def upgrade_to_checkpoint_evidence(self, root):
+        artifacts = root / "checkpoint-fixture"
+        artifacts.mkdir()
+        graph = REPO / "m5out" / "gapbs_graphs" / "g20.sg"
+        self.assertTrue(graph.is_file())
+        gem5 = artifacts / "gem5.opt"
+        gem5.write_bytes(b"gem5")
+        config_source = artifacts / "x86-gapbs-amu-se.py"
+        config_source.write_bytes(b"config")
+        graph_sha = self.validator.EXPECTED_GRAPH_SHA256
+
+        checkpoint_fields = [
+            "graph_path",
+            "graph_scale",
+            "graph_sha256",
+            "checkpoint_id",
+            "checkpoint_manifest",
+            "checkpoint_binary_sha256",
+            "checkpoint_restores",
+        ]
+        for latency, delay in self.validator.EXPECTED_LATENCIES.items():
+            summary = root / latency / "summary.csv"
+            with summary.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fields = list(reader.fieldnames)
+                rows = list(reader)
+            for field in checkpoint_fields:
+                fields.append(field)
+            for row in rows:
+                run_dir = Path(row["run_dir"])
+                binary = (
+                    artifacts
+                    / "bin"
+                    / row["label"]
+                    / row["benchmark"]
+                )
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(
+                    f"{row['kind']}-{row['benchmark']}".encode()
+                )
+                arguments = ["-f", str(graph.resolve()), "-n", "2", "-v"]
+                identity = {
+                    "schema": 1,
+                    "kind": row["kind"],
+                    "binary_path": str(binary.resolve()),
+                    "binary_sha256": self.checkpoint.sha256_file(binary),
+                    "graph_path": str(graph.resolve()),
+                    "graph_sha256": graph_sha,
+                    "graph_scale": 20,
+                    "arguments": arguments,
+                    "cores": 2,
+                    "memory_size": "4GiB",
+                    "gem5_path": str(gem5.resolve()),
+                    "gem5_sha256": self.checkpoint.sha256_file(gem5),
+                    "config_path": str(config_source.resolve()),
+                    "config_sha256": self.checkpoint.sha256_file(
+                        config_source
+                    ),
+                    "model_parameters": {
+                        "kind": row["kind"],
+                        "env": "",
+                    },
+                }
+                checkpoint_id = self.checkpoint.identity_key(identity)
+                checkpoint_root = artifacts / "checkpoints" / checkpoint_id
+                checkpoint_root.mkdir(parents=True, exist_ok=True)
+                (checkpoint_root / "m5.cpt").write_bytes(b"checkpoint")
+                manifest = self.checkpoint.write_manifest(
+                    checkpoint_root, identity
+                )
+                (run_dir / "config.ini").write_text(
+                    self.checkpoint_config(
+                        binary.resolve(),
+                        graph.resolve(),
+                        row["benchmark"],
+                        row["kind"],
+                        delay,
+                    ),
+                    encoding="utf-8",
+                )
+                (run_dir / "gem5.log").write_text(
+                    f"GAPBS_CHECKPOINT_RESTORED path={checkpoint_root}\n"
+                    "Dump stats at the end of the measured ROI!\n"
+                    "Verification: PASS\n",
+                    encoding="utf-8",
+                )
+                completed = int(row["cira_completed"])
+                (run_dir / "stats.txt").write_text(
+                    self.checkpoint_stats(row["kind"], completed),
+                    encoding="utf-8",
+                )
+                row.update(
+                    {
+                        "fast_forward_cpu": "",
+                        "cpu_switches": "0",
+                        "graph_path": str(graph.resolve()),
+                        "graph_scale": "20",
+                        "graph_sha256": graph_sha,
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_manifest": str(manifest),
+                        "checkpoint_binary_sha256": identity[
+                            "binary_sha256"
+                        ],
+                        "checkpoint_restores": "1",
+                    }
+                )
+            with summary.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
 
     def mutate_summary(self, root, latency, predicate, **updates):
         summary = root / latency / "summary.csv"
@@ -315,20 +572,32 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
         cira_stats.write_text(
             cira_stats.read_text(encoding="utf-8")
             .replace(
-                "processor.switch.core.data 5000",
-                "processor.switch.core.data 4000",
+                "processor.cores0.core.data 2500",
+                "processor.cores0.core.data 2000",
             )
             .replace(
-                "demandMisses::total 5014",
-                "demandMisses::total 4014",
+                "processor.cores1.core.data 2500",
+                "processor.cores1.core.data 2000",
             )
             .replace(
-                "demandAccesses::processor.switch.core.data 5011",
-                "demandAccesses::processor.switch.core.data 4011",
+                "demandMisses::total 2507",
+                "demandMisses::total 2007",
             )
             .replace(
-                "demandAccesses::total 5038",
-                "demandAccesses::total 4038",
+                "demandAccesses::total 2518",
+                "demandAccesses::total 2018",
+            )
+            .replace(
+                "demandAccesses::total 2520",
+                "demandAccesses::total 2020",
+            )
+            .replace(
+                "processor.cores0.core.data 2505",
+                "processor.cores0.core.data 2005",
+            )
+            .replace(
+                "processor.cores1.core.data 2506",
+                "processor.cores1.core.data 2006",
             ),
             encoding="utf-8",
         )
@@ -379,7 +648,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "missing End marker for first ROI stats section",
+                "missing End marker for simulation statistics section",
             ):
                 self.validator.validate_sweep(root)
 
@@ -429,15 +698,15 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
-                "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
-                "board.cxl_mem_link0.cpu_side_port 137\n",
+                "board.cache_hierarchy.membus.pktCount_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_mem_link0.cpu_side_port 60\n",
                 "",
             )
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "expected exactly one first-ROI statistic matching .*"
-                "pktCount_.*found 0",
+                "expected directional CXL cells",
             ):
                 self.validator.validate_sweep(root)
 
@@ -457,7 +726,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 writer.writerows(rows)
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "cxl_packets=4195 != exact first-ROI packet count 137",
+                "cxl_packets=4195 != exact first-ROI value 137",
             ):
                 self.validator.validate_sweep(root)
 
@@ -467,18 +736,18 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
-                "board.cache_hierarchy.membus.pktCount::total 9999\n",
+                "simInsts 10\n",
                 (
+                    "simInsts 10\n"
                     "board.cache_hierarchy.membus.pktCount_other::"
                     "board.cxl_mem_link0.cpu_side_port 1\n"
-                    "board.cache_hierarchy.membus.pktCount::total 9999\n"
                 ),
+                1,
             )
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "expected exactly one first-ROI statistic matching .*"
-                "pktCount_.*found 2",
+                "expected directional CXL cells",
             ):
                 self.validator.validate_sweep(root)
 
@@ -488,13 +757,14 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
-                "board.cache_hierarchy.membus.pktSize_l2.mem_side_port::",
+                "board.cache_hierarchy.membus.pktSize_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::",
                 "board.cache_hierarchy.membus.pktSize_other.mem_side_port::",
                 1,
             )
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
-                self.validator.ValidationError, "directional identity mismatch"
+                self.validator.ValidationError, "expected directional CXL cells"
             ):
                 self.validator.validate_sweep(root)
 
@@ -505,7 +775,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
                 "board.cache_hierarchy.l2-cache-0.demandMisses::"
-                "processor.switch.core.data 5000\n",
+                "processor.cores0.core.data 2500\n",
                 "",
             )
             stats.write_text(text, encoding="utf-8")
@@ -522,21 +792,34 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             stats = root / "200ns" / "pr" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
                 "board.cache_hierarchy.l2-cache-0.demandHits::"
-                "processor.switch.core.data 11\n",
+                "processor.cores0.core.data 5\n",
                 "",
             ).replace(
-                "board.cache_hierarchy.l2-cache-0.demandHits::total 24\n",
-                "board.cache_hierarchy.l2-cache-0.demandHits::total 13\n",
+                "board.cache_hierarchy.l2-cache-0.demandHits::total 11\n",
+                "board.cache_hierarchy.l2-cache-0.demandHits::total 6\n",
             ).replace(
                 "board.cache_hierarchy.l2-cache-0.demandAccesses::"
-                "processor.switch.core.data 5011\n",
+                "processor.cores0.core.data 2505\n",
                 "board.cache_hierarchy.l2-cache-0.demandAccesses::"
-                "processor.switch.core.data 5000\n",
+                "processor.cores0.core.data 2500\n",
             ).replace(
-                "board.cache_hierarchy.l2-cache-0."
-                "demandAccesses::total 5038\n",
-                "board.cache_hierarchy.l2-cache-0."
-                "demandAccesses::total 5027\n",
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::total 2518\n",
+                "board.cache_hierarchy.l2-cache-0.demandAccesses::total 2513\n",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-1.demandHits::"
+                "processor.cores1.core.data 6\n",
+                "",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-1.demandHits::total 13\n",
+                "board.cache_hierarchy.l2-cache-1.demandHits::total 7\n",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-1.demandAccesses::"
+                "processor.cores1.core.data 2506\n",
+                "board.cache_hierarchy.l2-cache-1.demandAccesses::"
+                "processor.cores1.core.data 2500\n",
+            ).replace(
+                "board.cache_hierarchy.l2-cache-1.demandAccesses::total 2520\n",
+                "board.cache_hierarchy.l2-cache-1.demandAccesses::total 2514\n",
             )
             stats.write_text(text, encoding="utf-8")
             summary = root / "200ns" / "summary.csv"
@@ -563,66 +846,22 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "200ns" / "pr" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8")
-            for line in (
-                "board.cache_hierarchy.l1d-cache-0."
-                "demandMisses::processor.switch.core.data 10\n",
-                "board.cache_hierarchy.l1d-cache-0.demandMisses::total 10\n",
-                "board.cache_hierarchy.l2-cache-0.demandMisses::"
-                "processor.switch.core.data 5000\n",
-                "board.cache_hierarchy.l2-cache-0.demandMisses::"
-                "processor.switch.core.inst 14\n",
-                "board.cache_hierarchy.l2-cache-0.demandMisses::total 5014\n",
-                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
-                "processor.switch.core.data 5011\n",
-            ):
-                text = text.replace(line, "")
-            text = text.replace(
-                "board.cache_hierarchy.l2-cache-0.demandHits::"
-                "processor.switch.core.data 11\n",
-                "",
-            )
-            text = text.replace(
-                "board.cache_hierarchy.l2-cache-0.demandHits::"
-                "processor.switch.core.inst 13\n",
-                (
-                    "board.cache_hierarchy.l1d-cache-0.demandHits::"
-                    "processor.switch.core.data 99\n"
-                    "board.cache_hierarchy.l1d-cache-0.demandHits::total 99\n"
-                    "board.cache_hierarchy.l1d-cache-0.demandAccesses::"
-                    "processor.switch.core.data 99\n"
-                    "board.cache_hierarchy.l1d-cache-0."
-                    "demandAccesses::total 99\n"
-                    "board.cache_hierarchy.l2-cache-0.demandHits::"
-                    "processor.switch.core.inst 13\n"
-                ),
-            )
-            text = text.replace(
-                "board.cache_hierarchy.l1d-cache-0.demandHits::"
-                "processor.switch.core.data 90\n"
-                "board.cache_hierarchy.l1d-cache-0.demandHits::total 90\n"
-                "board.cache_hierarchy.l1d-cache-0.demandAccesses::"
-                "processor.switch.core.data 100\n"
-                "board.cache_hierarchy.l1d-cache-0."
-                "demandAccesses::total 100\n",
-                "",
-            )
-            text = text.replace(
-                "board.cache_hierarchy.l2-cache-0.demandHits::total 24\n",
-                (
-                    "board.cache_hierarchy.l2-cache-0.demandHits::total 13\n"
-                    "board.cache_hierarchy.l2-cache-0.demandAccesses::"
-                    "processor.switch.core.inst 13\n"
-                    "board.cache_hierarchy.l2-cache-0."
-                    "demandAccesses::total 13\n"
-                ),
-            )
-            text = text.replace(
-                "board.cache_hierarchy.l2-cache-0.demandAccesses::"
-                "processor.switch.core.inst 27\n"
-                "board.cache_hierarchy.l2-cache-0."
-                "demandAccesses::total 5038\n",
-                "",
-            )
+            for core, hits, misses in ((0, 46, 4), (1, 44, 6)):
+                root_name = f"board.cache_hierarchy.l1d-cache-{core}"
+                requestor = f"processor.cores{core}.core.data"
+                text = text.replace(
+                    f"{root_name}.demandMisses::{requestor} {misses}\n",
+                    "",
+                ).replace(
+                    f"{root_name}.demandMisses::total {misses}\n",
+                    "",
+                ).replace(
+                    f"{root_name}.demandAccesses::{requestor} 50\n",
+                    f"{root_name}.demandAccesses::{requestor} {hits}\n",
+                ).replace(
+                    f"{root_name}.demandAccesses::total 50\n",
+                    f"{root_name}.demandAccesses::total {hits}\n",
+                )
             stats.write_text(text, encoding="utf-8")
             self.mutate_summary(
                 root,
@@ -630,9 +869,6 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 lambda row: row["benchmark"] == "pr"
                 and row["kind"] == "baseline",
                 l1d_demand_misses="0",
-                l2d_demand_hits="0",
-                l2d_demand_misses="0",
-                l2i_demand_misses="0",
             )
             result = self.validator.validate_sweep(root)
             self.assertEqual(result.row_count, 48)
@@ -643,14 +879,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "500ns" / "bc" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8")
-            for line in (
+            text = text.replace(
                 "board.cache_hierarchy.l2-cache-0.demandMisses::"
-                "processor.switch.core.data 5000\n",
-                "board.cache_hierarchy.l2-cache-0.demandMisses::"
-                "processor.switch.core.inst 14\n",
-                "board.cache_hierarchy.l2-cache-0.demandMisses::total 5014\n",
-            ):
-                text = text.replace(line, "")
+                "processor.cores0.core.data 2500\n",
+                "",
+            )
             stats.write_text(text, encoding="utf-8")
             self.mutate_summary(
                 root,
@@ -662,7 +895,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "omitted nonzero demandMisses",
+                "demandMisses family total",
             ):
                 self.validator.validate_sweep(root)
 
@@ -673,14 +906,15 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             stats = root / "2us" / "sssp" / "cxl_vanilla" / "stats.txt"
             stats.write_text(
                 stats.read_text(encoding="utf-8").replace(
-                    "processor.switch.core.data 5000",
-                    "processor.cores.core.data 5000",
+                    "processor.cores0.core.data 46",
+                    "processor.cores.core.data 46",
                     1,
                 ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
-                self.validator.ValidationError, "legacy cache requestor"
+                self.validator.ValidationError,
+                "omitted nonzero demandHits",
             ):
                 self.validator.validate_sweep(root)
 
@@ -691,14 +925,15 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             stats = root / "2us" / "sssp" / "cxl_vanilla" / "stats.txt"
             stats.write_text(
                 stats.read_text(encoding="utf-8").replace(
-                    "processor.switch.core.data 5000",
-                    "procesor.swotch.core.data 5000",
+                    "processor.cores0.core.data 46",
+                    "procesor.cores0.core.data 46",
                     1,
                 ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
-                self.validator.ValidationError, "unknown cache requestor"
+                self.validator.ValidationError,
+                "omitted nonzero demandHits",
             ):
                 self.validator.validate_sweep(root)
 
@@ -708,7 +943,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             self.make_sweep(root)
             stats = root / "200ns" / "bfs" / "cxl_vanilla" / "stats.txt"
             text = stats.read_text(encoding="utf-8").replace(
-                "board.cxl_mem_link0.cpu_side_port 137\n",
+                "board.cxl_mem_link0.cpu_side_port 60\n",
                 "board.cxl_mem_link0.cpu_side_port 9007199254740993\n",
                 1,
             )
@@ -718,15 +953,15 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 reader = csv.DictReader(stream)
                 fields = reader.fieldnames
                 rows = list(reader)
-            rows[0]["cxl_packets"] = "9007199254740992"
+            rows[0]["cxl_packets"] = "9007199254741069"
             with summary.open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.DictWriter(stream, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(rows)
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "9007199254740992 != exact first-ROI packet count "
-                "9007199254740993",
+                "9007199254741069 != exact first-ROI value "
+                "9007199254741070",
             ):
                 self.validator.validate_sweep(root)
 
@@ -761,7 +996,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             stats.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(
                 self.validator.ValidationError,
-                "missing board.cira.avgLatency",
+                "missing required ROI statistic: board.cira.avgLatency",
             ):
                 self.validator.validate_sweep(root)
 
@@ -823,7 +1058,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     writer.writerows(rows)
                 with self.assertRaisesRegex(
                     self.validator.ValidationError,
-                    "non-owner cira_total_latency must be blank or zero",
+                    "cira_total_latency=999 != exact first-ROI value 0",
                 ):
                     self.validator.validate_sweep(root)
 
@@ -852,21 +1087,144 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 ):
                     self.validator.validate_sweep(root)
 
+    def test_rejects_noncanonical_graph_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            self.mutate_summary(
+                root,
+                "200ns",
+                lambda row: row["benchmark"] == "bfs"
+                and row["kind"] == "baseline",
+                graph_sha256="0" * 64,
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError, "graph_sha256"
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_manifest_identity_or_missing_payload(self):
+        for case in ("identity", "manifest", "payload"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                summary = root / "200ns" / "summary.csv"
+                with summary.open(newline="", encoding="utf-8") as stream:
+                    row = next(csv.DictReader(stream))
+                manifest = Path(row["checkpoint_manifest"])
+                if case == "identity":
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                    payload["identity"]["cores"] = 1
+                    manifest.write_text(
+                        json.dumps(payload), encoding="utf-8"
+                    )
+                    expected = "manifest checkpoint id mismatch"
+                elif case == "manifest":
+                    manifest.unlink()
+                    expected = "missing checkpoint manifest"
+                else:
+                    (manifest.parent / "m5.cpt").unlink()
+                    expected = "missing checkpoint payload"
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, expected
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_zero_or_duplicate_restore_marker(self):
+        for count in (0, 2):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                log = root / "200ns" / "bfs" / "cxl_vanilla" / "gem5.log"
+                lines = [
+                    line
+                    for line in log.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith("GAPBS_CHECKPOINT_RESTORED path=")
+                ]
+                marker = "GAPBS_CHECKPOINT_RESTORED path=/checkpoint"
+                log.write_text(
+                    "\n".join([marker] * count + lines) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, "restore marker count"
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_missing_or_different_serialized_graph_argument(self):
+        for case in ("missing", "different"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                summary = root / "200ns" / "summary.csv"
+                with summary.open(newline="", encoding="utf-8") as stream:
+                    row = next(csv.DictReader(stream))
+                config = Path(row["run_dir"]) / "config.ini"
+                graph = row["graph_path"]
+                if case == "missing":
+                    replacement = ""
+                else:
+                    replacement = f"-f {root / 'other.sg'}"
+                config.write_text(
+                    config.read_text(encoding="utf-8").replace(
+                        f"-f {graph}", replacement, 1
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, "config workload graph"
+                ):
+                    self.validator.validate_sweep(root)
+
+    def test_rejects_zero_or_extra_stats_sections(self):
+        for case in ("zero", "extra"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                stats = (
+                    root
+                    / "200ns"
+                    / "bfs"
+                    / "cxl_vanilla"
+                    / "stats.txt"
+                )
+                if case == "zero":
+                    stats.write_text("no stats\n", encoding="utf-8")
+                    expected = "missing simulation statistics section"
+                else:
+                    with stats.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            "---------- Begin Simulation Statistics "
+                            "----------\n"
+                            "simTicks 300\n"
+                            "---------- End Simulation Statistics   "
+                            "----------\n"
+                        )
+                    expected = "found 3 complete sections"
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, expected
+                ):
+                    self.validator.validate_sweep(root)
+
     def test_rejects_switch_marker_count_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.make_sweep(root)
             log = root / "200ns" / "bfs" / "cxl_vanilla" / "gem5.log"
-            log.write_text("Verification: PASS\n", encoding="utf-8")
+            log.write_text(
+                log.read_text(encoding="utf-8")
+                + "Switching from fast-forward CPU to timing CPU!\n",
+                encoding="utf-8",
+            )
             with self.assertRaisesRegex(
                 self.validator.ValidationError, "cpu_switches"
             ):
                 self.validator.validate_sweep(root)
 
     def test_rejects_config_workload_shape_mismatch(self):
-        for option, replacement in (
-            ("scale", "-g 19 -n 2"),
-            ("iterations", "-g 20 -n 1"),
+        for option, old, replacement in (
+            ("graph", "-f ", "-g 20 "),
+            ("iterations", "-n 2", "-n 1"),
         ):
             with self.subTest(option=option), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -874,13 +1232,17 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 config = root / "200ns" / "bfs" / "cxl_vanilla" / "config.ini"
                 config.write_text(
                     config.read_text(encoding="utf-8").replace(
-                        "-g 20 -n 2", replacement, 1
+                        old, replacement, 1
                     ),
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(
                     self.validator.ValidationError,
-                    f"config workload {option}",
+                    (
+                        "must not use -g"
+                        if option == "graph"
+                        else f"config workload {option}"
+                    ),
                 ):
                     self.validator.validate_sweep(root)
 
@@ -903,12 +1265,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cxl_mem_link0.cpu_side_port ",
             ),
             (
-                "starting CPU",
-                "type=BaseAtomicSimpleCPU",
-                "type=BaseTimingSimpleCPU",
-            ),
-            (
-                "switch CPU",
+                "expected Timing",
                 "type=BaseTimingSimpleCPU",
                 "type=BaseAtomicSimpleCPU",
             ),
@@ -968,7 +1325,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     if field == "demand_probe_target"
                     else
                     "mem_side_port="
-                    "board.cache_hierarchy.l2buses.cpu_side_ports[2]"
+                    "board.cache_hierarchy.l2buses0.cpu_side_ports[2]"
                 )
                 config.write_text(
                     text.replace(line, replacement, 1), encoding="utf-8"
@@ -1090,20 +1447,32 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     path.write_text(
                         path.read_text(encoding="utf-8")
                         .replace(
-                            "processor.switch.core.data 5000",
-                            "processor.switch.core.data 4096",
+                            "processor.cores0.core.data 2500",
+                            "processor.cores0.core.data 2048",
                         )
                         .replace(
-                            "demandMisses::total 5014",
-                            "demandMisses::total 4110",
+                            "processor.cores1.core.data 2500",
+                            "processor.cores1.core.data 2048",
                         )
                         .replace(
-                            "demandAccesses::processor.switch.core.data 5011",
-                            "demandAccesses::processor.switch.core.data 4107",
+                            "processor.cores0.core.data 2505",
+                            "processor.cores0.core.data 2053",
                         )
                         .replace(
-                            "demandAccesses::total 5038",
-                            "demandAccesses::total 4134",
+                            "processor.cores1.core.data 2506",
+                            "processor.cores1.core.data 2054",
+                        )
+                        .replace(
+                            "demandMisses::total 2507",
+                            "demandMisses::total 2055",
+                        )
+                        .replace(
+                            "demandAccesses::total 2518",
+                            "demandAccesses::total 2066",
+                        )
+                        .replace(
+                            "demandAccesses::total 2520",
+                            "demandAccesses::total 2068",
                         ),
                         encoding="utf-8",
                     )
@@ -1113,20 +1482,32 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     path.write_text(
                         path.read_text(encoding="utf-8")
                         .replace(
-                            "processor.switch.core.data 4000",
-                            "processor.switch.core.data 5000",
+                            "processor.cores0.core.data 2000",
+                            "processor.cores0.core.data 2500",
                         )
                         .replace(
-                            "demandMisses::total 4014",
-                            "demandMisses::total 5014",
+                            "processor.cores1.core.data 2000",
+                            "processor.cores1.core.data 2500",
                         )
                         .replace(
-                            "demandAccesses::processor.switch.core.data 4011",
-                            "demandAccesses::processor.switch.core.data 5011",
+                            "processor.cores0.core.data 2005",
+                            "processor.cores0.core.data 2505",
                         )
                         .replace(
-                            "demandAccesses::total 4038",
-                            "demandAccesses::total 5038",
+                            "processor.cores1.core.data 2006",
+                            "processor.cores1.core.data 2506",
+                        )
+                        .replace(
+                            "demandMisses::total 2007",
+                            "demandMisses::total 2507",
+                        )
+                        .replace(
+                            "demandAccesses::total 2018",
+                            "demandAccesses::total 2518",
+                        )
+                        .replace(
+                            "demandAccesses::total 2020",
+                            "demandAccesses::total 2520",
                         ),
                         encoding="utf-8",
                     )

@@ -11,11 +11,25 @@ import json
 import os
 import re
 import shlex
+import sys
 import tempfile
 from collections import namedtuple
 from decimal import Decimal, InvalidOperation
 from io import StringIO
 from pathlib import Path
+
+
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import compare_gapbs_cxl_amu_cira as gapbs_runner  # noqa: E402
+from gapbs_checkpoint import (  # noqa: E402
+    CheckpointError,
+    identity_key,
+    load_manifest,
+    sha256_file,
+)
 
 
 EXPECTED_LATENCIES = {
@@ -34,6 +48,12 @@ CXL_PACKET_STAT_PREFIX = "board.cache_hierarchy.membus.pktCount_"
 CXL_BYTE_STAT_PREFIX = "board.cache_hierarchy.membus.pktSize_"
 CXL_STAT_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
 CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
+CHECKPOINT_RESTORE_MARKER = "GAPBS_CHECKPOINT_RESTORED path="
+ROI_DUMP_MARKER = "Dump stats at the end of the measured ROI!"
+EXPECTED_GRAPH_SHA256 = (
+    "ce900a7147a073835a7450e8f1afedf9f13db6833652bf2f9647819be26bedb3"
+)
+EXPECTED_GRAPH_SIZE = 133_986_161
 CACHE_SUMMARY_STATS = {
     "l1d_demand_misses": (
         "board.cache_hierarchy.l1d-cache-0.demandMisses::"
@@ -82,10 +102,12 @@ METADATA_EXPECTED = {
     "scale": "20",
     "iterations": "2",
     "measured_trial": "1",
-    "fast_forward_cpu": "atomic",
+    "fast_forward_cpu": "",
     "roi_cpu": "timing",
-    "cpu_switches": "1",
+    "cpu_switches": "0",
     "all_memory_cxl": "true",
+    "graph_scale": "20",
+    "checkpoint_restores": "1",
 }
 REQUIRED_SUMMARY_FIELDS = {
     "benchmark",
@@ -101,6 +123,13 @@ REQUIRED_SUMMARY_FIELDS = {
     "cpu_switches",
     "cxl_link_delay",
     "all_memory_cxl",
+    "graph_path",
+    "graph_scale",
+    "graph_sha256",
+    "checkpoint_id",
+    "checkpoint_manifest",
+    "checkpoint_binary_sha256",
+    "checkpoint_restores",
     "sim_ticks",
     "sim_insts",
     "speedup_vs_cxl",
@@ -121,22 +150,36 @@ class ValidationError(RuntimeError):
     pass
 
 
+_HASH_CACHE = {}
+
+
+def verified_sha256(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _HASH_CACHE:
+        _HASH_CACHE[key] = sha256_file(path)
+    return _HASH_CACHE[key]
+
+
 def parse_first_stats_section(path):
-    stats = {}
-    in_section = False
-    ended = False
+    sections = []
+    stats = None
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("---------- Begin Simulation Statistics"):
-            if in_section:
-                break
-            in_section = True
+            if stats is not None:
+                raise ValidationError(
+                    f"{path}: nested simulation statistics section"
+                )
+            stats = {}
             continue
-        if in_section and line.startswith(
+        if stats is not None and line.startswith(
             "---------- End Simulation Statistics"
         ):
-            ended = True
-            break
-        if not in_section:
+            sections.append(stats)
+            stats = None
+            continue
+        if stats is None:
             continue
         fields = line.split()
         if len(fields) < 2:
@@ -145,13 +188,29 @@ def parse_first_stats_section(path):
             stats[fields[0]] = Decimal(fields[1])
         except InvalidOperation:
             continue
-    if not in_section:
-        raise ValidationError(f"{path}: missing simulation statistics section")
-    if not ended:
+    if stats is not None:
         raise ValidationError(
-            f"{path}: missing End marker for first ROI stats section"
+            f"{path}: missing End marker for simulation statistics section"
         )
-    return stats
+    if not sections:
+        raise ValidationError(f"{path}: missing simulation statistics section")
+    if len(sections) not in (1, 2):
+        raise ValidationError(
+            f"{path}: expected one ROI section and at most one final section; "
+            f"found {len(sections)} complete sections"
+        )
+    if len(sections) == 2:
+        roi_ticks = sections[0].get("simTicks")
+        final_ticks = sections[1].get("simTicks")
+        if (
+            roi_ticks is None
+            or final_ticks is None
+            or final_ticks < roi_ticks
+        ):
+            raise ValidationError(
+                f"{path}: final statistics section does not follow ROI"
+            )
+    return sections[0]
 
 
 def require_decimal(mapping, name, context, *, integer=False, positive=False):
@@ -394,7 +453,9 @@ def config_value(config, section, key, path):
         raise ValidationError(f"{path}: missing [{section}] {key}") from error
 
 
-def validate_config(path, expected_delay, kind):
+def validate_config(
+    path, expected_delay, kind, expected_graph, expected_binary
+):
     config = parse_config(path)
     board_range = config_value(config, "board", "mem_ranges", path)
     link_range = config_value(
@@ -466,20 +527,36 @@ def validate_config(path, expected_delay, kind):
             f"{path}: CXL cpu_side_port binding does not match "
             f"membus.mem_side_ports[{cpu_index}]"
         )
-    start_type = config_value(
-        config, "board.processor.start.core", "type", path
+    forbidden = sorted(
+        section
+        for section in config.sections()
+        if section.startswith("board.processor.start")
+        or section.startswith("board.processor.switch")
     )
-    if start_type != "BaseAtomicSimpleCPU":
+    if forbidden:
         raise ValidationError(
-            f"{path}: starting CPU is {start_type}, expected Atomic"
+            f"{path}: checkpoint restore config contains start/switch CPUs: "
+            + ", ".join(forbidden)
         )
-    switch_type = config_value(
-        config, "board.processor.switch.core", "type", path
+    core_sections = sorted(
+        section
+        for section in config.sections()
+        if re.fullmatch(r"board\.processor\.cores[01]\.core", section)
     )
-    if switch_type != "BaseTimingSimpleCPU":
+    if core_sections != [
+        "board.processor.cores0.core",
+        "board.processor.cores1.core",
+    ]:
         raise ValidationError(
-            f"{path}: switch CPU is {switch_type}, expected Timing"
+            f"{path}: expected exact two-core processor sections; "
+            f"found {core_sections}"
         )
+    for section in core_sections:
+        cpu_type = config_value(config, section, "type", path)
+        if cpu_type != "BaseTimingSimpleCPU":
+            raise ValidationError(
+                f"{path}: [{section}] type={cpu_type}, expected Timing"
+            )
     workload_commands = [
         section["cmd"]
         for section in config.values()
@@ -487,10 +564,26 @@ def validate_config(path, expected_delay, kind):
     ]
     if not workload_commands:
         raise ValidationError(f"{path}: missing config workload command")
+    if len(workload_commands) != 1:
+        raise ValidationError(
+            f"{path}: expected one workload command; "
+            f"found {len(workload_commands)}"
+        )
     for command in workload_commands:
         arguments = shlex.split(command)
+        if not arguments:
+            raise ValidationError(f"{path}: empty config workload command")
+        if Path(arguments[0]).resolve() != Path(expected_binary).resolve():
+            raise ValidationError(
+                f"{path}: workload binary {arguments[0]!r} does not match "
+                f"checkpoint binary {str(expected_binary)!r}"
+            )
+        if "-g" in arguments:
+            raise ValidationError(
+                f"{path}: checkpoint workload must not use -g: {command!r}"
+            )
         for option, expected, description in (
-            ("-g", "20", "scale"),
+            ("-f", str(Path(expected_graph).resolve()), "graph"),
             ("-n", "2", "iterations"),
         ):
             positions = [
@@ -521,7 +614,7 @@ def validate_config(path, expected_delay, kind):
             config, "board.cira", "mem_side_port", path
         )
         cira_binding = re.fullmatch(
-            r"board\.cache_hierarchy\.l2buses\.cpu_side_ports\[(\d+)\]",
+            r"board\.cache_hierarchy\.l2buses0\.cpu_side_ports\[(\d+)\]",
             cira_port,
         )
         if cira_binding is None:
@@ -531,7 +624,7 @@ def validate_config(path, expected_delay, kind):
             )
         l2_cpu_ports = config_value(
             config,
-            "board.cache_hierarchy.l2buses",
+            "board.cache_hierarchy.l2buses0",
             "cpu_side_ports",
             path,
         ).split()
@@ -550,6 +643,10 @@ def validate_config(path, expected_delay, kind):
 def parse_log(path):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     switches = sum(line == CPU_SWITCH_MARKER for line in lines)
+    restores = sum(
+        line.startswith(CHECKPOINT_RESTORE_MARKER) for line in lines
+    )
+    roi_dumps = sum(line == ROI_DUMP_MARKER for line in lines)
     verification = "missing"
     for line in lines:
         if "Verification: FAIL" in line:
@@ -557,7 +654,7 @@ def parse_log(path):
             break
         if "Verification: PASS" in line:
             verification = "pass"
-    return switches, verification
+    return switches, restores, roi_dumps, verification
 
 
 def zero_or_blank(row, field, context):
@@ -583,6 +680,93 @@ def validate_metadata(row, latency, context):
         )
 
 
+def validate_checkpoint_manifest(row, context):
+    graph = Path(row["graph_path"])
+    if not graph.is_file():
+        raise ValidationError(f"{context}: missing graph file: {graph}")
+    graph = graph.resolve()
+    graph_sha = verified_sha256(graph)
+    if row["graph_sha256"] != graph_sha:
+        raise ValidationError(
+            f"{context}: graph_sha256={row['graph_sha256']} != {graph_sha}"
+        )
+    if graph_sha != EXPECTED_GRAPH_SHA256:
+        raise ValidationError(
+            f"{context}: graph hash is not canonical g20: {graph_sha}"
+        )
+    if graph.stat().st_size != EXPECTED_GRAPH_SIZE:
+        raise ValidationError(
+            f"{context}: graph size={graph.stat().st_size}, "
+            f"expected {EXPECTED_GRAPH_SIZE}"
+        )
+
+    manifest_path = Path(row["checkpoint_manifest"])
+    if manifest_path.name != "manifest.json" or not manifest_path.is_file():
+        raise ValidationError(
+            f"{context}: missing checkpoint manifest: {manifest_path}"
+        )
+    checkpoint_root = manifest_path.parent
+    if not (checkpoint_root / "m5.cpt").is_file():
+        raise ValidationError(
+            f"{context}: missing checkpoint payload: "
+            f"{checkpoint_root / 'm5.cpt'}"
+        )
+    try:
+        manifest = load_manifest(checkpoint_root)
+    except CheckpointError as error:
+        raise ValidationError(f"{context}: {error}") from error
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise ValidationError(f"{context}: invalid checkpoint identity")
+    expected_id = identity_key(identity)
+    if manifest.get("checkpoint_id") != expected_id:
+        raise ValidationError(f"{context}: manifest checkpoint id mismatch")
+    if row["checkpoint_id"] != expected_id:
+        raise ValidationError(f"{context}: summary checkpoint id mismatch")
+
+    expected_arguments = ["-f", str(graph), "-n", "2", "-v"]
+    exact = {
+        "schema": 1,
+        "kind": row["kind"],
+        "graph_path": str(graph),
+        "graph_sha256": graph_sha,
+        "graph_scale": 20,
+        "arguments": expected_arguments,
+        "cores": 2,
+    }
+    for field, expected in exact.items():
+        if identity.get(field) != expected:
+            raise ValidationError(
+                f"{context}: checkpoint identity {field}="
+                f"{identity.get(field)!r}, expected {expected!r}"
+            )
+    binary = Path(identity.get("binary_path", ""))
+    if not binary.is_file():
+        raise ValidationError(
+            f"{context}: missing checkpoint binary: {binary}"
+        )
+    binary_sha = verified_sha256(binary)
+    if identity.get("binary_sha256") != binary_sha:
+        raise ValidationError(
+            f"{context}: checkpoint binary hash mismatch"
+        )
+    if row["checkpoint_binary_sha256"] != binary_sha:
+        raise ValidationError(
+            f"{context}: summary checkpoint binary hash mismatch"
+        )
+    for prefix in ("gem5", "config"):
+        source = Path(identity.get(f"{prefix}_path", ""))
+        if not source.is_file():
+            raise ValidationError(
+                f"{context}: missing checkpoint {prefix}: {source}"
+            )
+        if identity.get(f"{prefix}_sha256") != verified_sha256(source):
+            raise ValidationError(
+                f"{context}: checkpoint {prefix} hash mismatch"
+            )
+    return identity
+
+
 def validate_row(row, latency, expected_delay, expected_run_dir):
     context = f"{latency}/{row['benchmark']}/{row['label']}"
     if row["status"] != "ok" or row["verification"] != "pass":
@@ -596,13 +780,35 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
         raise ValidationError(
             f"{context}: run_dir={run_dir} does not match {expected_run_dir}"
         )
-    validate_config(run_dir / "config.ini", expected_delay, row["kind"])
-    switches, raw_verification = parse_log(run_dir / "gem5.log")
+    identity = validate_checkpoint_manifest(row, context)
+    validate_config(
+        run_dir / "config.ini",
+        expected_delay,
+        row["kind"],
+        identity["graph_path"],
+        identity["binary_path"],
+    )
+    switches, restores, roi_dumps, raw_verification = parse_log(
+        run_dir / "gem5.log"
+    )
     reported_switches = require_summary_counter(row, "cpu_switches", context)
     if switches != reported_switches:
         raise ValidationError(
             f"{context}: cpu_switches={reported_switches} != exact "
             f"switch marker count {switches}"
+        )
+    reported_restores = require_summary_counter(
+        row, "checkpoint_restores", context
+    )
+    if restores != 1 or reported_restores != restores:
+        raise ValidationError(
+            f"{context}: checkpoint_restores={reported_restores} != exact "
+            f"restore marker count {restores}"
+        )
+    if roi_dumps != 1:
+        raise ValidationError(
+            f"{context}: expected exactly one explicit ROI dump marker; "
+            f"found {roi_dumps}"
         )
     if raw_verification != row["verification"]:
         raise ValidationError(
@@ -630,20 +836,31 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
     if speedup <= 0:
         raise ValidationError(f"{context}: speedup_vs_cxl must be positive")
 
-    packets, byte_count = require_directional_pair(stats, stats_path)
-    for field, exact, unit_name in (
-        ("cxl_packets", packets, "packet count"),
-        ("cxl_bytes", byte_count, "byte count"),
+    try:
+        diagnostics = gapbs_runner.extract_diagnostic_metrics(
+            stats, row["kind"], num_cores=2
+        )
+    except gapbs_runner.StatsError as error:
+        raise ValidationError(f"{stats_path}: {error}") from error
+    for field in (
+        "cxl_packets",
+        "cxl_bytes",
+        *CACHE_SUMMARY_STATS,
+        *CIRA_LATENCY_SUMMARY_STATS,
     ):
-        reported = require_summary_counter(row, field, context)
-        if reported != exact:
-            raise ValidationError(
-                f"{context}: {field}={reported} != exact first-ROI "
-                f"{unit_name} {exact}"
+        if (
+            row["kind"] != "cira"
+            and field in CIRA_LATENCY_SUMMARY_STATS
+            and row[field] == ""
+        ):
+            reported = Decimal(0)
+        else:
+            reported = (
+                require_summary_number(row, field, context)
+                if field == "cira_avg_latency"
+                else require_summary_counter(row, field, context)
             )
-    for field in CACHE_SUMMARY_STATS:
-        reported = require_summary_counter(row, field, context)
-        exact = require_cache_counter(stats, field, stats_path)
+        exact = diagnostics[field]
         if reported != exact:
             raise ValidationError(
                 f"{context}: {field}={reported} != exact first-ROI "
@@ -692,20 +909,6 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
             raise ValidationError(
                 f"{context}: cira_csr_prefetches={csr}, expected > 0"
             )
-        for field, stat_name in CIRA_LATENCY_SUMMARY_STATS.items():
-            if field == "cira_total_latency":
-                reported = Decimal(
-                    require_summary_counter(row, field, context)
-                )
-                exact = Decimal(require_counter(stats, stat_name, stats_path))
-            else:
-                reported = require_summary_number(row, field, context)
-                exact = require_decimal(stats, stat_name, stats_path)
-            if reported != exact:
-                raise ValidationError(
-                    f"{context}: {field}={reported} != exact "
-                    f"first-ROI value {exact}"
-                )
     else:
         for field in (*CIRA_COUNTER_STATS, *CIRA_LATENCY_SUMMARY_STATS):
             zero_or_blank(row, field, context)
@@ -1054,7 +1257,7 @@ def main():
     else:
         print(
             f"PASS: {result.row_count}/48 rows; canonical scale-20 "
-            f"Atomic-to-Timing CXL evidence validated; "
+            f"two-core checkpoint CXL evidence validated; "
             f"{result.amu_rows} AMU balances; "
             f"{result.cira_rows} CIRA balances"
         )
