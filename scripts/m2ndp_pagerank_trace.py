@@ -183,6 +183,44 @@ def parse_float32_map(path, base, count):
     return result
 
 
+def flip_float32_bit_for_test(path, base, *, index, bit):
+    if index < 0 or bit < 0 or bit >= 32:
+        raise ValueError("float32 test bit location is out of range")
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    target = base + index * 4
+    mode = None
+    matches = []
+    for line_index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line == "_META_":
+            mode = "type"
+        elif mode == "type":
+            mode = "float_data" if line == "float32" else "other"
+        elif line == "_DATA_":
+            mode = "float_rows" if mode == "float_data" else "other_rows"
+        elif mode == "float_rows" and line:
+            fields = line.split()
+            address = int(fields[0], 16)
+            word_index = (target - address) // 4
+            if (
+                target >= address
+                and target < address + (len(fields) - 1) * 4
+                and word_index >= 0
+            ):
+                before = float32_bits(float(fields[word_index + 1]))
+                after = before ^ (1 << bit)
+                fields[word_index + 1] = _format_float_word(after)
+                lines[line_index] = " ".join(fields)
+                matches.append((before, after))
+    if len(matches) != 1:
+        raise artifacts.EvidenceError(
+            f"float32 test target match count is {len(matches)}, expected 1"
+        )
+    _atomic_write_text(path, "\n".join(lines) + "\n")
+    return matches[0]
+
+
 def _kernel(name, kernel_id, body):
     return (
         f"-kernel name = {name}\n"

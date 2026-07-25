@@ -82,12 +82,24 @@ class PageRankTraceTest(unittest.TestCase):
 
     def test_memory_map_round_trips_all_float_words(self):
         self.generate()
+        path = self.root / "trace/0/K3_PULL_DAMP_output.data"
         parsed = trace.parse_float32_map(
-            self.root / "trace/0/K3_PULL_DAMP_output.data",
+            path,
             trace.SCORES_ADDR,
             self.bundle.meta.num_nodes,
         )
         self.assertEqual(parsed, self.reference_words)
+        before, after = trace.flip_float32_bit_for_test(
+            path, trace.SCORES_ADDR, index=0, bit=0
+        )
+        self.assertEqual(before, self.reference_words[0])
+        self.assertEqual(after, self.reference_words[0] ^ 1)
+        parsed = trace.parse_float32_map(
+            path,
+            trace.SCORES_ADDR,
+            self.bundle.meta.num_nodes,
+        )
+        self.assertEqual(parsed[0], self.reference_words[0] ^ 1)
 
     def test_constants_record_exact_float32_steps(self):
         self.generate()
