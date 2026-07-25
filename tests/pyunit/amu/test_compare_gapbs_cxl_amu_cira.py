@@ -788,6 +788,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 outdir=root / "out",
                 graph=graph,
                 graph_scale=20,
+                cores=2,
                 iterations=2,
                 measure_trial=1,
                 cxl_link_delay="1us",
@@ -834,6 +835,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 )
         self.assertEqual(row["status"], "restore-timeout")
         self.assertEqual(row["verification"], "missing")
+        self.assertEqual(row["cores"], 2)
         self.assertIn("timed out", row["error"])
 
 

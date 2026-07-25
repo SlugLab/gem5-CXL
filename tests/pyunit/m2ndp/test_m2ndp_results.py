@@ -195,6 +195,41 @@ class M2NDPResultTest(unittest.TestCase):
             ):
                 results.parse_gem5_summary(path)
 
+    def test_smoke_mode_accepts_non_g20_hash_without_weakening_default(self):
+        smoke_hash = "1" * 64
+        row = dict(self.gem5_pass.row, graph_sha256=smoke_hash)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.csv"
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+            with self.assertRaisesRegex(
+                artifacts.EvidenceError, "graph_sha256"
+            ):
+                results.parse_gem5_summary(path)
+            evidence = results.parse_gem5_summary(
+                path, smoke_test=True
+            )
+        self.assertEqual(evidence.row["graph_sha256"], smoke_hash)
+
+        provenance = results.ProvenanceEvidence(
+            **{
+                **self.provenance.__dict__,
+                "graph_sha256": smoke_hash,
+            }
+        )
+        smoke_gem5 = results.Gem5Evidence(row=row, sim_ticks=240000)
+        summary = results.build_summary(
+            gem5=smoke_gem5,
+            funcsim=self.funcsim_pass,
+            ndpsim=self.ndpsim_pass,
+            calibration=self.calibration_pass,
+            provenance=provenance,
+            smoke_test=True,
+        )
+        self.assertEqual(summary["graph_sha256"], smoke_hash)
+
     def test_speedup_is_suppressed_when_funcsim_fails(self):
         with self.assertRaisesRegex(
             artifacts.EvidenceError, "FuncSim"

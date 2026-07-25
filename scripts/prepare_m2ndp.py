@@ -28,6 +28,8 @@ PATCHED_PATHS = frozenset(
         "perf_runner/synthetic_traffic.h",
         "src/memory_map.cc",
         "src/memory_map.h",
+        "src/m2ndp.cc",
+        "src/m2ndp_config.cc",
     }
 )
 

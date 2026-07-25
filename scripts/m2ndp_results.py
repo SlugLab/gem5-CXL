@@ -233,13 +233,21 @@ def parse_ndpsim(log, *, returncode=0, output_text=None):
     )
 
 
-def _validate_gem5_row(row):
-    for field, expected in _GEM5_CONTRACT.items():
+def _validate_gem5_row(row, *, smoke_test=False):
+    contract = dict(_GEM5_CONTRACT)
+    if smoke_test:
+        contract.pop("graph_sha256")
+    for field, expected in contract.items():
         actual = row.get(field)
         if actual != expected:
             raise artifacts.EvidenceError(
                 f"gem5 {field}={actual!r}, expected {expected!r}"
             )
+    graph_sha256 = row.get("graph_sha256", "")
+    if not _HASH_RE.fullmatch(graph_sha256):
+        raise artifacts.EvidenceError(
+            "gem5 graph_sha256 is not a SHA-256"
+        )
     ticks_text = row.get("sim_ticks", "")
     if not re.fullmatch(r"[0-9]+", ticks_text):
         raise artifacts.EvidenceError(
@@ -251,7 +259,7 @@ def _validate_gem5_row(row):
     return ticks
 
 
-def parse_gem5_summary(path):
+def parse_gem5_summary(path, *, smoke_test=False):
     path = Path(path)
     if not path.is_file():
         raise artifacts.EvidenceError(f"gem5 summary is missing: {path}")
@@ -261,7 +269,7 @@ def parse_gem5_summary(path):
         raise artifacts.EvidenceError(
             f"gem5 summary row count is {len(rows)}, expected 1"
         )
-    ticks = _validate_gem5_row(rows[0])
+    ticks = _validate_gem5_row(rows[0], smoke_test=smoke_test)
     return Gem5Evidence(dict(rows[0]), ticks)
 
 
@@ -274,7 +282,9 @@ def _require_decimal_positive(value, name, *, allow_zero=False):
     return value
 
 
-def _validate_provenance(provenance, calibration, funcsim, gem5):
+def _validate_provenance(
+    provenance, calibration, funcsim, gem5, *, smoke_test=False
+):
     if provenance is None:
         raise artifacts.EvidenceError("provenance evidence is missing")
     for field in dataclasses.fields(provenance):
@@ -283,7 +293,10 @@ def _validate_provenance(provenance, calibration, funcsim, gem5):
             raise artifacts.EvidenceError(
                 f"provenance {field.name} is not a SHA-256"
             )
-    if provenance.graph_sha256 != artifacts.EXPECTED_G20_SHA256:
+    if (
+        not smoke_test
+        and provenance.graph_sha256 != artifacts.EXPECTED_G20_SHA256
+    ):
         raise artifacts.EvidenceError("provenance graph hash is not g20")
     if provenance.graph_sha256 != gem5.row["graph_sha256"]:
         raise artifacts.EvidenceError("gem5/provenance graph hash mismatch")
@@ -314,8 +327,11 @@ def build_summary(
     ndpsim,
     calibration,
     provenance=None,
+    smoke_test=False,
 ):
-    sim_ticks = _validate_gem5_row(gem5.row)
+    sim_ticks = _validate_gem5_row(
+        gem5.row, smoke_test=smoke_test
+    )
     if sim_ticks != gem5.sim_ticks:
         raise artifacts.EvidenceError(
             "gem5 evidence sim_ticks does not match its summary row"
@@ -364,7 +380,11 @@ def build_summary(
             "calibration residual exceeds one link clock"
         )
     _validate_provenance(
-        provenance, calibration, funcsim, gem5
+        provenance,
+        calibration,
+        funcsim,
+        gem5,
+        smoke_test=smoke_test,
     )
     gem5_seconds = decimal.Decimal(sim_ticks) / decimal.Decimal(10**12)
     m2ndp_seconds = decimal.Decimal(

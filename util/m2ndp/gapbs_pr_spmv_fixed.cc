@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
+#include <immintrin.h>
 #include <unistd.h>
 
 #include <gem5/m5ops.h>
@@ -88,39 +88,20 @@ void WriteAll(int descriptor, const void *data, size_t size) {
   }
 }
 
-void WriteScoreBits(const std::string &path,
-                    const pvector<ScoreT> &scores) {
-  const std::string temporary = path + ".tmp";
-  const int descriptor =
-      open(temporary.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-  if (descriptor < 0)
-    throw std::runtime_error("cannot open reference output");
-  try {
-    for (ScoreT score : scores) {
-      uint32_t bits = 0;
-      static_assert(sizeof(bits) == sizeof(score), "float32 required");
-      std::memcpy(&bits, &score, sizeof(bits));
-      const uint8_t encoded[4] = {
-          static_cast<uint8_t>(bits),
-          static_cast<uint8_t>(bits >> 8),
-          static_cast<uint8_t>(bits >> 16),
-          static_cast<uint8_t>(bits >> 24),
-      };
-      WriteAll(descriptor, encoded, sizeof(encoded));
-    }
-    if (fsync(descriptor) != 0)
-      throw std::runtime_error("reference fsync failed");
-    if (close(descriptor) != 0)
-      throw std::runtime_error("reference close failed");
-  } catch (...) {
-    close(descriptor);
-    unlink(temporary.c_str());
-    throw;
-  }
-  if (rename(temporary.c_str(), path.c_str()) != 0) {
-    unlink(temporary.c_str());
-    throw std::runtime_error("reference rename failed");
-  }
+void CommitScoreBits(const std::string &path,
+                     const pvector<ScoreT> &scores) {
+  static_assert(sizeof(ScoreT) == sizeof(uint32_t), "float32 required");
+  const uint64_t size = scores.size() * sizeof(ScoreT);
+  constexpr uint64_t kCacheLineBytes = 64;
+  const uint8_t *bytes =
+      reinterpret_cast<const uint8_t *>(scores.data());
+  for (uint64_t offset = 0; offset < size; offset += kCacheLineBytes)
+    _mm_clflush(bytes + offset);
+  _mm_mfence();
+  const uint64_t written =
+      m5_write_file(scores.data(), size, 0, path.c_str());
+  if (written != size)
+    throw std::runtime_error("reference m5_write_file was short");
 }
 
 int main(int argc, char **argv) {
@@ -129,6 +110,7 @@ int main(int argc, char **argv) {
     return 64;
   Builder builder(cli);
   Graph g = builder.MakeGraph();
+  const std::string reference_path = M2NDP_REFERENCE_RAW_PATH;
 
   for (int trial = 0; trial < cli.num_trials(); ++trial) {
     pvector<ScoreT> scores(g.num_nodes());
@@ -150,7 +132,7 @@ int main(int argc, char **argv) {
       WriteAll(STDERR_FILENO, marker, std::strlen(marker));
       if (!verification_passed)
         m5_fail(0, 1);
-      WriteScoreBits(M2NDP_REFERENCE_RAW_PATH, scores);
+      CommitScoreBits(reference_path, scores);
     }
   }
   m5_exit(0);

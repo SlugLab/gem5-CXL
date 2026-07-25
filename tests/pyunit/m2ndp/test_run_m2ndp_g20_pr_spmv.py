@@ -4,6 +4,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import m2ndp_artifacts as artifacts
 from scripts import run_m2ndp_g20_pr_spmv as runner
@@ -107,6 +108,21 @@ class OrchestratorTest(unittest.TestCase):
         before = runner.hash_path(tree)
         nested.write_text("two")
         self.assertNotEqual(before, runner.hash_path(tree))
+
+    def test_funcsim_output_directory_exists_before_launch(self):
+        def fake_run(*_args, **_kwargs):
+            self.assertTrue(self.paths.funcsim_dump.parent.is_dir())
+            return 2
+
+        with mock.patch.object(runner, "_run_command", fake_run):
+            with self.assertRaises(runner.StageCommandError):
+                runner._execute_stage(
+                    "funcsim",
+                    self.options,
+                    self.paths,
+                    ["FuncSim"],
+                    self.paths.logs / "funcsim.log",
+                )
 
 
 if __name__ == "__main__":

@@ -298,7 +298,7 @@ def _launch(kernel_id, base, size, int_args, float_args=()):
     total_args = len(int_args) + len(float_args)
     smem_size = 96
     fields = [
-        "0",
+        "1",
         str(kernel_id),
         f"0x{base:x}",
         f"0x{size:x}",

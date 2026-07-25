@@ -111,7 +111,7 @@ class PageRankTraceTest(unittest.TestCase):
             self.root / "trace/0/K3_PULL_DAMP_launch.txt"
         ).read_text().strip()
         fields = launch.split()
-        self.assertEqual(fields[:2], ["0", "3"])
+        self.assertEqual(fields[:2], ["1", "3"])
         self.assertEqual(fields[6:12], [
             f"0x{trace.IN_OFFSETS_ADDR:x}",
             f"0x{trace.IN_NEIGHBORS_ADDR:x}",

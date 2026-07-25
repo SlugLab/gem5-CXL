@@ -443,3 +443,35 @@ index 22b4511..059ac89 100644
 -#endif  // FUNCSIM_MEMORY_MAP_H_
 \ No newline at end of file
 +#endif  // FUNCSIM_MEMORY_MAP_H_
+diff --git a/src/m2ndp.cc b/src/m2ndp.cc
+index bc3e129..d0a3d2d 100644
+--- a/src/m2ndp.cc
++++ b/src/m2ndp.cc
+@@ -181,8 +181,14 @@ void M2NDP::cycle() {
+ void M2NDP::register_ndp_kernel(int host_id, string kernel_path) {
+   NdpKernel *ndp_kernel = new NdpKernel();
+-  m_ndp_kernels[host_id].push_back(ndp_kernel);
+   M2NDPParser::parse_ndp_kernel(m_config->get_num_ndp_units(), kernel_path,
+                                ndp_kernel, m_config);
++  for (auto registered : m_ndp_kernels[host_id]) {
++    if (registered->kernel_id == ndp_kernel->kernel_id) {
++      delete ndp_kernel;
++      return;
++    }
++  }
++  m_ndp_kernels[host_id].push_back(ndp_kernel);
+   spdlog::info(
+       "Host {} Registered NDP kernel {} at  core cycle {} ndp cycle "
+       "{} to CXL {}",
+diff --git a/src/m2ndp_config.cc b/src/m2ndp_config.cc
+index a15bf47..7ef698a 100644
+--- a/src/m2ndp_config.cc
++++ b/src/m2ndp_config.cc
+@@ -119,6 +119,7 @@ int M2NDPConfig::next_clock_domain() {
+   if (m_core_time <= smallest) {
+     m_core_time += m_core_period;
+     mask |= CORE;
++    m_core_cycle++;
+   }
+   if(m_dram_time <= smallest) {
+     m_dram_time += m_dram_period;

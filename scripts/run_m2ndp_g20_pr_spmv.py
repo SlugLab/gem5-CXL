@@ -548,9 +548,12 @@ def _run_command(command, *, cwd, log, timeout):
         return 124
 
 
-def _pack_reference(paths):
+def _pack_reference(options, paths):
     meta = _graph_meta(paths)
-    gem5 = results.parse_gem5_summary(paths.gem5_run / "summary.csv")
+    gem5 = results.parse_gem5_summary(
+        paths.gem5_run / "summary.csv",
+        smoke_test=options.smoke_test,
+    )
     build = _load_json(paths.build / "manifest.json", "build manifest")
     raw_size = paths.reference_raw.stat().st_size
     expected_size = meta.num_nodes * 4
@@ -558,6 +561,8 @@ def _pack_reference(paths):
         raise artifacts.EvidenceError(
             f"gem5 raw reference size is {raw_size}, expected {expected_size}"
         )
+    with paths.reference_raw.open("rb") as stream:
+        os.fsync(stream.fileno())
     words = artifacts.BinaryArray(paths.reference_raw, "<I", meta.num_nodes)
     try:
         artifacts.write_reference(
@@ -647,7 +652,10 @@ def _git_head(root):
 
 def _publish(options, paths):
     meta = _graph_meta(paths)
-    gem5 = results.parse_gem5_summary(paths.gem5_run / "summary.csv")
+    gem5 = results.parse_gem5_summary(
+        paths.gem5_run / "summary.csv",
+        smoke_test=options.smoke_test,
+    )
     funcsim_log = (paths.logs / "funcsim.log").read_text(
         encoding="utf-8", errors="replace"
     )
@@ -682,6 +690,7 @@ def _publish(options, paths):
         ndpsim=ndpsim,
         calibration=calibrated,
         provenance=provenance,
+        smoke_test=options.smoke_test,
     )
     artifacts.atomic_write_csv(
         paths.summary,
@@ -733,6 +742,8 @@ def _execute_stage(stage, options, paths, command, log):
         "calibration",
         "ndpsim",
     }:
+        if stage == "funcsim":
+            paths.funcsim_dump.parent.mkdir(parents=True, exist_ok=True)
         cwd = (
             Path(options.m2ndp_root).resolve()
             if stage == "ndpsim"
@@ -760,7 +771,10 @@ def _execute_stage(stage, options, paths, command, log):
             bundle.in_neighbors.close()
             bundle.out_degree.close()
         elif stage == "gem5_baseline":
-            results.parse_gem5_summary(paths.gem5_run / "summary.csv")
+            results.parse_gem5_summary(
+                paths.gem5_run / "summary.csv",
+                smoke_test=options.smoke_test,
+            )
         elif stage == "funcsim":
             meta = _graph_meta(paths)
             results.parse_funcsim(
@@ -784,7 +798,7 @@ def _execute_stage(stage, options, paths, command, log):
             )
         return 0
     if stage == "reference_pack":
-        _pack_reference(paths)
+        _pack_reference(options, paths)
     elif stage == "trace_generate":
         _generate_trace(paths)
     elif stage == "publish":

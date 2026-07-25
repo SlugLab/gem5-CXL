@@ -11,6 +11,16 @@ from scripts import prepare_m2ndp as prepare
 
 
 class PrepareM2NDPTest(unittest.TestCase):
+    def test_patch_deduplicates_repeated_timing_kernel_registration(self):
+        patch = prepare.PATCH.read_text()
+        self.assertIn("src/m2ndp.cc", prepare.PATCHED_PATHS)
+        self.assertIn(
+            "registered->kernel_id == ndp_kernel->kernel_id", patch
+        )
+        self.assertIn("delete ndp_kernel;", patch)
+        self.assertIn("src/m2ndp_config.cc", prepare.PATCHED_PATHS)
+        self.assertIn("m_core_cycle++;", patch)
+
     def test_git_output_preserves_porcelain_status_prefix(self):
         with mock.patch.object(
             prepare.subprocess,

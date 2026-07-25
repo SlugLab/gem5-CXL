@@ -143,7 +143,17 @@ class MatchedPageRankSourceTest(unittest.TestCase):
         )
         self.assertLess(
             source.index("m5_work_end(trial, 0)"),
-            source.rindex("WriteScoreBits("),
+            source.rindex("CommitScoreBits("),
+        )
+        self.assertNotIn("fsync(descriptor)", source)
+        self.assertNotIn("O_TRUNC", source)
+        self.assertNotIn("OpenReferenceOutput", source)
+        self.assertIn("m5_write_file(", source)
+        self.assertIn("_mm_clflush(", source)
+        self.assertIn("_mm_mfence()", source)
+        self.assertLess(
+            source.index("_mm_mfence()"),
+            source.index("m5_write_file("),
         )
         self.assertNotIn("reduction(+ : error)", source)
         self.assertNotIn("if (error <", source)
@@ -177,6 +187,17 @@ class MatchedPageRankSourceTest(unittest.TestCase):
         self.assertFalse(manifest["convergence_reduction"])
         self.assertFalse(manifest["fp_contract"])
         self.assertTrue(Path(manifest["reference_raw_path"]).is_absolute())
+
+    def test_reference_dump_uses_checkpoint_safe_m5_pseudo_op(self):
+        source = (
+            REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
+        ).read_text()
+        self.assertLess(
+            source.index("m5_work_end(trial, 0)"),
+            source.rindex("CommitScoreBits("),
+        )
+        self.assertNotIn("open(path.c_str()", source)
+        self.assertIn("m5_write_file(", source)
 
 
 if __name__ == "__main__":
