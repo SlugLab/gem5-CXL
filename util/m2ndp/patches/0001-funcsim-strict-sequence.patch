@@ -1,0 +1,445 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 23b481e..91a870c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -97,6 +97,11 @@ if(PERFORMANCE_BUILD STREQUAL "1" OR ACCELSIM_BUILD STREQUAL "1")
+   endif()
+   
+   target_link_libraries(${PROJECT_NAME} ${PROJECT_NAME}_lib)
++  add_executable(M2NDPCXLProbe
++    "${CMAKE_SOURCE_DIR}/perf_runner/synthetic_traffic.cc"
++    "${CMAKE_SOURCE_DIR}/perf_runner/synthetic_traffic.h"
++    "${CMAKE_SOURCE_DIR}/perf_runner/cxl_probe_main.cc")
++  target_link_libraries(M2NDPCXLProbe ${PROJECT_NAME}_lib)
+   # enable_testing()
+   # add_subdirectory(test)
+ else()
+@@ -106,4 +111,3 @@ else()
+   add_executable(${PROJECT_NAME} ${SRC_FILES} "${CMAKE_SOURCE_DIR}/functional_runner/main.cc")
+   target_link_libraries(${PROJECT_NAME} ${CONAN_LIBS})
+ endif()
+-
+diff --git a/functional_runner/main.cc b/functional_runner/main.cc
+index 64c4496..823e50b 100644
+--- a/functional_runner/main.cc
++++ b/functional_runner/main.cc
+@@ -6,6 +6,7 @@
+ #include <spdlog/spdlog.h>
+ #include <spdlog/cfg/env.h>
+ #include <fstream>
++#include <memory>
+ 
+ namespace po = boost::program_options;
+ using namespace NDPSim;
+@@ -14,7 +15,7 @@ typedef enum {
+   LOOP
+ } TraceOption;
+ 
+-void functional_simulation(int argc, char** argv) {
++int functional_simulation(int argc, char** argv) {
+   spdlog::cfg::load_env_levels();
+   CommandLineParser cmd_parser = CommandLineParser();
+   cmd_parser.add_command_line_option<std::string>("ndp_trace",
+@@ -28,6 +29,14 @@ void functional_simulation(int argc, char** argv) {
+   cmd_parser.add_command_line_option<std::string>("config",
+                                                   "path for config file");
+   cmd_parser.add_command_line_option<int>("option", "trace option");
++  cmd_parser.add_command_line_option<std::string>(
++      "sequence_file", "tab-separated trace and launch sequence");
++  cmd_parser.add_command_line_option<std::string>(
++      "strict_float32_base", "strict comparison base address");
++  cmd_parser.add_command_line_option<uint64_t>(
++      "strict_float32_count", "strict comparison float32 count");
++  cmd_parser.add_command_line_option<std::string>(
++      "dump_float32_bits", "path for final raw float32 words");
+   try {
+     cmd_parser.parse(argc, argv);
+   } catch (const CommandLineParser::ParsingError& e) {
+@@ -41,6 +50,10 @@ void functional_simulation(int argc, char** argv) {
+   std::string target_map_path;
+   std::string config_path;
+   std::string launch_file_path;
++  std::string sequence_file_path;
++  std::string strict_float32_base;
++  std::string dump_float32_bits_path;
++  uint64_t strict_float32_count = 0;
+   TraceOption trace_option = SINGLE;
+ 
+   cmd_parser.set_if_defined("ndp_trace", &ndp_file_path);
+@@ -49,10 +62,80 @@ void functional_simulation(int argc, char** argv) {
+   cmd_parser.set_if_defined("launch_file", &launch_file_path);
+   cmd_parser.set_if_defined("config", &config_path);
+   cmd_parser.set_if_defined("option", (int*)&trace_option);
++  cmd_parser.set_if_defined("sequence_file", &sequence_file_path);
++  cmd_parser.set_if_defined("strict_float32_base", &strict_float32_base);
++  cmd_parser.set_if_defined("strict_float32_count", &strict_float32_count);
++  cmd_parser.set_if_defined("dump_float32_bits", &dump_float32_bits_path);
+ 
+   HashMemoryMap memory_map(memory_map_path);
+ 
+-  if (trace_option == SINGLE) {
++  if (!sequence_file_path.empty()) {
++    if (target_map_path.empty() || config_path.empty() ||
++        strict_float32_base.empty() || strict_float32_count == 0 ||
++        dump_float32_bits_path.empty()) {
++      std::fprintf(stderr,
++                   "strict sequence mode requires target, config, base, "
++                   "count, and dump arguments\n");
++      return 64;
++    }
++    std::ifstream sequence_file(sequence_file_path);
++    if (!sequence_file.good()) {
++      std::fprintf(stderr, "cannot open sequence file\n");
++      return 64;
++    }
++    M2NDPConfig* config = new M2NDPConfig(config_path, 1);
++    const int num_ndp = config->get_num_ndp_units();
++    if (config->get_use_synthetic_memory())
++      memory_map.set_synthetic_memory(config->get_synthetic_base_address(),
++                                      config->get_synthetic_memory_size());
++    std::vector<std::unique_ptr<NdpUnit>> ndp_units;
++    for (int id = 0; id < num_ndp; ++id)
++      ndp_units.emplace_back(new NdpUnit(config, &memory_map, id));
++
++    std::string line;
++    uint64_t launches = 0;
++    while (std::getline(sequence_file, line)) {
++      if (line.empty()) continue;
++      const size_t delimiter = line.find('\t');
++      if (delimiter == std::string::npos || delimiter == 0 ||
++          delimiter + 1 >= line.size()) {
++        std::fprintf(stderr, "invalid strict sequence line\n");
++        return 64;
++      }
++      const std::string trace_path = line.substr(0, delimiter);
++      const std::string launch_record = line.substr(delimiter + 1);
++      NdpKernel ndp_kernel;
++      M2NDPParser::parse_ndp_kernel(num_ndp, trace_path, &ndp_kernel, config);
++      for (int id = 0; id < num_ndp; ++id)
++        ndp_units[id]->Run(id, &ndp_kernel, launch_record);
++      ++launches;
++    }
++    if (launches == 0) {
++      std::fprintf(stderr, "strict sequence contains no launches\n");
++      return 64;
++    }
++
++    HashMemoryMap target_map(target_map_path);
++    uint64_t strict_base = 0;
++    try {
++      strict_base = std::stoull(strict_float32_base, nullptr, 0);
++    } catch (const std::exception&) {
++      std::fprintf(stderr, "invalid strict float32 base\n");
++      return 64;
++    }
++    ExactMatchResult result = target_map.MatchFloat32Bits(
++        memory_map, strict_base, strict_float32_count, stderr);
++    memory_map.DumpFloat32Bits(strict_base, strict_float32_count,
++                               dump_float32_bits_path);
++    std::printf("M2NDP_STRICT_MODE=1\n");
++    std::printf("M2NDP_STRICT_COMPARED=%llu\n",
++                static_cast<unsigned long long>(result.compared));
++    std::printf("M2NDP_STRICT_MISMATCHED=%llu\n",
++                static_cast<unsigned long long>(result.mismatched));
++    std::printf("M2NDP_STRICT_MATCH=%s\n",
++                result.matched ? "PASS" : "FAIL");
++    return result.matched ? 0 : 2;
++  } else if (trace_option == SINGLE) {
+     // Initialize NDP fuctions, Memory map, NDP units
+     spdlog::info("Running FuncSim in Single Kernel Mode..");
+ 
+@@ -111,7 +194,8 @@ void functional_simulation(int argc, char** argv) {
+   } 
+   HashMemoryMap target_map(target_map_path);
+   // Check memory value
+-  if (target_map.Match(memory_map)) {
++  bool matched = target_map.Match(memory_map);
++  if (matched) {
+     spdlog::info("Functional simulation success");
+     printf(" _____                             \n");
+     printf("/  ___|                             _ _ \n");
+@@ -122,9 +206,14 @@ void functional_simulation(int argc, char** argv) {
+   } else {
+     spdlog::info("Value Missmatch: Fucntional simulation fail");
+   }
++  return matched ? 0 : 2;
+ }
+ 
+ int main(int argc, char** argv) {
+-  functional_simulation(argc, argv);
+-  return 0;
+-}
+\ No newline at end of file
++  try {
++    return functional_simulation(argc, argv);
++  } catch (const std::exception& error) {
++    std::fprintf(stderr, "FuncSim: %s\n", error.what());
++    return 64;
++  }
++}
+diff --git a/perf_runner/cxl_probe_main.cc b/perf_runner/cxl_probe_main.cc
+new file mode 100644
+index 0000000..8bba5a2
+--- /dev/null
++++ b/perf_runner/cxl_probe_main.cc
+@@ -0,0 +1,15 @@
++#include <cstdio>
++#include <exception>
++
++#include "synthetic_traffic.h"
++
++int main(int argc, char** argv) {
++  try {
++    NDPSim::SyntheticTrafficRunner runner(argc, argv);
++    runner.run();
++    return 0;
++  } catch (const std::exception& error) {
++    std::fprintf(stderr, "M2NDPCXLProbe: %s\n", error.what());
++    return 64;
++  }
++}
+diff --git a/perf_runner/synthetic_traffic.cc b/perf_runner/synthetic_traffic.cc
+index 15c3df7..6c35d8f 100644
+--- a/perf_runner/synthetic_traffic.cc
++++ b/perf_runner/synthetic_traffic.cc
+@@ -1,5 +1,7 @@
+ #include "synthetic_traffic.h"
+ 
++#include <stdexcept>
++
+ #include "command_line_parser.h"
+ 
+ namespace NDPSim {
+@@ -9,6 +11,8 @@ SyntheticTrafficRunner::SyntheticTrafficRunner(int argc, char* argv[]) {
+                                                   "path for m2ndp config file");
+   cmd_parser.add_command_line_option<int>(
+       "num_reqs", "number of memory request");
++  cmd_parser.add_command_line_option<int>(
++      "request_bytes", "payload bytes per memory request");
+   try {
+     cmd_parser.parse(argc, argv);
+   } catch (const CommandLineParser::ParsingError& e) {
+@@ -19,6 +23,14 @@ SyntheticTrafficRunner::SyntheticTrafficRunner(int argc, char* argv[]) {
+   }
+   cmd_parser.set_if_defined("config", &m_config_file_path);
+   cmd_parser.set_if_defined("num_reqs", &m_num_reqs);
++  cmd_parser.set_if_defined("request_bytes", &m_request_bytes);
++  if (m_num_reqs <= 0 || m_request_bytes <= 0 ||
++      (m_request_bytes & (m_request_bytes - 1)) != 0 ||
++      m_request_bytes > MAX_MEMORY_ACCESS_SIZE) {
++    throw std::invalid_argument(
++        "num_reqs must be positive and request_bytes must be a positive "
++        "power of two no larger than MAX_MEMORY_ACCESS_SIZE");
++  }
+ 
+   m_m2ndp_config = new M2NDPConfig(m_config_file_path, 1);
+   m_m2ndp_config->set_functional_sim(false);
+@@ -28,6 +40,8 @@ SyntheticTrafficRunner::SyntheticTrafficRunner(int argc, char* argv[]) {
+ }
+ 
+ void SyntheticTrafficRunner::run() {
++  printf("M2NDP_CXL_PROBE request_bytes=%d requests=%d\n",
++         m_request_bytes, m_num_reqs);
+   extern Stats_NDPSim::StatList statlist;
+   FILE *output_file = fopen("output.txt", "w");
+   int finish_counter = 0;
+@@ -40,7 +54,7 @@ void SyntheticTrafficRunner::run() {
+     if(push_mem_req ) {
+       uint64_t random_addr = rand() % 100000000;
+       mem_fetch *mf = new mem_fetch(random_addr, GLOBAL_ACC_R, READ_REQUEST,
+-        PACKET_SIZE, CXL_OVERHEAD, 0);
++        m_request_bytes, CXL_OVERHEAD, 0);
+       mf->set_channel(m_m2ndp_config->get_channel_index(random_addr));
+       printf("Push to CXL link time: %d\n", m_m2ndp_config->get_ndp_cycle());
+       m_cxl_link->push_from_host(0, 0, mf);
+@@ -64,4 +78,4 @@ void SyntheticTrafficRunner::run() {
+   m_m2ndp->display_stats(output_file);
+   Stats_NDPSim::statlist.printall();
+ }
+-} // namespace NDPSim
+\ No newline at end of file
++} // namespace NDPSim
+diff --git a/perf_runner/synthetic_traffic.h b/perf_runner/synthetic_traffic.h
+index 8ef5d62..a0f760a 100644
+--- a/perf_runner/synthetic_traffic.h
++++ b/perf_runner/synthetic_traffic.h
+@@ -2,8 +2,8 @@
+ #define SYNTHETIC_TRAFFIC_RUNNER_H
+ 
+ #include "cxl_link.h"
++#include "m2ndp.h"
+ #include "m2ndp_config.h"
+-#include "m2ndp_switch.h"
+ 
+ namespace NDPSim {
+ class SyntheticTrafficRunner {
+@@ -13,11 +13,12 @@ class SyntheticTrafficRunner {
+     void match_memorymap() {}
+   private:
+     std::string m_config_file_path;
+-    int m_num_reqs;
++    int m_num_reqs = 0;
++    int m_request_bytes = PACKET_SIZE;
+     M2NDPConfig* m_m2ndp_config;
+     CxlLink* m_cxl_link;
+     M2NDP *m_m2ndp;
+     std::vector<std::queue<mem_fetch*>> m_memory_reqs;
+ };
+ } // namespace NDPSim
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/memory_map.cc b/src/memory_map.cc
+index cba7906..52c620c 100644
+--- a/src/memory_map.cc
++++ b/src/memory_map.cc
+@@ -1,5 +1,6 @@
+ #include "memory_map.h"
+ 
++#include <cstring>
+ #include <fstream>
+ #include <iostream>
+ #include <queue>
+@@ -313,6 +314,94 @@ bool HashMemoryMap::Match(MemoryMap& other2) {
+   return result;
+ }
+ 
++ExactMatchResult HashMemoryMap::MatchFloat32Bits(
++    MemoryMap& actual2, uint64_t base, uint64_t count, FILE* report) {
++  HashMemoryMap& actual = dynamic_cast<HashMemoryMap&>(actual2);
++  ExactMatchResult result{true, 0, 0};
++  for (uint64_t index = 0; index < count; ++index) {
++    const uint64_t address = base + index * sizeof(float);
++    const uint64_t packet_address = FormatAddr(address);
++    if (!CheckAddr(packet_address) || !actual.CheckAddr(packet_address)) {
++      result.matched = false;
++      ++result.mismatched;
++      if (report != nullptr) {
++        std::fprintf(report,
++                     "M2NDP_STRICT_MISMATCH index=%llu address=0x%llx "
++                     "reason=missing\n",
++                     static_cast<unsigned long long>(index),
++                     static_cast<unsigned long long>(address));
++      }
++      continue;
++    }
++    VectorData expected_packet = Load(packet_address);
++    VectorData actual_packet = actual.Load(packet_address);
++    const int element = (address % PACKET_SIZE) / sizeof(float);
++    if (expected_packet.GetType() != FLOAT32 ||
++        actual_packet.GetType() != FLOAT32) {
++      result.matched = false;
++      ++result.mismatched;
++      if (report != nullptr) {
++        std::fprintf(report,
++                     "M2NDP_STRICT_MISMATCH index=%llu address=0x%llx "
++                     "reason=type\n",
++                     static_cast<unsigned long long>(index),
++                     static_cast<unsigned long long>(address));
++      }
++      continue;
++    }
++    const float expected_value = expected_packet.GetFloatData(element);
++    const float actual_value = actual_packet.GetFloatData(element);
++    uint32_t expected_bits = 0;
++    uint32_t actual_bits = 0;
++    std::memcpy(&expected_bits, &expected_value, sizeof(expected_bits));
++    std::memcpy(&actual_bits, &actual_value, sizeof(actual_bits));
++    ++result.compared;
++    if (expected_bits != actual_bits) {
++      result.matched = false;
++      ++result.mismatched;
++      if (report != nullptr) {
++        std::fprintf(report,
++                     "M2NDP_STRICT_MISMATCH index=%llu address=0x%llx "
++                     "expected=0x%08x actual=0x%08x\n",
++                     static_cast<unsigned long long>(index),
++                     static_cast<unsigned long long>(address), expected_bits,
++                     actual_bits);
++      }
++    }
++  }
++  return result;
++}
++
++void HashMemoryMap::DumpFloat32Bits(uint64_t base, uint64_t count,
++                                    const std::string& path) {
++  std::ofstream output(path, std::ios::binary | std::ios::trunc);
++  if (!output.good())
++    throw std::runtime_error("cannot open strict float32 dump");
++  for (uint64_t index = 0; index < count; ++index) {
++    const uint64_t address = base + index * sizeof(float);
++    const uint64_t packet_address = FormatAddr(address);
++    if (!CheckAddr(packet_address))
++      throw std::runtime_error("strict float32 dump address missing");
++    VectorData packet = Load(packet_address);
++    if (packet.GetType() != FLOAT32)
++      throw std::runtime_error("strict float32 dump type mismatch");
++    const int element = (address % PACKET_SIZE) / sizeof(float);
++    const float value = packet.GetFloatData(element);
++    uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    const unsigned char encoded[4] = {
++        static_cast<unsigned char>(bits),
++        static_cast<unsigned char>(bits >> 8),
++        static_cast<unsigned char>(bits >> 16),
++        static_cast<unsigned char>(bits >> 24),
++    };
++    output.write(reinterpret_cast<const char*>(encoded), sizeof(encoded));
++  }
++  output.flush();
++  if (!output.good())
++    throw std::runtime_error("strict float32 dump write failed");
++}
++
+ VectorData HashMemoryMap::Load(uint64_t addr) {
+   assert(addr >= m_base && addr < m_base + m_size);
+   if (m_use_synthetic_memory) {
+@@ -646,4 +735,4 @@ uint64_t PointerMemoryMap::GetBaseAddr(uint64_t addr) {
+   }
+   return (uint64_t)-1;
+ }
+-}  // namespace NDPSim
+\ No newline at end of file
++}  // namespace NDPSim
+diff --git a/src/memory_map.h b/src/memory_map.h
+index 22b4511..059ac89 100644
+--- a/src/memory_map.h
++++ b/src/memory_map.h
+@@ -5,11 +5,18 @@
+ 
+ #include <bitset>
+ #include <cassert>
++#include <cstdio>
+ #include <string>
+ 
+ #include "common.h"
+ namespace NDPSim {
+ 
++struct ExactMatchResult {
++  bool matched;
++  uint64_t compared;
++  uint64_t mismatched;
++};
++
+ class MemoryMap {
+  public:
+   virtual ~MemoryMap() = default;
+@@ -47,6 +54,10 @@ class HashMemoryMap : public MemoryMap {
+   virtual bool CheckAddr(uint64_t addr) override;
+   virtual void Reset() override;
+   void DumpMemory() override;
++  ExactMatchResult MatchFloat32Bits(MemoryMap& actual, uint64_t base,
++                                    uint64_t count, FILE* report);
++  void DumpFloat32Bits(uint64_t base, uint64_t count,
++                       const std::string& path);
+ private:
+   uint64_t m_size = 0;
+   uint64_t m_base = 0; 
+@@ -75,4 +86,4 @@ class PointerMemoryMap : public MemoryMap {
+   std::map<uint64_t, MemoryInfo> m_ptr_map;
+ };
+ }
+-#endif  // FUNCSIM_MEMORY_MAP_H_
+\ No newline at end of file
++#endif  // FUNCSIM_MEMORY_MAP_H_
