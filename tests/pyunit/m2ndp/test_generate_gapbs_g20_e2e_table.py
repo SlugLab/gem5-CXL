@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import csv
+import contextlib
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -746,6 +748,95 @@ class TableRenderingTest(unittest.TestCase):
                     for path in table.output_paths(output)
                 )
             )
+
+
+def valid_cli_args(root, roots, latency_csv, latency_root, output):
+    return [
+        "--m2ndp-results-root",
+        str(roots.m2ndp),
+        "--variants-results-root",
+        str(roots.variants),
+        "--latency-csv",
+        str(latency_csv),
+        "--latency-run-root",
+        str(latency_root),
+        "--output-dir",
+        str(output),
+    ]
+
+
+class TableCliTest(unittest.TestCase):
+    def test_cli_requires_all_explicit_roots(self):
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            table.parse_args([])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_main_reports_failure_and_preserves_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roots = write_formal_bundle(root)
+            latency_csv, latency_root = write_sensitivity_bundle(root)
+            output = root / "paper"
+            target = output / "gapbs-vtune-cxl-table.tex"
+            target.parent.mkdir(parents=True)
+            target.write_text("old\n", encoding="utf-8")
+            with mock.patch.object(
+                table,
+                "publish",
+                side_effect=table.TableEvidenceError("bad graph"),
+            ):
+                stream = io.StringIO()
+                with contextlib.redirect_stdout(stream):
+                    code = table.main(
+                        valid_cli_args(
+                            root,
+                            roots,
+                            latency_csv,
+                            latency_root,
+                            output,
+                        )
+                    )
+
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "GAPBS_G20_TABLE_FAILED error=bad graph",
+                stream.getvalue(),
+            )
+            self.assertEqual(
+                target.read_text(encoding="utf-8"), "old\n"
+            )
+
+    def test_main_success_prints_all_three_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roots = write_formal_bundle(root)
+            latency_csv, latency_root = write_sensitivity_bundle(root)
+            output = root / "paper"
+            stream = io.StringIO()
+            with (
+                mock.patch.object(table, "G20_WORDS", 4),
+                mock.patch.object(
+                    table, "git_head", return_value="c" * 40
+                ),
+                contextlib.redirect_stdout(stream),
+            ):
+                code = table.main(
+                    valid_cli_args(
+                        root,
+                        roots,
+                        latency_csv,
+                        latency_root,
+                        output,
+                    )
+                )
+
+            self.assertEqual(code, 0)
+            for path in table.output_paths(output):
+                self.assertIn(str(path), stream.getvalue())
+                self.assertTrue(path.is_file())
 
 
 if __name__ == "__main__":

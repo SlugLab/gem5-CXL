@@ -4,6 +4,7 @@
 
 """Generate the evidence-gated GAPBS g20 end-to-end paper table."""
 
+import argparse
 import csv
 import dataclasses
 import decimal
@@ -1047,3 +1048,41 @@ def publish(
     return publish_bytes(
         output_dir, csv_bytes, evidence_bytes, latex_bytes
     )
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--m2ndp-results-root", type=Path, required=True
+    )
+    parser.add_argument(
+        "--variants-results-root", type=Path, required=True
+    )
+    parser.add_argument("--latency-csv", type=Path, required=True)
+    parser.add_argument(
+        "--latency-run-root", type=Path, required=True
+    )
+    parser.add_argument("--output-dir", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    options = parse_args(argv)
+    try:
+        paths = publish(
+            options.m2ndp_results_root,
+            options.variants_results_root,
+            options.latency_csv,
+            options.latency_run_root,
+            options.output_dir,
+        )
+    except (TableEvidenceError, OSError, ValueError) as error:
+        print(f"GAPBS_G20_TABLE_FAILED error={error}")
+        return 1
+    for path in paths:
+        print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

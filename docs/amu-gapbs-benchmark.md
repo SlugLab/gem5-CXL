@@ -211,3 +211,38 @@ SSSP, or SPM-backed reads fail verification.
 Each result row points to a run directory containing `stats.txt`,
 `config.ini`, and `gem5.log`. The runner uses the first stats section as the
 explicit trial-1 ROI dump; gem5 may append one later final-exit section.
+
+## G20 AMU/CIRA/M2NDP table publication
+
+The paper table is generated only after the fixed-20 AMU, CIRA, and M2NDP
+formal pipelines finish. Run the publisher from the
+`m2ndp-g20-pr-spmv` worktree:
+
+```sh
+python3 scripts/generate_gapbs_g20_e2e_table.py \
+  --m2ndp-results-root m5out/m2ndp_g20_pr_spmv_e2e \
+  --variants-results-root m5out/matched_pr_spmv_g20_e2e \
+  --latency-csv \
+    /home/victoryang00/gem5-CXL/6472666535e6f359942ddac6/gapbs-amu-latency-results.csv \
+  --latency-run-root \
+    /home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table \
+  --output-dir \
+    /home/victoryang00/gem5-CXL/6472666535e6f359942ddac6
+```
+
+The command produces:
+
+- `gapbs-vtune-cxl-table.tex`, with a formal g20/1us end-to-end panel and a
+  separate scale-4 multi-latency sensitivity panel;
+- `gapbs-g20-e2e-results.csv`, with the unrounded Vanilla CXL, AMU, CIRA, and
+  M2NDP absolute latencies and speedups; and
+- `gapbs-g20-e2e-table-evidence.json`, with the machine-readable contract,
+  input hashes, unrounded values, and repository commit.
+
+The publisher is intentionally fail closed. It is expected to fail while any
+formal service is running or before its final summary/manifest exists. It
+also rejects the result on any verifier, bit-exact, graph, binary, delay,
+event-balance, FuncSim, NDPSim, or calibration mismatch. A running or
+successfully exited process alone never authorizes a displayed speedup.
+Validation and rendering finish before output replacement; on an evidence
+failure the existing paper table remains byte-for-byte unchanged.
