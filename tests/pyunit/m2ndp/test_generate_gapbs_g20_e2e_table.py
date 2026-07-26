@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import csv
+import hashlib
 import json
 import tempfile
 import unittest
@@ -614,6 +615,137 @@ class SensitivityEvidenceTest(unittest.TestCase):
                 table.TableEvidenceError, "escapes"
             ):
                 table.load_sensitivity(csv_path, run_root)
+
+
+def valid_main_rows():
+    return [
+        table.MainRow("Vanilla CXL", Decimal("2"), Decimal("1"), "PASS"),
+        table.MainRow(
+            "AMU", Decimal("4"), Decimal("0.5"), "Bit-exact PASS"
+        ),
+        table.MainRow(
+            "CIRA", Decimal("1.6"), Decimal("1.25"), "Bit-exact PASS"
+        ),
+        table.MainRow(
+            "M2NDP",
+            Decimal("0.5"),
+            Decimal("4"),
+            "FuncSim bit-exact PASS",
+        ),
+    ]
+
+
+def valid_sensitivity_values():
+    return {
+        latency: {
+            benchmark: {
+                "AMU": Decimal("0.5"),
+                "CIRA": Decimal("1.25"),
+            }
+            for benchmark in ("bfs", "bc", "pr", "sssp", "Geo.")
+        }
+        for latency in ("200ns", "500ns", "1us", "2us")
+    }
+
+
+class TableRenderingTest(unittest.TestCase):
+    def test_render_latex_has_separate_panels_and_no_cross_geomean(self):
+        latex = table.render_latex(
+            valid_main_rows(),
+            valid_sensitivity_values(),
+            evidence_sha256="a" * 64,
+        )
+
+        self.assertIn(r"\textbf{(a) Formal g20", latex)
+        self.assertIn(
+            r"\textbf{(b) Scale-4 latency sensitivity", latex
+        )
+        self.assertIn(r"M$^2$NDP", latex)
+        self.assertIn("FuncSim bit-exact PASS", latex)
+        self.assertEqual(latex.count("Geo."), 1)
+        self.assertIn("scale 4", latex)
+        self.assertIn("two Timing cores", latex)
+        self.assertIn(r"\label{tab:gapbs_vtune_cxl}", latex)
+        self.assertIn("2.000000 s", latex)
+        self.assertIn(r"0.50$\times$", latex)
+        self.assertIn("% Evidence SHA-256: " + "a" * 64, latex)
+
+    def test_csv_and_json_keep_unrounded_decimal_strings(self):
+        rows = valid_main_rows()
+        rows[1] = table.MainRow(
+            "AMU",
+            Decimal("4.123456789"),
+            Decimal("0.485026931357"),
+            "Bit-exact PASS",
+        )
+        csv_text = table.main_csv_bytes(rows).decode("utf-8")
+        evidence_bytes = table.evidence_json_bytes(
+            {"rows": [{"speedup": Decimal("0.485026931357")}]},
+            valid_sensitivity_values(),
+            {"input": "b" * 64},
+            repository_commit="c" * 40,
+        )
+        evidence = json.loads(evidence_bytes)
+
+        self.assertIn("4.123456789", csv_text)
+        self.assertIn("0.485026931357", csv_text)
+        self.assertEqual(
+            evidence["formal"]["rows"][0]["speedup"],
+            "0.485026931357",
+        )
+
+    def test_publish_writes_three_outputs_and_table_hash_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roots = write_formal_bundle(root)
+            latency_csv, latency_root = write_sensitivity_bundle(root)
+            output = root / "paper"
+            with (
+                mock.patch.object(table, "G20_WORDS", 4),
+                mock.patch.object(
+                    table, "git_head", return_value="c" * 40
+                ),
+            ):
+                paths = table.publish(
+                    roots.m2ndp,
+                    roots.variants,
+                    latency_csv,
+                    latency_root,
+                    output,
+                )
+
+            self.assertEqual(paths, table.output_paths(output))
+            self.assertTrue(all(path.is_file() for path in paths))
+            evidence_hash = hashlib.sha256(paths[1].read_bytes()).hexdigest()
+            self.assertIn(
+                f"% Evidence SHA-256: {evidence_hash}",
+                paths[2].read_text(encoding="utf-8"),
+            )
+            self.assertEqual(list(output.glob(".*.tmp")), [])
+
+    def test_rejected_input_preserves_existing_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "paper"
+            for path in table.output_paths(output):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"sentinel")
+
+            with self.assertRaises(table.TableEvidenceError):
+                table.publish(
+                    root / "broken-m2ndp",
+                    root / "broken-variants",
+                    root / "broken-latency.csv",
+                    root / "broken-old-runs",
+                    output,
+                )
+
+            self.assertTrue(
+                all(
+                    path.read_bytes() == b"sentinel"
+                    for path in table.output_paths(output)
+                )
+            )
 
 
 if __name__ == "__main__":
