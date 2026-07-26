@@ -324,6 +324,78 @@ def refresh_variant_evidence_hash(roots, kind):
     write_json(path, value)
 
 
+def write_sensitivity_bundle(root):
+    csv_path = root / "latency.csv"
+    run_root = root / "old-runs"
+    fieldnames = (
+        "latency",
+        "benchmark",
+        "label",
+        "kind",
+        "status",
+        "verification",
+        "sim_ticks",
+        "speedup_vs_cxl",
+        "run_dir",
+    )
+    delay_ticks = {
+        "200ns": "200000",
+        "500ns": "500000",
+        "1us": "1000000",
+        "2us": "2000000",
+    }
+    configurations = (
+        ("cxl_vanilla", "baseline", 1000, Decimal("1")),
+        ("amu", "amu", 2000, Decimal("0.5")),
+        ("cira_pgo", "cira", 800, Decimal("1.25")),
+    )
+    rows = []
+    for latency in ("200ns", "500ns", "1us", "2us"):
+        for benchmark in ("bfs", "bc", "pr", "sssp"):
+            for label, kind, ticks, speedup in configurations:
+                relative = (
+                    Path("m5out")
+                    / latency
+                    / benchmark
+                    / label
+                )
+                config = run_root / relative / "config.ini"
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text(
+                    f"delay={delay_ticks[latency]}\n",
+                    encoding="utf-8",
+                )
+                rows.append(
+                    {
+                        "latency": latency,
+                        "benchmark": benchmark,
+                        "label": label,
+                        "kind": kind,
+                        "status": "ok",
+                        "verification": "pass",
+                        "sim_ticks": str(ticks),
+                        "speedup_vs_cxl": str(speedup),
+                        "run_dir": relative.as_posix(),
+                    }
+                )
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path, run_root
+
+
+def rewrite_csv(path, mutate):
+    with path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+        fieldnames = tuple(rows[0])
+    mutate(rows)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 class FormalTableEvidenceTest(unittest.TestCase):
     def load_rows(self, roots):
         with mock.patch.object(table, "G20_WORDS", 4):
@@ -464,6 +536,84 @@ class FormalTableEvidenceTest(unittest.TestCase):
                 table.TableEvidenceError, "stored.*speedup"
             ):
                 self.load_rows(roots)
+
+
+class SensitivityEvidenceTest(unittest.TestCase):
+    def test_sensitivity_recomputes_rows_and_per_latency_geomean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, run_root = write_sensitivity_bundle(Path(tmp))
+            values = table.load_sensitivity(csv_path, run_root)
+
+        self.assertEqual(set(values), set(table.LATENCIES))
+        self.assertEqual(
+            values["1us"]["pr"]["AMU"], Decimal("0.5")
+        )
+        self.assertEqual(
+            values["1us"]["pr"]["CIRA"], Decimal("1.25")
+        )
+        self.assertEqual(
+            values["1us"]["Geo."]["AMU"], Decimal("0.5")
+        )
+        self.assertEqual(
+            values["1us"]["Geo."]["CIRA"], Decimal("1.25")
+        )
+
+    def test_sensitivity_rejects_duplicate_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, run_root = write_sensitivity_bundle(Path(tmp))
+
+            def duplicate(rows):
+                rows.append(dict(rows[0]))
+
+            rewrite_csv(csv_path, duplicate)
+            with self.assertRaisesRegex(
+                table.TableEvidenceError, "duplicate"
+            ):
+                table.load_sensitivity(csv_path, run_root)
+
+    def test_sensitivity_rejects_wrong_config_delay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, run_root = write_sensitivity_bundle(Path(tmp))
+            config = run_root / "m5out/200ns/bfs/amu/config.ini"
+            config.write_text("delay=1000000\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                table.TableEvidenceError, "delay"
+            ):
+                table.load_sensitivity(csv_path, run_root)
+
+    def test_sensitivity_rejects_stored_speedup_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, run_root = write_sensitivity_bundle(Path(tmp))
+
+            def drift(rows):
+                row = next(
+                    item
+                    for item in rows
+                    if item["latency"] == "1us"
+                    and item["benchmark"] == "pr"
+                    and item["kind"] == "amu"
+                )
+                row["speedup_vs_cxl"] = "0.6"
+
+            rewrite_csv(csv_path, drift)
+            with self.assertRaisesRegex(
+                table.TableEvidenceError, "stored speedup"
+            ):
+                table.load_sensitivity(csv_path, run_root)
+
+    def test_sensitivity_rejects_run_dir_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, run_root = write_sensitivity_bundle(Path(tmp))
+
+            def escape(rows):
+                rows[0]["run_dir"] = "../outside"
+
+            rewrite_csv(csv_path, escape)
+            with self.assertRaisesRegex(
+                table.TableEvidenceError, "escapes"
+            ):
+                table.load_sensitivity(csv_path, run_root)
 
 
 if __name__ == "__main__":

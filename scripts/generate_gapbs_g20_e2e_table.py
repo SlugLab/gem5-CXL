@@ -8,6 +8,7 @@ import csv
 import dataclasses
 import decimal
 import json
+import math
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,6 +31,15 @@ PATCH = REPO / "util/m2ndp/patches/0001-funcsim-strict-sequence.patch"
 G20_SHA256 = artifacts.EXPECTED_G20_SHA256
 G20_WORDS = 1 << 20
 TICKS_PER_SECOND = Decimal(10**12)
+LATENCIES = ("200ns", "500ns", "1us", "2us")
+WORKLOADS = ("bfs", "bc", "pr", "sssp")
+DELAY_TICKS = {
+    "200ns": "200000",
+    "500ns": "500000",
+    "1us": "1000000",
+    "2us": "2000000",
+}
+SPEEDUP_TOLERANCE = Decimal("1e-12")
 
 
 class TableEvidenceError(RuntimeError):
@@ -538,3 +548,178 @@ def load_formal_rows(m2ndp_root, variants_root):
         ValueError,
     ) as error:
         raise TableEvidenceError(str(error)) from error
+
+
+def close_speedup(stored, recomputed):
+    difference = abs(stored - recomputed)
+    limit = max(
+        SPEEDUP_TOLERANCE,
+        abs(recomputed) * SPEEDUP_TOLERANCE,
+    )
+    return difference <= limit
+
+
+def sensitivity_key(row):
+    latency = row.get("latency")
+    benchmark = row.get("benchmark")
+    if latency not in LATENCIES:
+        raise TableEvidenceError(
+            f"unsupported sensitivity latency: {latency!r}"
+        )
+    if benchmark not in WORKLOADS:
+        raise TableEvidenceError(
+            f"unsupported sensitivity workload: {benchmark!r}"
+        )
+    identity = (row.get("label"), row.get("kind"))
+    configurations = {
+        ("cxl_vanilla", "baseline"): "Baseline",
+        ("amu", "amu"): "AMU",
+        ("cira_pgo", "cira"): "CIRA",
+    }
+    configuration = configurations.get(identity)
+    if configuration is None:
+        raise TableEvidenceError(
+            f"unsupported sensitivity configuration: {identity!r}"
+        )
+    return latency, benchmark, configuration
+
+
+def _positive_integral_decimal(value, context):
+    try:
+        number = Decimal(str(value))
+    except decimal.InvalidOperation as error:
+        raise TableEvidenceError(f"{context} is not numeric") from error
+    if (
+        not number.is_finite()
+        or number <= 0
+        or number != number.to_integral_value()
+    ):
+        raise TableEvidenceError(
+            f"{context} must be a positive integer"
+        )
+    return number
+
+
+def validate_sensitivity_row(row, run_root):
+    key = sensitivity_key(row)
+    context = "/".join(key)
+    if row.get("status") != "ok":
+        raise TableEvidenceError(f"{context}: status is not ok")
+    if row.get("verification") != "pass":
+        raise TableEvidenceError(
+            f"{context}: verification is not pass"
+        )
+    ticks = _positive_integral_decimal(
+        row.get("sim_ticks"), f"{context} sim_ticks"
+    )
+    relative = Path(row.get("run_dir", ""))
+    if relative.is_absolute():
+        raise TableEvidenceError(f"{context}: run_dir must be relative")
+    run_dir = (run_root / relative).resolve()
+    try:
+        run_dir.relative_to(run_root)
+    except ValueError as error:
+        raise TableEvidenceError(
+            f"{context}: run_dir escapes the latency run root"
+        ) from error
+    require_config_delay(
+        run_dir / "config.ini", expected=DELAY_TICKS[key[0]]
+    )
+    stored = require_decimal(
+        row, "speedup_vs_cxl", f"{context} stored speedup"
+    )
+    return {
+        "ticks": ticks,
+        "stored_speedup": stored,
+        "run_dir": str(run_dir),
+    }
+
+
+def require_exact_sensitivity_keys(by_key):
+    expected = {
+        (latency, benchmark, configuration)
+        for latency in LATENCIES
+        for benchmark in WORKLOADS
+        for configuration in ("Baseline", "AMU", "CIRA")
+    }
+    actual = set(by_key)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise TableEvidenceError(
+            "sensitivity key set mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+
+
+def _geomean(values):
+    if not values or any(value <= 0 for value in values):
+        raise TableEvidenceError(
+            "sensitivity geomean inputs must be positive"
+        )
+    if all(value == values[0] for value in values):
+        return values[0]
+    return Decimal(
+        str(
+            math.exp(
+                sum(math.log(float(value)) for value in values)
+                / len(values)
+            )
+        )
+    )
+
+
+def calculate_sensitivity(by_key):
+    output = {}
+    for latency in LATENCIES:
+        output[latency] = {}
+        amu_values = []
+        cira_values = []
+        for benchmark in WORKLOADS:
+            baseline = by_key[(latency, benchmark, "Baseline")]
+            amu = by_key[(latency, benchmark, "AMU")]
+            cira = by_key[(latency, benchmark, "CIRA")]
+            amu_speedup = baseline["ticks"] / amu["ticks"]
+            cira_speedup = baseline["ticks"] / cira["ticks"]
+            for configuration, record, recomputed in (
+                ("Baseline", baseline, Decimal(1)),
+                ("AMU", amu, amu_speedup),
+                ("CIRA", cira, cira_speedup),
+            ):
+                if not close_speedup(
+                    record["stored_speedup"], recomputed
+                ):
+                    raise TableEvidenceError(
+                        f"{latency}/{benchmark}/{configuration}: "
+                        "stored speedup disagrees with recomputation"
+                    )
+            output[latency][benchmark] = {
+                "AMU": amu_speedup,
+                "CIRA": cira_speedup,
+            }
+            amu_values.append(amu_speedup)
+            cira_values.append(cira_speedup)
+        output[latency]["Geo."] = {
+            "AMU": _geomean(amu_values),
+            "CIRA": _geomean(cira_values),
+        }
+    return output
+
+
+def load_sensitivity(csv_path, run_root):
+    rows = read_csv(csv_path, "latency sensitivity")
+    run_root = Path(run_root).resolve()
+    if not run_root.is_dir():
+        raise TableEvidenceError(
+            f"latency run root is missing: {run_root}"
+        )
+    by_key = {}
+    for row in rows:
+        key = sensitivity_key(row)
+        if key in by_key:
+            raise TableEvidenceError(
+                f"duplicate sensitivity row: {key}"
+            )
+        by_key[key] = validate_sensitivity_row(row, run_root)
+    require_exact_sensitivity_keys(by_key)
+    return calculate_sensitivity(by_key)
