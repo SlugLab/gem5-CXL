@@ -184,8 +184,8 @@ def require_one_csv(path, context):
 ```
 
 Use `m2ndp_artifacts.sha256_file` for files and
-`m2ndp_artifacts.hash_path` for directory artifacts. Do not create a second
-hash implementation.
+`run_m2ndp_g20_pr_spmv.hash_path` for directory artifacts. Do not create a
+second hash implementation.
 
 - [ ] **Step 4: Implement `load_formal_rows`**
 
