@@ -526,7 +526,7 @@ def stage_output_paths(stage, paths):
     return mapping[stage]
 
 
-def _run_command(command, *, cwd, log, timeout):
+def _run_command(command, *, cwd, log, timeout, env=None):
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
     print("+", shlex.join(str(item) for item in command), flush=True)
@@ -535,6 +535,7 @@ def _run_command(command, *, cwd, log, timeout):
             completed = subprocess.run(
                 [str(item) for item in command],
                 cwd=cwd,
+                env=env,
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -546,6 +547,23 @@ def _run_command(command, *, cwd, log, timeout):
         with log.open("a", encoding="utf-8") as stream:
             stream.write(f"\nTIMEOUT: {error}\n")
         return 124
+
+
+def _m2ndp_runtime_environment(tools):
+    runtime_library = Path(tools).resolve() / "lib/libNDPSim_lib.so"
+    if not runtime_library.is_file():
+        raise artifacts.EvidenceError(
+            f"M2NDP runtime library is missing: {runtime_library}"
+        )
+    environment = os.environ.copy()
+    library_dir = str(runtime_library.parent)
+    inherited = environment.get("LD_LIBRARY_PATH")
+    environment["LD_LIBRARY_PATH"] = (
+        library_dir
+        if not inherited
+        else os.pathsep.join((library_dir, inherited))
+    )
+    return environment
 
 
 def _pack_reference(options, paths):
@@ -749,11 +767,17 @@ def _execute_stage(stage, options, paths, command, log):
             if stage == "ndpsim"
             else REPO
         )
+        environment = (
+            _m2ndp_runtime_environment(paths.tools)
+            if stage in {"calibration", "ndpsim"}
+            else None
+        )
         returncode = _run_command(
             command,
             cwd=cwd,
             log=log,
             timeout=options.timeout,
+            env=environment,
         )
         if returncode != 0:
             raise StageCommandError(stage, returncode, log)

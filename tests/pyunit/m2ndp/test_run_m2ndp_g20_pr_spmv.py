@@ -1,6 +1,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,6 +124,38 @@ class OrchestratorTest(unittest.TestCase):
                     ["FuncSim"],
                     self.paths.logs / "funcsim.log",
                 )
+
+    def test_calibration_exports_persistent_ndpsim_runtime_library(self):
+        captured = {}
+
+        def fake_run(*_args, **kwargs):
+            captured.update(kwargs)
+            return 2
+
+        runtime_library = self.paths.tools / "lib/libNDPSim_lib.so"
+        runtime_library.parent.mkdir(parents=True)
+        runtime_library.write_bytes(b"runtime library")
+        with (
+            mock.patch.dict(
+                os.environ, {"LD_LIBRARY_PATH": "/existing"}, clear=False
+            ),
+            mock.patch.object(runner, "_run_command", fake_run),
+            self.assertRaises(runner.StageCommandError),
+        ):
+            runner._execute_stage(
+                "calibration",
+                self.options,
+                self.paths,
+                ["calibrate"],
+                self.paths.logs / "calibration.log",
+            )
+
+        environment = captured.get("env")
+        self.assertIsNotNone(environment)
+        self.assertEqual(
+            environment["LD_LIBRARY_PATH"],
+            f"{runtime_library.parent}:/existing",
+        )
 
 
 if __name__ == "__main__":

@@ -119,6 +119,19 @@ def _copy_tool(source, destination):
     require_executable(destination)
 
 
+def _copy_runtime_library(source, destination):
+    source = Path(source)
+    if not source.is_file():
+        raise PrepareError(f"required runtime library is missing: {source}")
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    if not destination.is_file():
+        raise PrepareError(
+            f"runtime library copy is missing: {destination}"
+        )
+
+
 def _version(command):
     try:
         return subprocess.check_output(
@@ -249,6 +262,10 @@ def build_tools(
     cxl_probe = tools_dir / "bin/M2NDPCXLProbe"
     _copy_tool(root / "build/bin/NDPSim", ndpsim)
     _copy_tool(root / "build/bin/M2NDPCXLProbe", cxl_probe)
+    _copy_runtime_library(
+        root / "build/lib/libNDPSim_lib.so",
+        tools_dir / "lib/libNDPSim_lib.so",
+    )
     return funcsim, ndpsim, cxl_probe, commands
 
 

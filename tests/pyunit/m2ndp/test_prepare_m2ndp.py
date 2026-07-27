@@ -97,6 +97,7 @@ class PrepareM2NDPTest(unittest.TestCase):
             with (
                 mock.patch.object(prepare.subprocess, "run") as run,
                 mock.patch.object(prepare, "_copy_tool"),
+                mock.patch.object(prepare, "_copy_runtime_library"),
             ):
                 prepare.build_tools(
                     root,
@@ -127,6 +128,27 @@ class PrepareM2NDPTest(unittest.TestCase):
         self.assertTrue(
             first.kwargs["env"]["PATH"].startswith("/toolchain/bin:")
         )
+
+    def test_build_tools_copies_ndpsim_runtime_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "tools"
+            (root / "build/bin").mkdir(parents=True)
+            (root / "build/lib").mkdir(parents=True)
+            for name in ("FuncSim", "NDPSim", "M2NDPCXLProbe"):
+                executable = root / "build/bin" / name
+                executable.write_bytes(name.encode())
+                executable.chmod(0o755)
+            runtime_library = root / "build/lib/libNDPSim_lib.so"
+            runtime_library.write_bytes(b"persistent runtime library")
+
+            with mock.patch.object(prepare.subprocess, "run"):
+                prepare.build_tools(root, tools)
+
+            self.assertEqual(
+                (tools / "lib/libNDPSim_lib.so").read_bytes(),
+                b"persistent runtime library",
+            )
 
 
 if __name__ == "__main__":
