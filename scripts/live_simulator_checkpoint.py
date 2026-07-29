@@ -463,14 +463,6 @@ def main(argv=None):
     )
 
 
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except CheckpointError as error:
-        print(f"CHECKPOINT_ERROR: {error}", file=sys.stderr)
-        raise SystemExit(2)
-
-
 def validate_transaction(
     transaction, *, require_ready, require_same_kernel
 ):
@@ -494,3 +486,11 @@ def validate_transaction(
             require_same_kernel=require_same_kernel,
         )
     return transaction
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except CheckpointError as error:
+        print(f"CHECKPOINT_ERROR: {error}", file=sys.stderr)
+        raise SystemExit(2)

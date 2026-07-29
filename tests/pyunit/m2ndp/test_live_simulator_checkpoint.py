@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -178,6 +179,50 @@ class ManifestTest(unittest.TestCase):
             require_ready=True,
             require_same_kernel=False,
         )
+
+    def test_validate_transaction_cli_defines_helpers_before_main(self):
+        amu_path = self.root / "amu/manifest.json"
+        m2ndp_path = self.root / "m2ndp/manifest.json"
+        amu_path.parent.mkdir()
+        m2ndp_path.parent.mkdir()
+        current_host = dict(self.host)
+        current_host["kernel_release"] = checkpoint.platform.release()
+        amu_path.write_text(json.dumps(self.build(host=current_host)))
+        m2ndp_path.write_text(
+            json.dumps(
+                self.build(
+                    name="m2ndp",
+                    unit="m2ndp.service",
+                    host=current_host,
+                )
+            )
+        )
+        (self.root / "transaction.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "state": "ready_for_reboot",
+                    "workloads": {
+                        "amu": str(amu_path),
+                        "m2ndp": str(m2ndp_path),
+                    },
+                }
+            )
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "validate",
+                "--root",
+                str(self.root),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class CriuCommandTest(unittest.TestCase):
