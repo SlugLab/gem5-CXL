@@ -1,0 +1,18 @@
+[Unit]
+Description=Restore exact M2NDP NDPSim process tree from CRIU checkpoint
+After=local-fs.target
+After=gapbs-amu-criu-restore.service
+Requires=gapbs-amu-criu-restore.service
+ConditionPathExists=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/live-reboot-checkpoint-20260729/m2ndp/manifest.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv
+ExecStart=/usr/bin/python3 scripts/live_simulator_checkpoint.py restore --manifest /home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/live-reboot-checkpoint-20260729/m2ndp/manifest.json
+ExecStartPost=/usr/bin/python3 scripts/live_simulator_checkpoint.py verify-restored --manifest /home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/live-reboot-checkpoint-20260729/m2ndp/manifest.json
+RemainAfterExit=yes
+TimeoutStartSec=infinity
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

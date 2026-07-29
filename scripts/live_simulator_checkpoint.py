@@ -8,6 +8,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -325,12 +326,96 @@ def resolve_main_pid(unit, *, runner=subprocess.run):
     return pid
 
 
+def criu_restore_command(manifest_path):
+    checkpoint_root = Path(manifest_path).resolve().parent
+    return [
+        "criu",
+        "restore",
+        "--images-dir",
+        str(checkpoint_root / "images"),
+        "--work-dir",
+        str(checkpoint_root / "work"),
+        "--log-file",
+        "restore.log",
+        "--restore-detached",
+        "--shell-job",
+        "--file-locks",
+        "--manage-cgroups=ignore",
+    ]
+
+
+def validate_reboot_gate(predicates):
+    required = (
+        "manifests_valid",
+        "restore_units_enabled",
+        "source_units_disabled",
+        "original_pids_absent",
+        "dry_run_reboot_ok",
+    )
+    for name in required:
+        if predicates.get(name) is not True:
+            raise CheckpointError(f"reboot gate failed: {name}")
+    return True
+
+
+def restore_from_manifest(manifest_path, *, runner=subprocess.run):
+    manifest_path = Path(manifest_path).resolve()
+    manifest = load_json(manifest_path)
+    validate_manifest(
+        manifest,
+        manifest_path=manifest_path,
+        require_same_kernel=True,
+    )
+    command = criu_restore_command(manifest_path)
+    result = runner(
+        command,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise CheckpointError(
+            f"CRIU restore failed with status {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+    return manifest
+
+
+def verify_process_tree(manifest, *, current_tree):
+    expected = [
+        {
+            "pid": int(item["pid"]),
+            "ppid": int(item["ppid"]),
+            "cmdline": list(item["cmdline"]),
+        }
+        for item in manifest["process_tree"]
+    ]
+    actual = [
+        {
+            "pid": int(item["pid"]),
+            "ppid": int(item["ppid"]),
+            "cmdline": list(item["cmdline"]),
+        }
+        for item in current_tree
+    ]
+    if sorted(expected, key=lambda item: item["pid"]) != sorted(
+        actual, key=lambda item: item["pid"]
+    ):
+        raise CheckpointError("restored process tree mismatch")
+    return True
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Checkpoint and restore the live AMU and M2NDP jobs."
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
-    for action in ("preflight", "validate"):
+    for action in (
+        "preflight",
+        "validate",
+        "install-units",
+        "arm-reboot",
+    ):
         command = subparsers.add_parser(action)
         command.add_argument("--root", type=Path, required=True)
         if action == "validate":
@@ -341,7 +426,49 @@ def build_parser():
         command.add_argument(
             "--job", choices=("amu", "m2ndp"), required=True
         )
+    for action in ("restore", "verify-restored"):
+        command = subparsers.add_parser(action)
+        command.add_argument("--manifest", type=Path, required=True)
     return parser
+
+
+def main(argv=None):
+    options = build_parser().parse_args(argv)
+    if options.action == "restore":
+        restore_from_manifest(options.manifest)
+        return 0
+    if options.action == "verify-restored":
+        manifest = load_json(options.manifest)
+        current = capture_process_tree(manifest["root_pid"])
+        verify_process_tree(manifest, current_tree=current)
+        return 0
+    if options.action == "validate":
+        if options.job:
+            manifest_path = options.root / options.job / "manifest.json"
+            validate_manifest(
+                load_json(manifest_path),
+                manifest_path=manifest_path,
+                require_same_kernel=True,
+            )
+        else:
+            transaction_path = options.root / "transaction.json"
+            validate_transaction(
+                load_json(transaction_path),
+                require_ready=False,
+                require_same_kernel=True,
+            )
+        return 0
+    raise CheckpointError(
+        f"operational action requires explicit orchestration: {options.action}"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except CheckpointError as error:
+        print(f"CHECKPOINT_ERROR: {error}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def validate_transaction(

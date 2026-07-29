@@ -352,12 +352,169 @@ class CriuCommandTest(unittest.TestCase):
 
     def test_cli_declares_preflight_probe_dump_and_validate(self):
         parser = checkpoint.build_parser()
-        for action in ("preflight", "probe", "dump", "validate"):
+        for action in (
+            "preflight",
+            "probe",
+            "dump",
+            "validate",
+            "install-units",
+            "arm-reboot",
+        ):
             argv = [action, "--root", str(self.root)]
             if action in ("probe", "dump"):
                 argv += ["--job", "amu"]
             options = parser.parse_args(argv)
             self.assertEqual(options.action, action)
+
+        for action in ("restore", "verify-restored"):
+            options = parser.parse_args(
+                [action, "--manifest", str(self.root / "manifest.json")]
+            )
+            self.assertEqual(options.action, action)
+
+    def test_restore_command_uses_validated_image_and_work_directories(self):
+        manifest_path = self.root / "m2ndp/manifest.json"
+        command = checkpoint.criu_restore_command(manifest_path)
+        self.assertEqual(command[:2], ["criu", "restore"])
+        self.assertIn(str(self.root / "m2ndp/images"), command)
+        self.assertIn(str(self.root / "m2ndp/work"), command)
+        self.assertIn("--restore-detached", command)
+        self.assertIn("--shell-job", command)
+        self.assertIn("--file-locks", command)
+
+    def test_reboot_gate_rejects_each_missing_predicate(self):
+        ready = {
+            "manifests_valid": True,
+            "restore_units_enabled": True,
+            "source_units_disabled": True,
+            "original_pids_absent": True,
+            "dry_run_reboot_ok": True,
+        }
+        self.assertTrue(checkpoint.validate_reboot_gate(ready))
+        for predicate in ready:
+            failed = dict(ready)
+            failed[predicate] = False
+            with self.subTest(predicate=predicate):
+                with self.assertRaisesRegex(
+                    checkpoint.CheckpointError, predicate
+                ):
+                    checkpoint.validate_reboot_gate(failed)
+
+    def test_restore_unit_templates_are_fail_closed(self):
+        templates = (
+            REPO / "util/systemd/gapbs-amu-criu-restore.service",
+            REPO / "util/systemd/m2ndp-criu-restore.service",
+        )
+        for template in templates:
+            text = template.read_text()
+            self.assertIn("Type=oneshot", text)
+            self.assertIn("RemainAfterExit=yes", text)
+            self.assertIn("TimeoutStartSec=infinity", text)
+            self.assertIn("live_simulator_checkpoint.py restore", text)
+            self.assertIn("live_simulator_checkpoint.py verify-restored", text)
+        self.assertIn(
+            "After=gapbs-amu-criu-restore.service",
+            templates[1].read_text(),
+        )
+
+    def test_restore_validates_manifest_before_invoking_criu(self):
+        images = self.root / "amu/images"
+        images.mkdir(parents=True)
+        (images / "inventory.img").write_bytes(b"inventory")
+        (images / "pstree.img").write_bytes(b"pstree")
+        binary = self.root / "gem5.opt"
+        binary.write_bytes(b"gem5")
+        manifest = checkpoint.build_manifest(
+            name="amu",
+            unit="amu.service",
+            root_pid=123,
+            process_tree=[
+                {"pid": 123, "ppid": 1, "cmdline": ["python3", "runner.py"]}
+            ],
+            inputs=[binary],
+            image_dir=images,
+            progress={"kind": "gem5", "value": "warmup"},
+            host={
+                "kernel_release": checkpoint.platform.release(),
+                "hostname": "gpu01",
+                "boot_id": "boot-a",
+                "criu_version": "Version: 4.2",
+            },
+        )
+        manifest_path = self.root / "amu/manifest.json"
+        checkpoint.atomic_write_json(manifest_path, manifest)
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command, 0, stdout="", stderr=""
+            )
+
+        checkpoint.restore_from_manifest(manifest_path, runner=runner)
+        self.assertEqual(calls, [checkpoint.criu_restore_command(manifest_path)])
+
+        binary.write_bytes(b"bad!")
+        calls.clear()
+        with self.assertRaisesRegex(
+            checkpoint.CheckpointError, "checkpoint input hash mismatch"
+        ):
+            checkpoint.restore_from_manifest(manifest_path, runner=runner)
+        self.assertEqual(calls, [])
+
+    def test_verify_restored_requires_exact_pid_and_command_tree(self):
+        manifest = {
+            "root_pid": 123,
+            "process_tree": [
+                {"pid": 123, "ppid": 1, "cmdline": ["python3", "runner.py"]},
+                {"pid": 124, "ppid": 123, "cmdline": ["NDPSim"]},
+            ],
+        }
+        checkpoint.verify_process_tree(
+            manifest,
+            current_tree=[
+                {"pid": 123, "ppid": 1, "cmdline": ["python3", "runner.py"]},
+                {"pid": 124, "ppid": 123, "cmdline": ["NDPSim"]},
+            ],
+        )
+        with self.assertRaisesRegex(
+            checkpoint.CheckpointError, "restored process tree mismatch"
+        ):
+            checkpoint.verify_process_tree(
+                manifest,
+                current_tree=[
+                    {
+                        "pid": 123,
+                        "ppid": 1,
+                        "cmdline": ["python3", "different.py"],
+                    }
+                ],
+            )
+
+    def test_main_dispatches_verify_restored(self):
+        manifest_path = self.root / "manifest.json"
+        manifest = {
+            "root_pid": 123,
+            "process_tree": [
+                {"pid": 123, "ppid": 1, "cmdline": ["python3", "runner.py"]}
+            ],
+        }
+        manifest_path.write_text(json.dumps(manifest))
+        with mock.patch.object(
+            checkpoint,
+            "capture_process_tree",
+            return_value=manifest["process_tree"],
+        ):
+            self.assertEqual(
+                checkpoint.main(
+                    [
+                        "verify-restored",
+                        "--manifest",
+                        str(manifest_path),
+                    ]
+                ),
+                0,
+            )
 
 
 if __name__ == "__main__":
