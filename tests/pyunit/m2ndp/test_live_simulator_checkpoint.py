@@ -416,6 +416,10 @@ class CriuCommandTest(unittest.TestCase):
             "After=gapbs-amu-criu-restore.service",
             templates[1].read_text(),
         )
+        no_restart = (
+            REPO / "util/systemd/live-checkpoint-no-restart.conf"
+        ).read_text()
+        self.assertEqual(no_restart, "[Service]\nRestart=no\n")
 
     def test_restore_validates_manifest_before_invoking_criu(self):
         images = self.root / "amu/images"
