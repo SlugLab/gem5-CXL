@@ -246,3 +246,60 @@ event-balance, FuncSim, NDPSim, or calibration mismatch. A running or
 successfully exited process alone never authorizes a displayed speedup.
 Validation and rendering finish before output replacement; on an evidence
 failure the existing paper table remains byte-for-byte unchanged.
+
+## Live reboot recovery
+
+The formal scale-20 AMU and M2NDP jobs were checkpointed as complete host
+process trees before the 2026-07-29 reboot. This is distinct from the
+trial-0 gem5 checkpoint and the M2NDP top-level stage resume mechanism:
+CRIU preserves the live Python runner plus gem5 or NDPSim child at its
+current host-process state.
+
+The recovery implementation and tests are:
+
+```text
+scripts/live_simulator_checkpoint.py
+tests/pyunit/m2ndp/test_live_simulator_checkpoint.py
+util/systemd/gapbs-amu-criu-restore.service
+util/systemd/m2ndp-criu-restore.service
+```
+
+The generated evidence is rooted at:
+
+```text
+m5out/live-reboot-checkpoint-20260729/
+```
+
+`transaction.json` records the capture and restored boot IDs, exact process
+trees, image/input hashes, restore-unit results, and post-restore continuity
+samples. The original application-level resume units remain disabled so a
+failed CRIU restore cannot silently restart AMU warmup or the complete
+NDPSim stage.
+
+AMU restored as PID tree `205393 -> 205789`. M2NDP restored as
+`205476 -> 205971` at `Launch ID 21, K3_PULL_DAMP`. The M2NDP restore first
+failed closed because `ndpsim.log` had grown from the image-recorded
+53,680,423 bytes to 53,911,552 bytes. All 24 other regular files matched.
+The complete drifted log was preserved as
+`m2ndp/ndpsim.log.pre-restore-full-20260729` with SHA-256
+`836f5f71ddd71054dc397b08de536d081aa0b7ed0df871ee06892af047f3bbf0`;
+the working log was then truncated to the checkpoint offset before retrying.
+
+Post-restore verification requires both system units to report success, both
+exact PID/command trees to match their manifests, and live progress:
+
+```sh
+systemctl show -p ActiveState -p SubState -p Result \
+  gapbs-amu-criu-restore.service m2ndp-criu-restore.service
+python3 scripts/live_simulator_checkpoint.py verify-restored \
+  --manifest m5out/live-reboot-checkpoint-20260729/amu/manifest.json
+python3 scripts/live_simulator_checkpoint.py verify-restored \
+  --manifest m5out/live-reboot-checkpoint-20260729/m2ndp/manifest.json
+tail -n 5000 m5out/m2ndp_g20_pr_spmv_e2e/logs/ndpsim.log |
+  grep 'Launch ID' | tail -n 3
+```
+
+The first measured continuity sample advanced the same restored M2NDP launch
+from `2774/32770` to `2812/32770` while the log grew from 53,690,079 to
+53,692,314 bytes. This recovery evidence does not authorize a paper result;
+the normal bit-exact and end-to-end publication gates still apply.
