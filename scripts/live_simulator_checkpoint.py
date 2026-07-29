@@ -136,6 +136,30 @@ def validate_manifest(manifest, *, manifest_path, require_same_kernel):
         _validate_record(record, kind="checkpoint input")
     for record in manifest.get("images", {}).values():
         _validate_record(record, kind="checkpoint image")
+    seen_restore_files = set()
+    for record in manifest.get("restore_files", []):
+        path = Path(record.get("path", ""))
+        if not path.is_absolute():
+            raise CheckpointError(
+                f"restore file path must be absolute: {path}"
+            )
+        if record.get("policy") != "preserve_tail_then_truncate":
+            raise CheckpointError(
+                f"unsupported restore file policy: {record.get('policy')}"
+            )
+        checkpoint_size = record.get("checkpoint_size")
+        if (
+            not isinstance(checkpoint_size, int)
+            or isinstance(checkpoint_size, bool)
+            or checkpoint_size < 0
+        ):
+            raise CheckpointError(
+                f"invalid restore file checkpoint size: {path}"
+            )
+        resolved = str(path.resolve())
+        if resolved in seen_restore_files:
+            raise CheckpointError(f"duplicate restore file: {path}")
+        seen_restore_files.add(resolved)
     return manifest
 
 
@@ -358,13 +382,95 @@ def validate_reboot_gate(predicates):
     return True
 
 
-def restore_from_manifest(manifest_path, *, runner=subprocess.run):
+def _current_boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError as error:
+        raise CheckpointError(
+            f"cannot read current boot ID: {error}"
+        ) from error
+
+
+def reconcile_restore_files(manifest, *, manifest_path, boot_id=None):
+    boot_id = boot_id or _current_boot_id()
+    if not boot_id or any(
+        character not in "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+        for character in boot_id
+    ):
+        raise CheckpointError(f"invalid boot ID for restore evidence: {boot_id}")
+    reconciled = []
+    evidence_root = (
+        Path(manifest_path).resolve().parent / "restore-drift" / boot_id
+    )
+    for record in manifest.get("restore_files", []):
+        path = Path(record["path"])
+        expected = record["checkpoint_size"]
+        if not path.is_file():
+            raise CheckpointError(f"missing restore file: {path}")
+        actual = path.stat().st_size
+        if actual < expected:
+            raise CheckpointError(
+                "restore file is shorter than checkpoint: "
+                f"{path} actual={actual} expected={expected}"
+            )
+        if actual == expected:
+            continue
+
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        evidence_name = f"{path.name}.offset-{expected}.size-{actual}"
+        tail_path = evidence_root / f"{evidence_name}.tail"
+        temporary = tail_path.with_name(
+            f".{tail_path.name}.{os.getpid()}.tmp"
+        )
+        with path.open("rb") as source, temporary.open("xb") as target:
+            source.seek(expected)
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+        tail_sha256 = sha256_file(temporary)
+        if tail_path.exists():
+            if sha256_file(tail_path) != tail_sha256:
+                temporary.unlink()
+                raise CheckpointError(
+                    f"restore evidence collision: {tail_path}"
+                )
+            temporary.unlink()
+        else:
+            os.replace(temporary, tail_path)
+        evidence = {
+            "boot_id": boot_id,
+            "path": str(path),
+            "policy": record["policy"],
+            "checkpoint_size": expected,
+            "drifted_size": actual,
+            "drifted_sha256": sha256_file(path),
+            "tail_path": str(tail_path),
+            "tail_sha256": tail_sha256,
+            "tail_size": actual - expected,
+        }
+        atomic_write_json(evidence_root / f"{evidence_name}.json", evidence)
+        os.truncate(path, expected)
+        if path.stat().st_size != expected:
+            raise CheckpointError(
+                f"failed to reconcile restore file: {path}"
+            )
+        reconciled.append(evidence)
+    return reconciled
+
+
+def restore_from_manifest(
+    manifest_path, *, runner=subprocess.run, boot_id=None
+):
     manifest_path = Path(manifest_path).resolve()
     manifest = load_json(manifest_path)
     validate_manifest(
         manifest,
         manifest_path=manifest_path,
         require_same_kernel=True,
+    )
+    reconcile_restore_files(
+        manifest,
+        manifest_path=manifest_path,
+        boot_id=boot_id,
     )
     command = criu_restore_command(manifest_path)
     result = runner(

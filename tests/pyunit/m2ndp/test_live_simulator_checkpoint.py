@@ -511,6 +511,125 @@ class CriuCommandTest(unittest.TestCase):
             checkpoint.restore_from_manifest(manifest_path, runner=runner)
         self.assertEqual(calls, [])
 
+    def test_restore_preserves_allowlisted_log_tail_before_truncating(self):
+        images = self.root / "m2ndp/images"
+        images.mkdir(parents=True)
+        (images / "inventory.img").write_bytes(b"inventory")
+        (images / "pstree.img").write_bytes(b"pstree")
+        binary = self.root / "NDPSim"
+        binary.write_bytes(b"binary")
+        log = self.root / "ndpsim.log"
+        log.write_bytes(b"checkpoint-extra")
+        manifest = checkpoint.build_manifest(
+            name="m2ndp",
+            unit="m2ndp.service",
+            root_pid=123,
+            process_tree=[
+                {"pid": 123, "ppid": 1, "cmdline": ["NDPSim"]}
+            ],
+            inputs=[binary],
+            image_dir=images,
+            progress={"kind": "launch", "value": 21},
+            host={
+                "kernel_release": checkpoint.platform.release(),
+                "hostname": "gpu01",
+                "boot_id": "boot-a",
+                "criu_version": "Version: 4.2",
+            },
+        )
+        manifest["restore_files"] = [
+            {
+                "path": str(log),
+                "checkpoint_size": len(b"checkpoint"),
+                "policy": "preserve_tail_then_truncate",
+            }
+        ]
+        manifest_path = self.root / "m2ndp/manifest.json"
+        checkpoint.atomic_write_json(manifest_path, manifest)
+        observed = []
+
+        def runner(command, **kwargs):
+            observed.append(log.read_bytes())
+            return subprocess.CompletedProcess(
+                command, 0, stdout="", stderr=""
+            )
+
+        checkpoint.restore_from_manifest(
+            manifest_path,
+            runner=runner,
+            boot_id="boot-b",
+        )
+
+        self.assertEqual(observed, [b"checkpoint"])
+        self.assertEqual(log.read_bytes(), b"checkpoint")
+        evidence = list(
+            (manifest_path.parent / "restore-drift" / "boot-b").glob(
+                "*.tail"
+            )
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].read_bytes(), b"-extra")
+        records = list(
+            (manifest_path.parent / "restore-drift" / "boot-b").glob(
+                "*.json"
+            )
+        )
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_text())
+        self.assertEqual(record["checkpoint_size"], len(b"checkpoint"))
+        self.assertEqual(record["drifted_size"], len(b"checkpoint-extra"))
+        self.assertEqual(
+            record["tail_sha256"],
+            checkpoint.sha256_file(evidence[0]),
+        )
+
+    def test_restore_rejects_allowlisted_log_shorter_than_checkpoint(self):
+        images = self.root / "m2ndp/images"
+        images.mkdir(parents=True)
+        (images / "inventory.img").write_bytes(b"inventory")
+        (images / "pstree.img").write_bytes(b"pstree")
+        log = self.root / "ndpsim.log"
+        log.write_bytes(b"short")
+        manifest = checkpoint.build_manifest(
+            name="m2ndp",
+            unit="m2ndp.service",
+            root_pid=123,
+            process_tree=[
+                {"pid": 123, "ppid": 1, "cmdline": ["NDPSim"]}
+            ],
+            inputs=[],
+            image_dir=images,
+            progress={"kind": "launch", "value": 21},
+            host={
+                "kernel_release": checkpoint.platform.release(),
+                "hostname": "gpu01",
+                "boot_id": "boot-a",
+                "criu_version": "Version: 4.2",
+            },
+        )
+        manifest["restore_files"] = [
+            {
+                "path": str(log),
+                "checkpoint_size": 10,
+                "policy": "preserve_tail_then_truncate",
+            }
+        ]
+        manifest_path = self.root / "m2ndp/manifest.json"
+        checkpoint.atomic_write_json(manifest_path, manifest)
+        calls = []
+
+        with self.assertRaisesRegex(
+            checkpoint.CheckpointError,
+            "restore file is shorter than checkpoint",
+        ):
+            checkpoint.restore_from_manifest(
+                manifest_path,
+                runner=lambda command, **kwargs: calls.append(command),
+                boot_id="boot-b",
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(log.read_bytes(), b"short")
+
     def test_verify_restored_requires_exact_pid_and_command_tree(self):
         manifest = {
             "root_pid": 123,

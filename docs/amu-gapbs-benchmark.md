@@ -303,3 +303,26 @@ The first measured continuity sample advanced the same restored M2NDP launch
 from `2774/32770` to `2812/32770` while the log grew from 53,690,079 to
 53,692,314 bytes. This recovery evidence does not authorize a paper result;
 the normal bit-exact and end-to-end publication gates still apply.
+
+The host reset unexpectedly a second time on 2026-07-29: boot
+`a2ccaf57-b238-47d4-bac5-4edaa411bdbc` ended without an orderly shutdown at
+21:17 UTC and boot `eeda9abc-6661-4d6d-82b0-972d94ac86af` began at 21:25 UTC.
+AMU restored automatically. M2NDP again failed closed because the same
+append-open log had reached 54,194,176 bytes. All other fixed-size regular
+files still matched the CRIU image. The complete second drifted log is
+preserved as
+`m2ndp/ndpsim.log.pre-second-restore-20260729-eeda9abc`, size 54,194,176,
+SHA-256
+`d015676f02ced569a55581a8372fbb7aa8a8c0ddeb2a3ccea585ddcae8bf0207`.
+After exact truncation, the original M2NDP PID tree restored again and the
+same launch advanced from `3089/32770` to `3156/32770` in ten seconds.
+
+To make later crash recovery deterministic, the M2NDP manifest now
+allowlists only `ndpsim.log` with policy
+`preserve_tail_then_truncate` and its CRIU-recorded size. Before invoking
+CRIU, restore preserves any post-checkpoint tail plus SHA-256 evidence under
+`m2ndp/restore-drift/<boot-id>/`, then truncates exactly to the recorded
+offset. A missing or shorter file, invalid policy, non-absolute path, or
+unlisted mismatch remains a hard failure. The two redundant probe image
+directories were removed only after both final manifests revalidated,
+releasing about 12.6 GiB; the final images and all recovery evidence remain.
