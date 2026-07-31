@@ -219,7 +219,8 @@ formal pipelines finish. Run the publisher from the
 `m2ndp-g20-pr-spmv` worktree:
 
 ```sh
-python3 scripts/generate_gapbs_g20_e2e_table.py \
+env MPLCONFIGDIR=/tmp/gapbs-mplconfig \
+  python3 scripts/generate_gapbs_g20_e2e_table.py \
   --m2ndp-results-root m5out/m2ndp_g20_pr_spmv_e2e \
   --variants-results-root m5out/matched_pr_spmv_g20_e2e \
   --latency-csv \
@@ -237,92 +238,39 @@ The command produces:
 - `gapbs-g20-e2e-results.csv`, with the unrounded Vanilla CXL, AMU, CIRA, and
   M2NDP absolute latencies and speedups; and
 - `gapbs-g20-e2e-table-evidence.json`, with the machine-readable contract,
-  input hashes, unrounded values, and repository commit.
+  input hashes, unrounded values, and repository commit;
+- `fig/gapbs-g20-e2e.pdf`, the paper-ready two-panel vector figure; and
+- `fig/gapbs-g20-e2e.svg`, the editable vector figure.
+
+Both vector files embed the evidence JSON SHA-256. Panel (a) contains only the
+formal two-core, all-CXL, 1 us g20 PageRank comparison. Panel (b) contains only
+the separate scale-4, single-core sensitivity geomeans and is not g20 evidence.
 
 The publisher is intentionally fail closed. It is expected to fail while any
 formal service is running or before its final summary/manifest exists. It
 also rejects the result on any verifier, bit-exact, graph, binary, delay,
 event-balance, FuncSim, NDPSim, or calibration mismatch. A running or
 successfully exited process alone never authorizes a displayed speedup.
-Validation and rendering finish before output replacement; on an evidence
-failure the existing paper table remains byte-for-byte unchanged.
+All five outputs are validated and staged before replacement. Existing files
+are moved to sibling backups, and a failed promotion restores the prior five
+files byte-for-byte. No partial table/figure generation is visible to the
+paper.
 
-## Live reboot recovery
+## Current background recovery policy
 
-The formal scale-20 AMU and M2NDP jobs were checkpointed as complete host
-process trees before the 2026-07-29 reboot. This is distinct from the
-trial-0 gem5 checkpoint and the M2NDP top-level stage resume mechanism:
-CRIU preserves the live Python runner plus gem5 or NDPSim child at its
-current host-process state.
+Periodic and live CRIU checkpointing are disabled. The old
+`gapbs-amu-criu-restore.service` and `m2ndp-criu-restore.service` units must
+remain disabled; they are not part of the current run or publication path.
 
-The recovery implementation and tests are:
+The formal jobs use their application-level recovery mechanisms instead:
 
-```text
-scripts/live_simulator_checkpoint.py
-tests/pyunit/m2ndp/test_live_simulator_checkpoint.py
-util/systemd/gapbs-amu-criu-restore.service
-util/systemd/m2ndp-criu-restore.service
-```
+- `gapbs-matched-pr-spmv-amu-g20-resume.service` restores the validated gem5
+  trial-0 checkpoint and re-executes the warmup/measurement path.
+- `m2ndp-g20-pr-spmv-resume.service` uses the orchestrator's completed-stage
+  evidence and `--resume`; an interrupted NDPSim stage restarts that stage.
+- `gapbs-g20-table-publisher.timer` checks every five minutes and publishes only
+  after all final summaries and bit-exact gates are present.
 
-The generated evidence is rooted at:
-
-```text
-m5out/live-reboot-checkpoint-20260729/
-```
-
-`transaction.json` records the capture and restored boot IDs, exact process
-trees, image/input hashes, restore-unit results, and post-restore continuity
-samples. The original application-level resume units remain disabled so a
-failed CRIU restore cannot silently restart AMU warmup or the complete
-NDPSim stage.
-
-AMU restored as PID tree `205393 -> 205789`. M2NDP restored as
-`205476 -> 205971` at `Launch ID 21, K3_PULL_DAMP`. The M2NDP restore first
-failed closed because `ndpsim.log` had grown from the image-recorded
-53,680,423 bytes to 53,911,552 bytes. All 24 other regular files matched.
-The complete drifted log was preserved as
-`m2ndp/ndpsim.log.pre-restore-full-20260729` with SHA-256
-`836f5f71ddd71054dc397b08de536d081aa0b7ed0df871ee06892af047f3bbf0`;
-the working log was then truncated to the checkpoint offset before retrying.
-
-Post-restore verification requires both system units to report success, both
-exact PID/command trees to match their manifests, and live progress:
-
-```sh
-systemctl show -p ActiveState -p SubState -p Result \
-  gapbs-amu-criu-restore.service m2ndp-criu-restore.service
-python3 scripts/live_simulator_checkpoint.py verify-restored \
-  --manifest m5out/live-reboot-checkpoint-20260729/amu/manifest.json
-python3 scripts/live_simulator_checkpoint.py verify-restored \
-  --manifest m5out/live-reboot-checkpoint-20260729/m2ndp/manifest.json
-tail -n 5000 m5out/m2ndp_g20_pr_spmv_e2e/logs/ndpsim.log |
-  grep 'Launch ID' | tail -n 3
-```
-
-The first measured continuity sample advanced the same restored M2NDP launch
-from `2774/32770` to `2812/32770` while the log grew from 53,690,079 to
-53,692,314 bytes. This recovery evidence does not authorize a paper result;
-the normal bit-exact and end-to-end publication gates still apply.
-
-The host reset unexpectedly a second time on 2026-07-29: boot
-`a2ccaf57-b238-47d4-bac5-4edaa411bdbc` ended without an orderly shutdown at
-21:17 UTC and boot `eeda9abc-6661-4d6d-82b0-972d94ac86af` began at 21:25 UTC.
-AMU restored automatically. M2NDP again failed closed because the same
-append-open log had reached 54,194,176 bytes. All other fixed-size regular
-files still matched the CRIU image. The complete second drifted log is
-preserved as
-`m2ndp/ndpsim.log.pre-second-restore-20260729-eeda9abc`, size 54,194,176,
-SHA-256
-`d015676f02ced569a55581a8372fbb7aa8a8c0ddeb2a3ccea585ddcae8bf0207`.
-After exact truncation, the original M2NDP PID tree restored again and the
-same launch advanced from `3089/32770` to `3156/32770` in ten seconds.
-
-To make later crash recovery deterministic, the M2NDP manifest now
-allowlists only `ndpsim.log` with policy
-`preserve_tail_then_truncate` and its CRIU-recorded size. Before invoking
-CRIU, restore preserves any post-checkpoint tail plus SHA-256 evidence under
-`m2ndp/restore-drift/<boot-id>/`, then truncates exactly to the recorded
-offset. A missing or shorter file, invalid policy, non-absolute path, or
-unlisted mismatch remains a hard failure. The two redundant probe image
-directories were removed only after both final manifests revalidated,
-releasing about 12.6 GiB; the final images and all recovery evidence remain.
+This policy intentionally provides no periodic live-process snapshots. A
+service restart can repeat simulator work, but it cannot authorize or preserve
+a partial paper result.
