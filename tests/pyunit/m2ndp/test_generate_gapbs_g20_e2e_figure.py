@@ -4,6 +4,7 @@
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
+from xml.etree import ElementTree
 
 from scripts import generate_gapbs_g20_e2e_figure as figure
 
@@ -158,6 +159,56 @@ class FigureDataTest(unittest.TestCase):
                 valid_sensitivity(),
                 evidence_sha256="not-a-digest",
             )
+
+
+class FigureRenderingTest(unittest.TestCase):
+    def test_render_figure_emits_deterministic_vector_metadata(self):
+        first_pdf, first_svg = figure.render_figure(
+            valid_rows(),
+            valid_sensitivity(),
+            evidence_sha256="b" * 64,
+        )
+        second_pdf, second_svg = figure.render_figure(
+            valid_rows(),
+            valid_sensitivity(),
+            evidence_sha256="b" * 64,
+        )
+
+        self.assertEqual(first_pdf, second_pdf)
+        self.assertEqual(first_svg, second_svg)
+        self.assertTrue(first_pdf.startswith(b"%PDF-"))
+        self.assertIn(
+            b"Evidence SHA-256: " + b"b" * 64,
+            first_pdf,
+        )
+
+        root = ElementTree.fromstring(first_svg)
+        self.assertEqual(root.attrib["width"], "504pt")
+        self.assertEqual(root.attrib["height"], "230.4pt")
+        svg_text = first_svg.decode("utf-8")
+        self.assertIn("panel_a_scale=log", svg_text)
+        self.assertIn("scale-4, single-core", svg_text)
+        self.assertIn("not g20 evidence", svg_text)
+        self.assertIn("Vanilla CXL", svg_text)
+        self.assertIn("M2NDP", svg_text)
+
+    def test_render_figure_records_linear_scale(self):
+        rows = valid_rows()
+        seconds = (Decimal("8"), Decimal("7"), Decimal("6"), Decimal("1"))
+        for index, value in enumerate(seconds):
+            rows[index] = SimpleNamespace(
+                system=rows[index].system,
+                latency_seconds=value,
+                speedup=rows[index].speedup,
+            )
+
+        _pdf, svg = figure.render_figure(
+            rows,
+            valid_sensitivity(),
+            evidence_sha256="c" * 64,
+        )
+
+        self.assertIn("panel_a_scale=linear", svg.decode("utf-8"))
 
 
 if __name__ == "__main__":
