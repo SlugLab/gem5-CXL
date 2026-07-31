@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from decimal import Decimal
@@ -696,7 +697,7 @@ class TableRenderingTest(unittest.TestCase):
             "0.485026931357",
         )
 
-    def test_publish_writes_three_outputs_and_table_hash_comment(self):
+    def test_publish_writes_five_outputs_and_links_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             roots = write_formal_bundle(root)
@@ -717,13 +718,32 @@ class TableRenderingTest(unittest.TestCase):
                 )
 
             self.assertEqual(paths, table.output_paths(output))
+            self.assertEqual(
+                tuple(path.relative_to(output).as_posix() for path in paths),
+                (
+                    "gapbs-g20-e2e-results.csv",
+                    "gapbs-g20-e2e-table-evidence.json",
+                    "gapbs-vtune-cxl-table.tex",
+                    "fig/gapbs-g20-e2e.pdf",
+                    "fig/gapbs-g20-e2e.svg",
+                ),
+            )
             self.assertTrue(all(path.is_file() for path in paths))
             evidence_hash = hashlib.sha256(paths[1].read_bytes()).hexdigest()
             self.assertIn(
                 f"% Evidence SHA-256: {evidence_hash}",
                 paths[2].read_text(encoding="utf-8"),
             )
-            self.assertEqual(list(output.glob(".*.tmp")), [])
+            self.assertIn(
+                b"Evidence SHA-256: " + evidence_hash.encode("ascii"),
+                paths[3].read_bytes(),
+            )
+            self.assertIn(
+                f"Evidence SHA-256: {evidence_hash}",
+                paths[4].read_text(encoding="utf-8"),
+            )
+            self.assertEqual(list(output.rglob(".*.tmp")), [])
+            self.assertEqual(list(output.rglob(".*.bak")), [])
 
     def test_rejected_input_preserves_existing_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -748,6 +768,70 @@ class TableRenderingTest(unittest.TestCase):
                     for path in table.output_paths(output)
                 )
             )
+
+    def test_mid_promotion_failure_restores_previous_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roots = write_formal_bundle(root)
+            latency_csv, latency_root = write_sensitivity_bundle(root)
+            output = root / "paper"
+            relative_targets = (
+                "gapbs-g20-e2e-results.csv",
+                "gapbs-g20-e2e-table-evidence.json",
+                "gapbs-vtune-cxl-table.tex",
+                "fig/gapbs-g20-e2e.pdf",
+                "fig/gapbs-g20-e2e.svg",
+            )
+            targets = tuple(output / name for name in relative_targets)
+            for index, target in enumerate(targets):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(f"sentinel-{index}".encode("ascii"))
+
+            real_replace = os.replace
+            failure_injected = False
+
+            def fail_second_promotion(source, destination):
+                nonlocal failure_injected
+                source = Path(source)
+                destination = Path(destination)
+                if (
+                    not failure_injected
+                    and source.name.endswith(".tmp")
+                    and destination.name
+                    == "gapbs-g20-e2e-table-evidence.json"
+                ):
+                    failure_injected = True
+                    raise OSError("injected promotion failure")
+                return real_replace(source, destination)
+
+            with (
+                mock.patch.object(table, "G20_WORDS", 4),
+                mock.patch.object(
+                    table, "git_head", return_value="c" * 40
+                ),
+                mock.patch.object(
+                    table.os,
+                    "replace",
+                    side_effect=fail_second_promotion,
+                ),
+                self.assertRaisesRegex(OSError, "injected promotion"),
+            ):
+                table.publish(
+                    roots.m2ndp,
+                    roots.variants,
+                    latency_csv,
+                    latency_root,
+                    output,
+                )
+
+            self.assertTrue(failure_injected)
+            for index, target in enumerate(targets):
+                self.assertEqual(
+                    target.read_bytes(),
+                    f"sentinel-{index}".encode("ascii"),
+                )
+            self.assertEqual(list(output.rglob(".*.tmp")), [])
+            self.assertEqual(list(output.rglob(".*.bak")), [])
 
 
 def valid_cli_args(root, roots, latency_csv, latency_root, output):
@@ -809,7 +893,7 @@ class TableCliTest(unittest.TestCase):
                 target.read_text(encoding="utf-8"), "old\n"
             )
 
-    def test_main_success_prints_all_three_outputs(self):
+    def test_main_success_prints_all_five_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             roots = write_formal_bundle(root)

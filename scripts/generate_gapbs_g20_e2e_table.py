@@ -17,15 +17,18 @@ import re
 import subprocess
 from decimal import Decimal
 from pathlib import Path
+from xml.etree import ElementTree
 
 try:
     from scripts import calibrate_m2ndp_cxl as calibration
+    from scripts import generate_gapbs_g20_e2e_figure as paper_figure
     from scripts import m2ndp_artifacts as artifacts
     from scripts import m2ndp_results as results
     from scripts import run_gapbs_matched_pr_spmv_variants as matched_runner
     from scripts import run_m2ndp_g20_pr_spmv as orchestrator
 except ImportError:
     import calibrate_m2ndp_cxl as calibration
+    import generate_gapbs_g20_e2e_figure as paper_figure
     import m2ndp_artifacts as artifacts
     import m2ndp_results as results
     import run_gapbs_matched_pr_spmv_variants as matched_runner
@@ -935,30 +938,107 @@ def output_paths(output_dir):
         output_dir / "gapbs-g20-e2e-results.csv",
         output_dir / "gapbs-g20-e2e-table-evidence.json",
         output_dir / "gapbs-vtune-cxl-table.tex",
+        output_dir / "fig/gapbs-g20-e2e.pdf",
+        output_dir / "fig/gapbs-g20-e2e.svg",
     )
 
 
-def publish_bytes(output_dir, csv_bytes, evidence_bytes, latex_bytes):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    targets = output_paths(output_dir)
-    staged = []
+def _validate_publication_payloads(contents):
+    if any(not isinstance(content, bytes) or not content for content in contents):
+        raise TableEvidenceError("publication payloads must be nonempty bytes")
+    csv_bytes, evidence_bytes, latex_bytes, pdf_bytes, svg_bytes = contents
     try:
+        csv_rows = list(
+            csv.DictReader(io.StringIO(csv_bytes.decode("utf-8")))
+        )
+        evidence = json.loads(evidence_bytes.decode("utf-8"))
+        latex = latex_bytes.decode("utf-8")
+        svg_root = ElementTree.fromstring(svg_bytes)
+    except (
+        UnicodeDecodeError,
+        csv.Error,
+        json.JSONDecodeError,
+        ElementTree.ParseError,
+    ) as error:
+        raise TableEvidenceError(
+            f"publication payload is not parseable: {error}"
+        ) from error
+    if len(csv_rows) != 4:
+        raise TableEvidenceError("publication CSV must contain four rows")
+    if not isinstance(evidence, dict):
+        raise TableEvidenceError("publication evidence must be an object")
+    if r"\begin{table}" not in latex:
+        raise TableEvidenceError("publication TeX has no table")
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise TableEvidenceError("publication PDF signature is invalid")
+    if not svg_root.tag.endswith("svg"):
+        raise TableEvidenceError("publication SVG root is invalid")
+
+
+def _recover_stale_backup(target, backup):
+    if not backup.exists():
+        return
+    if target.exists():
+        backup.unlink()
+    else:
+        os.replace(backup, target)
+
+
+def publish_bytes(
+    output_dir,
+    csv_bytes,
+    evidence_bytes,
+    latex_bytes,
+    pdf_bytes,
+    svg_bytes,
+):
+    output_dir = Path(output_dir)
+    targets = output_paths(output_dir)
+    contents = (
+        csv_bytes,
+        evidence_bytes,
+        latex_bytes,
+        pdf_bytes,
+        svg_bytes,
+    )
+    _validate_publication_payloads(contents)
+    staged = []
+    backups = []
+    promoted = []
+    try:
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            backup = target.with_name(f".{target.name}.bak")
+            _recover_stale_backup(target, backup)
         for target, content in zip(
             targets,
-            (csv_bytes, evidence_bytes, latex_bytes),
+            contents,
             strict=True,
         ):
             temporary = target.with_name(f".{target.name}.tmp")
             temporary.unlink(missing_ok=True)
             temporary.write_bytes(content)
             staged.append((temporary, target))
+        for target in targets:
+            backup = target.with_name(f".{target.name}.bak")
+            if target.exists():
+                os.replace(target, backup)
+                backups.append((backup, target))
         for temporary, target in staged:
             os.replace(temporary, target)
+            promoted.append(target)
     except BaseException:
+        for target in promoted:
+            target.unlink(missing_ok=True)
+        for backup, target in reversed(backups):
+            if backup.exists():
+                target.unlink(missing_ok=True)
+                os.replace(backup, target)
         for temporary, _target in staged:
             temporary.unlink(missing_ok=True)
         raise
+    for backup, _target in backups:
+        backup.unlink(missing_ok=True)
     return targets
 
 
@@ -1045,8 +1125,18 @@ def publish(
         sensitivity,
         evidence_sha256=evidence_sha256,
     ).encode("utf-8")
+    pdf_bytes, svg_bytes = paper_figure.render_figure(
+        rows,
+        sensitivity,
+        evidence_sha256=evidence_sha256,
+    )
     return publish_bytes(
-        output_dir, csv_bytes, evidence_bytes, latex_bytes
+        output_dir,
+        csv_bytes,
+        evidence_bytes,
+        latex_bytes,
+        pdf_bytes,
+        svg_bytes,
     )
 
 
