@@ -300,7 +300,7 @@ Process::initState()
     pTable->initState();
 
     initVirtMem.reset(new SETranslatingPortProxy(
-                tc, SETranslatingPortProxy::Always));
+                tc, SETranslatingPortProxy::Always, 0, true));
 
     // load object file into target memory
     image.write(*initVirtMem);

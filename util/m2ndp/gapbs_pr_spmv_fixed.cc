@@ -42,7 +42,7 @@ void PageRankPullFixed(const Graph &g, pvector<ScoreT> &scores,
 #pragma omp parallel for
     for (NodeID node = 0; node < g.num_nodes(); ++node)
       outgoing_contrib[node] = scores[node] / g.out_degree(node);
-#pragma omp parallel for schedule(dynamic, 16384)
+#pragma omp parallel for schedule(static)
     for (NodeID u = 0; u < g.num_nodes(); ++u) {
       ScoreT incoming_total = 0.0f;
       for (NodeID v : g.in_neigh(u))

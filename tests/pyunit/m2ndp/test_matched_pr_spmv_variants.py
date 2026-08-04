@@ -14,6 +14,15 @@ FIXED_SOURCE = REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
 
 
 class MatchedVariantSourceTest(unittest.TestCase):
+    def test_fixed_pull_rows_are_partitioned_across_both_cores(self):
+        source = FIXED_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            "#pragma omp parallel for schedule(static)\n"
+            "    for (NodeID u = 0; u < g.num_nodes(); ++u)",
+            source,
+        )
+        self.assertNotIn("schedule(dynamic, 16384)", source)
+
     def test_amu_batches_loads_but_commits_float_adds_in_csr_order(self):
         generated = variants.transform_source(
             FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
@@ -38,20 +47,24 @@ class MatchedVariantSourceTest(unittest.TestCase):
         )
         self.assertIn("constexpr int kPageRankIterations = 20;", generated)
 
-    def test_cira_prefetches_a_future_row_before_unchanged_ordered_adds(self):
+    def test_cira_prefetches_future_row_batches_before_ordered_adds(self):
         generated = variants.transform_source(
             FIXED_SOURCE.read_text(encoding="utf-8"), "cira"
         )
 
-        future = generated.index("GAPBS_CIRA_FUTURE_NODE(g, u, pf_u)")
+        future = generated.index(
+            "GAPBS_CIRA_FUTURE_BLOCK(g, u, pf_begin, pf_count)"
+        )
+        boundary = generated.index("u % GAPBS_CIRA_ROW_BATCH == 0")
         prefetch = generated.index(
-            "GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROW("
-            "g, pf_u, outgoing_contrib)"
+            "GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROWS("
+            "g, pf_begin, pf_count, outgoing_contrib)"
         )
         current = generated.index("auto neigh = g.in_neigh(u)")
         ordered_add = generated.index(
             "incoming_total = incoming_total + outgoing_contrib[v]"
         )
+        self.assertLess(boundary, future)
         self.assertLess(future, prefetch)
         self.assertLess(prefetch, current)
         self.assertLess(current, ordered_add)
@@ -61,6 +74,7 @@ class MatchedVariantSourceTest(unittest.TestCase):
             ),
             1,
         )
+        self.assertNotIn("GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROW(", generated)
 
     def test_compile_commands_disable_contraction_and_fast_math(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,6 +89,7 @@ class MatchedVariantSourceTest(unittest.TestCase):
                 m5_library=root / "libm5.a",
                 amu_batch_size=64,
                 cira_prefetch_distance=16,
+                cira_row_batch=256,
                 cira_max_outstanding=256,
             )
 
@@ -82,6 +97,25 @@ class MatchedVariantSourceTest(unittest.TestCase):
         self.assertIn("-fno-fast-math", command)
         self.assertIn("-DGAPBS_AMU_BATCH_SIZE=64", command)
         self.assertNotIn("-ffast-math", command)
+
+    def test_cira_compile_command_sets_aggressive_row_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = variants.compile_command(
+                kind="cira",
+                cxx="g++",
+                source=root / "pr_spmv.cc",
+                gapbs_root=root / "gapbs",
+                generated_dir=root / "generated",
+                output=root / "bin/pr_spmv",
+                m5_library=root / "libm5.a",
+                amu_batch_size=64,
+                cira_prefetch_distance=16,
+                cira_row_batch=256,
+                cira_max_outstanding=256,
+            )
+
+        self.assertIn("-DGAPBS_CIRA_ROW_BATCH=256", command)
 
 
 class MatchedVariantBitGateTest(unittest.TestCase):

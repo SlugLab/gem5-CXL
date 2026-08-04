@@ -17,6 +17,7 @@
 #include "base/trace.hh"
 #include "cpu/thread_context.hh"
 #include "debug/CIRA.hh"
+#include "mem/cache/base.hh"
 #include "mem/port_proxy.hh"
 #include "sim/system.hh"
 
@@ -74,6 +75,8 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "CPU data demands served after a CIRA-origin L2 fill"),
       ADD_STAT(latePrefetches, statistics::units::Count::get(),
                "CPU data demands arriving before a CIRA-origin L2 fill"),
+      ADD_STAT(issuedCsrPrefetchesPerCore, statistics::units::Count::get(),
+               "CIRA CSR descriptors accepted per target core"),
       ADD_STAT(issuedPrefetchesPerCore, statistics::units::Count::get(),
                "CIRA prefetch requests issued per target core"),
       ADD_STAT(completedPrefetchesPerCore, statistics::units::Count::get(),
@@ -100,6 +103,7 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "Average CIRA request latency",
                totalLatency / completedPrefetches)
 {
+    issuedCsrPrefetchesPerCore.init(num_cores);
     issuedPrefetchesPerCore.init(num_cores);
     completedPrefetchesPerCore.init(num_cores);
     coalescedPrefetchesPerCore.init(num_cores);
@@ -107,6 +111,7 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
     latePrefetchesPerCore.init(num_cores);
     for (size_t core = 0; core < num_cores; ++core) {
         const std::string label = std::to_string(core);
+        issuedCsrPrefetchesPerCore.subname(core, label);
         issuedPrefetchesPerCore.subname(core, label);
         completedPrefetchesPerCore.subname(core, label);
         coalescedPrefetchesPerCore.subname(core, label);
@@ -172,6 +177,14 @@ CIRA::init()
              "CIRA %s has %llu ports but %llu probe targets", name(),
              static_cast<unsigned long long>(memSidePorts.size()),
              static_cast<unsigned long long>(demandProbeTargets.size()));
+    targetCaches.clear();
+    targetCaches.reserve(demandProbeTargets.size());
+    for (SimObject *target : demandProbeTargets) {
+        auto *cache = dynamic_cast<BaseCache *>(target);
+        panic_if(!cache, "CIRA %s demand probe target %s is not a cache",
+                 name(), target->name());
+        targetCaches.push_back(cache);
+    }
     panic_if(registry.count(system) && registry[system] != this,
              "Only one CIRA instance per System is currently supported");
     registry[system] = this;
@@ -469,8 +482,13 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
                 chunk.size - chunkOffset, lineRemaining));
             const Addr paddr = chunk.paddr + chunkOffset;
             const Addr physicalLine = paddr - paddr % cacheLineSize;
+            const bool secure = chunk.flags.isSet(Request::SECURE);
+            const bool alreadyCovered = !targetCaches.empty() &&
+                (targetCaches.at(targetCore)->inCache(physicalLine, secure) ||
+                 targetCaches.at(targetCore)->inMissQueue(
+                     physicalLine, secure));
             if (tracker.tracked(physicalLine) ||
-                !localLines.insert(physicalLine).second) {
+                alreadyCovered || !localLines.insert(physicalLine).second) {
                 ++stats.coalescedPrefetches;
                 ++stats.coalescedPrefetchesPerCore[targetCore];
             } else {
@@ -689,6 +707,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         }
 
         ++stats.issuedCsrPrefetches;
+        ++stats.issuedCsrPrefetchesPerCore[targetCore];
         stats.csrRowsVisited += desc.rowCount;
 
         CsrWalkState walk;
@@ -733,6 +752,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
     }
 
     ++stats.issuedCsrPrefetches;
+    ++stats.issuedCsrPrefetchesPerCore[targetCore];
     uint64_t accepted = 0;
     const uint64_t rowEnd = desc.rowStart + desc.rowCount;
     for (uint64_t row = desc.rowStart; row < rowEnd; ++row) {

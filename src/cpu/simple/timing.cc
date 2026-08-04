@@ -514,6 +514,19 @@ TimingSimpleCPU::handleWritePacket()
     } else if (!dcachePort.sendTimingReq(dcache_pkt)) {
         _status = DcacheRetry;
     } else {
+        // Keep a functional-only SE syscall shadow in physical memory.  The
+        // CXL timing hierarchy still owns all timing and coherence behavior,
+        // but this fork's functional proxy cannot observe dirty private-cache
+        // data when servicing host-emulated syscalls such as clone3/write.
+        if (!FullSystem && !req->isSwap() &&
+            !req->hasAtomicOpFunctor() &&
+            !req->getFlags().isSet(Request::STORE_NO_DATA) &&
+            !dcache_pkt->isHtmTransactional()) {
+            Packet shadow_pkt(req, MemCmd::WriteReq);
+            shadow_pkt.dataStaticConst(
+                dcache_pkt->getConstPtr<uint8_t>());
+            system->getPhysMem().functionalAccess(&shadow_pkt);
+        }
         _status = DcacheWaitResponse;
         // memory system takes ownership of packet
         dcache_pkt = NULL;

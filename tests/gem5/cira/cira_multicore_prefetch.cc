@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <sched.h>
 
+#include <immintrin.h>
 #include <gem5/m5ops.h>
 
 #include "cira.h"
@@ -118,6 +119,15 @@ main()
         for (int i = 0; i < NumValues; ++i)
             values[core][i] = (core + 1) * 1000 + i;
     }
+
+    // Force the target lines out of both private cache hierarchies so this
+    // routing test exercises real CIRA timing requests instead of the
+    // resident-line suppression path.
+    for (size_t offset = 0; offset < sizeof(records); offset += 64)
+        _mm_clflush(reinterpret_cast<unsigned char *>(records) + offset);
+    for (size_t offset = 0; offset < sizeof(values); offset += 64)
+        _mm_clflush(reinterpret_cast<unsigned char *>(values) + offset);
+    _mm_mfence();
 
     cira_cfgwr(CIRA_CFG_MAX_OUTSTANDING, 256);
     cira_cfgwr(CIRA_CFG_ENABLE, 1);

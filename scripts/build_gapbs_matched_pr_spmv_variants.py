@@ -61,13 +61,11 @@ _AMU_PULL_LOOP = (
     "      }"
 )
 _CIRA_PULL_LOOP = (
-    "      NodeID pf_u;\n"
-    "      if (GAPBS_CIRA_FUTURE_NODE(g, u, pf_u)) {\n"
-    "        auto pf_neigh = g.in_neigh(pf_u);\n"
-    "        if (pf_neigh.begin() != pf_neigh.end())\n"
-    "          GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROW("
-    "g, pf_u, outgoing_contrib);\n"
-    "      }\n"
+    "      NodeID pf_begin, pf_count;\n"
+    "      if (u % GAPBS_CIRA_ROW_BATCH == 0 &&\n"
+    "          GAPBS_CIRA_FUTURE_BLOCK(g, u, pf_begin, pf_count))\n"
+    "        GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROWS("
+    "g, pf_begin, pf_count, outgoing_contrib);\n"
     "      auto neigh = g.in_neigh(u);\n"
     "      for (auto v_it = neigh.begin(); v_it != neigh.end(); ++v_it) {\n"
     "        NodeID v = *v_it;\n"
@@ -115,6 +113,7 @@ def compile_command(
     m5_library,
     amu_batch_size,
     cira_prefetch_distance,
+    cira_row_batch,
     cira_max_outstanding,
 ):
     command = [
@@ -132,6 +131,7 @@ def compile_command(
         command += [
             f"-DGAPBS_CIRA_PREFETCH_DISTANCE={cira_prefetch_distance}",
             f"-DGAPBS_CIRA_NODE_DISTANCE={cira_prefetch_distance}",
+            f"-DGAPBS_CIRA_ROW_BATCH={cira_row_batch}",
             f"-DGAPBS_CIRA_MAX_OUTSTANDING={cira_max_outstanding}",
             "-DGAPBS_CIRA_RANGE_LIMIT=0",
             "-DGAPBS_CIRA_USE_CSR=1",
@@ -209,6 +209,7 @@ def build_variant(
     m5_library,
     amu_batch_size,
     cira_prefetch_distance,
+    cira_row_batch,
     cira_max_outstanding,
 ):
     variant_root = Path(outdir) / kind
@@ -248,6 +249,7 @@ def build_variant(
         m5_library=m5_library,
         amu_batch_size=amu_batch_size,
         cira_prefetch_distance=cira_prefetch_distance,
+        cira_row_batch=cira_row_batch,
         cira_max_outstanding=cira_max_outstanding,
     )
     baseline_builder.run(command)
@@ -281,6 +283,7 @@ def main(argv=None):
     )
     parser.add_argument("--amu-batch-size", type=int, default=64)
     parser.add_argument("--cira-prefetch-distance", type=int, default=0)
+    parser.add_argument("--cira-row-batch", type=int, default=256)
     parser.add_argument("--cira-max-outstanding", type=int, default=256)
     args = parser.parse_args(argv)
 
@@ -293,6 +296,8 @@ def main(argv=None):
         parser.error("--amu-batch-size must be positive")
     if args.cira_prefetch_distance < 0:
         parser.error("--cira-prefetch-distance must be non-negative")
+    if args.cira_row_batch <= 0:
+        parser.error("--cira-row-batch must be positive")
     if args.cira_max_outstanding <= 0:
         parser.error("--cira-max-outstanding must be positive")
 
@@ -313,6 +318,7 @@ def main(argv=None):
                 m5_library=args.m5_library,
                 amu_batch_size=args.amu_batch_size,
                 cira_prefetch_distance=cira_distance,
+                cira_row_batch=args.cira_row_batch,
                 cira_max_outstanding=args.cira_max_outstanding,
             )
         )
@@ -332,6 +338,7 @@ def main(argv=None):
         "compiler": baseline_builder.compiler_version(args.cxx),
         "amu_batch_size": args.amu_batch_size,
         "cira_prefetch_distance": cira_distance,
+        "cira_row_batch": args.cira_row_batch,
         "cira_profile_mode": "override-non-pgo" if override else "pgo",
         "cira_profiles": profiles,
         "cira_profile_sha256": {

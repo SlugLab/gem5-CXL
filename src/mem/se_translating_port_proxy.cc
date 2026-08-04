@@ -47,8 +47,9 @@ namespace gem5
 {
 
 SETranslatingPortProxy::SETranslatingPortProxy(
-        ThreadContext *tc, AllocType alloc, Request::Flags _flags) :
-    TranslatingPortProxy(tc, _flags), allocating(alloc)
+        ThreadContext *tc, AllocType alloc, Request::Flags _flags,
+        bool bypass_caches) :
+    TranslatingPortProxy(tc, _flags, bypass_caches), allocating(alloc)
 {}
 
 bool

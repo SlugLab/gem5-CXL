@@ -3,6 +3,7 @@
 
 import csv
 import importlib.util
+import inspect
 import subprocess
 import tempfile
 import unittest
@@ -462,6 +463,8 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "board.cira.completedPrefetchesPerCore::1": Decimal(120),
             "board.cira.usefulPrefetchesPerCore::0": Decimal(10),
             "board.cira.usefulPrefetchesPerCore::1": Decimal(12),
+            "board.cira.issuedCsrPrefetchesPerCore::0": Decimal(5),
+            "board.cira.issuedCsrPrefetchesPerCore::1": Decimal(6),
             "board.cira.coalescedPrefetches": Decimal(500),
             "board.cira.rejectedQueueFull": Decimal(0),
             "board.cira.droppedCsrDescriptors": Decimal(0),
@@ -474,10 +477,11 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(evidence["cira_issued_per_core"], "100;120")
         self.assertEqual(evidence["cira_completed_per_core"], "100;120")
         self.assertEqual(evidence["cira_useful_per_core"], "10;12")
+        self.assertEqual(evidence["cira_csr_per_core"], "5;6")
         self.assertEqual(evidence["cira_coalesced"], Decimal(500))
         self.assertEqual(evidence["cira_csr_queue_high_watermark"], Decimal(8))
 
-        for field in ("cira_issued_per_core", "cira_completed_per_core"):
+        for field in ("cira_csr_per_core",):
             with self.subTest(field=field):
                 candidate = dict(evidence)
                 candidate[field] = "100;0"
@@ -485,6 +489,13 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                     self.runner.cira_evidence_failure(candidate, 2),
                     "inactive-cira-core",
                 )
+
+        candidate = dict(evidence)
+        candidate["cira_issued_per_core"] = "100;0"
+        candidate["cira_completed_per_core"] = "100;0"
+        self.assertIsNone(
+            self.runner.cira_evidence_failure(candidate, 2)
+        )
 
         for field in (
             "cira_rejected_queue_full",
@@ -635,6 +646,10 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(metrics["l2d_demand_misses"], Decimal(22))
         self.assertEqual(metrics["l2i_demand_hits"], Decimal(6))
         self.assertEqual(metrics["l2i_demand_misses"], Decimal(6))
+
+    def test_run_one_forwards_the_configured_core_count(self):
+        source = inspect.getsource(self.runner.run_one)
+        self.assertIn("num_cores=args.cores", source)
 
     def test_two_core_rejects_missing_directional_core_cell(self):
         stats = self.two_core_stats()

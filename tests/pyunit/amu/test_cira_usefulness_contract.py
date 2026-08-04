@@ -13,6 +13,10 @@ REPO = Path(__file__).resolve().parents[3]
 CIRA_PY = REPO / "src" / "mem" / "CIRA.py"
 CIRA_HH = REPO / "src" / "mem" / "cira.hh"
 CIRA_CC = REPO / "src" / "mem" / "cira.cc"
+TRANSLATING_PORT_PROXY_CC = REPO / "src" / "mem" / "translating_port_proxy.cc"
+PROCESS_CC = REPO / "src" / "sim" / "process.cc"
+SYSCALL_EMUL_HH = REPO / "src" / "sim" / "syscall_emul.hh"
+TIMING_SIMPLE_CC = REPO / "src" / "cpu" / "simple" / "timing.cc"
 GAPBS_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
 )
@@ -25,6 +29,60 @@ CIRA_MULTICORE_CONFIG = (
 
 
 class CiraUsefulnessTrackerContractTest(unittest.TestCase):
+    def test_cira_filters_lines_already_present_or_pending_in_target_l2(self):
+        source = CIRA_CC.read_text(encoding="utf-8")
+        issue = source[
+            source.index("CIRA::issuePrefetch(") : source.index(
+                "CIRA::issueIndexedPrefetch("
+            )
+        ]
+        self.assertIn("targetCaches.at(targetCore)->inCache", issue)
+        self.assertIn("targetCaches.at(targetCore)->inMissQueue", issue)
+
+    def test_se_proxy_reads_coherent_dirty_guest_memory(self):
+        source = TRANSLATING_PORT_PROXY_CC.read_text(encoding="utf-8")
+        constructor = source[
+            source.index("TranslatingPortProxy::TranslatingPortProxy(") :
+            source.index("bool\nTranslatingPortProxy::tryOnBlob")
+        ]
+        self.assertIn(
+            "makeFunctionalAccess(tc, bypass_caches)",
+            constructor,
+        )
+        self.assertIn("tc->sendFunctional(&coherent_pkt)", source)
+        self.assertIn("getPhysMem().functionalAccess(pkt)", source)
+        self.assertIn("if (bypassCaches)", source)
+        self.assertIn("if (pkt->isWrite())", source)
+        self.assertNotIn("getPhysMem().functionalAccess", constructor)
+        process = PROCESS_CC.read_text(encoding="utf-8")
+        self.assertIn(
+            "tc, SETranslatingPortProxy::Always, 0, true",
+            process,
+        )
+
+    def test_clone3_does_not_eagerly_read_pointer_arguments(self):
+        source = SYSCALL_EMUL_HH.read_text(encoding="utf-8")
+        clone3 = source[
+            source.index("clone3Func(") : source.index(
+                "cloneFunc(", source.index("clone3Func(")
+            )
+        ]
+        self.assertIn("VPtr<> ptidPtr", clone3)
+        self.assertIn("VPtr<> ctidPtr", clone3)
+        self.assertIn("VPtr<> tlsPtr", clone3)
+        self.assertNotIn("VPtr<uint64_t>", clone3)
+
+    def test_timing_se_stores_update_the_syscall_shadow(self):
+        source = TIMING_SIMPLE_CC.read_text(encoding="utf-8")
+        handle_write = source[
+            source.index("TimingSimpleCPU::handleWritePacket()") :
+            source.index("TimingSimpleCPU::writeMem(")
+        ]
+        self.assertIn("SE syscall shadow", handle_write)
+        self.assertIn("getPhysMem().functionalAccess(&shadow_pkt)", handle_write)
+        self.assertIn("!FullSystem", handle_write)
+        self.assertIn("!req->isSwap()", handle_write)
+
     def test_transition_machine(self):
         compiler = shutil.which("g++") or shutil.which("c++")
         self.assertIsNotNone(compiler, "a C++ compiler is required")
@@ -234,6 +292,7 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("queuedCsrWalks() const", cira_hh)
         self.assertIn("droppedCsrDescriptors", cira_hh)
         self.assertIn("csrQueueHighWatermark", cira_hh)
+        self.assertIn("issuedCsrPrefetchesPerCore", cira_hh)
         self.assertIn("resolveTargetCore(ThreadContext *tc)", cira_hh)
         self.assertIn(
             "p.port_mem_side_ports_connection_count", cira_cc

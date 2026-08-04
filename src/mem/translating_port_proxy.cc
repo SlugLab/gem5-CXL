@@ -54,11 +54,35 @@
 namespace gem5
 {
 
-TranslatingPortProxy::TranslatingPortProxy(
-        ThreadContext *tc, Request::Flags _flags) :
-    PortProxy([tc](PacketPtr pkt)->void {
+namespace
+{
+
+PortProxy::SendFunctionalFunc
+makeFunctionalAccess(ThreadContext *tc, bool bypassCaches)
+{
+    if (bypassCaches) {
+        return [tc](PacketPtr pkt) {
             tc->getSystemPtr()->getPhysMem().functionalAccess(pkt);
-        }, tc->getSystemPtr()->cacheLineSize()),
+        };
+    }
+    return [tc](PacketPtr pkt) {
+        if (pkt->isWrite()) {
+            Packet coherent_pkt(pkt->req, pkt->cmd);
+            coherent_pkt.dataStaticConst(pkt->getConstPtr<uint8_t>());
+            tc->sendFunctional(&coherent_pkt);
+            tc->getSystemPtr()->getPhysMem().functionalAccess(pkt);
+            return;
+        }
+        tc->getSystemPtr()->getPhysMem().functionalAccess(pkt);
+    };
+}
+
+} // anonymous namespace
+
+TranslatingPortProxy::TranslatingPortProxy(
+        ThreadContext *tc, Request::Flags _flags, bool bypass_caches) :
+    PortProxy(makeFunctionalAccess(tc, bypass_caches),
+              tc->getSystemPtr()->cacheLineSize()),
     _tc(tc), flags(_flags)
 {}
 

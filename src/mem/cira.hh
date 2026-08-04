@@ -30,6 +30,7 @@ namespace gem5
 
 class ThreadContext;
 class System;
+class BaseCache;
 
 class CIRA : public ClockedObject
 {
@@ -193,6 +194,7 @@ class CIRA : public ClockedObject
         statistics::Scalar coalescedPrefetches;
         statistics::Scalar usefulPrefetches;
         statistics::Scalar latePrefetches;
+        statistics::Vector issuedCsrPrefetchesPerCore;
         statistics::Vector issuedPrefetchesPerCore;
         statistics::Vector completedPrefetchesPerCore;
         statistics::Vector coalescedPrefetchesPerCore;
@@ -237,6 +239,7 @@ class CIRA : public ClockedObject
     std::vector<std::unique_ptr<MemoryPort>> memSidePorts;
     const RequestorID requestorId;
     const std::vector<SimObject *> demandProbeTargets;
+    std::vector<BaseCache *> targetCaches;
 
     const uint64_t cacheLineSize;
     std::vector<CiraLineUsefulnessTracker> lineTrackers;

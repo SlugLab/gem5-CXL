@@ -1864,9 +1864,12 @@ SyscallReturn
 clone3Func(SyscallDesc *desc, ThreadContext *tc,
            VPtr<typename OS::tgt_clone_args> cl_args, RegVal size)
 {
-    VPtr<uint64_t> ptidPtr((Addr)cl_args->parent_tid, tc);
-    VPtr<uint64_t> ctidPtr((Addr)cl_args->child_tid, tc);
-    VPtr<uint64_t> tlsPtr((Addr)cl_args->tls, tc);
+    // These fields are addresses, not values to fetch eagerly.  In
+    // particular, unused clone3 pointer fields are allowed to contain data
+    // that is only meaningful when the corresponding flag is set.
+    VPtr<> ptidPtr((Addr)cl_args->parent_tid, tc);
+    VPtr<> ctidPtr((Addr)cl_args->child_tid, tc);
+    VPtr<> tlsPtr((Addr)cl_args->tls, tc);
     // Clone3 gives the stack as the *lowest* address, but clone/__clone2
     // expects the stack parameter to be the actual stack pointer
     uint64_t new_stack = cl_args->stack + cl_args->stack_size;

@@ -66,7 +66,8 @@ class SETranslatingPortProxy : public TranslatingPortProxy
 
   public:
     SETranslatingPortProxy(ThreadContext *tc, AllocType alloc=NextPage,
-                           Request::Flags _flags=0);
+                           Request::Flags _flags=0,
+                           bool bypass_caches=false);
 };
 
 } // namespace gem5

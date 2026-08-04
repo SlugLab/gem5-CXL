@@ -133,6 +133,7 @@ CIRA_EVIDENCE_STATS = {
     "cira_csr_queue_high_watermark": "board.cira.csrQueueHighWatermark",
 }
 CIRA_PER_CORE_STATS = {
+    "cira_csr_per_core": "board.cira.issuedCsrPrefetchesPerCore",
     "cira_issued_per_core": "board.cira.issuedPrefetchesPerCore",
     "cira_completed_per_core": "board.cira.completedPrefetchesPerCore",
     "cira_useful_per_core": "board.cira.usefulPrefetchesPerCore",
@@ -175,6 +176,7 @@ SUMMARY_FIELDS = (
     "cira_late",
     "cira_read_packets",
     "cira_read_bytes",
+    "cira_csr_per_core",
     "cira_issued_per_core",
     "cira_completed_per_core",
     "cira_useful_per_core",
@@ -690,9 +692,14 @@ def cira_evidence_failure(evidence, num_cores):
         Decimal(value)
         for value in evidence["cira_completed_per_core"].split(";")
     ]
-    if len(issued) != num_cores or len(completed) != num_cores:
+    descriptors = [
+        Decimal(value)
+        for value in evidence["cira_csr_per_core"].split(";")
+    ]
+    if (len(issued) != num_cores or len(completed) != num_cores or
+            len(descriptors) != num_cores):
         raise StatsError("CIRA per-core evidence width does not match cores")
-    if any(value <= 0 for value in issued + completed):
+    if any(value <= 0 for value in descriptors):
         return "inactive-cira-core"
     if issued != completed:
         return "cira-incomplete-work"
@@ -1280,7 +1287,10 @@ def run_one(args, benchmark, label, binary_dir, kind):
     owned_metrics = extract_owned_metrics(stats, kind)
     cira_evidence = extract_cira_evidence(stats, kind, args.cores)
     diagnostic_metrics = extract_diagnostic_metrics(
-        stats, kind, fast_forward=bool(args.fast_forward_cpu)
+        stats,
+        kind,
+        fast_forward=bool(args.fast_forward_cpu),
+        num_cores=args.cores,
     )
     if (
         kind == "cira"

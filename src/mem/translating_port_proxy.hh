@@ -73,7 +73,8 @@ class TranslatingPortProxy : public PortProxy
             std::function<void(const TranslationGen::Range &)> func) const;
 
   public:
-    TranslatingPortProxy(ThreadContext *tc, Request::Flags _flags=0);
+    TranslatingPortProxy(ThreadContext *tc, Request::Flags _flags=0,
+                         bool bypass_caches=false);
 
     /** Version of tryReadblob that translates virt->phys and deals
       * with page boundries. */
