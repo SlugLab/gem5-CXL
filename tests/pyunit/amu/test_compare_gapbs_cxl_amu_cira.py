@@ -454,6 +454,76 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 ):
                     self.runner.extract_owned_metrics(candidate, "cira")
 
+    def test_two_core_cira_evidence_rejects_inactive_and_dropped_work(self):
+        stats = {
+            "board.cira.issuedPrefetchesPerCore::0": Decimal(100),
+            "board.cira.issuedPrefetchesPerCore::1": Decimal(120),
+            "board.cira.completedPrefetchesPerCore::0": Decimal(100),
+            "board.cira.completedPrefetchesPerCore::1": Decimal(120),
+            "board.cira.usefulPrefetchesPerCore::0": Decimal(10),
+            "board.cira.usefulPrefetchesPerCore::1": Decimal(12),
+            "board.cira.coalescedPrefetches": Decimal(500),
+            "board.cira.rejectedQueueFull": Decimal(0),
+            "board.cira.droppedCsrDescriptors": Decimal(0),
+            "board.cira.csrQueueHighWatermark": Decimal(8),
+        }
+        evidence = self.runner.extract_cira_evidence(stats, "cira", 2)
+        self.assertEqual(
+            self.runner.cira_evidence_failure(evidence, 2), None
+        )
+        self.assertEqual(evidence["cira_issued_per_core"], "100;120")
+        self.assertEqual(evidence["cira_completed_per_core"], "100;120")
+        self.assertEqual(evidence["cira_useful_per_core"], "10;12")
+        self.assertEqual(evidence["cira_coalesced"], Decimal(500))
+        self.assertEqual(evidence["cira_csr_queue_high_watermark"], Decimal(8))
+
+        for field in ("cira_issued_per_core", "cira_completed_per_core"):
+            with self.subTest(field=field):
+                candidate = dict(evidence)
+                candidate[field] = "100;0"
+                self.assertEqual(
+                    self.runner.cira_evidence_failure(candidate, 2),
+                    "inactive-cira-core",
+                )
+
+        for field in (
+            "cira_rejected_queue_full",
+            "cira_dropped_csr_descriptors",
+        ):
+            with self.subTest(field=field):
+                candidate = dict(evidence)
+                candidate[field] = Decimal(1)
+                self.assertEqual(
+                    self.runner.cira_evidence_failure(candidate, 2),
+                    "cira-rejected-work",
+                )
+
+    def test_cira_forwards_bounded_scheduler_parameters(self):
+        args = SimpleNamespace(
+            cira_max_outstanding=256,
+            cira_max_send_queue=1024,
+            cira_max_csr_walk_queue=4096,
+            cira_csr_lines_per_turn=64,
+            cira_max_completed_lines=65536,
+            cira_issue_latency="1ns",
+            cira_completion_latency="0ns",
+            env=[],
+        )
+        cmd = []
+        self.runner.append_kind_args(cmd, args, "cira")
+        for option, value in (
+            ("--cira-max-csr-walk-queue", "4096"),
+            ("--cira-csr-lines-per-turn", "64"),
+            ("--cira-max-completed-lines", "65536"),
+        ):
+            index = cmd.index(option)
+            self.assertEqual(cmd[index + 1], value)
+
+        parameters = self.runner.checkpoint_model_parameters(args, "cira")
+        self.assertEqual(parameters["cira_max_csr_walk_queue"], 4096)
+        self.assertEqual(parameters["cira_csr_lines_per_turn"], 64)
+        self.assertEqual(parameters["cira_max_completed_lines"], 65536)
+
     def test_counts_exact_cpu_switch_markers(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "gem5.log"

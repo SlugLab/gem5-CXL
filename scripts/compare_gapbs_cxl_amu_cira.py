@@ -126,6 +126,17 @@ OWNED_COUNTER_STATS = {
     "cira_read_packets": ("cira", "board.cira.readPackets"),
     "cira_read_bytes": ("cira", "board.cira.readBytes"),
 }
+CIRA_EVIDENCE_STATS = {
+    "cira_coalesced": "board.cira.coalescedPrefetches",
+    "cira_rejected_queue_full": "board.cira.rejectedQueueFull",
+    "cira_dropped_csr_descriptors": "board.cira.droppedCsrDescriptors",
+    "cira_csr_queue_high_watermark": "board.cira.csrQueueHighWatermark",
+}
+CIRA_PER_CORE_STATS = {
+    "cira_issued_per_core": "board.cira.issuedPrefetchesPerCore",
+    "cira_completed_per_core": "board.cira.completedPrefetchesPerCore",
+    "cira_useful_per_core": "board.cira.usefulPrefetchesPerCore",
+}
 CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
 CHECKPOINT_SAVE_MARKER = "GAPBS_CHECKPOINT_SAVED path="
 CHECKPOINT_RESTORE_MARKER = "GAPBS_CHECKPOINT_RESTORED path="
@@ -164,6 +175,13 @@ SUMMARY_FIELDS = (
     "cira_late",
     "cira_read_packets",
     "cira_read_bytes",
+    "cira_issued_per_core",
+    "cira_completed_per_core",
+    "cira_useful_per_core",
+    "cira_coalesced",
+    "cira_rejected_queue_full",
+    "cira_dropped_csr_descriptors",
+    "cira_csr_queue_high_watermark",
     "cxl_packets",
     "cxl_bytes",
     "l1d_demand_misses",
@@ -628,6 +646,59 @@ def extract_owned_metrics(stats, kind):
     return metrics
 
 
+def extract_cira_evidence(stats, kind, num_cores):
+    if num_cores < 1:
+        raise StatsError(f"num_cores must be positive; got {num_cores}")
+
+    if kind != "cira":
+        return {
+            **{field: "" for field in CIRA_PER_CORE_STATS},
+            **{field: 0 for field in CIRA_EVIDENCE_STATS},
+        }
+
+    evidence = {}
+    for field, stat_name in CIRA_EVIDENCE_STATS.items():
+        if stat_name not in stats:
+            raise StatsError(f"missing required ROI statistic: {stat_name}")
+        evidence[field] = stats[stat_name]
+
+    for field, stat_root in CIRA_PER_CORE_STATS.items():
+        values = []
+        for core in range(num_cores):
+            stat_name = f"{stat_root}::{core}"
+            if stat_name not in stats:
+                raise StatsError(
+                    f"missing required ROI statistic: {stat_name}"
+                )
+            values.append(str(stats[stat_name]))
+        evidence[field] = ";".join(values)
+    return evidence
+
+
+def cira_evidence_failure(evidence, num_cores):
+    if (
+        evidence["cira_rejected_queue_full"] != 0
+        or evidence["cira_dropped_csr_descriptors"] != 0
+    ):
+        return "cira-rejected-work"
+
+    issued = [
+        Decimal(value)
+        for value in evidence["cira_issued_per_core"].split(";")
+    ]
+    completed = [
+        Decimal(value)
+        for value in evidence["cira_completed_per_core"].split(";")
+    ]
+    if len(issued) != num_cores or len(completed) != num_cores:
+        raise StatsError("CIRA per-core evidence width does not match cores")
+    if any(value <= 0 for value in issued + completed):
+        return "inactive-cira-core"
+    if issued != completed:
+        return "cira-incomplete-work"
+    return None
+
+
 def parse_cpu_switches(path):
     if not path.exists():
         return 0
@@ -705,6 +776,12 @@ def append_kind_args(cmd, args, kind):
             str(args.cira_max_outstanding),
             "--cira-max-send-queue",
             str(args.cira_max_send_queue),
+            "--cira-max-csr-walk-queue",
+            str(args.cira_max_csr_walk_queue),
+            "--cira-csr-lines-per-turn",
+            str(args.cira_csr_lines_per_turn),
+            "--cira-max-completed-lines",
+            str(args.cira_max_completed_lines),
             "--cira-issue-latency",
             args.cira_issue_latency,
             "--cira-completion-latency",
@@ -741,6 +818,9 @@ def checkpoint_model_parameters(args, kind):
             {
                 "cira_max_outstanding": args.cira_max_outstanding,
                 "cira_max_send_queue": args.cira_max_send_queue,
+                "cira_max_csr_walk_queue": args.cira_max_csr_walk_queue,
+                "cira_csr_lines_per_turn": args.cira_csr_lines_per_turn,
+                "cira_max_completed_lines": args.cira_max_completed_lines,
                 "cira_issue_latency": args.cira_issue_latency,
                 "cira_completion_latency": args.cira_completion_latency,
             }
@@ -1058,12 +1138,14 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
     try:
         stats = parse_stats(run_dir / "stats.txt")
         owned_metrics = extract_owned_metrics(stats, kind)
+        cira_evidence = extract_cira_evidence(stats, kind, args.cores)
         diagnostic_metrics = extract_diagnostic_metrics(
             stats, kind, fast_forward=False, num_cores=args.cores
         )
     except StatsError:
         stats = {}
         owned_metrics = {}
+        cira_evidence = {}
         diagnostic_metrics = {}
         if status == "ok":
             status = "invalid-stats"
@@ -1079,6 +1161,11 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
     ):
         status = "no-cira-events"
 
+    if kind == "cira" and status == "ok":
+        evidence_failure = cira_evidence_failure(cira_evidence, args.cores)
+        if evidence_failure != "inactive-cira-core" or not args.allow_zero_cira:
+            status = evidence_failure or status
+
     return {
         "benchmark": benchmark,
         "label": label,
@@ -1091,6 +1178,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         "sim_insts": stats.get("simInsts", ""),
         **provenance,
         **owned_metrics,
+        **cira_evidence,
         **diagnostic_metrics,
         "run_dir": str(run_dir),
     }
@@ -1190,6 +1278,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         elif verification == "missing":
             status = "verification-missing"
     owned_metrics = extract_owned_metrics(stats, kind)
+    cira_evidence = extract_cira_evidence(stats, kind, args.cores)
     diagnostic_metrics = extract_diagnostic_metrics(
         stats, kind, fast_forward=bool(args.fast_forward_cpu)
     )
@@ -1203,6 +1292,11 @@ def run_one(args, benchmark, label, binary_dir, kind):
         and not args.allow_zero_cira
     ):
         status = "no-cira-events"
+
+    if kind == "cira" and status == "ok":
+        evidence_failure = cira_evidence_failure(cira_evidence, args.cores)
+        if evidence_failure != "inactive-cira-core" or not args.allow_zero_cira:
+            status = evidence_failure or status
 
     return {
         "benchmark": benchmark,
@@ -1222,6 +1316,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         "sim_ticks": stats.get("simTicks", ""),
         "sim_insts": stats.get("simInsts", ""),
         **owned_metrics,
+        **cira_evidence,
         **diagnostic_metrics,
         "run_dir": str(run_dir),
     }
@@ -1314,6 +1409,9 @@ def main():
     parser.add_argument("--asmc-latency", default="0ns")
     parser.add_argument("--cira-max-outstanding", type=int, default=256)
     parser.add_argument("--cira-max-send-queue", type=int, default=1024)
+    parser.add_argument("--cira-max-csr-walk-queue", type=int, default=4096)
+    parser.add_argument("--cira-csr-lines-per-turn", type=int, default=64)
+    parser.add_argument("--cira-max-completed-lines", type=int, default=65536)
     parser.add_argument("--cira-issue-latency", default="1ns")
     parser.add_argument("--cira-completion-latency", default="0ns")
     parser.add_argument(
