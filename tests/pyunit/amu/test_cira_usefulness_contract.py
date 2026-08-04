@@ -16,6 +16,12 @@ CIRA_CC = REPO / "src" / "mem" / "cira.cc"
 GAPBS_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
 )
+CIRA_MULTICORE_WORKLOAD = (
+    REPO / "tests" / "gem5" / "cira" / "cira_multicore_prefetch.cc"
+)
+CIRA_MULTICORE_CONFIG = (
+    REPO / "tests" / "gem5" / "cira" / "run_cira_multicore.py"
+)
 
 
 class CiraUsefulnessTrackerContractTest(unittest.TestCase):
@@ -292,6 +298,102 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
             cira_cc.index("CIRA::recvReqRetry")
         ]
         self.assertNotIn("lineTracker.fill", recv_response)
+
+    def test_live_two_core_routing_and_coalescing(self):
+        self.assertTrue(CIRA_MULTICORE_WORKLOAD.is_file())
+        self.assertTrue(CIRA_MULTICORE_CONFIG.is_file())
+
+        gem5 = REPO / "build" / "X86" / "gem5.opt"
+        if not gem5.is_file():
+            self.skipTest(f"{gem5} is not built")
+
+        m5_library = (
+            REPO / "util" / "m5" / "build" / "x86" / "out" / "libm5.a"
+        )
+        if not m5_library.is_file():
+            subprocess.run(
+                [
+                    "scons",
+                    "-C",
+                    str(REPO / "util" / "m5"),
+                    "build/x86/out/libm5.a",
+                ],
+                cwd=REPO,
+                check=True,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            binary = tmp_path / "cira_multicore_prefetch"
+            outdir = tmp_path / "m5out"
+            compile_result = subprocess.run(
+                [
+                    "g++",
+                    "-std=c++17",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-static",
+                    "-no-pie",
+                    "-I",
+                    str(REPO / "include"),
+                    "-I",
+                    str(REPO / "util" / "cira"),
+                    str(CIRA_MULTICORE_WORKLOAD),
+                    str(m5_library),
+                    "-o",
+                    str(binary),
+                ],
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                compile_result.returncode,
+                0,
+                compile_result.stdout + compile_result.stderr,
+            )
+            run_result = subprocess.run(
+                [
+                    str(gem5),
+                    "--outdir",
+                    str(outdir),
+                    str(CIRA_MULTICORE_CONFIG),
+                    "--binary",
+                    str(binary),
+                ],
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(
+                run_result.returncode,
+                0,
+                run_result.stdout + run_result.stderr,
+            )
+
+            stats = {}
+            for line in (outdir / "stats.txt").read_text().splitlines():
+                fields = line.split()
+                if len(fields) >= 2:
+                    stats[fields[0]] = fields[1]
+
+            issued = [
+                int(stats[f"board.cira.issuedPrefetchesPerCore::{core}"])
+                for core in range(2)
+            ]
+            completed = [
+                int(stats[f"board.cira.completedPrefetchesPerCore::{core}"])
+                for core in range(2)
+            ]
+            self.assertGreater(issued[0], 0)
+            self.assertGreater(issued[1], 0)
+            self.assertEqual(completed, issued)
+            self.assertGreater(int(stats["board.cira.coalescedPrefetches"]), 0)
+            self.assertEqual(
+                int(stats["board.cira.droppedCsrDescriptors"]), 0
+            )
 
 
 if __name__ == "__main__":
