@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,23 +35,24 @@ constexpr uint64_t CiraCsrRecordSpan = 1ULL << 3;
 
 std::unordered_map<System *, CIRA *> CIRA::registry;
 
-CIRA::MemoryPort::MemoryPort(const std::string &name, CIRA &owner)
-    : RequestPort(name), owner(owner)
+CIRA::MemoryPort::MemoryPort(const std::string &name, CIRA &owner,
+                             PortID target_core)
+    : RequestPort(name), owner(owner), targetCore(target_core)
 {}
 
 bool
 CIRA::MemoryPort::recvTimingResp(PacketPtr pkt)
 {
-    return owner.recvTimingResp(pkt);
+    return owner.recvTimingResp(targetCore, pkt);
 }
 
 void
 CIRA::MemoryPort::recvReqRetry()
 {
-    owner.recvReqRetry();
+    owner.recvReqRetry(targetCore);
 }
 
-CIRA::CIRAStats::CIRAStats(statistics::Group *parent)
+CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
     : statistics::Group(parent),
       ADD_STAT(issuedPrefetches, statistics::units::Count::get(),
                "CIRA cacheline install/prefetch requests issued"),
@@ -62,10 +64,22 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent)
                "CSR rows visited by CIRA region prefetch descriptors"),
       ADD_STAT(completedPrefetches, statistics::units::Count::get(),
                "CIRA cacheline install/prefetch requests completed"),
+      ADD_STAT(coalescedPrefetches, statistics::units::Count::get(),
+               "CIRA cacheline candidates suppressed by tracked lines"),
       ADD_STAT(usefulPrefetches, statistics::units::Count::get(),
                "CPU data demands served after a CIRA-origin L2 fill"),
       ADD_STAT(latePrefetches, statistics::units::Count::get(),
                "CPU data demands arriving before a CIRA-origin L2 fill"),
+      ADD_STAT(issuedPrefetchesPerCore, statistics::units::Count::get(),
+               "CIRA prefetch requests issued per target core"),
+      ADD_STAT(completedPrefetchesPerCore, statistics::units::Count::get(),
+               "CIRA prefetch requests completed per target core"),
+      ADD_STAT(coalescedPrefetchesPerCore, statistics::units::Count::get(),
+               "CIRA cacheline candidates coalesced per target core"),
+      ADD_STAT(usefulPrefetchesPerCore, statistics::units::Count::get(),
+               "CIRA useful prefetches per target core"),
+      ADD_STAT(latePrefetchesPerCore, statistics::units::Count::get(),
+               "CIRA late prefetches per target core"),
       ADD_STAT(rejectedDisabled, statistics::units::Count::get(),
                "CIRA requests rejected because the model is disabled"),
       ADD_STAT(rejectedQueueFull, statistics::units::Count::get(),
@@ -81,16 +95,28 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent)
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
                "Average CIRA request latency",
                totalLatency / completedPrefetches)
-{}
+{
+    issuedPrefetchesPerCore.init(num_cores);
+    completedPrefetchesPerCore.init(num_cores);
+    coalescedPrefetchesPerCore.init(num_cores);
+    usefulPrefetchesPerCore.init(num_cores);
+    latePrefetchesPerCore.init(num_cores);
+    for (size_t core = 0; core < num_cores; ++core) {
+        const std::string label = std::to_string(core);
+        issuedPrefetchesPerCore.subname(core, label);
+        completedPrefetchesPerCore.subname(core, label);
+        coalescedPrefetchesPerCore.subname(core, label);
+        usefulPrefetchesPerCore.subname(core, label);
+        latePrefetchesPerCore.subname(core, label);
+    }
+}
 
 CIRA::CIRA(const Params &p)
     : ClockedObject(p),
       system(p.system),
-      memSidePort(name() + ".mem_side_port", *this),
       requestorId(system->getRequestorId(this)),
-      demandProbeTarget(p.demand_probe_target),
+      demandProbeTargets(p.demand_probe_targets),
       cacheLineSize(p.cache_line_size),
-      lineTracker(cacheLineSize),
       maxSendQueue(p.max_send_queue),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
@@ -98,8 +124,23 @@ CIRA::CIRA(const Params &p)
       enabled(p.enabled),
       sendEvent([this] { trySend(); }, name()),
       csrWalkEvent([this] { processCsrWalk(); }, name() + ".csr_walk"),
-      stats(this)
-{}
+      stats(this, p.port_mem_side_ports_connection_count)
+{
+    const size_t numCores = p.port_mem_side_ports_connection_count;
+    panic_if(numCores == 0, "CIRA %s requires at least one memory port", name());
+
+    memSidePorts.reserve(numCores);
+    lineTrackers.reserve(numCores);
+    for (PortID core = 0; core < numCores; ++core) {
+        memSidePorts.emplace_back(std::make_unique<MemoryPort>(
+            csprintf("%s.mem_side_ports[%d]", name(), core), *this, core));
+        lineTrackers.emplace_back(cacheLineSize, p.max_completed_lines);
+    }
+    sendQueues.resize(numCores);
+    retryPkts.resize(numCores, nullptr);
+    retryReady.resize(numCores, false);
+    csrWalkQueues.resize(numCores);
+}
 
 CIRA::~CIRA()
 {
@@ -112,8 +153,15 @@ CIRA::~CIRA()
 void
 CIRA::init()
 {
-    panic_if(!memSidePort.isConnected(),
-             "CIRA memory port of %s is not connected", name());
+    for (PortID core = 0; core < memSidePorts.size(); ++core) {
+        panic_if(!memSidePorts[core]->isConnected(),
+                 "CIRA memory port %d of %s is not connected", core, name());
+    }
+    panic_if(!demandProbeTargets.empty() &&
+             demandProbeTargets.size() != memSidePorts.size(),
+             "CIRA %s has %llu ports but %llu probe targets", name(),
+             static_cast<unsigned long long>(memSidePorts.size()),
+             static_cast<unsigned long long>(demandProbeTargets.size()));
     panic_if(registry.count(system) && registry[system] != this,
              "Only one CIRA instance per System is currently supported");
     registry[system] = this;
@@ -123,7 +171,7 @@ CIRA::init()
 void
 CIRA::CacheProbeListener::notify(const CacheAccessProbeArg &arg)
 {
-    owner.handleCacheProbe(event, arg);
+    owner.handleCacheProbe(targetCore, event, arg);
 }
 
 void
@@ -131,30 +179,36 @@ CIRA::regProbeListeners()
 {
     ClockedObject::regProbeListeners();
     probeListeners.clear();
-    if (!demandProbeTarget)
+    if (demandProbeTargets.empty())
         return;
 
-    ProbeManager *manager = demandProbeTarget->getProbeManager();
-    probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
-        *this, manager, "Hit", CacheProbeEvent::Hit));
-    probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
-        *this, manager, "Miss", CacheProbeEvent::Miss));
-    probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
-        *this, manager, "Fill", CacheProbeEvent::Fill));
+    for (PortID core = 0; core < demandProbeTargets.size(); ++core) {
+        ProbeManager *manager = demandProbeTargets[core]->getProbeManager();
+        probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
+            *this, manager, "Hit", CacheProbeEvent::Hit, core));
+        probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
+            *this, manager, "Miss", CacheProbeEvent::Miss, core));
+        probeListeners.emplace_back(std::make_unique<CacheProbeListener>(
+            *this, manager, "Fill", CacheProbeEvent::Fill, core));
+    }
 }
 
 void
 CIRA::resetStats()
 {
     ClockedObject::resetStats();
-    lineTracker.clear();
+    for (auto &tracker : lineTrackers)
+        tracker.clear();
 }
 
 Port &
 CIRA::getPort(const std::string &if_name, PortID idx)
 {
-    if (if_name == "mem_side_port")
-        return memSidePort;
+    if (if_name == "mem_side_ports") {
+        panic_if(idx == InvalidPortID || idx >= memSidePorts.size(),
+                 "CIRA %s invalid memory port index %d", name(), idx);
+        return *memSidePorts[idx];
+    }
     return ClockedObject::getPort(if_name, idx);
 }
 
@@ -224,20 +278,41 @@ CIRA::readIndex(ThreadContext *tc, Addr addr, uint64_t index_size,
 }
 
 bool
-CIRA::hasPrefetchSlot() const
+CIRA::hasPrefetchSlot(PortID targetCore) const
 {
     if (!enabled)
         return false;
 
-    const uint64_t queuedPackets = sendQueue.size() + (retryPkt ? 1 : 0);
+    panic_if(targetCore < 0 || targetCore >= sendQueues.size(),
+             "CIRA %s invalid target core %d", name(), targetCore);
+    const uint64_t queuedPackets = sendQueues[targetCore].size() +
+        (retryPkts[targetCore] ? 1 : 0);
     return outstanding.size() < maxOutstanding &&
            queuedPackets < maxSendQueue;
+}
+
+PortID
+CIRA::resolveTargetCore(ThreadContext *tc) const
+{
+    panic_if(!tc, "CIRA %s request has no thread context", name());
+    const ContextID context = tc->contextId();
+    panic_if(context < 0 || context >= memSidePorts.size(),
+             "CIRA %s context %d has no target port (ports=%llu)", name(),
+             context, static_cast<unsigned long long>(memSidePorts.size()));
+    return static_cast<PortID>(context);
+}
+
+bool
+CIRA::hasCsrWalks() const
+{
+    return std::any_of(csrWalkQueues.begin(), csrWalkQueues.end(),
+                       [](const auto &queue) { return !queue.empty(); });
 }
 
 void
 CIRA::scheduleCsrWalk(Tick when)
 {
-    if (csrWalkQueue.empty())
+    if (!hasCsrWalks())
         return;
 
     if (csrWalkEvent.scheduled()) {
@@ -252,11 +327,17 @@ CIRA::scheduleCsrWalk(Tick when)
 void
 CIRA::processCsrWalk()
 {
-    while (!csrWalkQueue.empty()) {
-        CsrWalkState &walk = csrWalkQueue.front();
+    while (hasCsrWalks()) {
+        const auto queueIt = std::find_if(
+            csrWalkQueues.begin(), csrWalkQueues.end(),
+            [](const auto &queue) { return !queue.empty(); });
+        const PortID targetCore = std::distance(csrWalkQueues.begin(), queueIt);
+        CsrWalkState &walk = queueIt->front();
+        panic_if(walk.targetCore != targetCore,
+                 "CIRA CSR walk queue/core ownership mismatch");
         bool madeProgress = false;
 
-        while (hasPrefetchSlot()) {
+        while (hasPrefetchSlot(targetCore)) {
             bool consumedEntry = false;
 
             if (walk.prefetchRecords && walk.recordLine < walk.recordsEnd) {
@@ -268,7 +349,7 @@ CIRA::processCsrWalk()
             }
 
             if (walk.prefetchValues && walk.nextEntry < walk.entryCount &&
-                hasPrefetchSlot()) {
+                hasPrefetchSlot(targetCore)) {
                 const uint64_t entry = walk.nextEntry++;
                 const Addr indexAddr = walk.recordsBegin +
                     entry * walk.recordStride + walk.indexOffset;
@@ -303,18 +384,18 @@ CIRA::processCsrWalk()
                     static_cast<unsigned long long>(
                         walk.rowStart + walk.rowCount),
                     static_cast<unsigned long long>(walk.entryCount));
-            csrWalkQueue.pop_front();
+            queueIt->pop_front();
             continue;
         }
 
-        if (!madeProgress || !hasPrefetchSlot()) {
+        if (!madeProgress || !hasPrefetchSlot(targetCore)) {
             DPRINTF(CIRA,
-                    "csr walk paused queued_walks=%llu outstanding=%llu "
-                    "send_queue=%llu retry=%d\n",
-                    static_cast<unsigned long long>(csrWalkQueue.size()),
+                    "csr walk paused core=%d outstanding=%llu "
+                    "send_queue=%llu retry=%d\n", targetCore,
                     static_cast<unsigned long long>(outstanding.size()),
-                    static_cast<unsigned long long>(sendQueue.size()),
-                    retryPkt != nullptr);
+                    static_cast<unsigned long long>(
+                        sendQueues[targetCore].size()),
+                    retryPkts[targetCore] != nullptr);
             return;
         }
     }
@@ -328,11 +409,7 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
         return 0;
     }
 
-    if (outstanding.size() >= maxOutstanding ||
-        sendQueue.size() >= maxSendQueue) {
-        ++stats.rejectedQueueFull;
-        return 0;
-    }
+    const PortID targetCore = resolveTargetCore(tc);
 
     const uint64_t requestSize = size ? size : cacheLineSize;
     const Addr lineBase = addr & ~(cacheLineSize - 1);
@@ -347,22 +424,44 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
         return 0;
     }
 
-    uint64_t packetsNeeded = retryPkt ? 1 : 0;
-    packetsNeeded += sendQueue.size();
+    struct Candidate
+    {
+        Addr paddr;
+        unsigned size;
+        Request::Flags flags;
+    };
+    std::vector<Candidate> candidates;
+    std::unordered_set<Addr> localLines;
+    auto &tracker = lineTrackers.at(targetCore);
+
     for (const auto &chunk : chunks) {
         Addr chunkOffset = 0;
         while (chunkOffset < chunk.size) {
             const uint64_t lineRemaining =
                 cacheLineSize - ((chunk.paddr + chunkOffset) %
                                  cacheLineSize);
-            const uint64_t pktSize = std::min(
-                chunk.size - chunkOffset, lineRemaining);
-            ++packetsNeeded;
+            const auto pktSize = static_cast<unsigned>(std::min(
+                chunk.size - chunkOffset, lineRemaining));
+            const Addr paddr = chunk.paddr + chunkOffset;
+            const Addr physicalLine = paddr - paddr % cacheLineSize;
+            if (tracker.tracked(physicalLine) ||
+                !localLines.insert(physicalLine).second) {
+                ++stats.coalescedPrefetches;
+                ++stats.coalescedPrefetchesPerCore[targetCore];
+            } else {
+                candidates.push_back({paddr, pktSize, chunk.flags});
+            }
             chunkOffset += pktSize;
         }
     }
 
-    if (packetsNeeded > maxSendQueue) {
+    if (candidates.empty())
+        return 0;
+
+    const uint64_t queuedPackets = sendQueues[targetCore].size() +
+        (retryPkts[targetCore] ? 1 : 0);
+    if (outstanding.size() >= maxOutstanding ||
+        queuedPackets + candidates.size() > maxSendQueue) {
         ++stats.rejectedQueueFull;
         return 0;
     }
@@ -370,6 +469,7 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
     const uint64_t id = nextId++;
     auto state = std::make_unique<RequestState>();
     state->id = id;
+    state->targetCore = targetCore;
     state->tc = tc;
     state->vaddr = addr;
     state->size = installSize;
@@ -377,41 +477,33 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
     RequestState *rawState = state.get();
     outstanding[id] = std::move(state);
 
-    for (const auto &chunk : chunks) {
-        Addr chunkOffset = 0;
-        while (chunkOffset < chunk.size) {
-            const uint64_t remaining = chunk.size - chunkOffset;
-            const uint64_t lineRemaining =
-                cacheLineSize - ((chunk.paddr + chunkOffset) %
-                                 cacheLineSize);
-            const auto pktSize = static_cast<unsigned>(
-                std::min(remaining, lineRemaining));
+    for (const auto &candidate : candidates) {
+        RequestPtr req = std::make_shared<Request>(
+            candidate.paddr, candidate.size, candidate.flags, requestorId);
+        req->taskId(context_switch_task_id::Prefetcher);
+        panic_if(!lineTrackers.at(targetCore).issueIfAbsent(
+                     req->getPaddr()),
+                 "CIRA duplicate line admitted after coalescing");
 
-            RequestPtr req = std::make_shared<Request>(
-                chunk.paddr + chunkOffset, pktSize, chunk.flags,
-                requestorId);
-            req->taskId(context_switch_task_id::Prefetcher);
-            lineTracker.issue(req->getPaddr());
-
-            PacketPtr pkt = new Packet(req, MemCmd::SoftPFReq);
-            pkt->allocate();
-            pkt->senderState = new PacketSenderState(id);
-            rawState->pendingPackets++;
-            enqueuePacket(pkt);
-            chunkOffset += pktSize;
-        }
+        PacketPtr pkt = new Packet(req, MemCmd::SoftPFReq);
+        pkt->allocate();
+        pkt->senderState = new PacketSenderState(id, targetCore);
+        rawState->pendingPackets++;
+        enqueuePacket(targetCore, pkt);
     }
 
     ++stats.issuedPrefetches;
+    ++stats.issuedPrefetchesPerCore[targetCore];
 
     DPRINTF(CIRA,
             "issue id=%#llx vaddr=%#llx size=%llu install_size=%llu "
-            "chunks=%llu\n",
+            "target_core=%d chunks=%llu packets=%llu\n",
             static_cast<unsigned long long>(id),
             static_cast<unsigned long long>(addr),
             static_cast<unsigned long long>(size),
             static_cast<unsigned long long>(installSize),
-            static_cast<unsigned long long>(chunks.size()));
+            targetCore, static_cast<unsigned long long>(chunks.size()),
+            static_cast<unsigned long long>(candidates.size()));
 
     scheduleSend(curTick() + issueLatency);
     return id;
@@ -427,6 +519,7 @@ CIRA::issueIndexedPrefetch(ThreadContext *tc, Addr base_addr,
         ++stats.rejectedDisabled;
         return 0;
     }
+    const PortID targetCore = resolveTargetCore(tc);
 
     IndexedPrefetchDesc desc;
     desc.baseAddr = base_addr;
@@ -458,8 +551,7 @@ CIRA::issueIndexedPrefetch(ThreadContext *tc, Addr base_addr,
 
     uint64_t accepted = 0;
     for (uint64_t i = 0; i < desc.count; ++i) {
-        if (outstanding.size() >= maxOutstanding ||
-            sendQueue.size() >= maxSendQueue) {
+        if (!hasPrefetchSlot(targetCore)) {
             break;
         }
 
@@ -502,6 +594,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         ++stats.rejectedDisabled;
         return 0;
     }
+    const PortID targetCore = resolveTargetCore(tc);
 
     CsrPrefetchDesc desc;
     desc.offsetsAddr = offsets_addr;
@@ -570,6 +663,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
 
         CsrWalkState walk;
         walk.tc = tc;
+        walk.targetCore = targetCore;
         walk.recordsBegin = rowRecordAddr;
         walk.recordsEnd = desc.recordsAddr;
         walk.recordLine = rowRecordAddr & ~(cacheLineSize - 1);
@@ -583,7 +677,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         walk.rowCount = desc.rowCount;
         walk.prefetchRecords = prefetchRecords;
         walk.prefetchValues = prefetchValues;
-        csrWalkQueue.push_back(walk);
+        csrWalkQueues[targetCore].push_back(walk);
         scheduleCsrWalk(curTick() + issueLatency);
 
         DPRINTF(CIRA,
@@ -599,7 +693,8 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
                 static_cast<unsigned long long>(desc.valueSize),
                 static_cast<unsigned long long>(desc.flags),
                 static_cast<unsigned long long>(count),
-                static_cast<unsigned long long>(csrWalkQueue.size()));
+                static_cast<unsigned long long>(
+                    csrWalkQueues[targetCore].size()));
 
         return count;
     }
@@ -607,8 +702,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
     uint64_t accepted = 0;
     const uint64_t rowEnd = desc.rowStart + desc.rowCount;
     for (uint64_t row = desc.rowStart; row < rowEnd; ++row) {
-        if (outstanding.size() >= maxOutstanding ||
-            sendQueue.size() >= maxSendQueue) {
+        if (!hasPrefetchSlot(targetCore)) {
             break;
         }
 
@@ -648,8 +742,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
             continue;
 
         for (uint64_t entry = 0; entry < count; ++entry) {
-            if (outstanding.size() >= maxOutstanding ||
-                sendQueue.size() >= maxSendQueue) {
+            if (!hasPrefetchSlot(targetCore)) {
                 break;
             }
 
@@ -687,19 +780,17 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
 }
 
 void
-CIRA::enqueuePacket(PacketPtr pkt)
+CIRA::enqueuePacket(PortID targetCore, PacketPtr pkt)
 {
-    panic_if(sendQueue.size() >= maxSendQueue,
+    auto &queue = sendQueues.at(targetCore);
+    panic_if(queue.size() >= maxSendQueue,
              "CIRA send queue overflow after admission check");
-    sendQueue.push_back(pkt);
+    queue.push_back(pkt);
 }
 
 void
-CIRA::scheduleSend(Tick when, bool force_retry)
+CIRA::scheduleSend(Tick when)
 {
-    if (retryPkt && !force_retry)
-        return;
-
     if (sendEvent.scheduled()) {
         if (when < sendEvent.when())
             reschedule(sendEvent, when);
@@ -711,43 +802,64 @@ CIRA::scheduleSend(Tick when, bool force_retry)
 void
 CIRA::trySend()
 {
-    PacketPtr pkt = retryPkt;
-    if (!pkt) {
-        if (sendQueue.empty())
-            return;
-        pkt = sendQueue.front();
-        sendQueue.pop_front();
+    bool sendableWork = false;
+    const PortID startCore = nextSendCore;
+    for (size_t offset = 0; offset < memSidePorts.size(); ++offset) {
+        const PortID targetCore =
+            (startCore + offset) % memSidePorts.size();
+        auto &queue = sendQueues[targetCore];
+        PacketPtr &retryPkt = retryPkts[targetCore];
+        const bool retrying = retryPkt != nullptr;
+
+        if (retrying && !retryReady[targetCore])
+            continue;
+        if (!retrying && queue.empty())
+            continue;
+
+        PacketPtr pkt = retryPkt;
+        if (!pkt) {
+            pkt = queue.front();
+            queue.pop_front();
+        }
+
+        DPRINTF(CIRA,
+                "send core=%d addr=%#llx size=%u cmd=%s retry=%d "
+                "queued=%llu\n", targetCore,
+                static_cast<unsigned long long>(pkt->getAddr()),
+                pkt->req->getSize(), pkt->cmd.toString(), retrying,
+                static_cast<unsigned long long>(queue.size()));
+
+        if (memSidePorts[targetCore]->sendTimingReq(pkt)) {
+            ++stats.readPackets;
+            stats.readBytes += pkt->req->getSize();
+            retryPkt = nullptr;
+            retryReady[targetCore] = false;
+            nextSendCore = (targetCore + 1) % memSidePorts.size();
+            sendableWork = sendableWork || !queue.empty();
+        } else {
+            retryPkt = pkt;
+            retryReady[targetCore] = false;
+        }
     }
 
-    DPRINTF(CIRA, "send addr=%#llx size=%u cmd=%s retry=%d queued=%llu\n",
-            static_cast<unsigned long long>(pkt->getAddr()),
-            pkt->req->getSize(), pkt->cmd.toString(), retryPkt != nullptr,
-            static_cast<unsigned long long>(sendQueue.size()));
-
-    if (memSidePort.sendTimingReq(pkt)) {
-        DPRINTF(CIRA, "send accepted addr=%#llx queued=%llu\n",
-                static_cast<unsigned long long>(pkt->getAddr()),
-                static_cast<unsigned long long>(sendQueue.size()));
-        ++stats.readPackets;
-        stats.readBytes += pkt->req->getSize();
-        retryPkt = nullptr;
-        if (!sendQueue.empty())
-            scheduleSend(curTick() + 1);
-        if (!csrWalkQueue.empty())
-            scheduleCsrWalk(curTick() + 1);
-    } else {
-        DPRINTF(CIRA, "send blocked addr=%#llx queued=%llu\n",
-                static_cast<unsigned long long>(pkt->getAddr()),
-                static_cast<unsigned long long>(sendQueue.size()));
-        retryPkt = pkt;
+    for (PortID core = 0; core < memSidePorts.size(); ++core) {
+        sendableWork = sendableWork || !sendQueues[core].empty() ||
+            (retryPkts[core] && retryReady[core]);
     }
+    if (sendableWork)
+        scheduleSend(curTick() + 1);
+    if (hasCsrWalks())
+        scheduleCsrWalk(curTick() + 1);
 }
 
 bool
-CIRA::recvTimingResp(PacketPtr pkt)
+CIRA::recvTimingResp(PortID targetCore, PacketPtr pkt)
 {
     auto *senderState = dynamic_cast<PacketSenderState *>(pkt->senderState);
     panic_if(!senderState, "CIRA response without CIRA sender state");
+    panic_if(senderState->targetCore != targetCore,
+             "CIRA response returned on core %d for core %d", targetCore,
+             senderState->targetCore);
 
     DPRINTF(CIRA, "response id=%#llx addr=%#llx size=%u error=%d\n",
             static_cast<unsigned long long>(senderState->id),
@@ -758,6 +870,8 @@ CIRA::recvTimingResp(PacketPtr pkt)
     const auto it = outstanding.find(id);
     if (it != outstanding.end()) {
         RequestState &state = *it->second;
+        panic_if(state.targetCore != targetCore,
+                 "CIRA request/response target ownership mismatch");
         panic_if(state.pendingPackets == 0,
                  "CIRA response underflow for request %#llx",
                  static_cast<unsigned long long>(id));
@@ -780,12 +894,16 @@ CIRA::recvTimingResp(PacketPtr pkt)
 }
 
 void
-CIRA::recvReqRetry()
+CIRA::recvReqRetry(PortID targetCore)
 {
-    DPRINTF(CIRA, "recvReqRetry queued=%llu retry=%d\n",
-            static_cast<unsigned long long>(sendQueue.size()),
-            retryPkt != nullptr);
-    scheduleSend(curTick(), true);
+    panic_if(targetCore < 0 || targetCore >= retryPkts.size(),
+             "CIRA retry for invalid core %d", targetCore);
+    panic_if(!retryPkts[targetCore],
+             "CIRA retry for core %d without a blocked packet", targetCore);
+    retryReady[targetCore] = true;
+    DPRINTF(CIRA, "recvReqRetry core=%d queued=%llu\n", targetCore,
+            static_cast<unsigned long long>(sendQueues[targetCore].size()));
+    scheduleSend(curTick());
 }
 
 bool
@@ -820,7 +938,7 @@ CIRA::isCpuDataDemand(const PacketPtr pkt) const
 }
 
 void
-CIRA::handleCacheProbe(CacheProbeEvent event,
+CIRA::handleCacheProbe(PortID targetCore, CacheProbeEvent event,
                        const CacheAccessProbeArg &arg)
 {
     PacketPtr pkt = arg.pkt;
@@ -828,6 +946,7 @@ CIRA::handleCacheProbe(CacheProbeEvent event,
         return;
 
     const bool ciraOrigin = pkt->req->requestorId() == requestorId;
+    auto &lineTracker = lineTrackers.at(targetCore);
 
     if (event == CacheProbeEvent::Fill) {
         lineTracker.fill(pkt->getAddr(), ciraOrigin);
@@ -848,9 +967,11 @@ CIRA::handleCacheProbe(CacheProbeEvent event,
     if (attribution ==
         CiraLineUsefulnessTracker::DemandAttribution::Useful) {
         ++stats.usefulPrefetches;
+        ++stats.usefulPrefetchesPerCore[targetCore];
     } else if (attribution ==
                CiraLineUsefulnessTracker::DemandAttribution::Late) {
         ++stats.latePrefetches;
+        ++stats.latePrefetchesPerCore[targetCore];
     }
 }
 
@@ -865,13 +986,14 @@ CIRA::completeRequest(uint64_t id)
     finished[state.tc].push_back(id);
     stats.totalLatency += curTick() - state.issueTick;
     ++stats.completedPrefetches;
+    ++stats.completedPrefetchesPerCore[state.targetCore];
 
     DPRINTF(CIRA, "complete id=%#llx latency=%llu\n",
             static_cast<unsigned long long>(id),
             static_cast<unsigned long long>(curTick() - state.issueTick));
 
     outstanding.erase(it);
-    if (!csrWalkQueue.empty())
+    if (hasCsrWalks())
         scheduleCsrWalk(curTick() + 1);
 }
 
@@ -943,17 +1065,25 @@ CIRA::reset()
     if (csrWalkEvent.scheduled())
         deschedule(csrWalkEvent);
 
-    while (!sendQueue.empty()) {
-        deleteQueuedPacket(sendQueue.front());
-        sendQueue.pop_front();
+    for (auto &queue : sendQueues) {
+        while (!queue.empty()) {
+            deleteQueuedPacket(queue.front());
+            queue.pop_front();
+        }
     }
 
-    deleteQueuedPacket(retryPkt);
-    retryPkt = nullptr;
-    csrWalkQueue.clear();
+    for (auto &retryPkt : retryPkts) {
+        deleteQueuedPacket(retryPkt);
+        retryPkt = nullptr;
+    }
+    std::fill(retryReady.begin(), retryReady.end(), false);
+    for (auto &queue : csrWalkQueues)
+        queue.clear();
     outstanding.clear();
     finished.clear();
-    lineTracker.clear();
+    for (auto &tracker : lineTrackers)
+        tracker.clear();
+    nextSendCore = 0;
     nextId = 1;
 }
 

@@ -212,6 +212,24 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("max_csr_walk_queue = Param.Unsigned(", cira_py)
         self.assertIn("csr_lines_per_turn = Param.Unsigned(", cira_py)
         self.assertIn("max_completed_lines = Param.Unsigned(", cira_py)
+        self.assertIn("PortID targetCore", cira_hh)
+        self.assertIn(
+            "std::vector<std::unique_ptr<MemoryPort>> memSidePorts", cira_hh
+        )
+        self.assertIn(
+            "std::vector<CiraLineUsefulnessTracker> lineTrackers", cira_hh
+        )
+        self.assertIn(
+            "std::vector<std::deque<CsrWalkState>> csrWalkQueues", cira_hh
+        )
+        self.assertIn("resolveTargetCore(ThreadContext *tc)", cira_hh)
+        self.assertIn(
+            "p.port_mem_side_ports_connection_count", cira_cc
+        )
+        self.assertIn("p.demand_probe_targets", cira_cc)
+        self.assertIn(
+            "lineTrackers.at(targetCore).issueIfAbsent", cira_cc
+        )
         self.assertIn("usefulPrefetches", cira_hh)
         self.assertIn("latePrefetches", cira_hh)
         self.assertIn('"Hit"', cira_cc)
@@ -224,7 +242,7 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
             ]
         )
         self.assertIn("resetStats()", cira_hh)
-        self.assertIn("lineTracker.clear()", cira_cc)
+        self.assertIn("tracker.clear()", cira_cc)
         self.assertIn(
             "taskId() != context_switch_task_id::Prefetcher", cira_cc
         )
