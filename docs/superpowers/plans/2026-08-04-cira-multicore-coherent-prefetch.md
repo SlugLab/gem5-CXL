@@ -60,7 +60,8 @@ assert(bounded.issueIfAbsent(0x9130));
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_cira_usefulness_contract.CiraUsefulnessTrackerContractTest.test_transition_machine -v
+python3 tests/pyunit/amu/test_cira_usefulness_contract.py \
+  CiraUsefulnessTrackerContractTest.test_transition_machine -v
 ```
 
 Expected: compilation fails because the two-argument constructor, `tracked`, and `issueIfAbsent` do not exist.
@@ -92,7 +93,7 @@ Run the command from Step 2. Expected: one test passes and the generated C++ pro
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_cira_usefulness_contract -v
+python3 tests/pyunit/amu/test_cira_usefulness_contract.py -v
 ```
 
 Expected: all existing transition and integration contract tests pass.
@@ -133,7 +134,8 @@ self.assertNotIn('"l2-cache-0"', config[config.index('def _connect_things'):conf
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_cira_usefulness_contract.CiraUsefulnessTrackerContractTest.test_cira_probe_and_stats_integration_contract -v
+python3 tests/pyunit/amu/test_cira_usefulness_contract.py \
+  CiraUsefulnessTrackerContractTest.test_cira_probe_and_stats_integration_contract -v
 ```
 
 Expected: failure because CIRA still declares and connects one scalar port/probe.
@@ -281,7 +283,7 @@ lines if packet allocation cannot be completed atomically.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_cira_usefulness_contract -v
+python3 tests/pyunit/amu/test_cira_usefulness_contract.py -v
 scons build/X86/gem5.opt -j2
 ```
 
@@ -341,7 +343,7 @@ walker. Preserve CSR entry order within each descriptor.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_cira_usefulness_contract -v
+python3 tests/pyunit/amu/test_cira_usefulness_contract.py -v
 scons build/X86/gem5.opt -j2
 ```
 
@@ -386,7 +388,7 @@ nonzero. Test that `append_kind_args` forwards all three new CIRA parameters.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_compare_gapbs_cxl_amu_cira -v
+python3 tests/pyunit/amu/test_compare_gapbs_cxl_amu_cira.py -v
 ```
 
 Expected: new tests fail because the runner neither parses nor gates these fields.
@@ -470,9 +472,8 @@ git commit -m "test: prove two-core CIRA routing and coalescing"
 - [ ] **Step 1: Run the complete focused test suite**
 
 ```bash
-python3 -m unittest \
-  tests.pyunit.amu.test_cira_usefulness_contract \
-  tests.pyunit.amu.test_compare_gapbs_cxl_amu_cira -v
+python3 tests/pyunit/amu/test_cira_usefulness_contract.py -v
+python3 tests/pyunit/amu/test_compare_gapbs_cxl_amu_cira.py -v
 scons build/X86/gem5.opt -j2
 ```
 
