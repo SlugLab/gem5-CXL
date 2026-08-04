@@ -204,7 +204,14 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         cira_cc = CIRA_CC.read_text(encoding="utf-8")
         config = GAPBS_CONFIG.read_text(encoding="utf-8")
 
-        self.assertIn("demand_probe_target", cira_py)
+        self.assertIn("mem_side_ports = VectorRequestPort(", cira_py)
+        self.assertIn(
+            "demand_probe_targets = VectorParam.SimObject(", cira_py
+        )
+        self.assertNotIn("demand_probe_target = Param.SimObject(", cira_py)
+        self.assertIn("max_csr_walk_queue = Param.Unsigned(", cira_py)
+        self.assertIn("csr_lines_per_turn = Param.Unsigned(", cira_py)
+        self.assertIn("max_completed_lines = Param.Unsigned(", cira_py)
         self.assertIn("usefulPrefetches", cira_hh)
         self.assertIn("latePrefetches", cira_hh)
         self.assertIn('"Hit"', cira_cc)
@@ -223,8 +230,18 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         )
         self.assertIn("getRequestorName", cira_cc)
         self.assertIn('".data"', cira_cc)
-        self.assertIn("cira.demand_probe_target", config)
-        self.assertIn("cira.mem_side_port", config)
+        self.assertIn(
+            "for idx, l2bus in enumerate(self.cache_hierarchy.l2buses):",
+            config,
+        )
+        self.assertIn(
+            "cira.mem_side_ports = l2bus.cpu_side_ports", config
+        )
+        self.assertIn("cira.demand_probe_targets = [", config)
+        connect_body = config[
+            config.index("def _connect_things"):config.index("parser =")
+        ]
+        self.assertNotIn('"l2-cache-0"', connect_body)
 
         recv_response = cira_cc[
             cira_cc.index("CIRA::recvTimingResp"):

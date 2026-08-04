@@ -123,12 +123,15 @@ class CXLSimpleBoard(SimpleBoard):
             return
 
         if self._cira_to_l2 and hasattr(self.cache_hierarchy, "l2buses"):
-            cira.demand_probe_target = getattr(
-                self.cache_hierarchy, "l2-cache-0"
-            )
-            cira.mem_side_port = self.cache_hierarchy.l2buses[0].cpu_side_ports
+            cira.demand_probe_targets = [
+                getattr(self.cache_hierarchy, f"l2-cache-{idx}")
+                for idx in range(len(self.cache_hierarchy.l2buses))
+            ]
+            for idx, l2bus in enumerate(self.cache_hierarchy.l2buses):
+                cira.mem_side_ports = l2bus.cpu_side_ports
         else:
-            cira.mem_side_port = self.cache_hierarchy.get_cpu_side_port()
+            cira.demand_probe_targets = []
+            cira.mem_side_ports = self.cache_hierarchy.get_cpu_side_port()
 
 parser = argparse.ArgumentParser(
     description="Run local X86 GAPBS binaries, including AMU-instrumented ones."
@@ -193,6 +196,9 @@ parser.add_argument(
 )
 parser.add_argument("--cira-max-outstanding", type=int, default=256)
 parser.add_argument("--cira-max-send-queue", type=int, default=1024)
+parser.add_argument("--cira-max-csr-walk-queue", type=int, default=4096)
+parser.add_argument("--cira-csr-lines-per-turn", type=int, default=64)
+parser.add_argument("--cira-max-completed-lines", type=int, default=65536)
 parser.add_argument("--cira-issue-latency", default="1ns")
 parser.add_argument("--cira-completion-latency", default="0ns")
 parser.add_argument(
@@ -344,6 +350,9 @@ if args.cira:
     board.cira = CIRA(
         max_outstanding=args.cira_max_outstanding,
         max_send_queue=args.cira_max_send_queue,
+        max_csr_walk_queue=args.cira_max_csr_walk_queue,
+        csr_lines_per_turn=args.cira_csr_lines_per_turn,
+        max_completed_lines=args.cira_max_completed_lines,
         issue_latency=args.cira_issue_latency,
         completion_latency=args.cira_completion_latency,
     )

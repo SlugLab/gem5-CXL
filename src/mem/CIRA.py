@@ -12,9 +12,11 @@ class CIRA(ClockedObject):
     cxx_class = "gem5::CIRA"
 
     system = Param.System(Parent.any, "System this CIRA model belongs to")
-    mem_side_port = RequestPort("Timing prefetch port toward cache/memory")
-    demand_probe_target = Param.SimObject(
-        NULL, "First private L2 used for CIRA usefulness attribution"
+    mem_side_ports = VectorRequestPort(
+        "Per-core timing prefetch ports toward private L2s"
+    )
+    demand_probe_targets = VectorParam.SimObject(
+        [], "Private L2s used for target-local CIRA usefulness attribution"
     )
 
     cache_line_size = Param.Unsigned(
@@ -25,6 +27,15 @@ class CIRA(ClockedObject):
     )
     max_send_queue = Param.Unsigned(
         1024, "Maximum queued CIRA memory packets waiting for the cache port"
+    )
+    max_csr_walk_queue = Param.Unsigned(
+        4096, "Maximum total queued CIRA CSR descriptors"
+    )
+    csr_lines_per_turn = Param.Unsigned(
+        64, "Maximum unique line candidates expanded per scheduling turn"
+    )
+    max_completed_lines = Param.Unsigned(
+        65536, "Maximum completed usefulness records retained per core"
     )
     issue_latency = Param.Latency(
         "1ns", "Delay from m5op issue to first CIRA memory packet send"
