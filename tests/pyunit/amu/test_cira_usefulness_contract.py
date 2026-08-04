@@ -222,6 +222,12 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn(
             "std::vector<std::deque<CsrWalkState>> csrWalkQueues", cira_hh
         )
+        self.assertIn("const uint64_t maxCsrWalkQueue", cira_hh)
+        self.assertIn("const uint64_t csrLinesPerTurn", cira_hh)
+        self.assertIn("PortID nextCsrCore", cira_hh)
+        self.assertIn("queuedCsrWalks() const", cira_hh)
+        self.assertIn("droppedCsrDescriptors", cira_hh)
+        self.assertIn("csrQueueHighWatermark", cira_hh)
         self.assertIn("resolveTargetCore(ThreadContext *tc)", cira_hh)
         self.assertIn(
             "p.port_mem_side_ports_connection_count", cira_cc
@@ -230,6 +236,26 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn(
             "lineTrackers.at(targetCore).issueIfAbsent", cira_cc
         )
+        capacity_check = cira_cc.index(
+            "queuedCsrWalks() >= maxCsrWalkQueue"
+        )
+        record_span_validation = cira_cc.index(
+            "csr invalid record span descriptor"
+        )
+        accepted_descriptor = cira_cc.index(
+            "++stats.issuedCsrPrefetches", capacity_check
+        )
+        queue_insert = cira_cc.index(
+            "csrWalkQueues[targetCore].push_back(walk)"
+        )
+        self.assertLess(record_span_validation, capacity_check)
+        self.assertLess(capacity_check, accepted_descriptor)
+        self.assertLess(capacity_check, queue_insert)
+        self.assertIn("++stats.droppedCsrDescriptors", cira_cc)
+        self.assertIn("stats.csrQueueHighWatermark", cira_cc)
+        self.assertIn("const PortID startCore = nextCsrCore", cira_cc)
+        self.assertIn("candidatesThisTurn < csrLinesPerTurn", cira_cc)
+        self.assertIn("nextCsrCore = (targetCore + 1)", cira_cc)
         self.assertIn("usefulPrefetches", cira_hh)
         self.assertIn("latePrefetches", cira_hh)
         self.assertIn('"Hit"', cira_cc)

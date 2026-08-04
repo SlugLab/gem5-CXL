@@ -187,6 +187,8 @@ class CIRA : public ClockedObject
         statistics::Scalar issuedIndexedPrefetches;
         statistics::Scalar issuedCsrPrefetches;
         statistics::Scalar csrRowsVisited;
+        statistics::Scalar droppedCsrDescriptors;
+        statistics::Scalar csrQueueHighWatermark;
         statistics::Scalar completedPrefetches;
         statistics::Scalar coalescedPrefetches;
         statistics::Scalar usefulPrefetches;
@@ -214,6 +216,7 @@ class CIRA : public ClockedObject
     PortID resolveTargetCore(ThreadContext *tc) const;
     bool hasPrefetchSlot(PortID targetCore) const;
     bool hasCsrWalks() const;
+    size_t queuedCsrWalks() const;
     void scheduleCsrWalk(Tick when);
     void processCsrWalk();
     void enqueuePacket(PortID targetCore, PacketPtr pkt);
@@ -238,6 +241,8 @@ class CIRA : public ClockedObject
     const uint64_t cacheLineSize;
     std::vector<CiraLineUsefulnessTracker> lineTrackers;
     const uint64_t maxSendQueue;
+    const uint64_t maxCsrWalkQueue;
+    const uint64_t csrLinesPerTurn;
     const Tick issueLatency;
     const Tick completionLatency;
 
@@ -253,6 +258,7 @@ class CIRA : public ClockedObject
     PortID nextSendCore = 0;
     EventFunctionWrapper sendEvent;
     std::vector<std::deque<CsrWalkState>> csrWalkQueues;
+    PortID nextCsrCore = 0;
     EventFunctionWrapper csrWalkEvent;
     std::vector<std::unique_ptr<CacheProbeListener>> probeListeners;
 

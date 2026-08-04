@@ -62,6 +62,10 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "CIRA CSR region prefetch descriptors issued"),
       ADD_STAT(csrRowsVisited, statistics::units::Count::get(),
                "CSR rows visited by CIRA region prefetch descriptors"),
+      ADD_STAT(droppedCsrDescriptors, statistics::units::Count::get(),
+               "CIRA CSR descriptors dropped because the walk queue was full"),
+      ADD_STAT(csrQueueHighWatermark, statistics::units::Count::get(),
+               "Maximum number of queued CIRA CSR walk descriptors"),
       ADD_STAT(completedPrefetches, statistics::units::Count::get(),
                "CIRA cacheline install/prefetch requests completed"),
       ADD_STAT(coalescedPrefetches, statistics::units::Count::get(),
@@ -118,6 +122,8 @@ CIRA::CIRA(const Params &p)
       demandProbeTargets(p.demand_probe_targets),
       cacheLineSize(p.cache_line_size),
       maxSendQueue(p.max_send_queue),
+      maxCsrWalkQueue(p.max_csr_walk_queue),
+      csrLinesPerTurn(p.csr_lines_per_turn),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
       maxOutstanding(p.max_outstanding),
@@ -128,6 +134,10 @@ CIRA::CIRA(const Params &p)
 {
     const size_t numCores = p.port_mem_side_ports_connection_count;
     panic_if(numCores == 0, "CIRA %s requires at least one memory port", name());
+    panic_if(maxCsrWalkQueue == 0,
+             "CIRA %s requires a nonzero CSR walk queue", name());
+    panic_if(csrLinesPerTurn == 0,
+             "CIRA %s requires a nonzero CSR scheduling quantum", name());
 
     memSidePorts.reserve(numCores);
     lineTrackers.reserve(numCores);
@@ -309,6 +319,15 @@ CIRA::hasCsrWalks() const
                        [](const auto &queue) { return !queue.empty(); });
 }
 
+size_t
+CIRA::queuedCsrWalks() const
+{
+    size_t queued = 0;
+    for (const auto &queue : csrWalkQueues)
+        queued += queue.size();
+    return queued;
+}
+
 void
 CIRA::scheduleCsrWalk(Tick when)
 {
@@ -327,43 +346,51 @@ CIRA::scheduleCsrWalk(Tick when)
 void
 CIRA::processCsrWalk()
 {
-    while (hasCsrWalks()) {
-        const auto queueIt = std::find_if(
-            csrWalkQueues.begin(), csrWalkQueues.end(),
-            [](const auto &queue) { return !queue.empty(); });
-        const PortID targetCore = std::distance(csrWalkQueues.begin(), queueIt);
-        CsrWalkState &walk = queueIt->front();
+    const PortID numCores = memSidePorts.size();
+    const PortID startCore = nextCsrCore;
+    bool consumedCandidate = false;
+
+    for (PortID offset = 0; offset < numCores; ++offset) {
+        const PortID targetCore = (startCore + offset) % numCores;
+        auto &queue = csrWalkQueues[targetCore];
+        if (queue.empty() || !hasPrefetchSlot(targetCore))
+            continue;
+
+        CsrWalkState &walk = queue.front();
         panic_if(walk.targetCore != targetCore,
                  "CIRA CSR walk queue/core ownership mismatch");
-        bool madeProgress = false;
+        uint64_t candidatesThisTurn = 0;
 
-        while (hasPrefetchSlot(targetCore)) {
+        while (candidatesThisTurn < csrLinesPerTurn &&
+               hasPrefetchSlot(targetCore)) {
             bool consumedEntry = false;
 
             if (walk.prefetchRecords && walk.recordLine < walk.recordsEnd) {
                 const Addr line = walk.recordLine;
                 walk.recordLine += cacheLineSize;
-                if (issuePrefetch(walk.tc, line, cacheLineSize) != 0)
-                    madeProgress = true;
+                issuePrefetch(walk.tc, line, cacheLineSize);
+                ++candidatesThisTurn;
+                consumedCandidate = true;
                 consumedEntry = true;
             }
 
             if (walk.prefetchValues && walk.nextEntry < walk.entryCount &&
+                candidatesThisTurn < csrLinesPerTurn &&
                 hasPrefetchSlot(targetCore)) {
                 const uint64_t entry = walk.nextEntry++;
+                ++candidatesThisTurn;
+                consumedCandidate = true;
+                consumedEntry = true;
                 const Addr indexAddr = walk.recordsBegin +
                     entry * walk.recordStride + walk.indexOffset;
                 uint64_t index = 0;
                 if (!readIndex(walk.tc, indexAddr, walk.indexSize, index)) {
                     ++stats.translationFaults;
-                    consumedEntry = true;
                     continue;
                 }
 
                 const Addr target = walk.valuesAddr + index * walk.valueSize;
-                if (issuePrefetch(walk.tc, target, walk.valueSize) != 0)
-                    madeProgress = true;
-                consumedEntry = true;
+                issuePrefetch(walk.tc, target, walk.valueSize);
             }
 
             if (!consumedEntry)
@@ -384,21 +411,19 @@ CIRA::processCsrWalk()
                     static_cast<unsigned long long>(
                         walk.rowStart + walk.rowCount),
                     static_cast<unsigned long long>(walk.entryCount));
-            queueIt->pop_front();
-            continue;
+            queue.pop_front();
         }
 
-        if (!madeProgress || !hasPrefetchSlot(targetCore)) {
-            DPRINTF(CIRA,
-                    "csr walk paused core=%d outstanding=%llu "
-                    "send_queue=%llu retry=%d\n", targetCore,
-                    static_cast<unsigned long long>(outstanding.size()),
-                    static_cast<unsigned long long>(
-                        sendQueues[targetCore].size()),
-                    retryPkts[targetCore] != nullptr);
-            return;
-        }
+        nextCsrCore = (targetCore + 1) % numCores;
     }
+
+    bool canExpand = false;
+    for (PortID core = 0; core < numCores; ++core) {
+        canExpand = canExpand ||
+            (!csrWalkQueues[core].empty() && hasPrefetchSlot(core));
+    }
+    if (hasCsrWalks() && consumedCandidate && canExpand)
+        scheduleCsrWalk(curTick() + 1);
 }
 
 uint64_t
@@ -644,8 +669,6 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         (desc.flags == 0 || (desc.flags & CiraCsrPrefetchValues) != 0);
     const bool offsetsArePtrs = (desc.flags & CiraCsrOffsetsArePtrs) != 0;
 
-    ++stats.issuedCsrPrefetches;
-
     if (recordSpan) {
         if (desc.offsetsAddr == 0 || desc.recordsAddr <= desc.offsetsAddr ||
             desc.recordStride == 0) {
@@ -659,6 +682,13 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         if (count == 0)
             return 0;
 
+        if (queuedCsrWalks() >= maxCsrWalkQueue) {
+            ++stats.rejectedQueueFull;
+            ++stats.droppedCsrDescriptors;
+            return 0;
+        }
+
+        ++stats.issuedCsrPrefetches;
         stats.csrRowsVisited += desc.rowCount;
 
         CsrWalkState walk;
@@ -678,6 +708,9 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         walk.prefetchRecords = prefetchRecords;
         walk.prefetchValues = prefetchValues;
         csrWalkQueues[targetCore].push_back(walk);
+        stats.csrQueueHighWatermark = std::max(
+            queuedCsrWalks(),
+            static_cast<size_t>(stats.csrQueueHighWatermark.value()));
         scheduleCsrWalk(curTick() + issueLatency);
 
         DPRINTF(CIRA,
@@ -699,6 +732,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         return count;
     }
 
+    ++stats.issuedCsrPrefetches;
     uint64_t accepted = 0;
     const uint64_t rowEnd = desc.rowStart + desc.rowCount;
     for (uint64_t row = desc.rowStart; row < rowEnd; ++row) {
@@ -1084,6 +1118,7 @@ CIRA::reset()
     for (auto &tracker : lineTrackers)
         tracker.clear();
     nextSendCore = 0;
+    nextCsrCore = 0;
     nextId = 1;
 }
 
