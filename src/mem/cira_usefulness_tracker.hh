@@ -7,8 +7,11 @@
 #define __MEM_CIRA_USEFULNESS_TRACKER_HH__
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <unordered_map>
+#include <utility>
 
 namespace gem5
 {
@@ -23,16 +26,41 @@ class CiraLineUsefulnessTracker
         Late
     };
 
-    explicit CiraLineUsefulnessTracker(uint64_t line_size)
-        : lineSize(line_size)
+    explicit CiraLineUsefulnessTracker(
+        uint64_t line_size, size_t max_completed_lines = 4096)
+        : lineSize(line_size), maxCompletedLines(max_completed_lines)
     {
         assert(lineSize != 0);
+        assert(maxCompletedLines != 0);
     }
 
     void
     issue(uint64_t addr)
     {
-        ++lines[lineAddress(addr)].outstandingRefs;
+        const auto line = lineAddress(addr);
+        auto [it, inserted] = lines.try_emplace(line);
+        if (inserted)
+            it->second.generation = nextGeneration++;
+        ++it->second.outstandingRefs;
+    }
+
+    bool
+    issueIfAbsent(uint64_t addr)
+    {
+        const auto line = lineAddress(addr);
+        auto [it, inserted] = lines.try_emplace(line);
+        if (!inserted)
+            return false;
+
+        it->second.outstandingRefs = 1;
+        it->second.generation = nextGeneration++;
+        return true;
+    }
+
+    bool
+    tracked(uint64_t addr) const
+    {
+        return lines.find(lineAddress(addr)) != lines.end();
     }
 
     void
@@ -70,7 +98,11 @@ class CiraLineUsefulnessTracker
 
         if (state.outstandingRefs != 0) {
             state.outstandingRefs = 0;
-            state.completed = true;
+            if (!state.completed) {
+                state.completed = true;
+                completedLines.emplace_back(it->first, state.generation);
+                trimCompletedLines();
+            }
         }
     }
 
@@ -116,6 +148,8 @@ class CiraLineUsefulnessTracker
     clear()
     {
         lines.clear();
+        completedLines.clear();
+        nextGeneration = 1;
     }
 
   private:
@@ -124,7 +158,23 @@ class CiraLineUsefulnessTracker
         uint32_t outstandingRefs = 0;
         bool completed = false;
         bool suppressFill = false;
+        uint64_t generation = 0;
     };
+
+    void
+    trimCompletedLines()
+    {
+        while (completedLines.size() > maxCompletedLines) {
+            const auto [line, generation] = completedLines.front();
+            completedLines.pop_front();
+
+            const auto it = lines.find(line);
+            if (it != lines.end() && it->second.completed &&
+                it->second.generation == generation) {
+                lines.erase(it);
+            }
+        }
+    }
 
     uint64_t
     lineAddress(uint64_t addr) const
@@ -133,7 +183,10 @@ class CiraLineUsefulnessTracker
     }
 
     const uint64_t lineSize;
+    const size_t maxCompletedLines;
+    uint64_t nextGeneration = 1;
     std::unordered_map<uint64_t, LineState> lines;
+    std::deque<std::pair<uint64_t, uint64_t>> completedLines;
 };
 
 } // namespace gem5

@@ -136,6 +136,29 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
                 tracker.clear();
                 assert(tracker.outstandingRefs(0x8800) == 0);
                 assert(tracker.demand(0x8800, false) == Attribution::None);
+
+                // Coalescing accepts one request per tracked cacheline. A
+                // bounded completed history retires the oldest undemanded
+                // line without confusing newer generations of that line.
+                CiraLineUsefulnessTracker bounded(64, 2);
+                assert(!bounded.tracked(0x9000));
+                assert(bounded.issueIfAbsent(0x9000));
+                assert(!bounded.issueIfAbsent(0x903f));
+                bounded.fill(0x9008, true);
+                assert(bounded.tracked(0x9010));
+
+                assert(bounded.issueIfAbsent(0x9100));
+                bounded.fill(0x9100, true);
+                assert(bounded.issueIfAbsent(0x9200));
+                bounded.fill(0x9200, true);
+                assert(!bounded.tracked(0x9000));
+                assert(bounded.tracked(0x9100));
+                assert(bounded.tracked(0x9200));
+
+                assert(bounded.demand(0x9110, true) ==
+                       Attribution::Useful);
+                assert(!bounded.tracked(0x9100));
+                assert(bounded.issueIfAbsent(0x9130));
                 return 0;
             }
             """
