@@ -34,10 +34,15 @@ class MatchedVariantSourceTest(unittest.TestCase):
         score_load = generated.index(
             "load_values(score_addrs, scores_batch, amu_count)"
         )
+        node_bounds = generated.index(
+            "AMU_INVALID_NODE node=%lld num_nodes=%lld"
+        )
         ordered_add = generated.index(
             "incoming_total = incoming_total + scores_batch[amu_i]"
         )
         self.assertLess(node_load, score_load)
+        self.assertLess(node_load, node_bounds)
+        self.assertLess(node_bounds, score_load)
         self.assertLess(score_load, ordered_add)
         self.assertEqual(
             generated.count(
