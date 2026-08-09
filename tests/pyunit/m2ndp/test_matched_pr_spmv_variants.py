@@ -53,11 +53,18 @@ class MatchedVariantSourceTest(unittest.TestCase):
         )
 
         prime = generated.index("gapbs_amu::prime_worker_stack_pages();")
+        graph_prime = generated.index("gapbs_amu::prime_graph_pages(g);")
         work_begin = generated.index("m5_work_begin(trial, 0);")
+        self.assertLess(graph_prime, prime)
         self.assertLess(prime, work_begin)
+        self.assertIn("if (trial == 0)", generated[graph_prime - 40:prime])
         self.assertIn("#pragma omp parallel", variants.amu_builder.AMU_HEADER)
         self.assertIn(
             "volatile unsigned char stack_pages[",
+            variants.amu_builder.AMU_HEADER,
+        )
+        self.assertIn(
+            "static inline void prime_graph_pages",
             variants.amu_builder.AMU_HEADER,
         )
 

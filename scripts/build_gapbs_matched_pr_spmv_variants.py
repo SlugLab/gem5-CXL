@@ -108,7 +108,11 @@ def transform_source(source, kind):
             )
         transformed = transformed.replace(
             _WORK_BEGIN,
-            "    gapbs_amu::prime_worker_stack_pages();\n" + _WORK_BEGIN,
+            "    if (trial == 0) {\n"
+            "      gapbs_amu::prime_graph_pages(g);\n"
+            "      gapbs_amu::prime_worker_stack_pages();\n"
+            "    }\n"
+            + _WORK_BEGIN,
             1,
         )
     return transformed
