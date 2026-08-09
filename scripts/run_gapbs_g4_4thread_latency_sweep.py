@@ -45,6 +45,7 @@ class Options:
     outdir: Path
     timeout: int = 0
     resume: bool = False
+    stop_after_latency: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -185,6 +186,9 @@ def new_state(options=None):
             "page_rank_iterations": profile.page_rank_iterations,
             "latencies": list(profile.latencies),
             "all_memory_cxl": True,
+            "stop_after_latency": (
+                options.stop_after_latency if options is not None else None
+            ),
             **external,
         },
         "latencies": {
@@ -302,6 +306,14 @@ def _utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def reached_stop_boundary(entry, options):
+    return (
+        options.stop_after_latency is not None
+        and entry.latency == options.stop_after_latency
+        and entry.system == SYSTEMS[-1]
+    )
+
+
 def run_action(entry, state, options, paths):
     command = command_for_action(entry, options, paths)
     log = paths.logs / f"{entry.latency}-{entry.system}.log"
@@ -391,6 +403,7 @@ def parse_args(argv=None):
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--stop-after-latency", choices=LATENCIES)
     args = parser.parse_args(argv)
     return Options(
         graph=args.graph.resolve(),
@@ -401,6 +414,7 @@ def parse_args(argv=None):
         outdir=args.outdir.resolve(),
         timeout=args.timeout,
         resume=args.resume,
+        stop_after_latency=args.stop_after_latency,
     )
 
 
@@ -429,6 +443,13 @@ def main(argv=None):
                 f"latency={entry.latency} system={entry.system}",
                 flush=True,
             )
+            if reached_stop_boundary(entry, options):
+                print(
+                    "G4_SWEEP_STOP_BOUNDARY "
+                    f"latency={entry.latency} status={paths.status}",
+                    flush=True,
+                )
+                return 0
     except (
         SweepError,
         artifacts.EvidenceError,

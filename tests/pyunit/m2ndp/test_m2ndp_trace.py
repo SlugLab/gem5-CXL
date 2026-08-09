@@ -9,7 +9,10 @@ from pathlib import Path
 from scripts import m2ndp_artifacts as artifacts
 from scripts import m2ndp_pagerank_trace as trace
 
-from test_m2ndp_build import write_meta, write_words
+try:
+    from test_m2ndp_build import write_meta, write_words
+except ModuleNotFoundError:
+    from m2ndp.test_m2ndp_build import write_meta, write_words
 
 
 class PageRankTraceTest(unittest.TestCase):

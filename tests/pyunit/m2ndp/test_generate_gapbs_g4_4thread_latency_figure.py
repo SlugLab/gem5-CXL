@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 from scripts import generate_gapbs_g4_4thread_latency_figure as figure
-from test_generate_gapbs_g4_4thread_latency_results import make_valid_rows
+try:
+    from test_generate_gapbs_g4_4thread_latency_results import make_valid_rows
+except ModuleNotFoundError:
+    from m2ndp.test_generate_gapbs_g4_4thread_latency_results import (
+        make_valid_rows,
+    )
 
 
 class FigureDataTest(unittest.TestCase):

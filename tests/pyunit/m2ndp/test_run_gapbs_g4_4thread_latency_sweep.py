@@ -21,6 +21,7 @@ class SweepRunnerTest(unittest.TestCase):
             outdir=root / "sweep",
             timeout=0,
             resume=False,
+            stop_after_latency=None,
         )
 
     def test_matrix_has_four_latencies_and_four_systems(self):
@@ -219,6 +220,60 @@ class SweepRunnerTest(unittest.TestCase):
         self.assertFalse(options.resume)
         self.assertEqual(options.timeout, 0)
         self.assertEqual(options.graph.name, "g4.sg")
+
+    def test_cli_accepts_only_a_formal_stop_after_latency(self):
+        base = [
+            "--graph", "g4.sg",
+            "--cxlmemuring", "CXLMemUring",
+            "--m2ndp-root", "M2NDP-public",
+            "--gem5", "gem5.opt",
+            "--variants-build", "variants",
+            "--outdir", "sweep",
+        ]
+
+        options = runner.parse_args(
+            [*base, "--stop-after-latency", "200ns"]
+        )
+
+        self.assertEqual(options.stop_after_latency, "200ns")
+        with self.assertRaises(SystemExit):
+            runner.parse_args(
+                [*base, "--stop-after-latency", "300ns"]
+            )
+
+    def test_stop_boundary_is_after_all_four_systems_at_latency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            options = dataclasses.replace(
+                self.make_options(Path(tmp)),
+                stop_after_latency="200ns",
+            )
+
+            self.assertFalse(
+                runner.reached_stop_boundary(
+                    runner.MatrixEntry("200ns", "cira"), options
+                )
+            )
+            self.assertTrue(
+                runner.reached_stop_boundary(
+                    runner.MatrixEntry("200ns", "m2ndp"), options
+                )
+            )
+            self.assertFalse(
+                runner.reached_stop_boundary(
+                    runner.MatrixEntry("500ns", "m2ndp"), options
+                )
+            )
+
+    def test_stop_after_latency_is_bound_into_resume_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            options = dataclasses.replace(
+                self.make_options(Path(tmp)),
+                stop_after_latency="200ns",
+            )
+
+            state = runner.new_state(options)
+
+        self.assertEqual(state["contract"]["stop_after_latency"], "200ns")
 
 
 if __name__ == "__main__":
