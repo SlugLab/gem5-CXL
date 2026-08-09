@@ -43,6 +43,7 @@ class MatchedVariantSourceTest(unittest.TestCase):
         self.assertLess(node_load, score_load)
         self.assertLess(node_load, node_bounds)
         self.assertLess(node_bounds, score_load)
+        self.assertNotIn("return;", generated[node_bounds:score_load])
         self.assertLess(score_load, ordered_add)
         self.assertEqual(
             generated.count(
