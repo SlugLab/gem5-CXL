@@ -267,7 +267,7 @@ def build_tools(
                     "--settings",
                     f"compiler.version={conan_compiler_version}",
                     "--settings",
-                    "compiler.libcxx=libstdc++11",
+                    "compiler.libcxx=libstdc++",
                 ]
                 if conan_compiler_version is not None
                 else []

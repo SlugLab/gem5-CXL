@@ -123,7 +123,7 @@ class PrepareM2NDPTest(unittest.TestCase):
                 "--settings",
                 "compiler.version=13",
                 "--settings",
-                "compiler.libcxx=libstdc++11",
+                "compiler.libcxx=libstdc++",
             ],
         )
         self.assertEqual(
