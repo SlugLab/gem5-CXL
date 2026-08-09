@@ -176,6 +176,15 @@ def validate_publication_graph(meta: GraphMeta, smoke_test: bool) -> None:
         )
 
 
+def validate_profile_graph(meta: GraphMeta, profile) -> None:
+    if meta.graph_sha256 != profile.graph_sha256:
+        raise EvidenceError("graph SHA-256 does not match profile")
+    if meta.num_nodes != profile.num_nodes:
+        raise EvidenceError("graph node count does not match profile")
+    if meta.num_directed_edges < 0:
+        raise EvidenceError("graph directed edge count is negative")
+
+
 def load_graph_meta(path: Path) -> GraphMeta:
     try:
         value = json.loads(Path(path).read_text())

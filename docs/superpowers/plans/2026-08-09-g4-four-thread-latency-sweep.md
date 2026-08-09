@@ -18,7 +18,9 @@
 - Modify `tests/pyunit/m2ndp/test_run_gapbs_matched_pr_spmv_variants.py`: prove g4/four-thread argument construction and fail-closed row validation.
 - Modify `scripts/m2ndp_artifacts.py`: validate graph metadata against a selected formal profile.
 - Modify `scripts/m2ndp_results.py`: validate gem5 and provenance evidence against a selected profile and latency.
+- Modify `scripts/compare_gapbs_cxl_amu_cira.py`: accept the same formal profile at the checkpoint CLI boundary so g4/four-core baselines are launchable without smoke mode.
 - Modify `scripts/run_m2ndp_g20_pr_spmv.py`: make cores, graph contract, latency, state, calibration, and manifest profile-aware without changing default g20 behavior.
+- Modify `tests/pyunit/amu/test_compare_gapbs_cxl_amu_cira.py`: cover the formal four-thread checkpoint profile gate.
 - Modify `tests/pyunit/m2ndp/test_m2ndp_artifacts.py`, `tests/pyunit/m2ndp/test_m2ndp_results.py`, and `tests/pyunit/m2ndp/test_run_m2ndp_g20_pr_spmv.py`: cover both formal profiles and cross-profile rejection.
 - Create `scripts/run_gapbs_g4_4thread_latency_sweep.py`: resumable sequential 4-latency orchestrator.
 - Create `tests/pyunit/m2ndp/test_run_gapbs_g4_4thread_latency_sweep.py`: matrix, command, resume, and failure tests.
@@ -323,7 +325,9 @@ git commit -m "feat: run matched variants under formal profiles"
 **Files:**
 - Modify: `scripts/m2ndp_artifacts.py`
 - Modify: `scripts/m2ndp_results.py`
+- Modify: `scripts/compare_gapbs_cxl_amu_cira.py`
 - Modify: `scripts/run_m2ndp_g20_pr_spmv.py`
+- Modify: `tests/pyunit/amu/test_compare_gapbs_cxl_amu_cira.py`
 - Modify: `tests/pyunit/m2ndp/test_m2ndp_artifacts.py`
 - Modify: `tests/pyunit/m2ndp/test_m2ndp_results.py`
 - Modify: `tests/pyunit/m2ndp/test_run_m2ndp_g20_pr_spmv.py`
@@ -450,7 +454,9 @@ Resolve the profile in `new_state`, `gem5_command`, trace validation,
 calibration command construction, and final manifest construction. Record
 `profile`, `cores`, `threads`, and `cxl_link_delay` in the immutable state
 contract. Call calibration with the selected latency, and pass the selected
-profile and latency into `m2ndp_results`.
+profile and latency into `m2ndp_results`. Thread the profile through the
+lower-level comparison CLI as well; otherwise its legacy two-core/scale-20
+checkpoint gate rejects the generated formal g4 command before gem5 starts.
 
 - [ ] **Step 5: Run the M2NDP suites**
 

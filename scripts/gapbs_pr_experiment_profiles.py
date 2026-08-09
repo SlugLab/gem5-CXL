@@ -7,7 +7,10 @@
 import dataclasses
 from pathlib import Path
 
-from scripts import m2ndp_artifacts
+try:
+    from scripts import m2ndp_artifacts
+except ImportError:
+    import m2ndp_artifacts
 
 
 G4_SHA256 = (

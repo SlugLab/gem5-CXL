@@ -1,6 +1,8 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
+import dataclasses
+import json
 import os
 import tempfile
 import unittest
@@ -56,6 +58,55 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIn("--checkpoint-root", command)
         self.assertIn("--roi-work-events", command)
         self.assertIn("--verify", command)
+
+    def test_g4_commands_use_four_cores_and_selected_latency(self):
+        options = dataclasses.replace(
+            self.options,
+            profile="g4-4thread-sweep",
+            graph_scale=4,
+            cxl_link_delay="200ns",
+        )
+
+        gem5 = runner.gem5_command(options, self.paths)
+        calibrated = runner._calibration_command(options, self.paths)
+
+        self.assertEqual(gem5[gem5.index("--cores") + 1], "4")
+        self.assertEqual(
+            gem5[gem5.index("--cxl-link-delay") + 1], "200ns"
+        )
+        self.assertEqual(
+            calibrated[calibrated.index("--cxl-delay") + 1], "200ns"
+        )
+
+    def test_g4_state_records_immutable_profile_contract(self):
+        options = dataclasses.replace(
+            self.options,
+            profile="g4-4thread-sweep",
+            graph_scale=4,
+            cxl_link_delay="2us",
+        )
+
+        contract = runner.new_state(options)["contract"]
+
+        self.assertEqual(contract["profile"], "g4-4thread-sweep")
+        self.assertEqual(contract["cores"], 4)
+        self.assertEqual(contract["threads"], 4)
+        self.assertEqual(contract["cxl_link_delay"], "2us")
+
+    def test_resume_migrates_legacy_g20_contract(self):
+        legacy = runner.new_state(self.options)
+        for field in ("profile", "graph_sha256", "threads"):
+            legacy["contract"].pop(field)
+        self.paths.status.write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+        options = dataclasses.replace(self.options, resume=True)
+
+        state = runner._load_or_create_state(options, self.paths)
+
+        self.assertEqual(
+            state["contract"], runner.new_state(options)["contract"]
+        )
 
     def test_failed_funcsim_blocks_ndpsim_and_summary(self):
         state = self.state_with("funcsim", status="failed")

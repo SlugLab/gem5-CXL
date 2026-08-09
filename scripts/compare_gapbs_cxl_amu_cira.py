@@ -30,6 +30,12 @@ from gapbs_checkpoint import (  # noqa: E402
     validate_reuse,
     write_manifest,
 )
+from gapbs_pr_experiment_profiles import (  # noqa: E402
+    PROFILES as EXPERIMENT_PROFILES,
+    ProfileError,
+    get_profile,
+    require_latency,
+)
 
 
 DEFAULT_GEM5 = REPO / "build" / "X86" / "gem5.opt"
@@ -1354,6 +1360,36 @@ def write_summary(path, rows):
             writer.writerow(out)
 
 
+def validate_checkpoint_profile(args):
+    profile = get_profile(getattr(args, "profile", "g20-2thread-1us"))
+    if args.smoke_test:
+        return profile
+    require_latency(profile, args.cxl_link_delay)
+    expected = {
+        "graph_scale": profile.graph_scale,
+        "cores": profile.cores,
+        "iterations": profile.trials,
+        "measure_trial": profile.measured_trial,
+    }
+    for field, value in expected.items():
+        if getattr(args, field) != value:
+            raise ProfileError(
+                f"{field}={getattr(args, field)!r}, expected {value!r} "
+                f"for {profile.name}"
+            )
+    thread_setting = f"OMP_NUM_THREADS={profile.threads}"
+    omp_settings = [
+        value for value in args.env if value.startswith("OMP_NUM_THREADS=")
+    ]
+    if not omp_settings:
+        args.env.append(thread_setting)
+    elif omp_settings != [thread_setting]:
+        raise ProfileError(
+            f"OMP_NUM_THREADS must be {profile.threads} for {profile.name}"
+        )
+    return profile
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare CXL-only, AMU, and CIRA local GAPBS binaries."
@@ -1389,6 +1425,11 @@ def main():
         help="Serialized GAPBS graph loaded with -f in checkpoint mode.",
     )
     parser.add_argument("--graph-scale", type=int)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(EXPERIMENT_PROFILES),
+        default="g20-2thread-1us",
+    )
     parser.add_argument(
         "--checkpoint-root",
         type=Path,
@@ -1488,14 +1529,12 @@ def main():
                 "checkpoint mode requires --iterations 2 "
                 "and --measure-trial 1"
             )
-        if args.cores != 2:
-            parser.error("checkpoint mode requires --cores 2")
         if args.graph_scale is None:
             args.graph_scale = args.scale
-        if args.graph_scale != 20 and not args.smoke_test:
-            parser.error(
-                "publication checkpoint mode requires --graph-scale 20"
-            )
+        try:
+            validate_checkpoint_profile(args)
+        except ProfileError as error:
+            parser.error(str(error))
         args.scale = args.graph_scale
     elif args.checkpoint_root is not None:
         parser.error("--checkpoint-root requires --graph")

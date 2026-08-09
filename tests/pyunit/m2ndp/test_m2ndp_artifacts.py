@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts import gapbs_pr_experiment_profiles as profiles
 from scripts import m2ndp_artifacts as artifacts
 
 
@@ -23,6 +24,31 @@ def reference_header(num_nodes):
 
 
 class M2NDPArtifactTest(unittest.TestCase):
+    def test_g4_metadata_passes_formal_profile(self):
+        meta = artifacts.GraphMeta(
+            graph_sha256=profiles.G4_SHA256,
+            num_nodes=16,
+            num_directed_edges=64,
+            directed=False,
+        )
+        artifacts.validate_profile_graph(
+            meta, profiles.get_profile("g4-4thread-sweep")
+        )
+
+    def test_profile_graph_rejects_wrong_node_count(self):
+        meta = artifacts.GraphMeta(
+            graph_sha256=profiles.G4_SHA256,
+            num_nodes=15,
+            num_directed_edges=64,
+            directed=False,
+        )
+        with self.assertRaisesRegex(
+            artifacts.EvidenceError, "node count"
+        ):
+            artifacts.validate_profile_graph(
+                meta, profiles.get_profile("g4-4thread-sweep")
+            )
+
     def test_graph_bundle_rejects_wrong_g20_hash(self):
         meta = artifacts.GraphMeta(
             graph_sha256="0" * 64,

@@ -11,8 +11,10 @@ import re
 from pathlib import Path
 
 try:
+    from scripts import gapbs_pr_experiment_profiles as profiles
     from scripts import m2ndp_artifacts as artifacts
 except ImportError:
+    import gapbs_pr_experiment_profiles as profiles
     import m2ndp_artifacts as artifacts
 
 
@@ -61,20 +63,24 @@ class ProvenanceEvidence:
 
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-_GEM5_CONTRACT = {
-    "benchmark": "pr_spmv",
-    "kind": "baseline",
-    "status": "ok",
-    "verification": "pass",
-    "roi_cpu": "timing",
-    "cores": "2",
-    "cxl_link_delay": "1us",
-    "all_memory_cxl": "True",
-    "graph_sha256": artifacts.EXPECTED_G20_SHA256,
-    "iterations": "2",
-    "measured_trial": "1",
-    "checkpoint_restores": "1",
-}
+
+
+def expected_gem5_contract(profile, latency):
+    profiles.require_latency(profile, latency)
+    return {
+        "benchmark": "pr_spmv",
+        "kind": "baseline",
+        "status": "ok",
+        "verification": "pass",
+        "roi_cpu": "timing",
+        "cores": str(profile.cores),
+        "cxl_link_delay": latency,
+        "all_memory_cxl": "True",
+        "graph_sha256": profile.graph_sha256,
+        "iterations": str(profile.trials),
+        "measured_trial": str(profile.measured_trial),
+        "checkpoint_restores": "1",
+    }
 
 
 def _single_match(text, pattern, name, *, flags=0):
@@ -233,8 +239,8 @@ def parse_ndpsim(log, *, returncode=0, output_text=None):
     )
 
 
-def _validate_gem5_row(row, *, smoke_test=False):
-    contract = dict(_GEM5_CONTRACT)
+def validate_gem5_row(row, *, profile, latency, smoke_test=False):
+    contract = expected_gem5_contract(profile, latency)
     if smoke_test:
         contract.pop("graph_sha256")
     for field, expected in contract.items():
@@ -243,6 +249,15 @@ def _validate_gem5_row(row, *, smoke_test=False):
             raise artifacts.EvidenceError(
                 f"gem5 {field}={actual!r}, expected {expected!r}"
             )
+    scale = row.get("scale")
+    if (
+        not smoke_test
+        and scale not in (None, "")
+        and scale != str(profile.graph_scale)
+    ):
+        raise artifacts.EvidenceError(
+            f"gem5 scale={scale!r}, expected {profile.graph_scale!r}"
+        )
     graph_sha256 = row.get("graph_sha256", "")
     if not _HASH_RE.fullmatch(graph_sha256):
         raise artifacts.EvidenceError(
@@ -259,7 +274,15 @@ def _validate_gem5_row(row, *, smoke_test=False):
     return ticks
 
 
-def parse_gem5_summary(path, *, smoke_test=False):
+def parse_gem5_summary(
+    path,
+    *,
+    profile=None,
+    latency="1us",
+    smoke_test=False,
+):
+    if profile is None:
+        profile = profiles.get_profile("g20-2thread-1us")
     path = Path(path)
     if not path.is_file():
         raise artifacts.EvidenceError(f"gem5 summary is missing: {path}")
@@ -269,7 +292,12 @@ def parse_gem5_summary(path, *, smoke_test=False):
         raise artifacts.EvidenceError(
             f"gem5 summary row count is {len(rows)}, expected 1"
         )
-    ticks = _validate_gem5_row(rows[0], smoke_test=smoke_test)
+    ticks = validate_gem5_row(
+        rows[0],
+        profile=profile,
+        latency=latency,
+        smoke_test=smoke_test,
+    )
     return Gem5Evidence(dict(rows[0]), ticks)
 
 
@@ -283,7 +311,13 @@ def _require_decimal_positive(value, name, *, allow_zero=False):
 
 
 def _validate_provenance(
-    provenance, calibration, funcsim, gem5, *, smoke_test=False
+    provenance,
+    calibration,
+    funcsim,
+    gem5,
+    *,
+    profile,
+    smoke_test=False,
 ):
     if provenance is None:
         raise artifacts.EvidenceError("provenance evidence is missing")
@@ -295,9 +329,11 @@ def _validate_provenance(
             )
     if (
         not smoke_test
-        and provenance.graph_sha256 != artifacts.EXPECTED_G20_SHA256
+        and provenance.graph_sha256 != profile.graph_sha256
     ):
-        raise artifacts.EvidenceError("provenance graph hash is not g20")
+        raise artifacts.EvidenceError(
+            "provenance graph hash does not match profile"
+        )
     if provenance.graph_sha256 != gem5.row["graph_sha256"]:
         raise artifacts.EvidenceError("gem5/provenance graph hash mismatch")
     if provenance.m2ndp_config_sha256 != calibration.config_sha256:
@@ -327,10 +363,17 @@ def build_summary(
     ndpsim,
     calibration,
     provenance=None,
+    profile=None,
+    latency="1us",
     smoke_test=False,
 ):
-    sim_ticks = _validate_gem5_row(
-        gem5.row, smoke_test=smoke_test
+    if profile is None:
+        profile = profiles.get_profile("g20-2thread-1us")
+    sim_ticks = validate_gem5_row(
+        gem5.row,
+        profile=profile,
+        latency=latency,
+        smoke_test=smoke_test,
     )
     if sim_ticks != gem5.sim_ticks:
         raise artifacts.EvidenceError(
@@ -384,6 +427,7 @@ def build_summary(
         calibration,
         funcsim,
         gem5,
+        profile=profile,
         smoke_test=smoke_test,
     )
     gem5_seconds = decimal.Decimal(sim_ticks) / decimal.Decimal(10**12)
@@ -402,17 +446,18 @@ def build_summary(
             )
     return {
         "benchmark": "pr_spmv",
+        "profile": profile.name,
         "graph_sha256": provenance.graph_sha256,
         "gem5_binary_sha256": provenance.gem5_binary_sha256,
         "m2ndp_patch_sha256": provenance.m2ndp_patch_sha256,
         "m2ndp_config_sha256": provenance.m2ndp_config_sha256,
         "trace_sha256": provenance.trace_sha256,
-        "iterations": "20",
-        "trials": "2",
-        "measured_trial": "1",
-        "cores": "2",
+        "iterations": str(profile.page_rank_iterations),
+        "trials": str(profile.trials),
+        "measured_trial": str(profile.measured_trial),
+        "cores": str(profile.cores),
         "all_memory_cxl": "True",
-        "cxl_link_delay": "1us",
+        "cxl_link_delay": latency,
         "verification": "pass",
         "funcsim_strict": "pass",
         "funcsim_compared": str(funcsim.compared),

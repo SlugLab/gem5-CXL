@@ -856,6 +856,22 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         }
         self.assertTrue(expected <= set(self.runner.SUMMARY_FIELDS))
 
+    def test_formal_g4_checkpoint_profile_accepts_four_threads(self):
+        args = SimpleNamespace(
+            profile="g4-4thread-sweep",
+            smoke_test=False,
+            graph_scale=4,
+            cores=4,
+            iterations=2,
+            measure_trial=1,
+            cxl_link_delay="500ns",
+            env=["OMP_NUM_THREADS=4"],
+        )
+
+        profile = self.runner.validate_checkpoint_profile(args)
+
+        self.assertEqual(profile.name, "g4-4thread-sweep")
+
     def test_checkpoint_restore_timeout_returns_failure_row(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -2,7 +2,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Run the bit-exact g20 PageRank gem5-to-M2NDP experiment."""
+"""Run a bit-exact PageRank gem5-to-M2NDP experiment profile."""
 
 import argparse
 import csv
@@ -20,11 +20,13 @@ from pathlib import Path
 
 try:
     from scripts import calibrate_m2ndp_cxl as calibration
+    from scripts import gapbs_pr_experiment_profiles as profiles
     from scripts import m2ndp_artifacts as artifacts
     from scripts import m2ndp_pagerank_trace as pagerank_trace
     from scripts import m2ndp_results as results
 except ImportError:
     import calibrate_m2ndp_cxl as calibration
+    import gapbs_pr_experiment_profiles as profiles
     import m2ndp_artifacts as artifacts
     import m2ndp_pagerank_trace as pagerank_trace
     import m2ndp_results as results
@@ -82,6 +84,8 @@ class Options:
     resume: bool
     timeout: int
     stop_after: str | None
+    profile: str = "g20-2thread-1us"
+    cxl_link_delay: str = "1us"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,20 +153,30 @@ def _stage_record():
     }
 
 
+def _experiment_profile(options):
+    profile = profiles.get_profile(options.profile)
+    profiles.require_latency(profile, options.cxl_link_delay)
+    return profile
+
+
 def new_state(options):
+    profile = _experiment_profile(options)
     return {
         "schema": 1,
         "contract": {
             "benchmark": "pr_spmv",
+            "profile": profile.name,
             "graph": str(Path(options.graph).resolve()),
-            "graph_scale": options.graph_scale,
-            "page_rank_iterations": 20,
-            "trials": 2,
-            "measured_trial": 1,
+            "graph_scale": profile.graph_scale,
+            "graph_sha256": profile.graph_sha256,
+            "page_rank_iterations": profile.page_rank_iterations,
+            "trials": profile.trials,
+            "measured_trial": profile.measured_trial,
             "cpu": "timing",
-            "cores": 2,
+            "cores": profile.cores,
+            "threads": profile.threads,
             "all_memory_cxl": True,
-            "cxl_link_delay": "1us",
+            "cxl_link_delay": options.cxl_link_delay,
             "smoke_test": options.smoke_test,
         },
         "stages": {stage: _stage_record() for stage in STAGES},
@@ -267,6 +281,7 @@ def next_stage(state):
 
 
 def gem5_command(options, paths):
+    profile = _experiment_profile(options)
     command = [
         sys.executable,
         str(REPO / "scripts/compare_gapbs_cxl_amu_cira.py"),
@@ -279,19 +294,23 @@ def gem5_command(options, paths):
         "--graph",
         str(Path(options.graph).resolve()),
         "--graph-scale",
-        str(options.graph_scale),
+        str(profile.graph_scale),
+        "--profile",
+        profile.name,
         "--iterations",
-        "2",
+        str(profile.trials),
         "--measure-trial",
-        "1",
+        str(profile.measured_trial),
         "--cpu",
         "timing",
         "--cores",
-        "2",
+        str(profile.cores),
         "--checkpoint-root",
         str(paths.checkpoints),
         "--cxl-link-delay",
-        "1us",
+        options.cxl_link_delay,
+        "--env",
+        f"OMP_NUM_THREADS={profile.threads}",
         "--roi-work-events",
         "--verify",
         "--timeout",
@@ -377,7 +396,7 @@ def _calibration_command(options, paths):
         "--outdir",
         str(paths.calibration),
         "--cxl-delay",
-        "1us",
+        options.cxl_link_delay,
     ]
 
 
@@ -567,9 +586,12 @@ def _m2ndp_runtime_environment(tools):
 
 
 def _pack_reference(options, paths):
+    profile = _experiment_profile(options)
     meta = _graph_meta(paths)
     gem5 = results.parse_gem5_summary(
         paths.gem5_run / "summary.csv",
+        profile=profile,
+        latency=options.cxl_link_delay,
         smoke_test=options.smoke_test,
     )
     build = _load_json(paths.build / "manifest.json", "build manifest")
@@ -589,8 +611,8 @@ def _pack_reference(options, paths):
                 "schema": 1,
                 "graph_sha256": meta.graph_sha256,
                 "num_nodes": meta.num_nodes,
-                "iterations": 20,
-                "measured_trial": 1,
+                "iterations": profile.page_rank_iterations,
+                "measured_trial": profile.measured_trial,
                 "binary_sha256": build["binary_sha256"]["pr_spmv"],
                 "source_sha256": build["matched_source_sha256"],
             },
@@ -602,15 +624,16 @@ def _pack_reference(options, paths):
         raise artifacts.EvidenceError("gem5 baseline has no positive ROI")
 
 
-def _generate_trace(paths):
+def _generate_trace(options, paths):
+    profile = _experiment_profile(options)
     bundle = artifacts.load_graph_bundle(paths.csr)
     try:
         pagerank_trace.generate_trace(
             bundle=bundle,
             reference=artifacts.read_reference(paths.reference),
             outdir=paths.trace,
-            trials=2,
-            iterations=20,
+            trials=profile.trials,
+            iterations=profile.page_rank_iterations,
         )
     finally:
         bundle.in_offsets.close()
@@ -669,9 +692,12 @@ def _git_head(root):
 
 
 def _publish(options, paths):
+    profile = _experiment_profile(options)
     meta = _graph_meta(paths)
     gem5 = results.parse_gem5_summary(
         paths.gem5_run / "summary.csv",
+        profile=profile,
+        latency=options.cxl_link_delay,
         smoke_test=options.smoke_test,
     )
     funcsim_log = (paths.logs / "funcsim.log").read_text(
@@ -708,6 +734,8 @@ def _publish(options, paths):
         ndpsim=ndpsim,
         calibration=calibrated,
         provenance=provenance,
+        profile=profile,
+        latency=options.cxl_link_delay,
         smoke_test=options.smoke_test,
     )
     artifacts.atomic_write_csv(
@@ -788,15 +816,20 @@ def _execute_stage(stage, options, paths, command, log):
                 Path(log).read_text(encoding="utf-8"),
             )
             bundle = artifacts.load_graph_bundle(paths.csr)
-            artifacts.validate_publication_graph(
-                bundle.meta, options.smoke_test
-            )
+            if options.smoke_test:
+                artifacts.validate_publication_graph(bundle.meta, True)
+            else:
+                artifacts.validate_profile_graph(
+                    bundle.meta, _experiment_profile(options)
+                )
             bundle.in_offsets.close()
             bundle.in_neighbors.close()
             bundle.out_degree.close()
         elif stage == "gem5_baseline":
             results.parse_gem5_summary(
                 paths.gem5_run / "summary.csv",
+                profile=_experiment_profile(options),
+                latency=options.cxl_link_delay,
                 smoke_test=options.smoke_test,
             )
         elif stage == "funcsim":
@@ -824,7 +857,7 @@ def _execute_stage(stage, options, paths, command, log):
     if stage == "reference_pack":
         _pack_reference(options, paths)
     elif stage == "trace_generate":
-        _generate_trace(paths)
+        _generate_trace(options, paths)
     elif stage == "publish":
         _publish(options, paths)
     else:
@@ -911,6 +944,18 @@ def run_stage(stage, state, options, paths):
         raise
 
 
+def _migrate_legacy_g20_contract(state, expected_contract):
+    if expected_contract.get("profile") != "g20-2thread-1us":
+        return False
+    legacy_contract = dict(expected_contract)
+    for field in ("profile", "graph_sha256", "threads"):
+        legacy_contract.pop(field)
+    if state.get("contract") != legacy_contract:
+        return False
+    state["contract"] = expected_contract
+    return True
+
+
 def _load_or_create_state(options, paths):
     if paths.status.exists():
         if not options.resume:
@@ -918,9 +963,13 @@ def _load_or_create_state(options, paths):
                 f"run state exists; use --resume: {paths.status}"
             )
         state = _load_json(paths.status, "run state")
-        if state.get("schema") != 1 or state.get("contract") != new_state(
-            options
-        )["contract"]:
+        expected_contract = new_state(options)["contract"]
+        contract_matches = state.get("contract") == expected_contract
+        if not contract_matches:
+            contract_matches = _migrate_legacy_g20_contract(
+                state, expected_contract
+            )
+        if state.get("schema") != 1 or not contract_matches:
             raise artifacts.EvidenceError(
                 "resume contract differs from the recorded run"
             )
@@ -937,15 +986,16 @@ def _load_or_create_state(options, paths):
 
 
 def validate_options(options, paths):
+    profile = _experiment_profile(options)
     if options.timeout < 0:
         raise artifacts.EvidenceError("--timeout must be nonnegative")
     if options.stop_after is not None and options.stop_after not in STAGES:
         raise artifacts.EvidenceError(
             f"unknown --stop-after stage: {options.stop_after}"
         )
-    if options.graph_scale != 20 and not options.smoke_test:
+    if options.graph_scale != profile.graph_scale and not options.smoke_test:
         raise artifacts.EvidenceError(
-            "publication runs require --graph-scale 20"
+            "graph scale does not match experiment profile"
         )
     required_files = (
         ("graph", options.graph),
@@ -961,20 +1011,23 @@ def validate_options(options, paths):
     ):
         if not Path(path).is_dir():
             raise artifacts.EvidenceError(f"{label} is missing: {path}")
-    if (
-        not options.smoke_test
-        and artifacts.sha256_file(options.graph)
-        != artifacts.EXPECTED_G20_SHA256
-    ):
-        raise artifacts.EvidenceError(
-            "publication graph does not match the fixed g20 SHA-256"
-        )
+    if not options.smoke_test:
+        try:
+            profiles.validate_graph(profile, options.graph)
+        except profiles.ProfileError as error:
+            raise artifacts.EvidenceError(str(error)) from error
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--graph", type=Path, required=True)
     parser.add_argument("--graph-scale", type=int, default=20)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(profiles.PROFILES),
+        default="g20-2thread-1us",
+    )
+    parser.add_argument("--cxl-link-delay", default="1us")
     parser.add_argument("--cxlmemuring", type=Path, required=True)
     parser.add_argument("--m2ndp-root", type=Path, required=True)
     parser.add_argument("--gem5", type=Path, required=True)
@@ -995,6 +1048,8 @@ def parse_args(argv=None):
         resume=args.resume,
         timeout=args.timeout,
         stop_after=args.stop_after,
+        profile=args.profile,
+        cxl_link_delay=args.cxl_link_delay,
     )
 
 
@@ -1017,7 +1072,12 @@ def main(argv=None):
             if options.stop_after == stage:
                 print(f"M2NDP_RUN_STOPPED stage={stage}", flush=True)
                 return 0
-    except (artifacts.EvidenceError, OSError, KeyError) as error:
+    except (
+        artifacts.EvidenceError,
+        profiles.ProfileError,
+        OSError,
+        KeyError,
+    ) as error:
         paths.summary.unlink(missing_ok=True)
         print(f"M2NDP_RUN_FAILED error={error}", file=sys.stderr)
         return 1

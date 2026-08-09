@@ -7,6 +7,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
+from scripts import gapbs_pr_experiment_profiles as profiles
 from scripts import m2ndp_artifacts as artifacts
 from scripts import m2ndp_results as results
 
@@ -47,6 +48,7 @@ class M2NDPResultTest(unittest.TestCase):
                 "status": "ok",
                 "verification": "pass",
                 "roi_cpu": "timing",
+                "scale": "20",
                 "cores": "2",
                 "cxl_link_delay": "1us",
                 "all_memory_cxl": "True",
@@ -181,6 +183,57 @@ class M2NDPResultTest(unittest.TestCase):
                 writer.writerow(self.gem5_pass.row)
             evidence = results.parse_gem5_summary(path)
         self.assertEqual(evidence.sim_ticks, 240000)
+
+    def test_g4_gem5_row_requires_four_cores_and_selected_latency(self):
+        row = dict(
+            self.gem5_pass.row,
+            graph_sha256=profiles.G4_SHA256,
+            scale="4",
+            cores="4",
+            cxl_link_delay="2us",
+        )
+
+        ticks = results.validate_gem5_row(
+            row,
+            profile=profiles.get_profile("g4-4thread-sweep"),
+            latency="2us",
+        )
+
+        self.assertEqual(ticks, 240000)
+
+    def test_g4_summary_records_profile_cores_and_latency(self):
+        profile = profiles.get_profile("g4-4thread-sweep")
+        gem5 = results.Gem5Evidence(
+            row=dict(
+                self.gem5_pass.row,
+                graph_sha256=profiles.G4_SHA256,
+                scale="4",
+                cores="4",
+                cxl_link_delay="500ns",
+            ),
+            sim_ticks=240000,
+        )
+        provenance = results.ProvenanceEvidence(
+            **{
+                **self.provenance.__dict__,
+                "graph_sha256": profiles.G4_SHA256,
+            }
+        )
+
+        row = results.build_summary(
+            gem5=gem5,
+            funcsim=self.funcsim_pass,
+            ndpsim=self.ndpsim_pass,
+            calibration=self.calibration_pass,
+            provenance=provenance,
+            profile=profile,
+            latency="500ns",
+        )
+
+        self.assertEqual(row["profile"], "g4-4thread-sweep")
+        self.assertEqual(row["cores"], "4")
+        self.assertEqual(row["cxl_link_delay"], "500ns")
+
 
     def test_parse_gem5_summary_rejects_old_pr_row(self):
         row = dict(self.gem5_pass.row, benchmark="pr")
