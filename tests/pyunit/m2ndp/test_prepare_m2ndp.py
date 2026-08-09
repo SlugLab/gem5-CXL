@@ -106,6 +106,7 @@ class PrepareM2NDPTest(unittest.TestCase):
                     cmake="/toolchain/bin/cmake",
                     cc="/usr/bin/gcc-13",
                     cxx="/usr/bin/g++-13",
+                    conan_compiler_version="13",
                 )
         first = run.call_args_list[0]
         self.assertEqual(
@@ -117,6 +118,12 @@ class PrepareM2NDPTest(unittest.TestCase):
                 "--install-folder",
                 "build",
                 "--build=missing",
+                "--settings",
+                "compiler=gcc",
+                "--settings",
+                "compiler.version=13",
+                "--settings",
+                "compiler.libcxx=libstdc++11",
             ],
         )
         self.assertEqual(
@@ -128,6 +135,16 @@ class PrepareM2NDPTest(unittest.TestCase):
         self.assertTrue(
             first.kwargs["env"]["PATH"].startswith("/toolchain/bin:")
         )
+
+    def test_gcc_major_is_derived_from_validated_toolchain_version(self):
+        self.assertEqual(
+            prepare.gcc_major(
+                "x86_64-linux-gnu-g++-13 (Ubuntu 13.4.0-10ubuntu1) 13.4.0"
+            ),
+            "13",
+        )
+        with self.assertRaisesRegex(prepare.PrepareError, "GCC major"):
+            prepare.gcc_major("unknown compiler")
 
     def test_build_tools_copies_ndpsim_runtime_library(self):
         with tempfile.TemporaryDirectory() as tmp:

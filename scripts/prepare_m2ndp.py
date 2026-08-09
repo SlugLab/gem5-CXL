@@ -173,6 +173,16 @@ def validate_build_toolchain(*, conan, cmake, cc, cxx):
     return tools, versions
 
 
+def gcc_major(version_text):
+    match = re.search(r"\b(\d+)\.\d+(?:\.\d+)?\b", version_text)
+    if match is None:
+        raise PrepareError(
+            "could not derive GCC major from C++ compiler version: "
+            + version_text
+        )
+    return match.group(1)
+
+
 def build_state(
     *,
     root,
@@ -224,6 +234,7 @@ def build_tools(
     cmake="cmake",
     cc="gcc-13",
     cxx="g++-13",
+    conan_compiler_version=None,
 ):
     root = Path(root)
     tools_dir = Path(tools_dir)
@@ -249,6 +260,18 @@ def build_tools(
             "--install-folder",
             "build",
             "--build=missing",
+            *(
+                [
+                    "--settings",
+                    "compiler=gcc",
+                    "--settings",
+                    f"compiler.version={conan_compiler_version}",
+                    "--settings",
+                    "compiler.libcxx=libstdc++11",
+                ]
+                if conan_compiler_version is not None
+                else []
+            ),
         ],
         ["bash", "./scripts/build_functional.sh"],
         ["bash", "./scripts/build_timing.sh"],
@@ -307,6 +330,7 @@ def main(argv=None):
         cmake=toolchain["cmake"],
         cc=toolchain["cc"],
         cxx=toolchain["cxx"],
+        conan_compiler_version=gcc_major(toolchain_versions["cxx"]),
     )
     state = build_state(
         root=args.m2ndp_root,
