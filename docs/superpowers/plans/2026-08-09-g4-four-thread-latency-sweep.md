@@ -82,7 +82,7 @@ class ExperimentProfileTest(unittest.TestCase):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_gapbs_pr_experiment_profiles -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_gapbs_pr_experiment_profiles.py' -v
 ```
 
 Expected: FAIL with an import error for `gapbs_pr_experiment_profiles`.
@@ -171,7 +171,7 @@ def require_latency(profile, latency):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_gapbs_pr_experiment_profiles -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_gapbs_pr_experiment_profiles.py' -v
 ```
 
 Expected: all profile tests PASS.
@@ -227,7 +227,7 @@ def test_g4_row_rejects_two_core_result(self):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_run_gapbs_matched_pr_spmv_variants -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_matched_pr_spmv_variants.py' -v
 ```
 
 Expected: FAIL because profile and latency arguments are unsupported.
@@ -306,7 +306,7 @@ and developer smoke callers.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_run_gapbs_matched_pr_spmv_variants tests.pyunit.m2ndp.test_matched_pr_spmv_variants -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_*matched_pr_spmv_variants.py' -v
 ```
 
 Expected: PASS, including unchanged g20 defaults and new g4/four-thread cases.
@@ -375,7 +375,7 @@ def test_g4_m2ndp_command_is_four_core_two_trial_fixed_twenty(self):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_m2ndp_artifacts tests.pyunit.m2ndp.test_m2ndp_results tests.pyunit.m2ndp.test_run_m2ndp_g20_pr_spmv -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_*m2ndp*.py' -v
 ```
 
 Expected: FAIL on missing profile-aware APIs and option fields.
@@ -457,7 +457,7 @@ profile and latency into `m2ndp_results`.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_m2ndp_artifacts tests.pyunit.m2ndp.test_m2ndp_results tests.pyunit.m2ndp.test_run_m2ndp_g20_pr_spmv tests.pyunit.m2ndp.test_m2ndp_trace -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_*m2ndp*.py' -v
 ```
 
 Expected: all tests PASS for g20 defaults and g4 formal profile.
@@ -515,7 +515,7 @@ class SweepRunnerTest(unittest.TestCase):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_run_gapbs_g4_4thread_latency_sweep -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_g4_4thread_latency_sweep.py' -v
 ```
 
 Expected: FAIL because the sweep module does not exist.
@@ -555,7 +555,7 @@ latency under `runs/<latency>/` and never write to existing g20 roots.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_run_gapbs_g4_4thread_latency_sweep -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_g4_4thread_latency_sweep.py' -v
 ```
 
 Expected: all matrix, command, resume, and failure tests PASS.
@@ -609,7 +609,7 @@ def test_raw_hash_mismatch_blocks_publication(self):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_generate_gapbs_g4_4thread_latency_results -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_generate_gapbs_g4_4thread_latency_results.py' -v
 ```
 
 Expected: FAIL because the publisher does not exist.
@@ -651,7 +651,7 @@ to `published/` only after reloading and revalidating all outputs.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_generate_gapbs_g4_4thread_latency_results -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_generate_gapbs_g4_4thread_latency_results.py' -v
 ```
 
 Expected: all completeness, correctness, arithmetic, and atomic-publication
@@ -694,7 +694,7 @@ def test_vanilla_is_explicit_one_x_reference(self):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_generate_gapbs_g4_4thread_latency_figure -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_generate_gapbs_g4_4thread_latency_figure.py' -v
 ```
 
 Expected: FAIL because the figure module does not exist.
@@ -712,7 +712,7 @@ and evidence SHA-256 in PDF/SVG metadata. Use fixed colors and
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_generate_gapbs_g4_4thread_latency_figure -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_generate_gapbs_g4_4thread_latency_figure.py' -v
 ```
 
 Expected: PASS and deterministic non-empty PDF/SVG byte streams.
