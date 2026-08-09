@@ -740,8 +740,16 @@ git commit -m "feat: plot g4 four-thread latency sweep"
 Document these paths and parameters:
 
 ```bash
-python3 scripts/build_gapbs_matched_pr_spmv_variants.py \
+python3 scripts/build_gapbs_m2ndp_pr_spmv.py \
   --cxlmemuring /home/victoryang00/CXLMemUring \
+  --outdir m5out/g4_4thread_latency_sweep_20260809/build/baseline \
+  --reference-raw m5out/g4_4thread_latency_sweep_20260809/build/baseline-unused.u32 \
+  --m5-library util/m5/build/x86/out/libm5.a
+
+python3 scripts/build_gapbs_matched_pr_spmv_variants.py \
+  --baseline-build m5out/g4_4thread_latency_sweep_20260809/build/baseline \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m5-library util/m5/build/x86/out/libm5.a \
   --outdir m5out/g4_4thread_latency_sweep_20260809/build/variants
 
 python3 scripts/run_gapbs_g4_4thread_latency_sweep.py \
@@ -759,27 +767,15 @@ python3 scripts/run_gapbs_g4_4thread_latency_sweep.py \
 Run:
 
 ```bash
-python3 -m unittest \
-  tests.pyunit.m2ndp.test_gapbs_pr_experiment_profiles \
-  tests.pyunit.m2ndp.test_run_gapbs_matched_pr_spmv_variants \
-  tests.pyunit.m2ndp.test_m2ndp_artifacts \
-  tests.pyunit.m2ndp.test_m2ndp_results \
-  tests.pyunit.m2ndp.test_run_m2ndp_g20_pr_spmv \
-  tests.pyunit.m2ndp.test_run_gapbs_g4_4thread_latency_sweep \
-  tests.pyunit.m2ndp.test_generate_gapbs_g4_4thread_latency_results \
-  tests.pyunit.m2ndp.test_generate_gapbs_g4_4thread_latency_figure \
-  -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_*.py' -v
+python3 -m unittest discover -s tests/pyunit/amu -p 'test_*.py' -v
 ```
 
 Expected: all listed tests PASS with zero failures and zero errors.
 
-Run:
-
-```bash
-python3 -m unittest discover -s tests/pyunit -p 'test_*.py'
-```
-
-Expected: full Python unit suite PASS.
+The repository-wide `tests/pyunit/test_run.py` file is a gem5 TestLib
+registration entrypoint, not a standalone `unittest` module; do not include
+it in ordinary discovery without initializing TestLib configuration.
 
 - [ ] **Step 3: Run static and compatibility checks**
 
@@ -872,8 +868,7 @@ After the service exits successfully, run:
 
 ```bash
 python3 scripts/generate_gapbs_g4_4thread_latency_results.py \
-  --results-root m5out/g4_4thread_latency_sweep_20260809 \
-  --output-dir m5out/g4_4thread_latency_sweep_20260809/published
+  --sweep-root m5out/g4_4thread_latency_sweep_20260809
 ```
 
 Expected: exactly 16 rows, four passed calibrations, zero bit mismatches, and

@@ -256,6 +256,125 @@ are moved to sibling backups, and a failed promotion restores the prior five
 files byte-for-byte. No partial table/figure generation is visible to the
 paper.
 
+## Formal g4 four-thread latency sweep
+
+This sweep is separate from the g20 services above. It uses the fixed graph
+
+```text
+/home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_graphs/g4.sg
+```
+
+whose required SHA-256 is
+`f234532690f6cfc30e993c4d9a1839e65002a618e7da20ea6a4242818b9c6c3d`.
+The formal profile fixes four timing cores, `OMP_NUM_THREADS=4`, all-CXL
+memory, two trials with trial 1 measured, 20 synchronous double-buffered
+PageRank iterations, and link latencies 200 ns, 500 ns, 1 us, and 2 us. Do
+not add `--smoke-test` to any command in this section.
+
+Build the common fixed-float32 source tree and the aggressive bit-exact AMU
+and coherent CIRA binaries:
+
+```sh
+python3 scripts/build_gapbs_m2ndp_pr_spmv.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --outdir m5out/g4_4thread_latency_sweep_20260809/build/baseline \
+  --reference-raw \
+    m5out/g4_4thread_latency_sweep_20260809/build/baseline-unused.u32 \
+  --m5-library util/m5/build/x86/out/libm5.a
+
+python3 scripts/build_gapbs_matched_pr_spmv_variants.py \
+  --baseline-build \
+    m5out/g4_4thread_latency_sweep_20260809/build/baseline \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m5-library util/m5/build/x86/out/libm5.a \
+  --outdir m5out/g4_4thread_latency_sweep_20260809/build/variants
+```
+
+Run the full 16-entry matrix in the foreground with no wall-clock limit:
+
+```sh
+python3 scripts/run_gapbs_g4_4thread_latency_sweep.py \
+  --graph \
+    /home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_graphs/g4.sg \
+  --variants-build \
+    m5out/g4_4thread_latency_sweep_20260809/build/variants \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m2ndp-root m5out/m2ndp/source \
+  --gem5 build/X86/gem5.opt \
+  --outdir m5out/g4_4thread_latency_sweep_20260809 \
+  --timeout 0
+```
+
+The order within every latency is Vanilla CXL, AMU, CIRA, then M2NDP. The
+Vanilla action stops the latency-specific M2NDP runner immediately after its
+fresh gem5 baseline; the later M2NDP action resumes the same hashed state.
+AMU and CIRA use isolated run directories and four-core checkpoint identities.
+No path above overlaps a g20 result or checkpoint directory.
+
+Before starting the persistent matrix, exercise the complete 200 ns row in
+an isolated proof root:
+
+```sh
+python3 scripts/run_gapbs_g4_4thread_latency_sweep.py \
+  --graph \
+    /home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_graphs/g4.sg \
+  --variants-build \
+    m5out/g4_4thread_latency_sweep_20260809/build/variants \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m2ndp-root m5out/m2ndp/source \
+  --gem5 build/X86/gem5.opt \
+  --outdir m5out/g4_4thread_latency_sweep_20260809-proof \
+  --stop-after-latency 200ns \
+  --timeout 0
+```
+
+The stop boundary is reached only after Vanilla, AMU, CIRA, and M2NDP have
+all passed at 200 ns. Its state contract records the stop latency, so it
+cannot later be resumed as the formal four-latency sweep.
+
+After an interruption, resume only from the same command contract:
+
+```sh
+python3 scripts/run_gapbs_g4_4thread_latency_sweep.py \
+  --graph \
+    /home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_graphs/g4.sg \
+  --variants-build \
+    m5out/g4_4thread_latency_sweep_20260809/build/variants \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m2ndp-root m5out/m2ndp/source \
+  --gem5 build/X86/gem5.opt \
+  --outdir m5out/g4_4thread_latency_sweep_20260809 \
+  --timeout 0 --resume
+```
+
+Resume accepts a passed entry only when its canonical output hash still
+matches. A failed or interrupted entry and all later entries return to
+pending. Input path, profile, graph, core/thread, trial, iteration, and
+latency-contract drift is rejected before any child process starts.
+
+Only after all 16 entries are passed, collect and atomically publish the
+canonical table inputs, then render the vector figure:
+
+```sh
+python3 scripts/generate_gapbs_g4_4thread_latency_results.py \
+  --sweep-root m5out/g4_4thread_latency_sweep_20260809
+
+python3 scripts/generate_gapbs_g4_4thread_latency_figure.py \
+  --csv \
+    m5out/g4_4thread_latency_sweep_20260809/published/gapbs-g4-4thread-latency-results.csv \
+  --evidence \
+    m5out/g4_4thread_latency_sweep_20260809/published/gapbs-g4-4thread-latency-evidence.json \
+  --outdir m5out/g4_4thread_latency_sweep_20260809/published
+```
+
+The publication directory must then contain the unrounded 16-row CSV, the
+machine-readable evidence JSON, `gapbs-g4-4thread-latency-table.tex`, and the
+PDF/SVG figure. The collector independently recomputes all host and M2NDP
+latencies and all same-latency speedups; checks four active balanced CIRA
+ports, AMU issued/completed balance, exact per-latency result-vector hashes,
+and all four M2NDP calibrations. Until these gates pass, do not replace the
+paper table or describe an intermediate row as a completed comparison.
+
 ## Current background recovery policy
 
 Periodic and live CRIU checkpointing are disabled. The old
