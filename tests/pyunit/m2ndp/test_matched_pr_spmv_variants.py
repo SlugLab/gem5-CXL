@@ -47,6 +47,25 @@ class MatchedVariantSourceTest(unittest.TestCase):
         )
         self.assertIn("constexpr int kPageRankIterations = 20;", generated)
 
+    def test_amu_primes_worker_stack_pages_before_trial_zero_checkpoint(self):
+        generated = variants.transform_source(
+            FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
+        )
+
+        prime = generated.index("gapbs_amu::prime_worker_stack_pages();")
+        work_begin = generated.index("m5_work_begin(trial, 0);")
+        self.assertLess(prime, work_begin)
+        self.assertIn("#pragma omp parallel", variants.amu_builder.AMU_HEADER)
+        self.assertIn(
+            "volatile unsigned char stack_pages[",
+            variants.amu_builder.AMU_HEADER,
+        )
+
+        cira = variants.transform_source(
+            FIXED_SOURCE.read_text(encoding="utf-8"), "cira"
+        )
+        self.assertNotIn("prime_worker_stack_pages", cira)
+
     def test_cira_prefetches_future_row_batches_before_ordered_adds(self):
         generated = variants.transform_source(
             FIXED_SOURCE.read_text(encoding="utf-8"), "cira"

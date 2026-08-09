@@ -72,6 +72,7 @@ _CIRA_PULL_LOOP = (
     "        incoming_total = incoming_total + outgoing_contrib[v];\n"
     "      }"
 )
+_WORK_BEGIN = "    m5_work_begin(trial, 0);"
 
 
 class VariantEvidenceError(RuntimeError):
@@ -95,11 +96,22 @@ def transform_source(source, kind):
             "fixed source must contain exactly one ordered pull loop"
         )
     transformed = source.replace('#include "pvector.h"\n', include, 1)
-    return transformed.replace(
+    transformed = transformed.replace(
         _PULL_LOOP,
         _AMU_PULL_LOOP if kind == "amu" else _CIRA_PULL_LOOP,
         1,
     )
+    if kind == "amu":
+        if transformed.count(_WORK_BEGIN) != 1:
+            raise VariantEvidenceError(
+                "fixed source must contain exactly one trial work-begin"
+            )
+        transformed = transformed.replace(
+            _WORK_BEGIN,
+            "    gapbs_amu::prime_worker_stack_pages();\n" + _WORK_BEGIN,
+            1,
+        )
+    return transformed
 
 
 def compile_command(
