@@ -2,7 +2,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Run only fixed-20 AMU/CIRA variants against the g20 publication contract."""
+"""Run fixed-20 AMU/CIRA variants against a formal experiment profile."""
 
 import argparse
 import json
@@ -13,14 +13,12 @@ from types import SimpleNamespace
 
 try:
     from scripts import compare_gapbs_cxl_amu_cira as comparison
+    from scripts import gapbs_pr_experiment_profiles as profiles
     from scripts import m2ndp_artifacts as artifacts
 except ImportError:
     import compare_gapbs_cxl_amu_cira as comparison
+    import gapbs_pr_experiment_profiles as profiles
     import m2ndp_artifacts as artifacts
-
-
-REPO = Path(__file__).resolve().parents[1]
-EXPECTED_G20_WORDS = 1 << 20
 
 
 class VariantRunError(RuntimeError):
@@ -28,22 +26,29 @@ class VariantRunError(RuntimeError):
 
 
 def make_compare_args(options):
+    profile = profiles.get_profile(
+        getattr(options, "profile", "g20-2thread-1us")
+    )
+    cxl_link_delay = getattr(options, "cxl_link_delay", "1us")
+    profiles.require_latency(profile, cxl_link_delay)
+    smoke_test = getattr(options, "smoke_test", False)
+    graph_scale = options.graph_scale if smoke_test else profile.graph_scale
     return SimpleNamespace(
         gem5=Path(options.gem5).resolve(),
         config=Path(options.config).resolve(),
-        scale=options.graph_scale,
-        iterations=2,
+        scale=graph_scale,
+        iterations=profile.trials,
         cpu="timing",
         fast_forward_cpu=None,
-        measure_trial=1,
-        cores=2,
+        measure_trial=profile.measured_trial,
+        cores=profile.cores,
         mem_size="4GiB",
         graph=Path(options.graph).resolve(),
-        graph_scale=options.graph_scale,
+        graph_scale=graph_scale,
         checkpoint_root=Path(options.checkpoint_root).resolve(),
         reuse_checkpoints=True,
-        smoke_test=getattr(options, "smoke_test", False),
-        cxl_link_delay="1us",
+        smoke_test=smoke_test,
+        cxl_link_delay=cxl_link_delay,
         disable_hw_prefetchers=False,
         l1_mshrs=None,
         l1_tgts_per_mshr=None,
@@ -65,7 +70,7 @@ def make_compare_args(options):
         cira_completion_latency="0ns",
         roi_work_events=True,
         verify=True,
-        env=[],
+        env=[f"OMP_NUM_THREADS={profile.threads}"],
         allow_zero_cira=False,
         timeout=options.timeout,
         dry_run=False,
@@ -82,17 +87,26 @@ def _integer(row, field):
         ) from error
 
 
-def validate_row(row, kind, *, smoke_test):
+def validate_row(
+    row,
+    kind,
+    *,
+    smoke_test,
+    profile_name="g20-2thread-1us",
+    latency="1us",
+):
+    profile = profiles.get_profile(profile_name)
+    profiles.require_latency(profile, latency)
     expected = {
         "benchmark": "pr_spmv",
         "kind": kind,
         "status": "ok",
         "verification": "pass",
-        "iterations": 2,
-        "measured_trial": 1,
+        "iterations": profile.trials,
+        "measured_trial": profile.measured_trial,
         "roi_cpu": "timing",
-        "cores": 2,
-        "cxl_link_delay": "1us",
+        "cores": profile.cores,
+        "cxl_link_delay": latency,
         "all_memory_cxl": True,
         "checkpoint_restores": 1,
     }
@@ -101,11 +115,16 @@ def validate_row(row, kind, *, smoke_test):
             raise VariantRunError(
                 f"{kind} {field}={row.get(field)!r}, expected {value!r}"
             )
-    if (
-        not smoke_test
-        and row.get("graph_sha256") != artifacts.EXPECTED_G20_SHA256
-    ):
-        raise VariantRunError(f"{kind} graph SHA-256 is not fixed g20")
+    if not smoke_test:
+        if row.get("scale") != profile.graph_scale:
+            raise VariantRunError(
+                f"{kind} scale={row.get('scale')!r}, "
+                f"expected {profile.graph_scale!r}"
+            )
+        if row.get("graph_sha256") != profile.graph_sha256:
+            raise VariantRunError(
+                f"{kind} graph SHA-256 does not match {profile.name}"
+            )
     if _integer(row, "sim_ticks") <= 0:
         raise VariantRunError(f"{kind} sim_ticks must be positive")
     if kind == "amu":
@@ -129,7 +148,11 @@ def validate_row(row, kind, *, smoke_test):
     return row
 
 
-def validate_config_delay(path):
+def validate_config_delay(path, latency="1us"):
+    try:
+        expected_ticks = profiles.LATENCY_TICKS[latency]
+    except KeyError as error:
+        raise VariantRunError(f"unsupported CXL latency: {latency}") from error
     values = [
         line.split("=", 1)[1].strip()
         for line in Path(path).read_text(
@@ -137,11 +160,12 @@ def validate_config_delay(path):
         ).splitlines()
         if line.startswith("delay=")
     ]
-    if values != ["1000000"]:
+    expected = str(expected_ticks)
+    if values != [expected]:
         raise VariantRunError(
-            f"{path}: CXL delay values are {values!r}, expected ['1000000']"
+            f"{path}: CXL delay values are {values!r}, expected {[expected]!r}"
         )
-    return 1_000_000
+    return expected_ticks
 
 
 def load_manifest(path):
@@ -208,6 +232,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--graph", type=Path, required=True)
     parser.add_argument("--graph-scale", type=int, default=20)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(profiles.PROFILES),
+        default="g20-2thread-1us",
+    )
+    parser.add_argument("--cxl-link-delay", default="1us")
     parser.add_argument("--variants-build", type=Path, required=True)
     parser.add_argument(
         "--kind",
@@ -230,10 +260,17 @@ def main(argv=None):
     summary_path.unlink(missing_ok=True)
     evidence_path.unlink(missing_ok=True)
     try:
+        profile = profiles.get_profile(options.profile)
+        profiles.require_latency(profile, options.cxl_link_delay)
         if options.timeout < 0:
             raise VariantRunError("--timeout must be nonnegative")
-        if options.graph_scale != 20 and not options.smoke_test:
-            raise VariantRunError("publication graph scale must be 20")
+        if (
+            options.graph_scale != profile.graph_scale
+            and not options.smoke_test
+        ):
+            raise VariantRunError(
+                "graph scale does not match experiment profile"
+            )
         for label, path in (
             ("gem5", options.gem5),
             ("gem5 config", options.config),
@@ -241,12 +278,8 @@ def main(argv=None):
         ):
             if not Path(path).is_file():
                 raise VariantRunError(f"{label} is missing: {path}")
-        if (
-            not options.smoke_test
-            and artifacts.sha256_file(options.graph)
-            != artifacts.EXPECTED_G20_SHA256
-        ):
-            raise VariantRunError("publication graph is not fixed g20")
+        if not options.smoke_test:
+            profiles.validate_graph(profile, options.graph)
 
         manifest_path = options.variants_build / "manifest.json"
         manifest, variants = load_manifest(manifest_path)
@@ -269,12 +302,20 @@ def main(argv=None):
                 binary.parent,
                 kind,
             )
-            validate_row(row, kind, smoke_test=options.smoke_test)
+            validate_row(
+                row,
+                kind,
+                smoke_test=options.smoke_test,
+                profile_name=profile.name,
+                latency=options.cxl_link_delay,
+            )
             run_dir = Path(row["run_dir"])
-            delay_ticks = validate_config_delay(run_dir / "config.ini")
+            delay_ticks = validate_config_delay(
+                run_dir / "config.ini", options.cxl_link_delay
+            )
             reference = Path(variant["reference_raw"])
             expected_words = (
-                EXPECTED_G20_WORDS
+                profile.num_nodes
                 if not options.smoke_test
                 else reference.stat().st_size // 4
             )
@@ -299,6 +340,8 @@ def main(argv=None):
             evidence_path,
             {
                 "schema": 1,
+                "profile": profile.name,
+                "cxl_link_delay": options.cxl_link_delay,
                 "graph_sha256": artifacts.sha256_file(options.graph),
                 "variant_manifest": str(manifest_path.resolve()),
                 "variant_manifest_sha256": artifacts.sha256_file(
@@ -314,6 +357,7 @@ def main(argv=None):
     except (
         VariantRunError,
         artifacts.EvidenceError,
+        profiles.ProfileError,
         OSError,
         KeyError,
     ) as error:

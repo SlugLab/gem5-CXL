@@ -38,6 +38,85 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         self.assertTrue(args.verify)
         self.assertEqual(args.timeout, 0)
 
+    def test_g4_profile_builds_four_core_latency_specific_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            options = SimpleNamespace(
+                profile="g4-4thread-sweep",
+                gem5=root / "gem5.opt",
+                config=root / "config.py",
+                graph=root / "g4.sg",
+                graph_scale=4,
+                cxl_link_delay="500ns",
+                checkpoint_root=root / "checkpoints",
+                outdir=root / "run",
+                timeout=0,
+            )
+
+            args = runner.make_compare_args(options)
+
+        self.assertEqual(args.scale, 4)
+        self.assertEqual(args.cores, 4)
+        self.assertEqual(args.cxl_link_delay, "500ns")
+        self.assertIn("OMP_NUM_THREADS=4", args.env)
+
+    def test_g4_row_rejects_two_core_result(self):
+        row = self.valid_row("cira")
+        row.update(
+            scale=4,
+            cores=2,
+            cxl_link_delay="500ns",
+            graph_sha256=(
+                "f234532690f6cfc30e993c4d9a1839e65002a618e7da20ea"
+                "6a4242818b9c6c3d"
+            ),
+        )
+
+        with self.assertRaisesRegex(runner.VariantRunError, "cores"):
+            runner.validate_row(
+                row,
+                "cira",
+                profile_name="g4-4thread-sweep",
+                latency="500ns",
+                smoke_test=False,
+            )
+
+    def test_config_delay_uses_selected_latency_ticks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.ini"
+            config.write_text("delay=500000\n", encoding="utf-8")
+
+            ticks = runner.validate_config_delay(config, "500ns")
+
+        self.assertEqual(ticks, 500_000)
+
+    def test_cli_accepts_formal_g4_profile_and_latency(self):
+        options = runner.parse_args(
+            [
+                "--gem5",
+                "gem5.opt",
+                "--graph",
+                "g4.sg",
+                "--graph-scale",
+                "4",
+                "--variants-build",
+                "variants",
+                "--kind",
+                "amu",
+                "--checkpoint-root",
+                "checkpoints",
+                "--outdir",
+                "run",
+                "--profile",
+                "g4-4thread-sweep",
+                "--cxl-link-delay",
+                "2us",
+            ]
+        )
+
+        self.assertEqual(options.profile, "g4-4thread-sweep")
+        self.assertEqual(options.cxl_link_delay, "2us")
+
     def test_amu_row_requires_completed_owned_loads(self):
         row = self.valid_row("amu")
         row["asmc_loads"] = 32
