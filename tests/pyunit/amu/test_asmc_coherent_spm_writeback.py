@@ -36,6 +36,19 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
         self.assertIn("state.spmChunks", SOURCE)
         self.assertIn("RequestPhase::SpmWriteback", SOURCE)
 
+    def test_load_source_uses_coherent_timing_read_not_functional_read(self):
+        issue = SOURCE[
+            SOURCE.index("ASMC::issue(ThreadContext"):
+            SOURCE.index("ASMC::startSpmWriteback")
+        ]
+        self.assertIn("MemCmd::ReadReq", issue)
+        self.assertIn(
+            "enqueuePackets(*raw_state, chunks, command, "
+            "RequestPhase::MemoryAccess)",
+            issue,
+        )
+        self.assertNotIn("readGuest(tc, mem_addr", issue)
+
     def test_finished_queue_is_after_writeback_not_functional_write(self):
         complete = SOURCE[
             SOURCE.index("ASMC::completeRequest"):

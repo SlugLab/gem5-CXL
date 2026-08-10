@@ -83,14 +83,15 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         self.assertLess(completion, copy_value)
         self.assertNotIn("memset(spm_, 0", header)
 
-    def test_window_flushes_each_source_before_issue(self):
+    def test_window_uses_coherent_source_reads_without_source_flushes(self):
         header = self.builder.AMU_HEADER
-        self.assertIn("flush_source_lines(addrs_[i], sizes_[i])", header)
-        flush = header.index("flush_source_lines(addrs_[i], sizes_[i])")
-        issue = header.index("amu_aload(spm_[i]", flush)
-        self.assertLess(flush, issue)
-        self.assertNotIn("flushed_lines", header)
-        issue_body = header[header.index("void issue_all()"):header.index("void wait_all()")]
+        self.assertNotIn("flush_source_lines", header)
+        issue_body = header[
+            header.index("void issue_all()") : header.index("void wait_all()")
+        ]
+        invalidate = issue_body.index("invalidate_spm_slot(spm_[i])")
+        issue = issue_body.index("amu_aload(spm_[i]")
+        self.assertLess(invalidate, issue)
         self.assertEqual(issue_body.count("mfence"), 1)
 
     def transform_source(self, benchmark, patch_function):

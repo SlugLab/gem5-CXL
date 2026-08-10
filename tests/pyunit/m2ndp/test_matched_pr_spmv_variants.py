@@ -52,26 +52,19 @@ class MatchedVariantSourceTest(unittest.TestCase):
             1,
         )
         self.assertIn("constexpr int kPageRankIterations = 20;", generated)
+        self.assertEqual(generated.count("gapbs_amu::load_values("), 2)
+        self.assertNotIn("gapbs_amu::load_value(", generated)
 
-    def test_amu_primes_worker_stack_pages_before_trial_zero_checkpoint(self):
+    def test_amu_has_no_variant_only_trial_zero_priming(self):
         generated = variants.transform_source(
             FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
         )
 
-        prime = generated.index("gapbs_amu::prime_worker_stack_pages();")
-        graph_prime = generated.index("gapbs_amu::prime_graph_pages(g);")
-        work_begin = generated.index("m5_work_begin(trial, 0);")
-        self.assertLess(graph_prime, prime)
-        self.assertLess(prime, work_begin)
-        self.assertIn("if (trial == 0)", generated[graph_prime - 40:prime])
-        self.assertIn("#pragma omp parallel", variants.amu_builder.AMU_HEADER)
-        self.assertIn(
-            "volatile unsigned char stack_pages[",
-            variants.amu_builder.AMU_HEADER,
-        )
-        self.assertIn(
-            "static inline void prime_graph_pages",
-            variants.amu_builder.AMU_HEADER,
+        self.assertNotIn("prime_graph_pages", generated)
+        self.assertNotIn("prime_worker_stack_pages", generated)
+        self.assertNotIn("prime_graph_pages", variants.amu_builder.AMU_HEADER)
+        self.assertNotIn(
+            "prime_worker_stack_pages", variants.amu_builder.AMU_HEADER
         )
 
         cira = variants.transform_source(
