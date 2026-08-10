@@ -4,17 +4,162 @@
 
 """Frozen CIRA rolling-window policy for formal PageRank experiments."""
 
+from dataclasses import asdict
+
+try:
+    from scripts import cira_hoist_model
+except ImportError:
+    import cira_hoist_model
+
 
 ROW_BLOCK_SIZE = 64
 CANDIDATE_1US_LEADS = (1, 2, 4, 8)
+SOURCE_CANDIDATES = {
+    "A": {
+        "name": "static-default",
+        "row_window_rows": 64,
+        "lead_blocks": 1,
+    },
+    "B": {
+        "name": "row-window-2048",
+        "row_window_rows": 2048,
+        "lead_blocks": 32,
+    },
+    "C": {
+        "name": "row-window-1024",
+        "row_window_rows": 1024,
+        "lead_blocks": 16,
+    },
+}
+CALIBRATED_1US_LEADS = tuple(
+    sorted({spec["lead_blocks"] for spec in SOURCE_CANDIDATES.values()})
+)
+ALL_1US_LEADS = tuple(sorted(set(CANDIDATE_1US_LEADS + CALIBRATED_1US_LEADS)))
 
 
 class LeadPolicyError(ValueError):
     pass
 
 
+def _source_rows(calibration):
+    try:
+        rows = calibration["sources"]["cira_csv"]["rows"]["pr_spmv"]
+    except (KeyError, TypeError) as error:
+        raise LeadPolicyError("calibration has no pr_spmv source rows") from error
+    if not isinstance(rows, dict):
+        raise LeadPolicyError("calibration pr_spmv rows are invalid")
+    return rows
+
+
+def _require_verified_row(rows, source_row):
+    try:
+        row = rows[source_row]
+    except KeyError as error:
+        raise LeadPolicyError(f"missing source row {source_row}") from error
+    if row.get("verification") != "PASS" or row.get("return_code") != 0:
+        raise LeadPolicyError(f"source row {source_row} is not verified")
+    return row
+
+
+def _hoist_candidate(source_row, *, cxl_latency_ns):
+    spec = SOURCE_CANDIDATES[source_row]
+    return cira_hoist_model.HoistCandidate(
+        name=source_row,
+        operands_dominate=True,
+        guards_available=True,
+        alias_safe=True,
+        invalidation_safe=True,
+        lifetime_safe=True,
+        available_slack_ns=cxl_latency_ns + 200,
+        issue_ns=5,
+        index_walk_ns=80,
+        queue_wait_ns=20,
+        cxl_memory_ns=cxl_latency_ns,
+        cache_install_ns=40,
+        expected_saved_stall_ns=400,
+        usefulness_probability=0.75,
+        descriptor_formation_ns=20,
+        runtime_guards_ns=10,
+        selection_cost_ns=0,
+        extra_traffic_ns=40,
+        cache_pollution_ns=10,
+        late_request_ns=20,
+        lead_rows=spec["row_window_rows"],
+    )
+
+
+def resolve_mode(
+    calibration, mode, *, source_row=None, cxl_latency_ns=1000
+):
+    """Resolve one mode from approved hardware rows and gate its hoist."""
+
+    if mode not in {"static", "pgo-selected", "few-shot-online"}:
+        raise LeadPolicyError(f"unknown CIRA mode {mode}")
+    if not isinstance(cxl_latency_ns, int) or cxl_latency_ns <= 0:
+        raise LeadPolicyError("CXL latency must be a positive integer")
+    rows = _source_rows(calibration)
+    if mode == "static":
+        if source_row not in {None, "A"}:
+            raise LeadPolicyError("static mode is fixed to source row A")
+        selected_row = "A"
+    elif mode == "pgo-selected":
+        if source_row is not None:
+            raise LeadPolicyError("PGO source row cannot be overridden")
+        candidates = {
+            name: _hoist_candidate(name, cxl_latency_ns=cxl_latency_ns)
+            for name in SOURCE_CANDIDATES
+        }
+        try:
+            selected_row = cira_hoist_model.select_pgo(candidates, rows).name
+        except cira_hoist_model.PolicyError as error:
+            raise LeadPolicyError(str(error)) from error
+        try:
+            declared = calibration["cira"]["primary"]["selected_source_mode"]
+        except (KeyError, TypeError) as error:
+            raise LeadPolicyError("calibration has no selected source mode") from error
+        if declared != selected_row:
+            raise LeadPolicyError(
+                f"PGO selected source {selected_row} differs from manifest {declared}"
+            )
+    else:
+        if source_row not in SOURCE_CANDIDATES:
+            raise LeadPolicyError(
+                "few-shot-online requires source row A, B, or C"
+            )
+        selected_row = source_row
+
+    source_evidence = _require_verified_row(rows, selected_row)
+    spec = SOURCE_CANDIDATES[selected_row]
+    if spec["row_window_rows"] % ROW_BLOCK_SIZE:
+        raise LeadPolicyError("source row window is not divisible by 64 rows")
+    if spec["lead_blocks"] != spec["row_window_rows"] // ROW_BLOCK_SIZE:
+        raise LeadPolicyError("source row lead differs from its row window")
+    candidate = _hoist_candidate(selected_row, cxl_latency_ns=cxl_latency_ns)
+    resources = cira_hoist_model.ResourceState(
+        descriptor_queue_free=1,
+        csr_walk_queue_free=1,
+        outstanding_reads_free=1,
+        destination_ports_free=1,
+        mshrs_free=1,
+        max_lead_rows=spec["row_window_rows"],
+    )
+    decision = cira_hoist_model.evaluate(candidate, resources)
+    if not decision.emit_prefetch:
+        raise LeadPolicyError(
+            f"CIRA {mode}/{selected_row} hoist rejected: {decision.reason}"
+        )
+    return {
+        "mode": mode,
+        "source_row": selected_row,
+        **spec,
+        "hardware_mean_time_ms": source_evidence.get("mean_time_ms"),
+        "hardware_speedup_mean": source_evidence.get("speedup_mean"),
+        "hoist_decision": asdict(decision),
+    }
+
+
 def lead_blocks_for_latency(selected_1us, latency_ns):
-    if selected_1us not in CANDIDATE_1US_LEADS:
+    if selected_1us not in ALL_1US_LEADS:
         raise LeadPolicyError("1us lead is outside the qualification set")
     if latency_ns <= 0:
         raise LeadPolicyError("latency must be positive")

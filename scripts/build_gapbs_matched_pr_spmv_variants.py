@@ -6,6 +6,7 @@
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import struct
@@ -16,11 +17,15 @@ try:
     from scripts import build_gapbs_amu_cxlmemuring as amu_builder
     from scripts import build_gapbs_cira_cxlmemuring as cira_builder
     from scripts import build_gapbs_m2ndp_pr_spmv as baseline_builder
+    from scripts import amu_cira_calibration as calibration
+    from scripts import cira_lead_policy
     from scripts import m2ndp_artifacts as artifacts
 except ImportError:
     import build_gapbs_amu_cxlmemuring as amu_builder
     import build_gapbs_cira_cxlmemuring as cira_builder
     import build_gapbs_m2ndp_pr_spmv as baseline_builder
+    import amu_cira_calibration as calibration
+    import cira_lead_policy
     import m2ndp_artifacts as artifacts
 
 
@@ -82,6 +87,35 @@ _CIRA_PULL_LOOP = (
 )
 class VariantEvidenceError(RuntimeError):
     pass
+
+
+def resolve_cira_build_policy(calibration_manifest, mode, *, source_row=None):
+    path = Path(calibration_manifest).resolve()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VariantEvidenceError(
+            f"invalid calibration manifest: {path}"
+        ) from error
+    try:
+        if value["schema"] != 1:
+            raise VariantEvidenceError("calibration schema must be 1")
+        if value["sources"]["amu_pdf"]["sha256"] != calibration.AMU_PDF_SHA256:
+            raise VariantEvidenceError("calibration AMU PDF hash differs")
+        if value["sources"]["cira_csv"]["sha256"] != calibration.CIRA_CSV_SHA256:
+            raise VariantEvidenceError("calibration CIRA CSV hash differs")
+        if value["amu"]["validation"]["status"] != "PASS":
+            raise VariantEvidenceError("AMU calibration validation did not pass")
+        policy = cira_lead_policy.resolve_mode(
+            value, mode, source_row=source_row
+        )
+    except (KeyError, TypeError, cira_lead_policy.LeadPolicyError) as error:
+        raise VariantEvidenceError(str(error)) from error
+    return {
+        **policy,
+        "calibration_manifest": str(path),
+        "calibration_manifest_sha256": calibration.sha256_file(path),
+    }
 
 
 def transform_source(source, kind):
@@ -218,6 +252,7 @@ def build_variant(
     cira_prefetch_distance,
     cira_row_batch,
     cira_max_outstanding,
+    cira_policy=None,
 ):
     variant_root = Path(outdir) / kind
     gapbs_root = variant_root / "src/gapbs"
@@ -260,7 +295,7 @@ def build_variant(
         cira_max_outstanding=cira_max_outstanding,
     )
     baseline_builder.run(command)
-    return {
+    evidence = {
         "kind": kind,
         "binary": str(output.resolve()),
         "binary_sha256": artifacts.sha256_file(output),
@@ -271,6 +306,9 @@ def build_variant(
         "gapbs_source_sha256": baseline_builder.hash_source_tree(gapbs_root),
         "command": [str(item) for item in command],
     }
+    if kind == "cira" and cira_policy is not None:
+        evidence["cira_policy"] = cira_policy
+    return evidence
 
 
 def main(argv=None):
@@ -292,6 +330,14 @@ def main(argv=None):
     parser.add_argument("--cira-prefetch-distance", type=int, default=0)
     parser.add_argument("--cira-row-batch", type=int, default=256)
     parser.add_argument("--cira-max-outstanding", type=int, default=256)
+    parser.add_argument(
+        "--cira-mode",
+        choices=("legacy", "static", "pgo-selected", "few-shot-online"),
+        default="legacy",
+    )
+    parser.add_argument("--calibration-manifest", type=Path)
+    parser.add_argument("--cira-source-row", choices=("A", "B", "C"))
+    parser.add_argument("--cira-policy-latency-ns", type=int, default=1000)
     args = parser.parse_args(argv)
 
     source_root = args.baseline_build / "src/gapbs"
@@ -307,9 +353,45 @@ def main(argv=None):
         parser.error("--cira-row-batch must be positive")
     if args.cira_max_outstanding <= 0:
         parser.error("--cira-max-outstanding must be positive")
+    if args.cira_policy_latency_ns <= 0:
+        parser.error("--cira-policy-latency-ns must be positive")
+
+    cira_policy = None
+    if args.cira_mode == "legacy":
+        if args.calibration_manifest is not None or args.cira_source_row is not None:
+            parser.error("legacy CIRA rejects calibration/source-row options")
+        cira_distance = args.cira_prefetch_distance
+    else:
+        if args.calibration_manifest is None:
+            parser.error("calibrated CIRA mode requires --calibration-manifest")
+        if args.cira_mode != "few-shot-online" and args.cira_source_row is not None:
+            parser.error("only few-shot-online accepts --cira-source-row")
+        try:
+            cira_policy = resolve_cira_build_policy(
+                args.calibration_manifest,
+                args.cira_mode,
+                source_row=args.cira_source_row,
+            )
+        except VariantEvidenceError as error:
+            parser.error(str(error))
+        base_1us_distance = cira_policy["lead_blocks"]
+        cira_distance = cira_lead_policy.lead_blocks_for_latency(
+            base_1us_distance, args.cira_policy_latency_ns
+        )
+        if (
+            args.cira_prefetch_distance != 0
+            and args.cira_prefetch_distance != cira_distance
+        ):
+            parser.error("CIRA distance override differs from calibrated policy")
+        cira_policy = {
+            **cira_policy,
+            "base_1us_lead_blocks": base_1us_distance,
+            "effective_lead_blocks": cira_distance,
+            "effective_latency_ns": args.cira_policy_latency_ns,
+        }
 
     cira_distance, profiles, override = cira_builder.resolve_profile(
-        args.cxlmemuring, "pr_spmv", args.cira_prefetch_distance
+        args.cxlmemuring, "pr_spmv", cira_distance
     )
     reference_dir = args.outdir / "reference"
     reference_dir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +409,7 @@ def main(argv=None):
                 cira_prefetch_distance=cira_distance,
                 cira_row_batch=args.cira_row_batch,
                 cira_max_outstanding=args.cira_max_outstanding,
+                cira_policy=cira_policy,
             )
         )
 
@@ -353,6 +436,9 @@ def main(argv=None):
             profile: artifacts.sha256_file(profile) for profile in profiles
         },
         "cira_max_outstanding": args.cira_max_outstanding,
+        "cira_mode": args.cira_mode,
+        "cira_policy_latency_ns": args.cira_policy_latency_ns,
+        "cira_policy": cira_policy,
         "variants": variant_rows,
     }
     artifacts.atomic_write_json(args.outdir / "manifest.json", manifest)

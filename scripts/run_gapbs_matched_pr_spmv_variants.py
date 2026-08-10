@@ -47,6 +47,10 @@ def make_compare_args(options):
     profiles.require_latency(profile, cxl_link_delay)
     smoke_test = getattr(options, "smoke_test", False)
     graph_scale = options.graph_scale if smoke_test else profile.graph_scale
+    asmc_profile = getattr(options, "asmc_profile", "legacy")
+    asmc_calibration_manifest = getattr(
+        options, "asmc_calibration_manifest", None
+    )
     return SimpleNamespace(
         gem5=Path(options.gem5).resolve(),
         config=Path(options.config).resolve(),
@@ -68,7 +72,15 @@ def make_compare_args(options):
         l1_tgts_per_mshr=None,
         l2_mshrs=None,
         l2_tgts_per_mshr=None,
-        asmc_spm_size="256KiB",
+        asmc_profile=asmc_profile,
+        asmc_calibration_manifest=(
+            Path(asmc_calibration_manifest).resolve()
+            if asmc_calibration_manifest is not None
+            else None
+        ),
+        asmc_spm_size=(
+            "64KiB" if asmc_profile == "paper-calibrated" else "256KiB"
+        ),
         asmc_granularity=8,
         asmc_max_outstanding=256,
         asmc_max_send_queue=512,
@@ -267,6 +279,12 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument(
+        "--asmc-profile",
+        choices=("legacy", "paper-calibrated", "paper-sensitivity-256k"),
+        default="legacy",
+    )
+    parser.add_argument("--asmc-calibration-manifest", type=Path)
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args(argv)
 

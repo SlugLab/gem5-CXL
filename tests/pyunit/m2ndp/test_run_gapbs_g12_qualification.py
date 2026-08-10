@@ -34,13 +34,50 @@ class G12QualificationTest(unittest.TestCase):
             (
                 "vanilla-1us",
                 "amu-1us",
-                "cira-lead-1-1us",
-                "cira-lead-2-1us",
-                "cira-lead-4-1us",
-                "cira-lead-8-1us",
+                "cira-static-1us",
+                "cira-pgo-selected-1us",
+                "cira-few-shot-sample-A-1us",
+                "cira-few-shot-sample-B-1us",
+                "cira-few-shot-sample-C-1us",
+                "cira-few-shot-online-1us",
                 "freeze-cira-policy",
             ),
         )
+
+    def test_few_shot_charges_all_samples_and_reconfiguration(self):
+        rows = {
+            "A": {**self.passing_candidate(1), "sim_ticks": 120, "raw_sha256": "a" * 64},
+            "B": {**self.passing_candidate(32), "sim_ticks": 100, "raw_sha256": "a" * 64},
+            "C": {**self.passing_candidate(16), "sim_ticks": 130, "raw_sha256": "a" * 64},
+        }
+        for row in rows.values():
+            row["hoist_decision"] = {"emit_prefetch": True}
+        result = qualification.freeze_few_shot_mode(
+            rows,
+            steady_row={
+                **self.passing_candidate(32),
+                "sim_ticks": 90,
+                "raw_sha256": "a" * 64,
+                "hoist_decision": {"emit_prefetch": True},
+            },
+            reconfiguration_ticks=7,
+        )
+        self.assertEqual(result["selected_source_row"], "B")
+        self.assertEqual(result["profiling_ticks"], 350)
+        self.assertEqual(result["reconfiguration_ticks"], 7)
+        self.assertEqual(result["steady_ticks"], 90)
+        self.assertEqual(result["end_to_end_ticks"], 447)
+
+    def test_pgo_static_ratio_is_bounded_not_forced_to_source_mean(self):
+        self.assertAlmostEqual(
+            qualification.validate_pgo_static_ratio(1000, 990),
+            1000 / 990,
+        )
+        for pgo_ticks in (900, 1100):
+            with self.assertRaisesRegex(
+                qualification.QualificationError, "PGO/static ratio"
+            ):
+                qualification.validate_pgo_static_ratio(1000, pgo_ticks)
 
     def test_candidate_gate_uses_activity_not_speedup_and_stops_first(self):
         rows = {

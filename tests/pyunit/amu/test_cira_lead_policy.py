@@ -7,6 +7,77 @@ from scripts import cira_lead_policy as policy
 
 
 class CiraLeadPolicyTest(unittest.TestCase):
+    def calibration(self):
+        rows = {
+            "A": {
+                "verification": "PASS", "return_code": 0,
+                "mean_time_ms": 181.223,
+            },
+            "B": {
+                "verification": "PASS", "return_code": 0,
+                "mean_time_ms": 180.505,
+            },
+            "C": {
+                "verification": "PASS", "return_code": 0,
+                "mean_time_ms": 187.470,
+            },
+        }
+        return {
+            "sources": {"cira_csv": {"rows": {"pr_spmv": rows}}},
+            "cira": {"primary": {"selected_source_mode": "B"}},
+        }
+
+    def test_source_candidates_map_exact_hardware_rows(self):
+        self.assertEqual(
+            policy.SOURCE_CANDIDATES,
+            {
+                "A": {
+                    "name": "static-default",
+                    "row_window_rows": 64,
+                    "lead_blocks": 1,
+                },
+                "B": {
+                    "name": "row-window-2048",
+                    "row_window_rows": 2048,
+                    "lead_blocks": 32,
+                },
+                "C": {
+                    "name": "row-window-1024",
+                    "row_window_rows": 1024,
+                    "lead_blocks": 16,
+                },
+            },
+        )
+
+    def test_three_modes_are_source_selected_and_hoist_gated(self):
+        calibration = self.calibration()
+        static = policy.resolve_mode(calibration, "static")
+        pgo = policy.resolve_mode(calibration, "pgo-selected")
+        few = policy.resolve_mode(
+            calibration, "few-shot-online", source_row="C"
+        )
+        self.assertEqual(static["source_row"], "A")
+        self.assertEqual(pgo["source_row"], "B")
+        self.assertEqual(few["source_row"], "C")
+        for selected in (static, pgo, few):
+            self.assertTrue(selected["hoist_decision"]["emit_prefetch"])
+            self.assertEqual(selected["row_window_rows"] % 64, 0)
+            self.assertEqual(
+                selected["lead_blocks"], selected["row_window_rows"] // 64
+            )
+
+    def test_pgo_rejects_abc_or_unverified_or_drifted_selection(self):
+        calibration = self.calibration()
+        calibration["cira"]["primary"]["selected_source_mode"] = "C"
+        with self.assertRaisesRegex(policy.LeadPolicyError, "selected source"):
+            policy.resolve_mode(calibration, "pgo-selected")
+        calibration = self.calibration()
+        calibration["sources"]["cira_csv"]["rows"]["pr_spmv"]["B"][
+            "verification"
+        ] = "FAIL"
+        with self.assertRaisesRegex(policy.LeadPolicyError, "verified"):
+            policy.resolve_mode(calibration, "pgo-selected")
+
     def test_frozen_latency_scaling(self):
         self.assertEqual(policy.lead_blocks_for_latency(2, 200), 1)
         self.assertEqual(policy.lead_blocks_for_latency(2, 500), 1)
@@ -16,7 +87,7 @@ class CiraLeadPolicyTest(unittest.TestCase):
         self.assertEqual(policy.CANDIDATE_1US_LEADS, (1, 2, 4, 8))
 
     def test_invalid_leads_and_latencies_fail_closed(self):
-        for selected in (0, 3, 16):
+        for selected in (0, 3, 7):
             with self.subTest(selected=selected):
                 with self.assertRaises(policy.LeadPolicyError):
                     policy.lead_blocks_for_latency(selected, 1000)

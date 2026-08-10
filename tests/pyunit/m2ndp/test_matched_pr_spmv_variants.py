@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import struct
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,37 @@ FIXED_SOURCE = REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
 
 
 class MatchedVariantSourceTest(unittest.TestCase):
+    def test_calibrated_build_policy_binds_mode_source_and_hoist(self):
+        calibration = {
+            "schema": 1,
+            "sources": {
+                "amu_pdf": {"sha256": variants.calibration.AMU_PDF_SHA256},
+                "cira_csv": {
+                    "sha256": variants.calibration.CIRA_CSV_SHA256,
+                    "rows": {
+                        "pr_spmv": {
+                            "A": {"verification": "PASS", "return_code": 0, "mean_time_ms": 11},
+                            "B": {"verification": "PASS", "return_code": 0, "mean_time_ms": 10},
+                            "C": {"verification": "PASS", "return_code": 0, "mean_time_ms": 12},
+                        }
+                    },
+                },
+            },
+            "amu": {"validation": {"status": "PASS"}},
+            "cira": {"primary": {"selected_source_mode": "B"}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "calibration.json"
+            path.write_text(json.dumps(calibration), encoding="utf-8")
+            policy = variants.resolve_cira_build_policy(
+                path, "pgo-selected", source_row=None
+            )
+        self.assertEqual(policy["mode"], "pgo-selected")
+        self.assertEqual(policy["source_row"], "B")
+        self.assertEqual(policy["lead_blocks"], 32)
+        self.assertTrue(policy["hoist_decision"]["emit_prefetch"])
+        self.assertEqual(len(policy["calibration_manifest_sha256"]), 64)
+
     def test_fixed_pull_rows_are_partitioned_across_both_cores(self):
         source = FIXED_SOURCE.read_text(encoding="utf-8")
         self.assertIn(
