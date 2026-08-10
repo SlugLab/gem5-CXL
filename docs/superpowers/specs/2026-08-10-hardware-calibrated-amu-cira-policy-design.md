@@ -135,7 +135,6 @@ N_effective = min(N_software_window,
                   queue_length,
                   max_outstanding,
                   floor(SPM_available / bytes_per_request),
-                  pending_queue_capacity,
                   downstream_capacity)
 
 T_request = T_aload_issue + T_id_batch_amortized + T_metadata
@@ -156,7 +155,10 @@ issued operations, useful overlap, consumer waits, window-full stalls,
 marks, and coherent SPM writebacks.
 
 The direct-paper profile uses 64 KiB SPM, workload-specific paper access
-granularities, and a 32-entry per-state-machine pending boundary. The formal
+granularities, and a 32-entry boundary for each internal AMU state-machine
+service queue. That per-stage pending boundary is not a global outstanding
+limit: serviced requests reside in the SPM-backed AMART, so multiple stages
+and hundreds of total in-flight requests remain possible. The formal
 `pr_spmv` profile begins with the repository's 8-byte AMU operation and the
 paper-calibrated 64 KiB SPM. It also reports a clearly labeled sensitivity
 point using the repository's prior 256 KiB SPM so that the source of any
