@@ -385,12 +385,33 @@ def validate_options(options, paths):
     variant_manifest = Path(options.variants_build) / "manifest.json"
     if not variant_manifest.is_file():
         raise SweepError(f"variant manifest is missing: {variant_manifest}")
+    validate_cira_partition_contract(
+        _load_json(variant_manifest), profile
+    )
     if paths.root in {
         Path(options.cxlmemuring).resolve(),
         Path(options.m2ndp_root).resolve(),
         Path(options.variants_build).resolve(),
     }:
         raise SweepError("output root must be isolated from input roots")
+
+
+def validate_cira_partition_contract(manifest, profile):
+    try:
+        distance = int(manifest["cira_prefetch_distance"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SweepError(
+            "variant manifest lacks a valid CIRA prefetch distance"
+        ) from error
+    nodes = 1 << profile.graph_scale
+    minimum_partition = nodes // profile.threads
+    maximum_distance = minimum_partition - 1
+    if distance < 1 or distance > maximum_distance:
+        raise SweepError(
+            f"CIRA prefetch distance {distance} does not fit the g4 "
+            f"static thread partition of {minimum_partition} rows; "
+            f"expected 1..{maximum_distance}"
+        )
 
 
 def parse_args(argv=None):

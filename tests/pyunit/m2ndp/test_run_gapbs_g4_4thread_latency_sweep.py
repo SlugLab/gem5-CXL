@@ -199,6 +199,20 @@ class SweepRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(runner.SweepError, "graph SHA-256"):
                 runner.validate_options(options, runner.make_paths(options))
 
+    def test_g4_cira_distance_must_fit_each_static_thread_partition(self):
+        profile = runner.profiles.get_profile("g4-4thread-sweep")
+
+        with self.assertRaisesRegex(
+            runner.SweepError, "CIRA prefetch distance 16.*partition"
+        ):
+            runner.validate_cira_partition_contract(
+                {"cira_prefetch_distance": 16}, profile
+            )
+
+        runner.validate_cira_partition_contract(
+            {"cira_prefetch_distance": 1}, profile
+        )
+
     def test_cli_parses_explicit_roots_without_smoke_mode(self):
         options = runner.parse_args(
             [

@@ -87,7 +87,6 @@ class MatchedVariantSourceTest(unittest.TestCase):
         future = generated.index(
             "GAPBS_CIRA_FUTURE_BLOCK(g, u, pf_begin, pf_count)"
         )
-        boundary = generated.index("u % GAPBS_CIRA_ROW_BATCH == 0")
         prefetch = generated.index(
             "GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROWS("
             "g, pf_begin, pf_count, outgoing_contrib)"
@@ -96,10 +95,14 @@ class MatchedVariantSourceTest(unittest.TestCase):
         ordered_add = generated.index(
             "incoming_total = incoming_total + outgoing_contrib[v]"
         )
-        self.assertLess(boundary, future)
         self.assertLess(future, prefetch)
         self.assertLess(prefetch, current)
         self.assertLess(current, ordered_add)
+        self.assertNotIn("u % GAPBS_CIRA_ROW_BATCH", generated)
+        self.assertIn(
+            "(current64 - thread_begin) % GAPBS_CIRA_ROW_BATCH",
+            variants.cira_builder.CIRA_HEADER,
+        )
         self.assertEqual(
             generated.count(
                 "incoming_total = incoming_total + outgoing_contrib[v]"

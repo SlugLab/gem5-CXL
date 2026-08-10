@@ -89,6 +89,8 @@ static inline bool future_block(const GraphT &g, NodeT current,
   if (GAPBS_CIRA_NODE_DISTANCE <= 0 || GAPBS_CIRA_ROW_BATCH <= 0 ||
       current64 < thread_begin || current64 >= thread_end)
     return false;
+  if ((current64 - thread_begin) % GAPBS_CIRA_ROW_BATCH != 0)
+    return false;
   const int64_t candidate =
       current64 + static_cast<int64_t>(GAPBS_CIRA_NODE_DISTANCE);
   if (candidate >= thread_end)

@@ -73,8 +73,7 @@ _AMU_PULL_LOOP = (
 )
 _CIRA_PULL_LOOP = (
     "      NodeID pf_begin, pf_count;\n"
-    "      if (u % GAPBS_CIRA_ROW_BATCH == 0 &&\n"
-    "          GAPBS_CIRA_FUTURE_BLOCK(g, u, pf_begin, pf_count))\n"
+    "      if (GAPBS_CIRA_FUTURE_BLOCK(g, u, pf_begin, pf_count))\n"
     "        GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROWS("
     "g, pf_begin, pf_count, outgoing_contrib);\n"
     "      auto neigh = g.in_neigh(u);\n"
