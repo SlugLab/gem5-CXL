@@ -69,7 +69,14 @@ accepted asynchronous concurrency, and it converts partial device writes to
 the hierarchy's normal `ReadEx`/upgrade/invalidate protocol. This is a
 coherence adapter, not a per-core ASMC or a software-visible result cache.
 Topology validation and directional CXL accounting require the resulting
-`board.asmc_io_cache.mem_side` cell.
+`board.asmc_io_cache.mem_side_port` cell.
+
+`SimpleBoard.mem_ranges` is initialized when the SE workload is installed,
+not when the board object is constructed. The I/O cache therefore binds its
+`addr_ranges` after `set_se_binary_workload()`. An empty range is a correctness
+failure: the cache accepts ASMC requests but drops CPU snoops in
+`recvTimingSnoopReq()`, allowing stale SPM data to reach the core. Validation
+must reject that topology before accepting any timing result.
 
 ## Completion and queue rules
 

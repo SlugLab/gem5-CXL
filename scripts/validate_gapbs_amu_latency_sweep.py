@@ -494,6 +494,13 @@ def validate_accelerator_config(config, path, kind, model_parameters):
             raise ValidationError(
                 f"{path}: AMU config is missing coherent ASMC I/O cache"
             )
+        cache_ranges = config_value(
+            config, "board.asmc_io_cache", "addr_ranges", path
+        ).split()
+        if not cache_ranges:
+            raise ValidationError(
+                f"{path}: ASMC I/O cache addr_ranges must not be empty"
+            )
         port = config_value(config, "board.asmc", "mem_side_port", path)
         if port != "board.asmc_io_cache.cpu_side":
             raise ValidationError(

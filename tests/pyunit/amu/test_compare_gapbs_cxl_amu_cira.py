@@ -718,12 +718,12 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         stats = self.two_core_stats()
         stats[
             "board.cache_hierarchy.membus.pktCount_"
-            "board.asmc_io_cache.mem_side::"
+            "board.asmc_io_cache.mem_side_port::"
             "board.cxl_mem_link0.cpu_side_port"
         ] = Decimal(9)
         stats[
             "board.cache_hierarchy.membus.pktSize_"
-            "board.asmc_io_cache.mem_side::"
+            "board.asmc_io_cache.mem_side_port::"
             "board.cxl_mem_link0.cpu_side_port"
         ] = Decimal(256)
         metrics = self.runner.extract_diagnostic_metrics(

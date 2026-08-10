@@ -77,6 +77,19 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             CONFIG,
         )
 
+    def test_io_cache_ranges_are_bound_after_workload_initializes_board(self):
+        workload = CONFIG.index("board.set_se_binary_workload(")
+        range_binding = CONFIG.index(
+            "board.asmc_io_cache.addr_ranges = board.mem_ranges"
+        )
+        self.assertGreater(range_binding, workload)
+
+        constructor = CONFIG[
+            CONFIG.index("board.asmc_io_cache = Cache("):
+            CONFIG.index("board.asmc.mem_side_port = ")
+        ]
+        self.assertNotIn("addr_ranges=board.mem_ranges", constructor)
+
 
 if __name__ == "__main__":
     unittest.main()

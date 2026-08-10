@@ -342,7 +342,6 @@ if not args.no_asmc:
         size="1KiB",
         tgts_per_mshr=16,
         write_buffers=args.asmc_max_outstanding,
-        addr_ranges=board.mem_ranges,
     )
     board.asmc.mem_side_port = board.asmc_io_cache.cpu_side
     if args.cxl_memory:
@@ -382,6 +381,11 @@ board.set_se_binary_workload(
     env_list=[f"OMP_NUM_THREADS={args.cores}", *args.env],
     checkpoint=checkpoint,
 )
+if not args.no_asmc:
+    # SimpleBoard initializes mem_ranges when its workload is installed.
+    # Binding the I/O cache range earlier silently leaves it empty, causing
+    # the cache to drop every coherent snoop while still accepting requests.
+    board.asmc_io_cache.addr_ranges = board.mem_ranges
 
 start_tick = None
 roi_state = None

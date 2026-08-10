@@ -413,6 +413,18 @@ ASMC::recvTimingResp(PacketPtr pkt)
                  static_cast<unsigned long long>(id));
         state.pendingPackets--;
 
+        if (state.size <= sizeof(uint64_t)) {
+            uint64_t payload = 0;
+            std::memcpy(&payload, state.data.data(), state.size);
+            DPRINTF(ASMC,
+                    "payload id=%#llx phase=%s value=%#llx pending=%u\n",
+                    static_cast<unsigned long long>(id),
+                    sender_state->phase == RequestPhase::MemoryAccess ?
+                        "memory" : "spm-writeback",
+                    static_cast<unsigned long long>(payload),
+                    state.pendingPackets);
+        }
+
         if (state.pendingPackets == 0 &&
             state.type == ReqType::Load &&
             state.phase == RequestPhase::MemoryAccess) {

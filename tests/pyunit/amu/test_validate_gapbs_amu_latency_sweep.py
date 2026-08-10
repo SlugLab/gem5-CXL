@@ -297,6 +297,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "board.asmc_io_cache.cpu_side\n"
             "[board.asmc_io_cache]\n"
             "type=Cache\n"
+            "addr_ranges=0:4294967296\n"
             "cpu_side=board.asmc.mem_side_port\n"
             "mem_side="
             "board.cache_hierarchy.membus.cpu_side_ports[0]\n"
@@ -388,12 +389,12 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             lines += [
                 (
                     "board.cache_hierarchy.membus.pktCount_"
-                    "board.asmc_io_cache.mem_side::"
+                    "board.asmc_io_cache.mem_side_port::"
                     "board.cxl_mem_link0.cpu_side_port 7"
                 ),
                 (
                     "board.cache_hierarchy.membus.pktSize_"
-                    "board.asmc_io_cache.mem_side::"
+                    "board.asmc_io_cache.mem_side_port::"
                     "board.cxl_mem_link0.cpu_side_port 64"
                 ),
             ]
@@ -1505,6 +1506,23 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                     self.validator.ValidationError, expected
                 ):
                     self.validator.validate_sweep(root)
+
+    def test_rejects_empty_asmc_io_cache_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            config = root / "200ns" / "bfs" / "amu" / "config.ini"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "addr_ranges=0:4294967296", "addr_ranges=", 1
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "ASMC I/O cache addr_ranges must not be empty",
+            ):
+                self.validator.validate_sweep(root)
 
     def test_rejects_zero_or_extra_stats_sections(self):
         for case in ("zero", "extra"):
