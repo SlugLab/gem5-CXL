@@ -294,7 +294,7 @@ def directional_stat_pair(stats, num_cores=1, kind="baseline"):
             for core in range(num_cores)
         }
         if kind == "amu":
-            expected_cells.add("board.asmc.mem_side_port")
+            expected_cells.add("board.asmc_io_cache.mem_side")
         directional = {}
         for label, prefix in (
             ("packet", CXL_PACKET_STAT_PREFIX),

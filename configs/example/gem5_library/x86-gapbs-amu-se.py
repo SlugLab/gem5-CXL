@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import m5
-from m5.objects import ASMC, CIRA, NULL, SerialLink
+from m5.objects import ASMC, CIRA, Cache, NULL, SerialLink
 
 from gapbs_roi_state import (
     GapbsCheckpointState,
@@ -333,8 +333,20 @@ if not args.no_asmc:
         completion_latency=args.asmc_completion_latency,
         asmc_latency=args.asmc_latency,
     )
+    board.asmc_io_cache = Cache(
+        assoc=8,
+        tag_latency=1,
+        data_latency=1,
+        response_latency=1,
+        mshrs=args.asmc_max_outstanding,
+        size="1KiB",
+        tgts_per_mshr=16,
+        write_buffers=args.asmc_max_outstanding,
+        addr_ranges=board.mem_ranges,
+    )
+    board.asmc.mem_side_port = board.asmc_io_cache.cpu_side
     if args.cxl_memory:
-        board.asmc.mem_side_port = cache_hierarchy.get_cpu_side_port()
+        board.asmc_io_cache.mem_side = cache_hierarchy.get_cpu_side_port()
     else:
         board.cxl_link = SerialLink(
             delay=args.cxl_link_delay,
@@ -343,7 +355,7 @@ if not args.no_asmc:
             req_size=args.cxl_link_req_size,
             resp_size=args.cxl_link_resp_size,
         )
-        board.asmc.mem_side_port = board.cxl_link.cpu_side_port
+        board.asmc_io_cache.mem_side = board.cxl_link.cpu_side_port
         board.cxl_link.mem_side_port = cache_hierarchy.get_cpu_side_port()
 
 if args.cira:

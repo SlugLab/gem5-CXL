@@ -280,7 +280,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             " board.cira.mem_side_port" if kind == "cira" else ""
         )
         asmc_membus_port = (
-            "cpu_side_ports=board.asmc.mem_side_port\n"
+            "cpu_side_ports=board.asmc_io_cache.mem_side\n"
             if kind == "amu"
             else ""
         )
@@ -294,6 +294,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "max_send_queue=512\n"
             "spm_size=262144\n"
             "mem_side_port="
+            "board.asmc_io_cache.cpu_side\n"
+            "[board.asmc_io_cache]\n"
+            "type=Cache\n"
+            "cpu_side=board.asmc.mem_side_port\n"
+            "mem_side="
             "board.cache_hierarchy.membus.cpu_side_ports[0]\n"
             if kind == "amu"
             else ""
@@ -383,12 +388,12 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             lines += [
                 (
                     "board.cache_hierarchy.membus.pktCount_"
-                    "board.asmc.mem_side_port::"
+                    "board.asmc_io_cache.mem_side::"
                     "board.cxl_mem_link0.cpu_side_port 7"
                 ),
                 (
                     "board.cache_hierarchy.membus.pktSize_"
-                    "board.asmc.mem_side_port::"
+                    "board.asmc_io_cache.mem_side::"
                     "board.cxl_mem_link0.cpu_side_port 64"
                 ),
             ]

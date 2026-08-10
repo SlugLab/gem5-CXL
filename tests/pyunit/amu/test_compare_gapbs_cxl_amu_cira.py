@@ -714,15 +714,17 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(metrics["l2i_demand_hits"], Decimal(6))
         self.assertEqual(metrics["l2i_demand_misses"], Decimal(1))
 
-    def test_two_core_amu_includes_exact_asmc_directional_cell(self):
+    def test_two_core_amu_includes_exact_asmc_io_directional_cell(self):
         stats = self.two_core_stats()
         stats[
             "board.cache_hierarchy.membus.pktCount_"
-            "board.asmc.mem_side_port::board.cxl_mem_link0.cpu_side_port"
+            "board.asmc_io_cache.mem_side::"
+            "board.cxl_mem_link0.cpu_side_port"
         ] = Decimal(9)
         stats[
             "board.cache_hierarchy.membus.pktSize_"
-            "board.asmc.mem_side_port::board.cxl_mem_link0.cpu_side_port"
+            "board.asmc_io_cache.mem_side::"
+            "board.cxl_mem_link0.cpu_side_port"
         ] = Decimal(256)
         metrics = self.runner.extract_diagnostic_metrics(
             stats, "amu", num_cores=2

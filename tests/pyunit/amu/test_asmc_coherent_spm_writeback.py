@@ -8,6 +8,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 HEADER = (REPO / "src/mem/asmc.hh").read_text(encoding="utf-8")
 SOURCE = (REPO / "src/mem/asmc.cc").read_text(encoding="utf-8")
+CONFIG = (
+    REPO / "configs/example/gem5_library/x86-gapbs-amu-se.py"
+).read_text(encoding="utf-8")
 
 
 class AsmcCoherentSpmWritebackTest(unittest.TestCase):
@@ -61,6 +64,18 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             SOURCE.index("ASMC::completeRequest")
         ]
         self.assertIn("schedule(sendEvent, curTick())", retry)
+
+    def test_asmc_uses_a_coherent_io_cache_before_the_membus(self):
+        self.assertIn("board.asmc_io_cache = Cache(", CONFIG)
+        self.assertIn(
+            "board.asmc.mem_side_port = board.asmc_io_cache.cpu_side",
+            CONFIG,
+        )
+        self.assertIn(
+            "board.asmc_io_cache.mem_side = "
+            "cache_hierarchy.get_cpu_side_port()",
+            CONFIG,
+        )
 
 
 if __name__ == "__main__":

@@ -490,14 +490,33 @@ def validate_accelerator_config(config, path, kind, model_parameters):
             raise ValidationError(f"{path}: AMU config is missing ASMC")
         if has_cira:
             raise ValidationError(f"{path}: AMU config must not contain CIRA")
+        if not config.has_section("board.asmc_io_cache"):
+            raise ValidationError(
+                f"{path}: AMU config is missing coherent ASMC I/O cache"
+            )
         port = config_value(config, "board.asmc", "mem_side_port", path)
+        if port != "board.asmc_io_cache.cpu_side":
+            raise ValidationError(
+                f"{path}: invalid ASMC mem_side_port binding: {port}"
+            )
+        cache_cpu_port = config_value(
+            config, "board.asmc_io_cache", "cpu_side", path
+        )
+        if cache_cpu_port != "board.asmc.mem_side_port":
+            raise ValidationError(
+                f"{path}: ASMC coherent I/O cache CPU-side binding is missing"
+            )
+        cache_mem_port = config_value(
+            config, "board.asmc_io_cache", "mem_side", path
+        )
         binding = re.fullmatch(
             r"board\.cache_hierarchy\.membus\.cpu_side_ports\[(\d+)\]",
-            port,
+            cache_mem_port,
         )
         if binding is None:
             raise ValidationError(
-                f"{path}: invalid ASMC mem_side_port binding: {port}"
+                f"{path}: invalid ASMC I/O cache mem_side binding: "
+                f"{cache_mem_port}"
             )
         cpu_ports = config_value(
             config,
@@ -508,10 +527,10 @@ def validate_accelerator_config(config, path, kind, model_parameters):
         index = int(binding.group(1))
         if (
             index >= len(cpu_ports)
-            or cpu_ports[index] != "board.asmc.mem_side_port"
+            or cpu_ports[index] != "board.asmc_io_cache.mem_side"
         ):
             raise ValidationError(
-                f"{path}: ASMC reciprocal membus binding is missing"
+                f"{path}: ASMC I/O cache reciprocal membus binding is missing"
             )
         size = parse_binary_quantity(
             model_parameters.get("asmc_spm_size"),

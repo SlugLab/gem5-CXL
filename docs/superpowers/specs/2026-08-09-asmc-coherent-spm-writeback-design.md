@@ -59,6 +59,18 @@ ASMC already uses for source traffic. In the all-CXL configuration this port
 continues through the cache hierarchy and CXL link, so both source data and
 destination SPM traffic obey the selected link latency and coherence model.
 
+The classic cache hierarchy requires a coherent I/O cache between a
+non-caching requestor and the point-of-coherence xbar. A raw device
+`WriteReq` attached directly beside the private L2 caches is not a legal
+snoop command when an L2 has a matching MSHR. The X86 GAPBS configuration
+therefore places one shared 1 KiB, one-cycle ASMC I/O cache between the ASMC
+port and the membus. It has 256 MSHRs and write buffers to preserve the
+accepted asynchronous concurrency, and it converts partial device writes to
+the hierarchy's normal `ReadEx`/upgrade/invalidate protocol. This is a
+coherence adapter, not a per-core ASMC or a software-visible result cache.
+Topology validation and directional CXL accounting require the resulting
+`board.asmc_io_cache.mem_side` cell.
+
 ## Completion and queue rules
 
 - A load with a source or destination translation fault is rejected before
