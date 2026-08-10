@@ -32,7 +32,7 @@ except ImportError:
 
 
 REPO = Path(__file__).resolve().parents[1]
-EXTERNAL_ROOT = Path("/mnt/disk0/gem5-CXL-g14-eval")
+EXTERNAL_ROOT = Path("/mnt/disk0/gem5-CXL-g14-eval/calibrated")
 STABLE_LINK = REPO / "m5out/g14-real-cxl-eval"
 MIN_FREE_BYTES = 100 * 1024**3
 LATENCIES = ("200ns", "500ns", "1us", "2us")
@@ -211,9 +211,13 @@ def require_external_root(
         raise SweepError(
             f"formal root {root} is not the frozen external root {expected_root}"
         )
-    if not stable_link.is_symlink() or stable_link.resolve() != root:
+    stable_target = (
+        expected_root.parent
+        if expected_root.name == "calibrated" else expected_root
+    )
+    if not stable_link.is_symlink() or stable_link.resolve() != stable_target:
         raise SweepError(
-            f"stable link {stable_link} must resolve exactly to {root}"
+            f"stable link {stable_link} must resolve exactly to {stable_target}"
         )
     free = shutil.disk_usage(root).free
     if free < min_free_bytes:
