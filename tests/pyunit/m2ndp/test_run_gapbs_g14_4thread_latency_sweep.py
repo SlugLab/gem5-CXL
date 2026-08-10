@@ -19,6 +19,8 @@ class G14SweepTest(unittest.TestCase):
             graph=root / "graphs/g14.sg",
             graph_manifest=root / "graphs/g14.manifest.json",
             policy=root / "policy/cira-lead.json",
+            qualification=root / "qualification/qualification.json",
+            calibration_manifest=root / "calibration/amu-cira.json",
             gem5=root / "gem5.opt",
             config=root / "config.py",
             cxlmemuring=root / "CXLMemUring",
@@ -29,15 +31,18 @@ class G14SweepTest(unittest.TestCase):
             stop_after=None,
         )
 
-    def test_matrix_is_exactly_latency_major_sixteen_actions(self):
+    def test_matrix_is_exactly_latency_major_twenty_four_actions(self):
         matrix = sweep.build_matrix()
-        self.assertEqual(len(matrix), 16)
+        self.assertEqual(len(matrix), 24)
         self.assertEqual(
             tuple((entry.latency, entry.system) for entry in matrix),
             tuple(
                 (latency, system)
                 for latency in ("200ns", "500ns", "1us", "2us")
-                for system in ("vanilla", "amu", "cira", "m2ndp")
+                for system in (
+                    "vanilla", "amu-paper-calibrated", "cira-static",
+                    "cira-pgo-selected", "cira-few-shot-online", "m2ndp",
+                )
             ),
         )
 
@@ -53,7 +58,8 @@ class G14SweepTest(unittest.TestCase):
             options = self.options(root)
             paths = sweep.make_paths(options)
             amu = sweep.command_for_action(
-                sweep.MatrixEntry("500ns", "amu"), options, paths
+                sweep.MatrixEntry("500ns", "amu-paper-calibrated"),
+                options, paths
             )
             vanilla = sweep.command_for_action(
                 sweep.MatrixEntry("1us", "vanilla"), options, paths
@@ -64,6 +70,9 @@ class G14SweepTest(unittest.TestCase):
             self.assertIn(str(options.graph.resolve()), command)
         self.assertIn("--kind", amu)
         self.assertEqual(amu[amu.index("--kind") + 1], "amu")
+        self.assertEqual(
+            amu[amu.index("--asmc-profile") + 1], "paper-calibrated"
+        )
         self.assertIn("--stop-after", vanilla)
         self.assertEqual(
             vanilla[vanilla.index("--stop-after") + 1], "gem5_baseline"
@@ -171,7 +180,8 @@ class G14SweepTest(unittest.TestCase):
             "output_paths": {},
         }
         self.assertEqual(
-            sweep.next_action(state), sweep.MatrixEntry("200ns", "amu")
+            sweep.next_action(state),
+            sweep.MatrixEntry("200ns", "amu-paper-calibrated")
         )
 
     def test_policy_loader_rejects_nonqualification_shape(self):

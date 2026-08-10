@@ -7,6 +7,7 @@
 import argparse
 import csv
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -36,7 +37,18 @@ STABLE_LINK = REPO / "m5out/g14-real-cxl-eval"
 MIN_FREE_BYTES = 100 * 1024**3
 LATENCIES = ("200ns", "500ns", "1us", "2us")
 LATENCY_NS = {"200ns": 200, "500ns": 500, "1us": 1000, "2us": 2000}
-SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
+SYSTEMS = (
+    "vanilla",
+    "amu-paper-calibrated",
+    "cira-static",
+    "cira-pgo-selected",
+    "cira-few-shot-online",
+    "m2ndp",
+)
+AMU_SYSTEM = "amu-paper-calibrated"
+CIRA_SYSTEMS = (
+    "cira-static", "cira-pgo-selected", "cira-few-shot-online"
+)
 
 
 class SweepError(RuntimeError):
@@ -56,6 +68,7 @@ class Options:
     graph_manifest: Path
     policy: Path
     qualification: Path
+    calibration_manifest: Path
     gem5: Path
     config: Path
     cxlmemuring: Path
@@ -125,13 +138,63 @@ def load_policy(path):
         or value.get("schema") != 1
         or value.get("row_block_size") != 64
         or value.get("selected_1us_lead_blocks")
-        not in cira_lead_policy.CANDIDATE_1US_LEADS
+        not in cira_lead_policy.ALL_1US_LEADS
         or value.get("candidate_1us_lead_blocks")
-        != list(cira_lead_policy.CANDIDATE_1US_LEADS)
+        != list(cira_lead_policy.ALL_1US_LEADS)
         or not isinstance(value.get("result_hashes"), dict)
         or not value["result_hashes"]
     ):
         raise SweepError("CIRA policy violates the qualification contract")
+    return value
+
+
+def load_calibrated_qualification(
+    path, *, calibration_manifest, gem5, config
+):
+    """Load the passed g12 gate and bind it to immutable current inputs."""
+
+    value = _load_json(path, "g12 calibrated qualification")
+    if (
+        value.get("schema") != 2
+        or value.get("status") != "PASS"
+        or value.get("raw_bit_exact") is not True
+    ):
+        raise SweepError("g12 calibration qualification is not passed")
+    provenance = value.get("calibration")
+    if not isinstance(provenance, dict) or provenance.get("status") != "PASS":
+        raise SweepError("g12 calibration provenance is not passed")
+    current_hashes = {
+        "calibration_manifest_sha256": artifacts.sha256_file(
+            calibration_manifest
+        ),
+        "gem5": artifacts.sha256_file(gem5),
+        "config": artifacts.sha256_file(config),
+    }
+    if (
+        provenance.get("calibration_manifest_sha256")
+        != current_hashes["calibration_manifest_sha256"]
+    ):
+        raise SweepError("g12 calibration manifest hash differs")
+    simulator = provenance.get("simulator_hashes")
+    if not isinstance(simulator, dict) or any(
+        simulator.get(name) != current_hashes[name]
+        for name in ("gem5", "config")
+    ):
+        raise SweepError("g12 calibrated simulator hash differs")
+    if provenance.get("amu_profile") != "paper-calibrated":
+        raise SweepError("g12 AMU profile is not paper-calibrated")
+    modes = provenance.get("mode_definitions")
+    expected = {
+        "static": "static",
+        "pgo_selected": "pgo-selected",
+        "few_shot_online": "few-shot-online",
+    }
+    if not isinstance(modes, dict) or any(
+        not isinstance(modes.get(name), dict)
+        or modes[name].get("cira_mode") != mode
+        for name, mode in expected.items()
+    ):
+        raise SweepError("g12 calibrated CIRA mode definitions differ")
     return value
 
 
@@ -249,6 +312,7 @@ def _m2ndp_command(entry, options, paths):
 
 
 def _matched_command(entry, options, paths):
+    kind = "amu" if entry.system == AMU_SYSTEM else "cira"
     return [
         sys.executable,
         str(REPO / "scripts/run_gapbs_matched_pr_spmv_variants.py"),
@@ -260,17 +324,19 @@ def _matched_command(entry, options, paths):
         "--graph-manifest", str(Path(options.graph_manifest).resolve()),
         "--cxl-link-delay", entry.latency,
         "--variants-build", str(paths.variants / entry.latency),
-        "--kind", entry.system,
+        "--kind", kind,
         "--checkpoint-root", str(paths.runs / entry.latency / "checkpoints"),
         "--outdir", str(paths.runs / entry.latency / entry.system),
         "--timeout", str(options.timeout),
+        "--asmc-profile", "paper-calibrated",
+        "--asmc-calibration-manifest", str(options.calibration_manifest),
     ]
 
 
 def command_for_action(entry, options, paths):
     if entry.system in {"vanilla", "m2ndp"}:
         return _m2ndp_command(entry, options, paths)
-    if entry.system in {"amu", "cira"}:
+    if entry.system == AMU_SYSTEM or entry.system in CIRA_SYSTEMS:
         return _matched_command(entry, options, paths)
     raise SweepError(f"unsupported system: {entry.system}")
 
@@ -315,14 +381,121 @@ def _read_one_row(path):
     return rows[0]
 
 
-def _variant_manifest(options, paths, latency):
-    policy = load_policy(options.policy)
-    lead = lead_for_latency(policy["selected_1us_lead_blocks"], latency)
-    build = paths.variants / latency
+def _write_one_row(path, row):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=tuple(row))
+        writer.writeheader()
+        writer.writerow(row)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _json_sha256(value):
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _augment_end_to_end_summary(entry, options, paths):
+    """Attach explicit steady/profiling/reconfiguration accounting."""
+
+    if entry.system in {"vanilla", "m2ndp"}:
+        return {}
+    summary = output_for_action(entry, paths)
+    row = _read_one_row(summary)
+    try:
+        steady_ticks = int(row["sim_ticks"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SweepError(f"{entry.latency}/{entry.system} has invalid ticks") from error
+    profiling_ticks = 0
+    reconfiguration_ticks = 0
+    if entry.system == "cira-few-shot-online":
+        qualification = load_calibrated_qualification(
+            options.qualification,
+            calibration_manifest=options.calibration_manifest,
+            gem5=options.gem5,
+            config=options.config,
+        )
+        try:
+            frozen = qualification["candidate_results"]["few_shot_online"]
+            profiling_ticks = int(frozen["profiling_ticks"])
+            reconfiguration_ticks = int(frozen["reconfiguration_ticks"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SweepError(
+                "g12 few-shot profiling cost is not frozen"
+            ) from error
+        if profiling_ticks <= 0 or reconfiguration_ticks <= 0:
+            raise SweepError("g12 few-shot costs must be positive")
+    row.update(
+        steady_ticks=str(steady_ticks),
+        profiling_ticks=str(profiling_ticks),
+        reconfiguration_ticks=str(reconfiguration_ticks),
+        end_to_end_ticks=str(
+            steady_ticks + profiling_ticks + reconfiguration_ticks
+        ),
+    )
+    _write_one_row(summary, row)
+    manifest_path, _ = _variant_manifest(
+        options, paths, entry.latency, entry.system
+    )
+    manifest = _load_json(manifest_path, "calibrated variant manifest")
+    policy = manifest.get("cira_policy")
+    return {
+        "policy_manifest_sha256": (
+            _json_sha256(policy) if entry.system in CIRA_SYSTEMS else ""
+        ),
+        "cira_mode": (
+            manifest.get("cira_mode") if entry.system in CIRA_SYSTEMS else ""
+        ),
+        "amu_profile": (
+            "paper-calibrated" if entry.system == AMU_SYSTEM else ""
+        ),
+        "steady_ticks": steady_ticks,
+        "profiling_ticks": profiling_ticks,
+        "reconfiguration_ticks": reconfiguration_ticks,
+        "end_to_end_ticks": (
+            steady_ticks + profiling_ticks + reconfiguration_ticks
+        ),
+    }
+
+
+def _mode_spec(options, system):
+    qualification = load_calibrated_qualification(
+        options.qualification,
+        calibration_manifest=options.calibration_manifest,
+        gem5=options.gem5,
+        config=options.config,
+    )
+    modes = qualification["calibration"]["mode_definitions"]
+    if system == AMU_SYSTEM:
+        return "static", None, 1
+    key = {
+        "cira-static": "static",
+        "cira-pgo-selected": "pgo_selected",
+        "cira-few-shot-online": "few_shot_online",
+    }[system]
+    definition = modes[key]
+    lead = definition.get("lead_blocks")
+    if not isinstance(lead, int) or lead <= 0:
+        raise SweepError(f"{system} has no qualified 1us lead")
+    source_row = (
+        definition.get("source_row")
+        if system == "cira-few-shot-online" else None
+    )
+    return definition["cira_mode"], source_row, lead
+
+
+def _variant_manifest(options, paths, latency, system):
+    mode, source_row, selected_1us = _mode_spec(options, system)
+    lead = lead_for_latency(selected_1us, latency)
+    build = paths.variants / latency / system
     manifest_path = build / "manifest.json"
     if not manifest_path.exists():
-        variant_builder.main(
-            [
+        arguments = [
                 "--baseline-build", str(options.baseline_build),
                 "--outdir", str(build),
                 "--cxlmemuring", str(options.cxlmemuring),
@@ -330,13 +503,24 @@ def _variant_manifest(options, paths, latency):
                 "--cxx", options.cxx,
                 "--cira-prefetch-distance", str(lead),
                 "--cira-row-batch", "64",
+                "--cira-mode", mode,
+                "--calibration-manifest", str(options.calibration_manifest),
+                "--cira-policy-latency-ns", str(LATENCY_NS[latency]),
             ]
-        )
+        if source_row is not None:
+            arguments.extend(("--cira-source-row", source_row))
+        variant_builder.main(arguments)
     manifest, variants = matched_runner.load_manifest(manifest_path)
     if int(manifest.get("cira_lead_blocks", -1)) != lead:
         raise SweepError(
             f"{latency} variant lead does not match frozen policy scaling"
         )
+    if manifest.get("cira_mode") != mode:
+        raise SweepError(f"{latency}/{system} CIRA mode differs")
+    if source_row is not None and manifest.get("cira_policy", {}).get(
+        "source_row"
+    ) != source_row:
+        raise SweepError(f"{latency}/{system} source row differs")
     return manifest_path, variants
 
 
@@ -346,15 +530,17 @@ def _input_paths(entry, options, paths):
         "graph_manifest": Path(options.graph_manifest),
         "policy": Path(options.policy),
         "qualification": Path(options.qualification),
+        "calibration_manifest": Path(options.calibration_manifest),
         "gem5": Path(options.gem5),
         "config": Path(options.config),
     }
-    if entry.system in {"amu", "cira"}:
+    if entry.system == AMU_SYSTEM or entry.system in CIRA_SYSTEMS:
         manifest_path, variants = _variant_manifest(
-            options, paths, entry.latency
+            options, paths, entry.latency, entry.system
         )
         inputs["variant_manifest"] = manifest_path
-        inputs["binary"] = Path(variants[entry.system]["binary"])
+        kind = "amu" if entry.system == AMU_SYSTEM else "cira"
+        inputs["binary"] = Path(variants[kind]["binary"])
         inputs["baseline_manifest"] = Path(options.baseline_build) / "manifest.json"
     return {name: Path(path).resolve() for name, path in inputs.items()}
 
@@ -388,11 +574,12 @@ def _summary_evidence_paths(entry, paths):
         output["workload_binary"] = (root / "build/bin/pr_spmv").resolve()
     else:
         manifest = _load_json(
-            paths.variants / entry.latency / "manifest.json",
+            paths.variants / entry.latency / entry.system / "manifest.json",
             "variant manifest",
         )
         variants = {item["kind"]: item for item in manifest["variants"]}
-        raw = Path(variants[entry.system]["reference_raw"])
+        kind = "amu" if entry.system == AMU_SYSTEM else "cira"
+        raw = Path(variants[kind]["reference_raw"])
     output["raw"] = raw.resolve()
     output["config"] = (Path(row["run_dir"]) / "config.ini").resolve()
     output["checkpoint"] = Path(row["checkpoint_manifest"]).resolve()
@@ -400,7 +587,7 @@ def _summary_evidence_paths(entry, paths):
 
 
 def _validate_bit_exact(entry, paths, outputs):
-    if entry.system not in {"amu", "cira"}:
+    if entry.system != AMU_SYSTEM and entry.system not in CIRA_SYSTEMS:
         return
     vanilla_raw = (
         paths.runs / entry.latency / "m2ndp/reference/scores.raw"
@@ -415,6 +602,7 @@ def _state_contract(options):
         "graph_manifest": options.graph_manifest,
         "policy": options.policy,
         "qualification": options.qualification,
+        "calibration_manifest": options.calibration_manifest,
         "gem5": options.gem5,
         "config": options.config,
         "baseline_manifest": Path(options.baseline_build) / "manifest.json",
@@ -492,6 +680,7 @@ def _validate_or_run(entry, options, paths, state):
         )
         artifacts.atomic_write_json(paths.status, state)
         raise SweepError(message)
+    accounting = _augment_end_to_end_summary(entry, options, paths)
     outputs = _summary_evidence_paths(entry, paths)
     _validate_bit_exact(entry, paths, outputs)
     output_hashes = shared.hash_named_paths(outputs)
@@ -503,6 +692,7 @@ def _validate_or_run(entry, options, paths, state):
         "input_paths": {name: str(path) for name, path in input_paths.items()},
         "output_paths": {name: str(path) for name, path in outputs.items()},
         "log": str(log.resolve()),
+        **accounting,
         "returncode": 0,
         "error": None,
     }
@@ -520,6 +710,7 @@ def _validate_options(options):
     for label, path in (
         ("graph", options.graph), ("graph manifest", options.graph_manifest),
         ("policy", options.policy), ("qualification", options.qualification),
+        ("calibration manifest", options.calibration_manifest),
         ("gem5", options.gem5), ("config", options.config),
         ("m5 library", options.m5_library),
         ("baseline build manifest", Path(options.baseline_build) / "manifest.json"),
@@ -538,7 +729,17 @@ def _validate_options(options):
     manifest = profiles.load_graph_manifest(options.graph_manifest)
     if Path(manifest.graph).resolve() != Path(options.graph).resolve():
         raise SweepError("g14 graph path differs from frozen manifest")
-    load_policy(options.policy)
+    policy = load_policy(options.policy)
+    load_calibrated_qualification(
+        options.qualification,
+        calibration_manifest=options.calibration_manifest,
+        gem5=options.gem5,
+        config=options.config,
+    )
+    if policy["result_hashes"].get("qualification") != artifacts.sha256_file(
+        options.qualification
+    ):
+        raise SweepError("CIRA policy is not bound to this qualification")
 
 
 def parse_args(argv=None):
@@ -563,6 +764,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--cxx", default=os.environ.get("CXX", "g++"))
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--only-latency", choices=LATENCIES)
     parser.add_argument("--stop-after", choices=SYSTEMS)
@@ -574,12 +776,18 @@ def parse_args(argv=None):
         g14_baseline if (g14_baseline / "manifest.json").is_file()
         else g12_baseline
     )
+    calibration_manifest = (
+        args.calibration_manifest.resolve()
+        if args.calibration_manifest is not None
+        else root / "calibration/amu-cira.json"
+    )
     return Options(
         root=root,
         graph=root / "graphs/g14.sg",
         graph_manifest=root / "graphs/g14.manifest.json",
         policy=root / "policy/cira-lead.json",
         qualification=root / "qualification/qualification.json",
+        calibration_manifest=calibration_manifest,
         gem5=args.gem5.resolve(),
         config=args.config.resolve(),
         cxlmemuring=args.cxlmemuring.resolve(),
