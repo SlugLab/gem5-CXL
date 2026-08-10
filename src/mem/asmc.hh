@@ -63,26 +63,37 @@ class ASMC : public ClockedObject
         Request::Flags flags = 0;
     };
 
+    enum class RequestPhase
+    {
+        MemoryAccess,
+        SpmWriteback,
+    };
+
     struct RequestState
     {
         uint64_t id = 0;
         ReqType type = ReqType::Load;
+        RequestPhase phase = RequestPhase::MemoryAccess;
         ThreadContext *tc = nullptr;
         Addr spmAddr = 0;
         Addr memAddr = 0;
         uint64_t size = 0;
         Tick issueTick = 0;
         std::vector<uint8_t> data;
+        std::vector<TranslationChunk> spmChunks;
         uint32_t pendingPackets = 0;
+        uint32_t reservedWritePackets = 0;
     };
 
     struct PacketSenderState : public Packet::SenderState
     {
-        PacketSenderState(uint64_t request_id, bool is_read)
-            : id(request_id), read(is_read)
+        PacketSenderState(uint64_t request_id, RequestPhase request_phase,
+                          bool is_read)
+            : id(request_id), phase(request_phase), read(is_read)
         {}
 
         uint64_t id;
+        RequestPhase phase;
         bool read;
     };
 
@@ -124,10 +135,14 @@ class ASMC : public ClockedObject
                    BaseMMU::Mode mode,
                    std::vector<TranslationChunk> &chunks) const;
     bool readGuest(ThreadContext *tc, Addr addr, void *data, uint64_t size);
-    bool writeGuest(ThreadContext *tc, Addr addr, const void *data,
-                    uint64_t size);
     bool readSpm(Addr addr, void *data, uint64_t size) const;
     void writeSpm(Addr addr, const void *data, uint64_t size);
+    uint32_t countPackets(
+        const std::vector<TranslationChunk> &chunks) const;
+    void enqueuePackets(RequestState &state,
+                        const std::vector<TranslationChunk> &chunks,
+                        MemCmd command, RequestPhase phase);
+    void startSpmWriteback(RequestState &state);
     void enqueuePacket(PacketPtr pkt);
     void scheduleSend(Tick when);
     void trySend();
@@ -160,6 +175,7 @@ class ASMC : public ClockedObject
     std::unordered_map<Addr, uint8_t> spmData;
     std::deque<PacketPtr> sendQueue;
     PacketPtr retryPkt = nullptr;
+    uint64_t reservedSendSlots = 0;
     EventFunctionWrapper sendEvent;
 
     ASMCStats stats;
