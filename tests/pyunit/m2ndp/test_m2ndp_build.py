@@ -214,6 +214,21 @@ class MatchedPageRankSourceTest(unittest.TestCase):
         self.assertFalse(manifest["fp_contract"])
         self.assertTrue(Path(manifest["reference_raw_path"]).is_absolute())
 
+    def test_experiment_header_is_written_with_absolute_reference(self):
+        builder = importlib.import_module(
+            "scripts.build_gapbs_m2ndp_pr_spmv"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "generated/m2ndp_experiment_config.h"
+            reference = root / "reference/scores.raw"
+            builder.write_experiment_header(header, reference)
+
+            text = header.read_text(encoding="utf-8")
+
+        self.assertIn(str(reference.resolve()), text)
+        self.assertIn("M2NDP_REFERENCE_RAW_PATH", text)
+
     def test_reference_dump_uses_checkpoint_safe_m5_pseudo_op(self):
         source = (
             REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"

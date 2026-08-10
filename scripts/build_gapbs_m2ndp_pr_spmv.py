@@ -104,6 +104,13 @@ def write_experiment_header(path, reference_raw):
     escaped = (
         reference.replace("\\", "\\\\").replace('"', '\\"')
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#ifndef M2NDP_EXPERIMENT_CONFIG_H\n"
+        "#define M2NDP_EXPERIMENT_CONFIG_H\n"
+        f'#define M2NDP_REFERENCE_RAW_PATH "{escaped}"\n'
+        "#endif\n"
+    )
 
 
 def patch_generated_graph_node_count(gapbs_root):
@@ -120,13 +127,6 @@ def patch_generated_graph_node_count(gapbs_root):
         encoding="utf-8",
     )
     return builder
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "#ifndef M2NDP_EXPERIMENT_CONFIG_H\n"
-        "#define M2NDP_EXPERIMENT_CONFIG_H\n"
-        f'#define M2NDP_REFERENCE_RAW_PATH "{escaped}"\n'
-        "#endif\n"
-    )
 
 
 def copy_gapbs_source(cxlmemuring, outdir):
