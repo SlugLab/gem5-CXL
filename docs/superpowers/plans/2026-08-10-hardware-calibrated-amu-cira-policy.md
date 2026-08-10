@@ -65,7 +65,7 @@ class CalibrationSourceTest(unittest.TestCase):
 
 - [ ] **Step 2: Run tests and verify the module is missing**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_amu_cira_calibration -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_amu_cira_calibration.py' -v`
 
 Expected: `ImportError: cannot import name 'amu_cira_calibration'`.
 
@@ -114,7 +114,7 @@ Parse CSV rows with `csv.DictReader`, require ten trials, convert numeric fields
 
 - [ ] **Step 4: Run source tests**
 
-Run: `AMU_PDF=/home/victoryang00/gem5-CXL/3663479.pdf CIRA_CSV=/root/ia780i_type2_delay_buffer_new/benchmark_gapbs_workloads_ci_long.csv python3 -m unittest tests.pyunit.amu.test_amu_cira_calibration -v`
+Run: `AMU_PDF=/home/victoryang00/gem5-CXL/3663479.pdf CIRA_CSV=/root/ia780i_type2_delay_buffer_new/benchmark_gapbs_workloads_ci_long.csv python3 -m unittest discover -s tests/pyunit/amu -p 'test_amu_cira_calibration.py' -v`
 
 Expected: all source/hash/classification tests pass.
 
@@ -155,7 +155,7 @@ def test_speedup_is_never_a_direct_parameter(self):
 
 - [ ] **Step 2: Run the fit tests and see the missing function**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_amu_cira_calibration.CalibrationFitTest -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_amu_cira_calibration.py' -v`
 
 Expected: `AttributeError` for `fit_amu_control_costs`.
 
@@ -221,7 +221,7 @@ GUPS 5 us modeled MLP is not greater than 130.
 
 - [ ] **Step 6: Run tests and a fixture fit**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_amu_cira_calibration -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_amu_cira_calibration.py' -v`
 
 Expected: all tests pass and repeated fits produce byte-identical JSON after excluding the output path.
 
@@ -264,7 +264,7 @@ def test_completion_and_polling_stats_are_recorded(self):
 
 - [ ] **Step 2: Run tests and verify the parameters are absent**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_asmc_paper_model -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_asmc_paper_model.py' -v`
 
 Expected: failures naming `pending_queue_entries` and new stats.
 
@@ -306,7 +306,7 @@ every new queue and state member in `reset()`.
 
 - [ ] **Step 5: Run source tests and build gem5**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_asmc_paper_model tests.pyunit.amu.test_asmc_coherent_spm_writeback -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_asmc_paper_model.py' -v` followed by `python3 -m unittest discover -s tests/pyunit/amu -p 'test_asmc_coherent_spm_writeback.py' -v`.
 
 Run: `scons build/X86/gem5.opt -j2`
 
@@ -334,7 +334,7 @@ Require `--asmc-calibration-manifest`, 64 KiB SPM for `paper-calibrated`, manife
 
 - [ ] **Step 2: Run the targeted tests**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_asmc_paper_model tests.pyunit.amu.test_compare_gapbs_cxl_amu_cira -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_asmc_paper_model.py' -v` followed by `python3 -m unittest discover -s tests/pyunit/amu -p 'test_compare_gapbs_cxl_amu_cira.py' -v`.
 
 Expected: failures for the missing manifest option and rolling submit/consume API.
 
@@ -363,7 +363,8 @@ Replace the generated batch helper with `AsyncWindow<T>` that keeps `head`, `tai
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_compare_gapbs_cxl_amu_cira tests.pyunit.amu.test_asmc_paper_model -v
+python3 -m unittest discover -s tests/pyunit/amu -p 'test_compare_gapbs_cxl_amu_cira.py' -v
+python3 -m unittest discover -s tests/pyunit/amu -p 'test_asmc_paper_model.py' -v
 ```
 
 Expected: generated-source assertions pass, including absence of a
@@ -406,7 +407,7 @@ def test_capacity_failure_leaves_demand_synchronous(self):
 
 - [ ] **Step 2: Run tests and verify the module is missing**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_cira_hoist_model -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_cira_hoist_model.py' -v`
 
 Expected: import failure.
 
@@ -420,7 +421,7 @@ Use frozen dataclasses `HoistCandidate`, `ResourceState`, and `HoistDecision`. E
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_cira_hoist_model -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_cira_hoist_model.py' -v`
 
 Expected: all tests pass.
 
@@ -444,7 +445,7 @@ Require actions for `cira-static-1us`, `cira-pgo-selected-1us`, and `cira-few-sh
 
 - [ ] **Step 2: Run tests and observe the old lead-only contract**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_cira_lead_policy tests.pyunit.m2ndp.test_run_gapbs_g12_qualification -v`
+Run: `python3 -m unittest discover -s tests/pyunit/amu -p 'test_cira_lead_policy.py' -v` followed by `python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_g12_qualification.py' -v`.
 
 Expected: missing mode/action assertions fail.
 
@@ -461,7 +462,9 @@ Run Vanilla and calibrated AMU once, then static and PGO-selected. Run few-shot 
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.amu.test_cira_lead_policy tests.pyunit.amu.test_cira_hoist_model tests.pyunit.m2ndp.test_run_gapbs_g12_qualification -v
+python3 -m unittest discover -s tests/pyunit/amu -p 'test_cira_lead_policy.py' -v
+python3 -m unittest discover -s tests/pyunit/amu -p 'test_cira_hoist_model.py' -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_g12_qualification.py' -v
 ```
 
 Expected: all tests pass; fixture evidence has four active CIRA ports, no
@@ -488,7 +491,7 @@ Test that changing either source hash, fit parameters, simulator hash, binary mo
 
 - [ ] **Step 2: Run the contract tests**
 
-Run: `python3 -m unittest tests.pyunit.m2ndp.test_calibrated_g12_g14_contract -v`
+Run: `python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_calibrated_g12_g14_contract.py' -v`
 
 Expected: failures because calibration hashes are not yet part of action contracts.
 
@@ -502,7 +505,13 @@ The g12 output contains selected AMU parameters, all CIRA mode definitions, fit 
 
 - [ ] **Step 5: Run orchestration tests and commit**
 
-Run: `python3 -m unittest tests.pyunit.m2ndp.test_run_gapbs_g12_qualification tests.pyunit.m2ndp.test_run_gapbs_g14_4thread_latency_sweep tests.pyunit.m2ndp.test_calibrated_g12_g14_contract -v`
+Run:
+
+```bash
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_g12_qualification.py' -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_run_gapbs_g14_4thread_latency_sweep.py' -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_calibrated_g12_g14_contract.py' -v
+```
 
 Expected: all tests pass.
 
@@ -544,7 +553,7 @@ Use separate styles for all five accelerated series and preserve the 200/500/100
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.m2ndp.test_generate_gapbs_g14_4thread_latency_results tests.pyunit.m2ndp.test_validate_gapbs_g14_4thread_latency_results tests.pyunit.m2ndp.test_generate_gapbs_g14_4thread_latency_figure -v
+python3 -m unittest discover -s tests/pyunit/m2ndp -p '*gapbs_g14_4thread_latency*.py' -v
 ```
 
 Expected: all tests pass and fixture generation produces deterministic
