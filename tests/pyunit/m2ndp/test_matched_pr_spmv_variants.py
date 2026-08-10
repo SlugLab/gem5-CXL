@@ -103,6 +103,12 @@ class MatchedVariantSourceTest(unittest.TestCase):
             1,
         )
         self.assertNotIn("GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROW(", generated)
+        header = variants.cira_builder.CIRA_HEADER
+        self.assertIn("GAPBS_CIRA_LEAD_BLOCKS", header)
+        self.assertIn("GAPBS_CIRA_ROW_BLOCK_SIZE 64", header)
+        self.assertIn(
+            "current_block_begin + lead_blocks * row_block_size", header
+        )
 
     def test_compile_commands_disable_contraction_and_fast_math(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,7 +132,7 @@ class MatchedVariantSourceTest(unittest.TestCase):
         self.assertIn("-DGAPBS_AMU_BATCH_SIZE=64", command)
         self.assertNotIn("-ffast-math", command)
 
-    def test_cira_compile_command_sets_aggressive_row_batch(self):
+    def test_cira_compile_command_sets_frozen_64_row_lead_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             command = variants.compile_command(
@@ -138,12 +144,15 @@ class MatchedVariantSourceTest(unittest.TestCase):
                 output=root / "bin/pr_spmv",
                 m5_library=root / "libm5.a",
                 amu_batch_size=64,
-                cira_prefetch_distance=16,
+                cira_prefetch_distance=2,
                 cira_row_batch=256,
                 cira_max_outstanding=256,
             )
 
-        self.assertIn("-DGAPBS_CIRA_ROW_BATCH=256", command)
+        self.assertIn("-DGAPBS_CIRA_LEAD_BLOCKS=2", command)
+        self.assertIn("-DGAPBS_CIRA_ROW_BLOCK_SIZE=64", command)
+        self.assertNotIn("-DGAPBS_CIRA_NODE_DISTANCE=2", command)
+        self.assertNotIn("-DGAPBS_CIRA_ROW_BATCH=256", command)
 
 
 class MatchedVariantBitGateTest(unittest.TestCase):

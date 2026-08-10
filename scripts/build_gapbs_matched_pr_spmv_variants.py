@@ -139,8 +139,8 @@ def compile_command(
     elif kind == "cira":
         command += [
             f"-DGAPBS_CIRA_PREFETCH_DISTANCE={cira_prefetch_distance}",
-            f"-DGAPBS_CIRA_NODE_DISTANCE={cira_prefetch_distance}",
-            f"-DGAPBS_CIRA_ROW_BATCH={cira_row_batch}",
+            f"-DGAPBS_CIRA_LEAD_BLOCKS={cira_prefetch_distance}",
+            "-DGAPBS_CIRA_ROW_BLOCK_SIZE=64",
             f"-DGAPBS_CIRA_MAX_OUTSTANDING={cira_max_outstanding}",
             "-DGAPBS_CIRA_RANGE_LIMIT=0",
             "-DGAPBS_CIRA_USE_CSR=1",
@@ -347,7 +347,8 @@ def main(argv=None):
         "compiler": baseline_builder.compiler_version(args.cxx),
         "amu_batch_size": args.amu_batch_size,
         "cira_prefetch_distance": cira_distance,
-        "cira_row_batch": args.cira_row_batch,
+        "cira_lead_blocks": cira_distance,
+        "cira_row_batch": 64,
         "cira_profile_mode": "override-non-pgo" if override else "pgo",
         "cira_profiles": profiles,
         "cira_profile_sha256": {
