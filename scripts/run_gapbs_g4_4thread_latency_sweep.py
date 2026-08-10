@@ -56,6 +56,37 @@ class RunPaths:
     logs: Path
 
 
+def hash_named_paths(paths):
+    """Hash a named immutable input/output set without float conversion."""
+    return {
+        name: artifacts.sha256_file(Path(path))
+        for name, path in sorted(paths.items())
+    }
+
+
+def immutable_passed_record(*, command, input_hashes, output_hashes):
+    return {
+        "status": "passed",
+        "command": [str(item) for item in command],
+        "input_hashes": dict(sorted(input_hashes.items())),
+        "output_hashes": dict(sorted(output_hashes.items())),
+    }
+
+
+def validate_immutable_passed_record(
+    record, *, command, input_hashes, output_hashes
+):
+    if record.get("status") != "passed":
+        raise SweepError("resume record is not passed")
+    if record.get("command") != [str(item) for item in command]:
+        raise SweepError("resume command differs from recorded command")
+    if record.get("input_hashes") != dict(sorted(input_hashes.items())):
+        raise SweepError("resume input or binary hash differs")
+    if record.get("output_hashes") != dict(sorted(output_hashes.items())):
+        raise SweepError("resume output hash differs")
+    return record
+
+
 def make_paths(options):
     root = Path(options.outdir).resolve()
     return RunPaths(

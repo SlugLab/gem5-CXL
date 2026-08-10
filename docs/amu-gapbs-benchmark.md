@@ -375,6 +375,61 @@ ports, AMU issued/completed balance, exact per-latency result-vector hashes,
 and all four M2NDP calibrations. Until these gates pass, do not replace the
 paper table or describe an intermediate row as a completed comparison.
 
+## G14 four-thread real-CXL formal runner
+
+The publication replacement uses deterministic g12 qualification and g14
+formal graphs on external storage. The g4 flow above remains a correctness and
+runner regression test; it is not real-CXL performance evidence. Before any
+graph generation or formal latency, require at least 100 GiB free and create
+the stable link exactly once:
+
+```sh
+mkdir -p /mnt/disk0/gem5-CXL-g14-eval
+ln -s /mnt/disk0/gem5-CXL-g14-eval \
+  /home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/g14-real-cxl-eval
+df -B1 /mnt/disk0
+readlink -f m5out/g14-real-cxl-eval
+```
+
+Prepare and freeze both graph manifests, then run qualification. The
+qualification uses four timing cores/threads, two trials, 20 synchronous
+PageRank iterations, a checkpoint immediately before trial 0, raw bit-exact
+comparison after every mechanism, and activity-only CIRA lead selection:
+
+```sh
+python3 scripts/prepare_gapbs_pr_graph.py \
+  --scale 12 --root /mnt/disk0/gem5-CXL-g14-eval/graphs
+python3 scripts/prepare_gapbs_pr_graph.py \
+  --scale 14 --root /mnt/disk0/gem5-CXL-g14-eval/graphs
+python3 scripts/run_gapbs_g12_qualification.py \
+  --root /mnt/disk0/gem5-CXL-g14-eval --resume
+```
+
+`qualification/qualification.json` must identify exactly one of
+`g12_real_cxl` and `g12_cache_resident` as true. The exclusively created
+`policy/cira-lead.json` freezes the smallest passing 1 us lead and its result
+hashes. A cache-resident g12 graph routes qualification to g14/1 us; it never
+waives the positive memory-controller traffic gate.
+
+Run the latency-major 16-entry formal matrix in a low-priority user service:
+
+```sh
+systemd-run --user --unit=gem5-g14-real-cxl \
+  --property=Nice=15 --property=IOSchedulingClass=idle \
+  --collect /usr/bin/python3 \
+  /home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/scripts/run_gapbs_g14_4thread_latency_sweep.py \
+  --root /mnt/disk0/gem5-CXL-g14-eval --resume
+```
+
+For the staged 1 us proof, use `--only-latency 1us --stop-after cira`; resume
+with the same root to continue through M2NDP. The immutable experiment contract
+does not include these operational stop filters, so a later full `--resume`
+continues the remaining matrix. The runner never falls back to another
+filesystem and never deletes a formal output directory. A passed action is
+reusable only when its command plus graph, binary, config, checkpoint, policy,
+raw-vector, and summary hashes still match. Every AMU/CIRA raw vector must be
+bit-identical to the same-latency Vanilla vector.
+
 ## Current background recovery policy
 
 Periodic and live CRIU checkpointing are disabled. The old
