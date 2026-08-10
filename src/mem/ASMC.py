@@ -27,6 +27,11 @@ class ASMC(ClockedObject):
     max_send_queue = Param.Unsigned(
         512, "Maximum queued memory packets waiting for the cache port"
     )
+    pending_queue_entries = Param.Unsigned(32, "Entries per internal service stage")
+    id_batch_entries = Param.Unsigned(32, "AMART IDs obtained per metadata refill")
+    metadata_latency = Param.Cycles(10, "Cycles for one metadata service")
+    id_refill_latency = Param.Cycles(0, "Additional cycles at an ID batch boundary")
+    completion_publish_latency = Param.Cycles(0, "Cycles to publish a completion")
     issue_latency = Param.Latency(
         "1ns", "Delay from m5op issue to first ASMC memory packet send"
     )

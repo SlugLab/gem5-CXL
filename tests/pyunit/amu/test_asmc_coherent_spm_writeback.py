@@ -25,7 +25,9 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
         self.assertIn("reservedWritePackets", HEADER)
         self.assertIn("reservedSendSlots", HEADER)
         self.assertIn("countPackets", HEADER)
-        self.assertIn("reservedSendSlots += spm_packets", SOURCE)
+        self.assertIn(
+            "reservedSendSlots += memory_packets + spm_packets", SOURCE
+        )
         self.assertIn(
             "reservedSendSlots -= state.reservedWritePackets", SOURCE
         )
@@ -42,11 +44,10 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             SOURCE.index("ASMC::startSpmWriteback")
         ]
         self.assertIn("MemCmd::ReadReq", issue)
-        self.assertIn(
-            "enqueuePackets(*raw_state, chunks, command, "
-            "RequestPhase::MemoryAccess)",
-            issue,
-        )
+        self.assertIn("startMemoryAccess", issue)
+        self.assertIn("MemCmd::ReadReq", issue)
+        self.assertIn("state.memoryChunks", issue)
+        self.assertIn("RequestPhase::MemoryAccess", issue)
         self.assertNotIn("readGuest(tc, mem_addr", issue)
 
     def test_finished_queue_is_after_writeback_not_functional_write(self):
@@ -56,11 +57,11 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
         ]
         self.assertNotIn("writeGuest", complete)
         self.assertIn("finished[state.tc].push_back(id)", complete)
-        response = SOURCE[
-            SOURCE.index("ASMC::recvTimingResp"):
-            SOURCE.index("ASMC::recvReqRetry")
+        completion = SOURCE[
+            SOURCE.index("ASMC::finishCompletionService"):
+            SOURCE.index("ASMC::startSpmWriteback")
         ]
-        self.assertIn("startSpmWriteback(state)", response)
+        self.assertIn("startSpmWriteback(state)", completion)
 
     def test_reset_clears_reserved_capacity(self):
         reset = SOURCE[SOURCE.index("ASMC::reset"):]

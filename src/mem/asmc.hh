@@ -37,6 +37,7 @@ class ASMC : public ClockedObject
     ~ASMC() override;
 
     void init() override;
+    void resetStats() override;
     Port &getPort(const std::string &if_name,
                   PortID idx = InvalidPortID) override;
 
@@ -80,8 +81,10 @@ class ASMC : public ClockedObject
         uint64_t size = 0;
         Tick issueTick = 0;
         std::vector<uint8_t> data;
+        std::vector<TranslationChunk> memoryChunks;
         std::vector<TranslationChunk> spmChunks;
         uint32_t pendingPackets = 0;
+        uint32_t reservedMemoryPackets = 0;
         uint32_t reservedWritePackets = 0;
     };
 
@@ -112,7 +115,11 @@ class ASMC : public ClockedObject
 
     struct ASMCStats : public statistics::Group
     {
-        ASMCStats(statistics::Group *parent);
+        ASMCStats(ASMC &owner);
+
+        void preDumpStats() override;
+
+        ASMC &owner;
 
         statistics::Scalar issuedLoads;
         statistics::Scalar issuedStores;
@@ -126,7 +133,17 @@ class ASMC : public ClockedObject
         statistics::Scalar readBytes;
         statistics::Scalar writeBytes;
         statistics::Scalar totalLatency;
+        statistics::Scalar outstandingIntegral;
+        statistics::Scalar occupancyTicks;
+        statistics::Scalar maxObservedOutstanding;
+        statistics::Scalar pendingQueueFull;
+        statistics::Scalar idBatchRefills;
+        statistics::Scalar metadataAccesses;
+        statistics::Scalar emptyGetfinPolls;
+        statistics::Scalar successfulGetfin;
+        statistics::Scalar consumerWaitTicks;
         statistics::Formula avgLatency;
+        statistics::Formula avgOutstanding;
     };
 
     uint64_t issue(ThreadContext *tc, ReqType type, Addr spm_addr,
@@ -142,6 +159,10 @@ class ASMC : public ClockedObject
     void enqueuePackets(RequestState &state,
                         const std::vector<TranslationChunk> &chunks,
                         MemCmd command, RequestPhase phase);
+    void startMemoryAccess(uint64_t id);
+    void startCompletionService(uint64_t id);
+    void activateCompletionService(uint64_t id);
+    void finishCompletionService(uint64_t id);
     void startSpmWriteback(RequestState &state);
     void enqueuePacket(PacketPtr pkt);
     void scheduleSend(Tick when);
@@ -149,6 +170,7 @@ class ASMC : public ClockedObject
     bool recvTimingResp(PacketPtr pkt);
     void recvReqRetry();
     void completeRequest(uint64_t id);
+    void updateOccupancyIntegral();
     void reset();
     void deleteQueuedPacket(PacketPtr pkt);
 
@@ -161,6 +183,11 @@ class ASMC : public ClockedObject
     const uint64_t spmSize;
     const uint64_t cacheLineSize;
     const uint64_t maxSendQueue;
+    const uint64_t pendingQueueEntries;
+    const uint64_t idBatchEntries;
+    const Cycles metadataLatency;
+    const Cycles idRefillLatency;
+    const Cycles completionPublishLatency;
     const Tick issueLatency;
     const Tick completionLatency;
 
@@ -169,9 +196,15 @@ class ASMC : public ClockedObject
     Tick configuredLatency;
     uint64_t nextId = 1;
     uint64_t spmUsed = 0;
+    uint64_t metadataPending = 0;
+    uint64_t completionPending = 0;
+    uint64_t idsRemaining = 0;
+    Tick lastOccupancyTick = 0;
 
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;
+    std::unordered_map<ThreadContext *, Tick> pollWaitStart;
+    std::deque<uint64_t> completionWaitQueue;
     std::unordered_map<Addr, uint8_t> spmData;
     std::deque<PacketPtr> sendQueue;
     PacketPtr retryPkt = nullptr;

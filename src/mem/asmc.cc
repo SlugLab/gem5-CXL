@@ -41,8 +41,8 @@ ASMC::MemoryPort::recvReqRetry()
     owner.recvReqRetry();
 }
 
-ASMC::ASMCStats::ASMCStats(statistics::Group *parent)
-    : statistics::Group(parent),
+ASMC::ASMCStats::ASMCStats(ASMC &owner)
+    : statistics::Group(&owner), owner(owner),
       ADD_STAT(issuedLoads, statistics::units::Count::get(),
                "AMU aload requests issued"),
       ADD_STAT(issuedStores, statistics::units::Count::get(),
@@ -67,10 +67,38 @@ ASMC::ASMCStats::ASMCStats(statistics::Group *parent)
                "Timing write bytes sent by ASMC"),
       ADD_STAT(totalLatency, statistics::units::Tick::get(),
                "Total AMU request latency from m5op issue to finish queue"),
+      ADD_STAT(outstandingIntegral, statistics::units::Count::get(),
+               "Integral of outstanding AMU requests over ticks"),
+      ADD_STAT(occupancyTicks, statistics::units::Tick::get(),
+               "Ticks represented by the outstanding-request integral"),
+      ADD_STAT(maxObservedOutstanding, statistics::units::Count::get(),
+               "Maximum simultaneously outstanding AMU requests"),
+      ADD_STAT(pendingQueueFull, statistics::units::Count::get(),
+               "Internal metadata/completion service backpressure events"),
+      ADD_STAT(idBatchRefills, statistics::units::Count::get(),
+               "AMART ID batch refills"),
+      ADD_STAT(metadataAccesses, statistics::units::Count::get(),
+               "Metadata services performed at issue and completion"),
+      ADD_STAT(emptyGetfinPolls, statistics::units::Count::get(),
+               "getfin calls that found no completed request"),
+      ADD_STAT(successfulGetfin, statistics::units::Count::get(),
+               "getfin calls that returned a completed request"),
+      ADD_STAT(consumerWaitTicks, statistics::units::Tick::get(),
+               "Ticks from first empty getfin poll to a successful poll"),
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
                "Average AMU request latency",
-               totalLatency / (completedLoads + completedStores))
+               totalLatency / (completedLoads + completedStores)),
+      ADD_STAT(avgOutstanding, statistics::units::Count::get(),
+               "Time-weighted average outstanding AMU requests",
+               outstandingIntegral / occupancyTicks)
 {}
+
+void
+ASMC::ASMCStats::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+    owner.updateOccupancyIntegral();
+}
 
 ASMC::ASMC(const Params &p)
     : ClockedObject(p),
@@ -80,14 +108,25 @@ ASMC::ASMC(const Params &p)
       spmSize(p.spm_size),
       cacheLineSize(p.cache_line_size),
       maxSendQueue(p.max_send_queue),
+      pendingQueueEntries(p.pending_queue_entries),
+      idBatchEntries(p.id_batch_entries),
+      metadataLatency(p.metadata_latency),
+      idRefillLatency(p.id_refill_latency),
+      completionPublishLatency(p.completion_publish_latency),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
       granularity(p.default_granularity ? p.default_granularity : 1),
       maxOutstanding(p.max_outstanding),
       configuredLatency(p.asmc_latency),
       sendEvent([this] { trySend(); }, name()),
-      stats(this)
-{}
+      stats(*this)
+{
+    panic_if(pendingQueueEntries == 0,
+             "ASMC pending_queue_entries must be non-zero");
+    panic_if(idBatchEntries == 0,
+             "ASMC id_batch_entries must be non-zero");
+    lastOccupancyTick = curTick();
+}
 
 ASMC::~ASMC()
 {
@@ -105,6 +144,16 @@ ASMC::init()
              "Only one ASMC instance per System is currently supported");
     registry[system] = this;
     ClockedObject::init();
+}
+
+void
+ASMC::resetStats()
+{
+    updateOccupancyIntegral();
+    ClockedObject::resetStats();
+    lastOccupancyTick = curTick();
+    pollWaitStart.clear();
+    stats.maxObservedOutstanding = outstanding.size();
 }
 
 Port &
@@ -241,6 +290,11 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
         return 0;
     }
 
+    if (metadataPending >= pendingQueueEntries) {
+        ++stats.pendingQueueFull;
+        return 0;
+    }
+
     if (spmUsed + granularity > spmSize) {
         ++stats.rejectedSpmFull;
         return 0;
@@ -279,7 +333,9 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     state->size = granularity;
     state->issueTick = curTick();
     state->data.resize(granularity);
+    state->memoryChunks = std::move(chunks);
     state->spmChunks = std::move(spm_chunks);
+    state->reservedMemoryPackets = memory_packets;
     state->reservedWritePackets = spm_packets;
 
     if (type == ReqType::Store) {
@@ -290,14 +346,22 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
         }
     }
 
+    updateOccupancyIntegral();
     spmUsed += state->size;
-    RequestState *raw_state = state.get();
     outstanding[id] = std::move(state);
-    reservedSendSlots += spm_packets;
+    stats.maxObservedOutstanding = std::max(
+        outstanding.size(),
+        static_cast<size_t>(stats.maxObservedOutstanding.value()));
+    reservedSendSlots += memory_packets + spm_packets;
+    metadataPending++;
 
-    const MemCmd command = type == ReqType::Load ?
-        MemCmd::ReadReq : MemCmd::WriteReq;
-    enqueuePackets(*raw_state, chunks, command, RequestPhase::MemoryAccess);
+    Tick service_delay = issueLatency + cyclesToTicks(metadataLatency);
+    if (idsRemaining == 0) {
+        idsRemaining = idBatchEntries;
+        ++stats.idBatchRefills;
+        service_delay += cyclesToTicks(idRefillLatency);
+    }
+    --idsRemaining;
 
     if (type == ReqType::Load)
         ++stats.issuedLoads;
@@ -312,10 +376,95 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
             static_cast<unsigned long long>(spm_addr),
             static_cast<unsigned long long>(mem_addr),
             static_cast<unsigned long long>(granularity),
-            chunks.size());
+            outstanding[id]->memoryChunks.size());
 
-    scheduleSend(curTick() + issueLatency);
+    auto *event = new EventFunctionWrapper(
+        [this, id] { startMemoryAccess(id); },
+        csprintf("%s.metadata_%llu", name(),
+                 static_cast<unsigned long long>(id)),
+        true);
+    schedule(event, curTick() + service_delay);
     return id;
+}
+
+void
+ASMC::startMemoryAccess(uint64_t id)
+{
+    const auto it = outstanding.find(id);
+    if (it == outstanding.end())
+        return;
+
+    RequestState &state = *it->second;
+    panic_if(metadataPending == 0 ||
+             reservedSendSlots < state.reservedMemoryPackets,
+             "ASMC invalid metadata service state for request %#llx",
+             static_cast<unsigned long long>(id));
+    metadataPending--;
+    ++stats.metadataAccesses;
+    reservedSendSlots -= state.reservedMemoryPackets;
+    state.reservedMemoryPackets = 0;
+    const MemCmd command = state.type == ReqType::Load ?
+        MemCmd::ReadReq : MemCmd::WriteReq;
+    enqueuePackets(state, state.memoryChunks, command,
+                   RequestPhase::MemoryAccess);
+    scheduleSend(curTick());
+}
+
+void
+ASMC::startCompletionService(uint64_t id)
+{
+    if (completionPending >= pendingQueueEntries) {
+        ++stats.pendingQueueFull;
+        completionWaitQueue.push_back(id);
+        return;
+    }
+    activateCompletionService(id);
+}
+
+void
+ASMC::activateCompletionService(uint64_t id)
+{
+    completionPending++;
+    auto *event = new EventFunctionWrapper(
+        [this, id] { finishCompletionService(id); },
+        csprintf("%s.completion_metadata_%llu", name(),
+                 static_cast<unsigned long long>(id)),
+        true);
+    schedule(event, curTick() + cyclesToTicks(metadataLatency));
+}
+
+void
+ASMC::finishCompletionService(uint64_t id)
+{
+    const auto it = outstanding.find(id);
+    if (it == outstanding.end())
+        return;
+
+    panic_if(completionPending == 0,
+             "ASMC completion service accounting underflow");
+    completionPending--;
+    ++stats.metadataAccesses;
+
+    RequestState &state = *it->second;
+    if (state.type == ReqType::Load &&
+        state.phase == RequestPhase::MemoryAccess) {
+        startSpmWriteback(state);
+    } else {
+        auto *event = new EventFunctionWrapper(
+            [this, id] { completeRequest(id); },
+            csprintf("%s.complete_%llu", name(),
+                     static_cast<unsigned long long>(id)),
+            true);
+        schedule(event, curTick() + completionLatency +
+                        configuredLatency +
+                        cyclesToTicks(completionPublishLatency));
+    }
+
+    if (!completionWaitQueue.empty()) {
+        const uint64_t waiting_id = completionWaitQueue.front();
+        completionWaitQueue.pop_front();
+        activateCompletionService(waiting_id);
+    }
 }
 
 void
@@ -428,14 +577,20 @@ ASMC::recvTimingResp(PacketPtr pkt)
         if (state.pendingPackets == 0 &&
             state.type == ReqType::Load &&
             state.phase == RequestPhase::MemoryAccess) {
-            startSpmWriteback(state);
+            startCompletionService(id);
         } else if (state.pendingPackets == 0) {
-            auto *event = new EventFunctionWrapper(
-                [this, id] { completeRequest(id); },
-                csprintf("%s.complete_%llu", name(),
-                         static_cast<unsigned long long>(id)),
-                true);
-            schedule(event, curTick() + completionLatency + configuredLatency);
+            if (state.phase == RequestPhase::SpmWriteback) {
+                auto *event = new EventFunctionWrapper(
+                    [this, id] { completeRequest(id); },
+                    csprintf("%s.complete_%llu", name(),
+                             static_cast<unsigned long long>(id)),
+                    true);
+                schedule(event, curTick() + completionLatency +
+                                configuredLatency +
+                                cyclesToTicks(completionPublishLatency));
+            } else {
+                startCompletionService(id);
+            }
         }
     }
 
@@ -463,7 +618,9 @@ ASMC::completeRequest(uint64_t id)
         return;
 
     RequestState &state = *it->second;
-    panic_if(state.pendingPackets != 0 || state.reservedWritePackets != 0,
+    panic_if(state.pendingPackets != 0 ||
+             state.reservedMemoryPackets != 0 ||
+             state.reservedWritePackets != 0,
              "ASMC completed request %#llx with pending packet state",
              static_cast<unsigned long long>(id));
     panic_if(state.type == ReqType::Load &&
@@ -488,18 +645,40 @@ ASMC::completeRequest(uint64_t id)
             state.type == ReqType::Load ? "aload" : "astore",
             static_cast<unsigned long long>(curTick() - state.issueTick));
 
+    updateOccupancyIntegral();
     outstanding.erase(it);
+}
+
+void
+ASMC::updateOccupancyIntegral()
+{
+    const Tick now = curTick();
+    panic_if(now < lastOccupancyTick, "ASMC occupancy time moved backwards");
+    const Tick elapsed = now - lastOccupancyTick;
+    stats.outstandingIntegral += elapsed * outstanding.size();
+    stats.occupancyTicks += elapsed;
+    lastOccupancyTick = now;
 }
 
 uint64_t
 ASMC::getFinished(ThreadContext *tc)
 {
     auto &queue = finished[tc];
-    if (queue.empty())
+    if (queue.empty()) {
+        ++stats.emptyGetfinPolls;
+        if (!outstanding.empty() && !pollWaitStart.count(tc))
+            pollWaitStart[tc] = curTick();
         return 0;
+    }
 
     const uint64_t id = queue.front();
     queue.pop_front();
+    ++stats.successfulGetfin;
+    const auto wait = pollWaitStart.find(tc);
+    if (wait != pollWaitStart.end()) {
+        stats.consumerWaitTicks += curTick() - wait->second;
+        pollWaitStart.erase(wait);
+    }
     return id;
 }
 
@@ -563,6 +742,7 @@ ASMC::deleteQueuedPacket(PacketPtr pkt)
 void
 ASMC::reset()
 {
+    updateOccupancyIntegral();
     while (!sendQueue.empty()) {
         deleteQueuedPacket(sendQueue.front());
         sendQueue.pop_front();
@@ -575,6 +755,12 @@ ASMC::reset()
     spmData.clear();
     spmUsed = 0;
     reservedSendSlots = 0;
+    metadataPending = 0;
+    completionPending = 0;
+    idsRemaining = 0;
+    completionWaitQueue.clear();
+    pollWaitStart.clear();
+    lastOccupancyTick = curTick();
     nextId = 1;
 }
 
