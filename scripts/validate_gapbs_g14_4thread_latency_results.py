@@ -46,7 +46,10 @@ def validate_directory(publication_root, sweep_root=None, *, expected_rows=None)
     paths, rows, evidence = _read_publication(publication_root)
     if evidence.get("csv_sha256") != artifacts.sha256_file(paths.csv):
         raise ValidationError("CSV/evidence hash mismatch")
-    if evidence.get("row_count") != 16 or not _same_rows(evidence.get("rows", []), rows):
+    expected_count = len(results.LATENCIES) * len(results.SYSTEMS)
+    if evidence.get("row_count") != expected_count or not _same_rows(
+        evidence.get("rows", []), rows
+    ):
         raise ValidationError("CSV/evidence row mismatch")
     try:
         validated = results.validate_matrix(
@@ -77,7 +80,8 @@ def validate_directory(publication_root, sweep_root=None, *, expected_rows=None)
         raise ValidationError("SVG does not match validated rows")
     hashes = {path.name: artifacts.sha256_file(path) for path in paths.files[:-1]}
     return {"schema": 1, "status": "pass", "profile": results.PROFILE,
-            "row_count": 16, "graph_sha256": evidence["graph_sha256"],
+            "row_count": expected_count,
+            "graph_sha256": evidence["graph_sha256"],
             "profile_manifest_sha256": evidence["profile_manifest_sha256"],
             "reparsed_raw_summaries": sweep_root is not None,
             "artifact_sha256": hashes}

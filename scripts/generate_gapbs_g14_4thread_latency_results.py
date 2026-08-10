@@ -34,7 +34,18 @@ except ImportError:
 PROFILE = "g14-4thread-sweep"
 LATENCIES = ("200ns", "500ns", "1us", "2us")
 LATENCY_NS = {"200ns": 200, "500ns": 500, "1us": 1000, "2us": 2000}
-SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
+SYSTEMS = (
+    "vanilla",
+    "amu-paper-calibrated",
+    "cira-static",
+    "cira-pgo-selected",
+    "cira-few-shot-online",
+    "m2ndp",
+)
+AMU_SYSTEM = "amu-paper-calibrated"
+CIRA_SYSTEMS = (
+    "cira-static", "cira-pgo-selected", "cira-few-shot-online"
+)
 TICKS_PER_SECOND = decimal.Decimal(10**12)
 VECTOR_BYTES = (1 << 14) * 4
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -62,11 +73,16 @@ FIELDNAMES = (
     "measured_trial", "iterations", "all_memory_cxl", "verification",
     "bit_exact", "raw_vector_bytes", "result_sha256", "roi_seconds",
     "roi_ticks", "roi_microseconds", "speedup", "sim_ticks",
+    "end_to_end_ticks", "profiling_ticks", "reconfiguration_ticks",
+    "steady_ticks", "amu_cira_calibration_sha256", "amu_profile",
+    "cira_mode", "policy_manifest_sha256", "fit_residuals_json",
+    "amu_pdf_doi", "amu_pdf_sha256", "cira_csv_sha256",
     "measured_cycles", "core_period_seconds", *REAL_CXL_FIELDS,
     "asmc_loads", "asmc_completed", "cira_prefetches", "cira_completed",
     "cira_indexed_prefetches", "cira_csr_prefetches",
     "cira_issued_per_core", "cira_completed_per_core", "cira_csr_per_core",
     "cira_rejected_queue_full", "cira_dropped_csr_descriptors",
+    "cira_rejected_csr_index_queue_full",
     "cira_csr_queue_high_watermark", "funcsim_compared",
     "funcsim_mismatched", "calibration_pass", "calibration_cxl_delay",
     "calibration_residual_ns", "calibration_link_period_ns",
@@ -143,17 +159,19 @@ def _row_seconds(row):
         cycles = _integer(row.get("measured_cycles"), "measured cycles")
         period = _decimal(row.get("core_period_seconds"), "core period")
         return decimal.Decimal(cycles) * period
-    return decimal.Decimal(_integer(row.get("sim_ticks"), "sim_ticks")) / TICKS_PER_SECOND
+    return _decimal(
+        row.get("end_to_end_ticks"), "end_to_end_ticks"
+    ) / TICKS_PER_SECOND
 
 
 def _validate_activity(row):
     system = row["system"]
-    if system == "amu":
+    if system == AMU_SYSTEM:
         issued = _integer(row.get("asmc_loads"), "AMU loads")
         completed = _integer(row.get("asmc_completed"), "AMU completed")
         if issued != completed:
             raise PublicationError("AMU mechanism gate failed")
-    elif system == "cira":
+    elif system in CIRA_SYSTEMS:
         completed = _integer(row.get("cira_completed"), "CIRA completed")
         descriptors = sum(_integer(row.get(field), field, allow_zero=True)
                           for field in ("cira_prefetches",
@@ -167,6 +185,7 @@ def _validate_activity(row):
             raise PublicationError("four active CIRA ports are required")
         _per_core(row, "cira_csr_per_core")
         for field in ("cira_rejected_queue_full",
+                      "cira_rejected_csr_index_queue_full",
                       "cira_dropped_csr_descriptors"):
             if _integer(row.get(field), field, allow_zero=True):
                 raise PublicationError(f"CIRA mechanism gate failed: {field}")
@@ -194,12 +213,17 @@ def _validate_activity(row):
 def validate_matrix(rows, *, graph_sha256, profile_manifest_sha256,
                     require_sensitivity=False, explanation=""):
     rows = [dict(row) for row in rows]
-    if len(rows) != 16:
-        raise PublicationError(f"publication requires exactly 16 rows, found {len(rows)}")
+    expected_count = len(LATENCIES) * len(SYSTEMS)
+    if len(rows) != expected_count:
+        raise PublicationError(
+            f"publication requires exactly {expected_count} rows, found {len(rows)}"
+        )
     expected_keys = {(latency, system) for latency in LATENCIES for system in SYSTEMS}
     keys = [(row.get("latency"), row.get("system")) for row in rows]
-    if len(set(keys)) != 16 or set(keys) != expected_keys:
-        raise PublicationError("publication is not the exact 16 rows")
+    if len(set(keys)) != expected_count or set(keys) != expected_keys:
+        raise PublicationError(
+            f"publication is not the exact {expected_count} calibrated rows"
+        )
     _sha(graph_sha256, "graph")
     _sha(profile_manifest_sha256, "profile manifest")
     by_key = {}
@@ -217,6 +241,43 @@ def validate_matrix(rows, *, graph_sha256, profile_manifest_sha256,
                 message = "vector length" if field == "raw_vector_bytes" else field
                 raise PublicationError(f"{context} {message} mismatch")
         _sha(row.get("result_sha256"), "result")
+        _sha(
+            row.get("amu_cira_calibration_sha256"),
+            "AMU/CIRA calibration manifest",
+        )
+        _sha(row.get("amu_pdf_sha256"), "AMU PDF")
+        _sha(row.get("cira_csv_sha256"), "CIRA CSV")
+        if row.get("amu_pdf_doi") != "10.1145/3663479":
+            raise PublicationError("AMU PDF DOI mismatch")
+        if row["system"] == AMU_SYSTEM and row.get("amu_profile") != "paper-calibrated":
+            raise PublicationError("AMU row is not paper-calibrated")
+        if row["system"] in CIRA_SYSTEMS:
+            expected_mode = row["system"].removeprefix("cira-")
+            if row.get("cira_mode") != expected_mode:
+                raise PublicationError(f"{context} CIRA mode mismatch")
+            _sha(row.get("policy_manifest_sha256"), "CIRA policy manifest")
+        try:
+            residuals = json.loads(row.get("fit_residuals_json", ""))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise PublicationError("missing calibrated residual fields") from error
+        if not isinstance(residuals, dict) or not residuals:
+            raise PublicationError("missing calibrated residual fields")
+        end_to_end = _decimal(row.get("end_to_end_ticks"), "end-to-end ticks")
+        profiling = _decimal(
+            row.get("profiling_ticks"), "profiling ticks", allow_zero=True
+        )
+        reconfiguration = _decimal(
+            row.get("reconfiguration_ticks"),
+            "reconfiguration ticks", allow_zero=True,
+        )
+        steady = _decimal(row.get("steady_ticks"), "steady ticks")
+        if end_to_end != profiling + reconfiguration + steady:
+            raise PublicationError(f"{context} end-to-end tick accounting mismatch")
+        if row["system"] == "cira-few-shot-online":
+            if profiling <= 0 or reconfiguration <= 0:
+                raise PublicationError("few-shot profiling costs are not charged")
+        elif profiling != 0 or reconfiguration != 0:
+            raise PublicationError(f"{context} has unexpected profiling cost")
         for field in COMMON_PROVENANCE:
             _sha(row.get(field), field)
         try:
@@ -262,7 +323,10 @@ def validate_matrix(rows, *, graph_sha256, profile_manifest_sha256,
                       for latency in LATENCIES]
             if decimal.Decimal(max(values) - min(values)) / decimal.Decimal(min(values)) > decimal.Decimal("0.05") and not explanation.strip():
                 raise PublicationError(f"{field} varies by more than 5 percent without explanation")
-    return tuple(by_key[(latency, system)][0] for latency in LATENCIES for system in SYSTEMS)
+    return tuple(
+        by_key[(latency, system)][0]
+        for latency in LATENCIES for system in SYSTEMS
+    )
 
 
 def _read_json(path, label):
@@ -302,8 +366,10 @@ def _record_provenance(record):
     }
 
 
-def _base(profile, manifest_sha, latency, system, source, raw, root, hashes,
-          provenance):
+def _base(
+    profile, manifest_sha, latency, system, source, raw, root, hashes,
+    provenance, calibration_provenance,
+):
     row = {field: "" for field in FIELDNAMES}
     raw = Path(raw)
     if raw.stat().st_size != profile.num_nodes * 4:
@@ -324,6 +390,33 @@ def _base(profile, manifest_sha, latency, system, source, raw, root, hashes,
         cira_completed="0", cira_indexed_prefetches="0",
         cira_csr_prefetches="0", cira_rejected_queue_full="0",
         cira_dropped_csr_descriptors="0", cira_csr_queue_high_watermark="0",
+        cira_rejected_csr_index_queue_full="0",
+        amu_cira_calibration_sha256=calibration_provenance[
+            "calibration_manifest_sha256"
+        ],
+        amu_profile=("paper-calibrated" if system == AMU_SYSTEM else ""),
+        cira_mode=(
+            system.removeprefix("cira-") if system in CIRA_SYSTEMS else ""
+        ),
+        fit_residuals_json=json.dumps(
+            {
+                "fit": calibration_provenance.get("fit_residuals", {}),
+                "holdout": calibration_provenance.get(
+                    "holdout_residuals", {}
+                ),
+            },
+            sort_keys=True, separators=(",", ":"),
+        ),
+        profiling_ticks="0", reconfiguration_ticks="0",
+        amu_pdf_doi=calibration_provenance.get("source_identity", {}).get(
+            "amu_pdf_doi", ""
+        ),
+        amu_pdf_sha256=calibration_provenance.get("source_hashes", {}).get(
+            "amu_pdf", ""
+        ),
+        cira_csv_sha256=calibration_provenance.get("source_hashes", {}).get(
+            "cira_csv", ""
+        ),
     )
     return row
 
@@ -341,9 +434,17 @@ def _record(state, latency, system):
 
 def _fill_gem5(row, source_row):
     row["sim_ticks"] = source_row["sim_ticks"]
-    seconds = decimal.Decimal(source_row["sim_ticks"]) / TICKS_PER_SECOND
+    row["steady_ticks"] = source_row["sim_ticks"]
+    row["end_to_end_ticks"] = source_row.get(
+        "end_to_end_ticks", source_row["sim_ticks"]
+    )
+    row["profiling_ticks"] = source_row.get("profiling_ticks", "0")
+    row["reconfiguration_ticks"] = source_row.get(
+        "reconfiguration_ticks", "0"
+    )
+    seconds = decimal.Decimal(row["end_to_end_ticks"]) / TICKS_PER_SECOND
     row["roi_seconds"] = str(seconds)
-    row["roi_ticks"] = source_row["sim_ticks"]
+    row["roi_ticks"] = row["end_to_end_ticks"]
     row["roi_microseconds"] = str(seconds * 10**6)
     for field in REAL_CXL_FIELDS:
         row[field] = source_row.get(field, "")
@@ -353,6 +454,18 @@ def collect_rows(sweep_root):
     root = Path(sweep_root).resolve()
     status_path = root / "formal/status.json"
     state = _read_json(status_path, "formal sweep status")
+    qualification_path = root / "qualification/qualification.json"
+    qualification = _read_json(
+        qualification_path, "calibrated g12 qualification"
+    )
+    calibration_provenance = qualification.get("calibration")
+    if (
+        qualification.get("schema") != 2
+        or qualification.get("status") != "PASS"
+        or not isinstance(calibration_provenance, dict)
+        or calibration_provenance.get("status") != "PASS"
+    ):
+        raise PublicationError("passed calibrated g12 qualification is required")
     manifest_path = root / "graphs/g14.manifest.json"
     profile = profiles.load_frozen_profile(PROFILE, manifest_path)
     manifest_sha = artifacts.sha256_file(manifest_path)
@@ -372,10 +485,11 @@ def collect_rows(sweep_root):
         )
         vanilla = _base(profile, manifest_sha, latency, "vanilla", vanilla_source,
                         vanilla_paths["raw"], root, vanilla_hashes,
-                        _record_provenance(vanilla_record))
+                        _record_provenance(vanilla_record),
+                        calibration_provenance)
         _fill_gem5(vanilla, vanilla_evidence.row)
         rows.append(vanilla)
-        for system in ("amu", "cira"):
+        for system in (AMU_SYSTEM, *CIRA_SYSTEMS):
             record, paths, hashes = _record(state, latency, system)
             source = paths["summary"]
             source_row = _single_csv(source, f"{latency}/{system} summary")
@@ -386,19 +500,28 @@ def collect_rows(sweep_root):
                           "cira_indexed_prefetches", "cira_csr_prefetches"):
                 typed[field] = int(typed.get(field, 0))
             typed["all_memory_cxl"] = source_row.get("all_memory_cxl") == "True"
-            matched.validate_row(typed, system, smoke_test=False, profile=profile,
+            kind = "amu" if system == AMU_SYSTEM else "cira"
+            matched.validate_row(typed, kind, smoke_test=False, profile=profile,
                                  latency=latency)
             matched.validate_config_delay(paths["config"], latency)
             row = _base(profile, manifest_sha, latency, system, source,
                         paths["raw"], root, {**hashes,
                         "binary": record.get("input_hashes", {}).get("binary", "")},
-                        _record_provenance(record))
+                        _record_provenance(record), calibration_provenance)
             _fill_gem5(row, source_row)
+            if system in CIRA_SYSTEMS:
+                row["policy_manifest_sha256"] = record.get(
+                    "policy_manifest_sha256",
+                    record.get("provenance", {}).get(
+                        "policy_manifest_sha256", ""
+                    ),
+                )
             for field in ("asmc_loads", "asmc_completed", "cira_prefetches",
                           "cira_completed", "cira_indexed_prefetches",
                           "cira_csr_prefetches", "cira_issued_per_core",
                           "cira_completed_per_core", "cira_csr_per_core",
                           "cira_rejected_queue_full", "cira_dropped_csr_descriptors",
+                          "cira_rejected_csr_index_queue_full",
                           "cira_csr_queue_high_watermark"):
                 row[field] = source_row.get(field, row[field])
             rows.append(row)
@@ -409,7 +532,8 @@ def collect_rows(sweep_root):
         artifact_hashes = final_manifest.get("artifact_sha256", {})
         calibration = _read_json(paths["calibration"], "M2NDP calibration")
         row = _base(profile, manifest_sha, latency, "m2ndp", source,
-                    paths["raw"], root, hashes, _record_provenance(record))
+                    paths["raw"], root, hashes, _record_provenance(record),
+                    calibration_provenance)
         if artifacts.sha256_file(paths["funcsim_raw"]) != row["result_sha256"]:
             raise PublicationError(f"{latency} FuncSim is not bit-exact")
         expected_m2 = {"profile": PROFILE, "benchmark": "pr_spmv",
@@ -477,6 +601,10 @@ def collect_rows(sweep_root):
             ),
         )
         seconds = _row_seconds(row)
+        row["steady_ticks"] = row["roi_ticks"] = str(
+            seconds * TICKS_PER_SECOND
+        )
+        row["end_to_end_ticks"] = row["steady_ticks"]
         row["roi_ticks"] = str(seconds * TICKS_PER_SECOND)
         row["roi_microseconds"] = str(seconds * 10**6)
         for field in REAL_CXL_FIELDS:
@@ -497,16 +625,30 @@ def collect_rows(sweep_root):
 
 
 def render_tex(rows):
-    labels = {"vanilla": "Vanilla CXL", "amu": "AMU", "cira": "CIRA",
-              "m2ndp": r"M$^2$NDP"}
-    lines = [r"\begin{tabular}{llrr}", r"\toprule",
+    labels = {
+        "vanilla": "Vanilla CXL",
+        "amu-paper-calibrated": "AMU (paper-calibrated)",
+        "cira-static": "CIRA static",
+        "cira-pgo-selected": "CIRA PGO-selected",
+        "cira-few-shot-online": "CIRA few-shot online",
+        "m2ndp": r"M$^2$NDP",
+    }
+    calibration = rows[0]
+    lines = [
+             "% AMU DOI: " + calibration["amu_pdf_doi"],
+             "% AMU PDF SHA-256: " + calibration["amu_pdf_sha256"],
+             "% CIRA CSV SHA-256: " + calibration["cira_csv_sha256"],
+             r"\begin{tabular}{llrr}", r"\toprule",
              r"CXL latency & System & ROI ($\mu$s) & Speedup \\", r"\midrule"]
     for index, row in enumerate(rows):
         latency = row["latency"].replace("us", r"\,$\mu$s")
         lines.append(f"{latency} & {labels[row['system']]} & "
                      f"{decimal.Decimal(row['roi_microseconds']):.3f} & "
                      f"{decimal.Decimal(row['speedup']):.3f}\\,$\\times$ \\\\")
-        if (index + 1) % 4 == 0 and index != 15:
+        if (
+            (index + 1) % len(SYSTEMS) == 0
+            and index != len(rows) - 1
+        ):
             lines.append(r"\midrule")
     return "\n".join((*lines, r"\bottomrule", r"\end{tabular}")) + "\n"
 
@@ -537,7 +679,8 @@ def write_staged_files(rows, staging, *, graph_sha256,
     _write_text(paths.tex, render_tex(rows))
     evidence = {"schema": 1, "profile": PROFILE, "graph_sha256": graph_sha256,
                 "profile_manifest_sha256": profile_manifest_sha256,
-                "row_count": 16, "csv_sha256": artifacts.sha256_file(paths.csv),
+                "row_count": len(LATENCIES) * len(SYSTEMS),
+                "csv_sha256": artifacts.sha256_file(paths.csv),
                 "rows": list(rows), "source_evidence": source_evidence or {}}
     artifacts.atomic_write_json(paths.evidence, evidence)
     from scripts import generate_gapbs_g14_4thread_latency_figure as figure

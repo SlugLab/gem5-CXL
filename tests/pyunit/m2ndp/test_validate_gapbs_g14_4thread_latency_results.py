@@ -45,7 +45,7 @@ class IndependentValidatorTest(unittest.TestCase):
                 )
                 report = validator.validate_directory(staging, root)
         self.assertTrue(report["reparsed_raw_summaries"])
-        self.assertEqual(report["row_count"], 16)
+        self.assertEqual(report["row_count"], 24)
 
     def test_reparsed_source_rows_must_match_published_rows(self):
         rows = make_valid_rows()
@@ -61,7 +61,7 @@ class IndependentValidatorTest(unittest.TestCase):
             ) as collect:
                 report = validator.validate_directory(staging, root / "sweep")
             collect.assert_called_once()
-            self.assertEqual(report["row_count"], 16)
+            self.assertEqual(report["row_count"], 24)
 
             staging.joinpath(publisher.SVG_NAME).write_bytes(b"<svg/>")
             with self.assertRaisesRegex(validator.ValidationError, "SVG"):

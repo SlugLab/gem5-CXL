@@ -285,6 +285,10 @@ def calibration_provenance(options, mode_results, raw_vector):
             "amu_pdf": manifest["sources"]["amu_pdf"]["sha256"],
             "cira_csv": manifest["sources"]["cira_csv"]["sha256"],
         }
+        source_identity = {
+            "amu_pdf_doi": manifest["sources"]["amu_pdf"]["citation"]["doi"],
+            "amu_pdf_title": manifest["sources"]["amu_pdf"]["citation"]["title"],
+        }
         fit = manifest["amu"]["fit"]
         formal_profile = manifest["amu"]["formal_profile"]
         validation = manifest["amu"]["validation"]
@@ -328,6 +332,7 @@ def calibration_provenance(options, mode_results, raw_vector):
             options.calibration_manifest
         ),
         "source_hashes": source_hashes,
+        "source_identity": source_identity,
         "amu_profile": "paper-calibrated",
         "fit_parameters": fit["parameters"],
         "fit_objective": fit.get("objective"),

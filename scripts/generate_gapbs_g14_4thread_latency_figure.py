@@ -22,10 +22,31 @@ except ImportError:
     import generate_gapbs_g14_4thread_latency_results as results
 
 
-SERIES = ("AMU", "CIRA", "M2NDP")
-SYSTEMS = {"AMU": "amu", "CIRA": "cira", "M2NDP": "m2ndp"}
-COLORS = {"AMU": "#0072B2", "CIRA": "#D18F00", "M2NDP": "#6B8E23"}
-STYLES = {"AMU": ("-", "o"), "CIRA": ("--", "s"), "M2NDP": (":", "^")}
+SERIES = (
+    "AMU (paper-calibrated)", "CIRA static", "CIRA PGO-selected",
+    "CIRA few-shot online", "M2NDP",
+)
+SYSTEMS = {
+    "AMU (paper-calibrated)": "amu-paper-calibrated",
+    "CIRA static": "cira-static",
+    "CIRA PGO-selected": "cira-pgo-selected",
+    "CIRA few-shot online": "cira-few-shot-online",
+    "M2NDP": "m2ndp",
+}
+COLORS = {
+    "AMU (paper-calibrated)": "#0072B2",
+    "CIRA static": "#D55E00",
+    "CIRA PGO-selected": "#E69F00",
+    "CIRA few-shot online": "#CC79A7",
+    "M2NDP": "#6B8E23",
+}
+STYLES = {
+    "AMU (paper-calibrated)": ("-", "o"),
+    "CIRA static": ("--", "s"),
+    "CIRA PGO-selected": ("-.", "D"),
+    "CIRA few-shot online": ((0, (3, 1, 1, 1)), "v"),
+    "M2NDP": (":", "^"),
+}
 
 
 class FigureDataError(ValueError):
@@ -54,8 +75,11 @@ def prepare_figure_data(rows, *, evidence_sha256):
     if not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256):
         raise FigureDataError("evidence SHA-256 is invalid")
     rows = tuple(dict(row) for row in rows)
-    if len(rows) != 16:
-        raise FigureDataError("figure requires 16 validated rows")
+    expected_count = len(results.LATENCIES) * len(results.SYSTEMS)
+    if len(rows) != expected_count:
+        raise FigureDataError(
+            f"figure requires {expected_count} validated rows"
+        )
     graph_hashes = {row.get("graph_sha256") for row in rows}
     manifest_hashes = {row.get("profile_manifest_sha256") for row in rows}
     if len(graph_hashes) != 1 or len(manifest_hashes) != 1:
@@ -103,7 +127,7 @@ def render_figure(rows, *, evidence_sha256):
             axis.set_yscale(data.y_scale)
             axis.grid(axis="y", color="#D9D9D9", linewidth=0.55)
             axis.spines[["top", "right"]].set_visible(False)
-            axis.legend(frameon=False, ncol=3, loc="upper left")
+            axis.legend(frameon=False, ncol=3, loc="upper left", fontsize=7)
             canvas.suptitle("GAPBS PageRank speedup vs. CXL latency",
                             x=0.10, y=0.97, ha="left", fontweight="bold")
             canvas.text(0.10, 0.89,
@@ -145,4 +169,3 @@ def write_figure(rows, *, evidence_sha256, outdir):
     _write(outdir / results.PDF_NAME, pdf)
     _write(outdir / results.SVG_NAME, svg)
     return outdir / results.PDF_NAME, outdir / results.SVG_NAME
-

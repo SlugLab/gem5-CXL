@@ -21,7 +21,10 @@ class CalibratedG12G14ContractTest(unittest.TestCase):
         return {
             "schema": 1,
             "sources": {
-                "amu_pdf": {"sha256": "a" * 64},
+                "amu_pdf": {
+                    "sha256": "a" * 64,
+                    "citation": {"doi": "10.1145/3663479", "title": "AMU"},
+                },
                 "cira_csv": {"sha256": "b" * 64},
             },
             "amu": {

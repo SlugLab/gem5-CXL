@@ -29,10 +29,20 @@ def make_valid_rows():
     rows = []
     for latency, vanilla_ticks in BASE_TICKS.items():
         for system, divisor in (
-            ("vanilla", 1), ("amu", 2), ("cira", 4), ("m2ndp", 5)
+            ("vanilla", 1),
+            ("amu-paper-calibrated", 2),
+            ("cira-static", 3),
+            ("cira-pgo-selected", 4),
+            ("cira-few-shot-online", 5),
+            ("m2ndp", 6),
         ):
-            ticks = vanilla_ticks // divisor
+            steady_ticks = vanilla_ticks // divisor
+            profiling_ticks = 300 if system == "cira-few-shot-online" else 0
+            reconfiguration_ticks = 7 if system == "cira-few-shot-online" else 0
+            ticks = steady_ticks + profiling_ticks + reconfiguration_ticks
             is_m2ndp = system == "m2ndp"
+            is_amu = system == "amu-paper-calibrated"
+            is_cira = system.startswith("cira-")
             row = {field: "" for field in publisher.FIELDNAMES}
             row.update(
                 profile="g14-4thread-sweep",
@@ -55,25 +65,38 @@ def make_valid_rows():
                 roi_ticks=str(ticks),
                 roi_microseconds=str(Decimal(ticks) / Decimal(10**6)),
                 speedup=str(Decimal(vanilla_ticks) / Decimal(ticks)),
-                sim_ticks="" if is_m2ndp else str(ticks),
+                sim_ticks="" if is_m2ndp else str(steady_ticks),
+                end_to_end_ticks=str(ticks),
+                profiling_ticks=str(profiling_ticks),
+                reconfiguration_ticks=str(reconfiguration_ticks),
+                steady_ticks=str(steady_ticks),
+                amu_cira_calibration_sha256="0" * 64,
+                amu_profile="paper-calibrated" if is_amu else "",
+                cira_mode=(system.removeprefix("cira-") if is_cira else ""),
+                policy_manifest_sha256="f" * 64 if is_cira else "",
+                fit_residuals_json='{"holdout":{"relative_error":0.1}}',
+                amu_pdf_doi="10.1145/3663479",
+                amu_pdf_sha256="a" * 64,
+                cira_csv_sha256="b" * 64,
                 measured_cycles=str(ticks) if is_m2ndp else "",
                 core_period_seconds="1e-12" if is_m2ndp else "",
                 mem_ctrl_read_reqs="1000",
                 mem_ctrl_read_bursts="1000",
                 mem_ctrl_bytes_read="64000",
                 mem_ctrl_cpu_data_reads="900",
-                asmc_loads="64" if system == "amu" else "0",
-                asmc_completed="64" if system == "amu" else "0",
-                cira_prefetches="64" if system == "cira" else "0",
-                cira_completed="64" if system == "cira" else "0",
+                asmc_loads="64" if is_amu else "0",
+                asmc_completed="64" if is_amu else "0",
+                cira_prefetches="64" if is_cira else "0",
+                cira_completed="64" if is_cira else "0",
                 cira_indexed_prefetches="0",
-                cira_csr_prefetches="16" if system == "cira" else "0",
-                cira_issued_per_core=("16;16;16;16" if system == "cira" else ""),
-                cira_completed_per_core=("16;16;16;16" if system == "cira" else ""),
-                cira_csr_per_core=("4;4;4;4" if system == "cira" else ""),
+                cira_csr_prefetches="16" if is_cira else "0",
+                cira_issued_per_core=("16;16;16;16" if is_cira else ""),
+                cira_completed_per_core=("16;16;16;16" if is_cira else ""),
+                cira_csr_per_core=("4;4;4;4" if is_cira else ""),
                 cira_rejected_queue_full="0",
+                cira_rejected_csr_index_queue_full="0",
                 cira_dropped_csr_descriptors="0",
-                cira_csr_queue_high_watermark=("16" if system == "cira" else "0"),
+                cira_csr_queue_high_watermark=("16" if is_cira else "0"),
                 funcsim_compared="16384" if is_m2ndp else "",
                 funcsim_mismatched="0" if is_m2ndp else "",
                 calibration_pass="pass" if is_m2ndp else "",
@@ -110,6 +133,21 @@ def write_completed_formal_sweep(root):
     manifest.parent.mkdir(parents=True)
     manifest.write_text("{}\n", encoding="utf-8")
     manifest_sha = artifacts.sha256_file(manifest)
+    qualification = root / "qualification/qualification.json"
+    qualification.parent.mkdir(parents=True)
+    qualification.write_text(json.dumps({
+        "schema": 2,
+        "status": "PASS",
+        "raw_bit_exact": True,
+        "calibration": {
+            "status": "PASS",
+            "calibration_manifest_sha256": "0" * 64,
+            "source_hashes": {"amu_pdf": "a" * 64, "cira_csv": "b" * 64},
+            "source_identity": {"amu_pdf_doi": "10.1145/3663479"},
+            "fit_residuals": {"gups@1": {"relative_error": 0.01}},
+            "holdout_residuals": {"stream@2": {"relative_error": 0.1}},
+        },
+    }) + "\n", encoding="utf-8")
     state = sweep.new_state({
         "profile": "g14-4thread-sweep",
         "hashes": {"graph_manifest": manifest_sha},
@@ -156,36 +194,55 @@ def write_completed_formal_sweep(root):
             "output_hashes": sweep.shared.hash_named_paths(vanilla_outputs),
         }
 
-        for system, divisor in (("amu", 2), ("cira", 4)):
+        for system, divisor in (
+            ("amu-paper-calibrated", 2),
+            ("cira-static", 3),
+            ("cira-pgo-selected", 4),
+            ("cira-few-shot-online", 5),
+        ):
+            kind = "amu" if system == "amu-paper-calibrated" else "cira"
+            is_cira = kind == "cira"
             raw = latency_root / f"{system}/scores.raw"
             raw.parent.mkdir(parents=True)
             raw.write_bytes(raw_payload)
             summary = latency_root / f"{system}/summary.csv"
             write_csv(summary, {
-                "benchmark": "pr_spmv", "kind": system, "status": "ok",
+                "benchmark": "pr_spmv", "kind": kind, "status": "ok",
                 "verification": "pass", "roi_cpu": "timing", "scale": "14",
                 "cores": "4", "cxl_link_delay": latency,
                 "all_memory_cxl": "True", "graph_sha256": GRAPH_SHA,
                 "iterations": "2", "measured_trial": "1",
                 "checkpoint_restores": "1", "sim_ticks": str(base_ticks // divisor),
-                "asmc_loads": "64" if system == "amu" else "0",
-                "asmc_completed": "64" if system == "amu" else "0",
-                "cira_prefetches": "64" if system == "cira" else "0",
-                "cira_completed": "64" if system == "cira" else "0",
+                "end_to_end_ticks": str(
+                    base_ticks // divisor
+                    + (307 if system == "cira-few-shot-online" else 0)
+                ),
+                "profiling_ticks": (
+                    "300" if system == "cira-few-shot-online" else "0"
+                ),
+                "reconfiguration_ticks": (
+                    "7" if system == "cira-few-shot-online" else "0"
+                ),
+                "asmc_loads": "64" if kind == "amu" else "0",
+                "asmc_completed": "64" if kind == "amu" else "0",
+                "cira_prefetches": "64" if is_cira else "0",
+                "cira_completed": "64" if is_cira else "0",
                 "cira_indexed_prefetches": "0",
-                "cira_csr_prefetches": "16" if system == "cira" else "0",
-                "cira_issued_per_core": "16;16;16;16" if system == "cira" else "",
-                "cira_completed_per_core": "16;16;16;16" if system == "cira" else "",
-                "cira_csr_per_core": "4;4;4;4" if system == "cira" else "",
+                "cira_csr_prefetches": "16" if is_cira else "0",
+                "cira_issued_per_core": "16;16;16;16" if is_cira else "",
+                "cira_completed_per_core": "16;16;16;16" if is_cira else "",
+                "cira_csr_per_core": "4;4;4;4" if is_cira else "",
                 "cira_rejected_queue_full": "0",
+                "cira_rejected_csr_index_queue_full": "0",
                 "cira_dropped_csr_descriptors": "0",
-                "cira_csr_queue_high_watermark": "16" if system == "cira" else "0",
+                "cira_csr_queue_high_watermark": "16" if is_cira else "0",
                 **real_cxl,
             })
             outputs = {"summary": summary, "raw": raw, "config": config,
                        "checkpoint": checkpoint}
             state["latencies"][latency][system] = {
                 "status": "passed", "input_hashes": {"binary": "7" * 64},
+                "policy_manifest_sha256": "f" * 64 if is_cira else "",
                 "output_paths": {name: str(path) for name, path in outputs.items()},
                 "output_hashes": sweep.shared.hash_named_paths(outputs),
             }
@@ -282,17 +339,17 @@ class MatrixTest(unittest.TestCase):
                 publisher.profiles, "load_frozen_profile", return_value=profile
             ):
                 rows, evidence = publisher.collect_rows(root)
-        self.assertEqual(len(rows), 16)
+        self.assertEqual(len(rows), 24)
         self.assertEqual(rows[0]["profile_manifest_sha256"], manifest_sha)
-        self.assertIn("manifest/trace", rows[3]["provenance_json"])
+        self.assertIn("manifest/trace", rows[5]["provenance_json"])
         self.assertEqual(evidence["profile_manifest_sha256"], manifest_sha)
 
-    def test_requires_exact_16_rows_and_recomputes_same_latency_speedup(self):
+    def test_requires_exact_24_rows_and_recomputes_same_latency_speedup(self):
         rows = make_valid_rows()
         validated = publisher.validate_matrix(
             rows, graph_sha256=GRAPH_SHA, profile_manifest_sha256=MANIFEST_SHA
         )
-        self.assertEqual(len(validated), 16)
+        self.assertEqual(len(validated), 24)
         for row in validated:
             vanilla = next(
                 item for item in validated
@@ -303,7 +360,7 @@ class MatrixTest(unittest.TestCase):
                 Decimal(row["speedup"]),
                 Decimal(vanilla["roi_seconds"]) / Decimal(row["roi_seconds"]),
             )
-        with self.assertRaisesRegex(publisher.PublicationError, "16 rows"):
+        with self.assertRaisesRegex(publisher.PublicationError, "24 rows"):
             publisher.validate_matrix(rows[:-1], graph_sha256=GRAPH_SHA,
                                       profile_manifest_sha256=MANIFEST_SHA)
 
@@ -354,7 +411,7 @@ class MatrixTest(unittest.TestCase):
             self.assertEqual(paths.root, current.resolve())
             self.assertEqual(set(path.name for path in paths.files), set(publisher.OUTPUT_NAMES))
             with paths.csv.open(newline="", encoding="utf-8") as stream:
-                self.assertEqual(len(list(csv.DictReader(stream))), 16)
+                self.assertEqual(len(list(csv.DictReader(stream))), 24)
 
     def test_late_validation_failure_preserves_existing_publication(self):
         with tempfile.TemporaryDirectory() as tmp:
