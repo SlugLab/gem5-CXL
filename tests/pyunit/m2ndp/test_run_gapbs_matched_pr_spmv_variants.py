@@ -4,6 +4,8 @@
 import tempfile
 import unittest
 import json
+import os
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +36,7 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         self.assertEqual(args.cira_max_csr_walk_queue, 4096)
         self.assertEqual(args.cira_csr_lines_per_turn, 64)
         self.assertEqual(args.cira_max_completed_lines, 65536)
+        self.assertEqual(args.cira_max_csr_index_reads, 1024)
         self.assertTrue(args.roi_work_events)
         self.assertTrue(args.verify)
         self.assertEqual(args.timeout, 0)
@@ -58,6 +61,61 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         self.assertEqual(args.scale, 4)
         self.assertEqual(args.cores, 4)
         self.assertEqual(args.cxl_link_delay, "500ns")
+        self.assertIn("OMP_NUM_THREADS=4", args.env)
+
+    def test_manifest_backed_g12_profile_builds_four_core_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "g12.sg"
+            generator = root / "converter"
+            nodes = 1 << 12
+            edges = 1
+            graph.write_bytes(
+                struct.pack("<?qq", False, edges, nodes)
+                + struct.pack(f"<{nodes + 1}q", *([0] * nodes + [edges]))
+                + struct.pack("<i", 0)
+            )
+            generator.write_bytes(b"generator")
+            os.chmod(generator, 0o755)
+            manifest = root / "g12.manifest.json"
+            from scripts import m2ndp_artifacts as artifacts
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "scale": 12,
+                        "graph": str(graph.resolve()),
+                        "graph_sha256": artifacts.sha256_file(graph),
+                        "generator": str(generator.resolve()),
+                        "generator_sha256": artifacts.sha256_file(generator),
+                        "generator_command": [
+                            str(generator.resolve()), "-g", "12", "-b",
+                            str(graph.resolve()),
+                        ],
+                        "num_nodes": nodes,
+                        "directed_edges": edges,
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            options = SimpleNamespace(
+                profile="g12-4thread-qualification",
+                graph_manifest=manifest,
+                gem5=root / "gem5.opt",
+                config=root / "config.py",
+                graph=graph,
+                graph_scale=12,
+                cxl_link_delay="1us",
+                checkpoint_root=root / "checkpoints",
+                outdir=root / "run",
+                timeout=0,
+            )
+
+            args = runner.make_compare_args(options)
+
+        self.assertEqual(args.scale, 12)
+        self.assertEqual(args.cores, 4)
+        self.assertEqual(args.iterations, 2)
         self.assertIn("OMP_NUM_THREADS=4", args.env)
 
     def test_g4_row_rejects_two_core_result(self):

@@ -25,10 +25,24 @@ class VariantRunError(RuntimeError):
     pass
 
 
+def resolve_profile(options):
+    name = getattr(options, "profile", "g20-2thread-1us")
+    manifest = getattr(options, "graph_manifest", None)
+    if name in profiles.FROZEN_PROFILE_CONTRACTS:
+        if manifest is None:
+            raise VariantRunError(
+                f"profile {name} requires --graph-manifest"
+            )
+        return profiles.load_frozen_profile(name, manifest)
+    if manifest is not None:
+        raise VariantRunError(
+            "--graph-manifest is only valid for a frozen profile"
+        )
+    return profiles.get_profile(name)
+
+
 def make_compare_args(options):
-    profile = profiles.get_profile(
-        getattr(options, "profile", "g20-2thread-1us")
-    )
+    profile = resolve_profile(options)
     cxl_link_delay = getattr(options, "cxl_link_delay", "1us")
     profiles.require_latency(profile, cxl_link_delay)
     smoke_test = getattr(options, "smoke_test", False)
@@ -64,6 +78,7 @@ def make_compare_args(options):
         cira_max_outstanding=256,
         cira_max_send_queue=1024,
         cira_max_csr_walk_queue=4096,
+        cira_max_csr_index_reads=1024,
         cira_csr_lines_per_turn=64,
         cira_max_completed_lines=65536,
         cira_issue_latency="1ns",
@@ -94,8 +109,9 @@ def validate_row(
     smoke_test,
     profile_name="g20-2thread-1us",
     latency="1us",
+    profile=None,
 ):
-    profile = profiles.get_profile(profile_name)
+    profile = profile or profiles.get_profile(profile_name)
     profiles.require_latency(profile, latency)
     expected = {
         "benchmark": "pr_spmv",
@@ -234,9 +250,12 @@ def parse_args(argv=None):
     parser.add_argument("--graph-scale", type=int, default=20)
     parser.add_argument(
         "--profile",
-        choices=tuple(profiles.PROFILES),
+        choices=tuple(
+            sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
+        ),
         default="g20-2thread-1us",
     )
+    parser.add_argument("--graph-manifest", type=Path)
     parser.add_argument("--cxl-link-delay", default="1us")
     parser.add_argument("--variants-build", type=Path, required=True)
     parser.add_argument(
@@ -260,7 +279,7 @@ def main(argv=None):
     summary_path.unlink(missing_ok=True)
     evidence_path.unlink(missing_ok=True)
     try:
-        profile = profiles.get_profile(options.profile)
+        profile = resolve_profile(options)
         profiles.require_latency(profile, options.cxl_link_delay)
         if options.timeout < 0:
             raise VariantRunError("--timeout must be nonnegative")
@@ -308,6 +327,7 @@ def main(argv=None):
                 smoke_test=options.smoke_test,
                 profile_name=profile.name,
                 latency=options.cxl_link_delay,
+                profile=profile,
             )
             run_dir = Path(row["run_dir"])
             delay_ticks = validate_config_delay(
