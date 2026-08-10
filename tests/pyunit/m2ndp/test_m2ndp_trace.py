@@ -4,6 +4,7 @@
 import struct
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 from scripts import m2ndp_artifacts as artifacts
@@ -136,6 +137,89 @@ class PageRankTraceTest(unittest.TestCase):
             "FP32",
         ])
         self.assertEqual(len(fields), 14)
+
+    def test_trace_manifest_binds_profile_latency_and_vanilla_raw(self):
+        profile = SimpleNamespace(
+            name="g14-4thread-sweep",
+            graph_sha256=self.bundle.meta.graph_sha256,
+            num_nodes=self.bundle.meta.num_nodes,
+            page_rank_iterations=20,
+            trials=2,
+            measured_trial=1,
+        )
+        result = trace.generate_trace(
+            bundle=self.bundle,
+            reference=self.reference,
+            outdir=self.root / "bound-trace",
+            trials=2,
+            iterations=20,
+            profile=profile,
+            profile_manifest_sha256="c" * 64,
+            cxl_link_delay="2us",
+            vanilla_raw_sha256="d" * 64,
+        )
+        meta = trace.read_trace_meta(result.meta_path)
+        self.assertEqual(meta["profile"], "g14-4thread-sweep")
+        self.assertEqual(meta["profile_manifest_sha256"], "c" * 64)
+        self.assertEqual(meta["cxl_link_delay"], "2us")
+        self.assertEqual(meta["vanilla_raw_sha256"], "d" * 64)
+        self.assertEqual(meta["measured_trial"], 1)
+        self.assertEqual(meta["stage_sequence"], list(trace.UNIQUE_KERNELS))
+        self.assertEqual(set(meta["kernel_sha256"]), set(trace.UNIQUE_KERNELS))
+
+    def test_frozen_g14_trace_contract_rejects_cross_latency_reuse(self):
+        profile = SimpleNamespace(
+            name="g14-4thread-sweep",
+            graph_sha256="a" * 64,
+            num_nodes=1 << 14,
+            page_rank_iterations=20,
+            trials=2,
+            measured_trial=1,
+        )
+        meta = {
+            "profile": profile.name,
+            "profile_manifest_sha256": "b" * 64,
+            "cxl_link_delay": "500ns",
+            "vanilla_raw_sha256": "c" * 64,
+            "graph_sha256": profile.graph_sha256,
+            "num_nodes": 1 << 14,
+            "num_directed_edges": 12345,
+            "trials": 2,
+            "measured_trial": 1,
+            "iterations": 20,
+            "stage_sequence": list(trace.UNIQUE_KERNELS),
+            "measure_marker": "K0_INIT_TRIAL1",
+            "kernel_sha256": {
+                name: format(index + 1, "064x")
+                for index, name in enumerate(trace.UNIQUE_KERNELS)
+            },
+        }
+        trace.validate_trace_binding(
+            meta,
+            profile=profile,
+            profile_manifest_sha256="b" * 64,
+            cxl_link_delay="500ns",
+            vanilla_raw_sha256="c" * 64,
+            directed_edges=12345,
+        )
+        for field, value in (
+            ("profile", "g12-4thread-qualification"),
+            ("cxl_link_delay", "1us"),
+            ("vanilla_raw_sha256", "d" * 64),
+            ("graph_sha256", "e" * 64),
+        ):
+            with self.subTest(field=field), self.assertRaises(
+                artifacts.EvidenceError
+            ):
+                candidate = dict(meta, **{field: value})
+                trace.validate_trace_binding(
+                    candidate,
+                    profile=profile,
+                    profile_manifest_sha256="b" * 64,
+                    cxl_link_delay="500ns",
+                    vanilla_raw_sha256="c" * 64,
+                    directed_edges=12345,
+                )
 
 
 if __name__ == "__main__":

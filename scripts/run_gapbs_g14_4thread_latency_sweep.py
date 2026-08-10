@@ -233,7 +233,7 @@ def _m2ndp_command(entry, options, paths):
         "--graph", str(Path(options.graph).resolve()),
         "--graph-scale", "14",
         "--profile", "g14-4thread-sweep",
-        "--graph-manifest", str(Path(options.graph_manifest).resolve()),
+        "--profile-manifest", str(Path(options.graph_manifest).resolve()),
         "--cxl-link-delay", entry.latency,
         "--cxlmemuring", str(Path(options.cxlmemuring).resolve()),
         "--m2ndp-root", str(Path(options.m2ndp_root).resolve()),

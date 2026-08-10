@@ -86,6 +86,7 @@ class Options:
     stop_after: str | None
     profile: str = "g20-2thread-1us"
     cxl_link_delay: str = "1us"
+    profile_manifest: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,9 +155,33 @@ def _stage_record():
 
 
 def _experiment_profile(options):
-    profile = profiles.get_profile(options.profile)
+    if options.profile in profiles.FROZEN_PROFILE_CONTRACTS:
+        if options.profile_manifest is None:
+            raise profiles.ProfileError(
+                f"profile {options.profile} requires --graph-manifest"
+            )
+        profile = profiles.load_frozen_profile(
+            options.profile, options.profile_manifest
+        )
+        manifest = profiles.load_graph_manifest(options.profile_manifest)
+        if Path(manifest.graph).resolve() != Path(options.graph).resolve():
+            raise profiles.ProfileError(
+                "graph path differs from frozen profile manifest"
+            )
+    else:
+        if options.profile_manifest is not None:
+            raise profiles.ProfileError(
+                "--graph-manifest is only valid for a frozen profile"
+            )
+        profile = profiles.get_profile(options.profile)
     profiles.require_latency(profile, options.cxl_link_delay)
     return profile
+
+
+def _profile_manifest_sha256(options):
+    if options.profile_manifest is None:
+        return ""
+    return artifacts.sha256_file(options.profile_manifest)
 
 
 def new_state(options):
@@ -169,6 +194,11 @@ def new_state(options):
             "graph": str(Path(options.graph).resolve()),
             "graph_scale": profile.graph_scale,
             "graph_sha256": profile.graph_sha256,
+            "profile_manifest": (
+                str(Path(options.profile_manifest).resolve())
+                if options.profile_manifest is not None else ""
+            ),
+            "profile_manifest_sha256": _profile_manifest_sha256(options),
             "page_rank_iterations": profile.page_rank_iterations,
             "trials": profile.trials,
             "measured_trial": profile.measured_trial,
@@ -318,6 +348,10 @@ def gem5_command(options, paths):
         "--outdir",
         str(paths.gem5_run),
     ]
+    if options.profile_manifest is not None:
+        command += [
+            "--graph-manifest", str(Path(options.profile_manifest).resolve())
+        ]
     if options.smoke_test:
         command.append("--smoke-test")
     return command
@@ -519,7 +553,10 @@ def stage_input_paths(stage, options, paths):
             paths.prepare_state,
         ],
     }
-    return mapping[stage]
+    selected = list(mapping[stage])
+    if options.profile_manifest is not None:
+        selected.append(Path(options.profile_manifest).resolve())
+    return selected
 
 
 def stage_output_paths(stage, paths):
@@ -634,11 +671,30 @@ def _generate_trace(options, paths):
             outdir=paths.trace,
             trials=profile.trials,
             iterations=profile.page_rank_iterations,
+            profile=profile,
+            profile_manifest_sha256=_profile_manifest_sha256(options),
+            cxl_link_delay=options.cxl_link_delay,
+            vanilla_raw_sha256=artifacts.sha256_file(paths.reference_raw),
         )
     finally:
         bundle.in_offsets.close()
         bundle.in_neighbors.close()
         bundle.out_degree.close()
+
+
+def _validate_trace_binding(options, paths):
+    if options.profile_manifest is None:
+        return
+    profile = _experiment_profile(options)
+    graph_meta = _graph_meta(paths)
+    pagerank_trace.validate_trace_binding(
+        pagerank_trace.read_trace_meta(paths.trace / "trace.meta.json"),
+        profile=profile,
+        profile_manifest_sha256=_profile_manifest_sha256(options),
+        cxl_link_delay=options.cxl_link_delay,
+        vanilla_raw_sha256=artifacts.sha256_file(paths.reference_raw),
+        directed_edges=graph_meta.num_directed_edges,
+    )
 
 
 def _parse_calibration(path):
@@ -665,6 +721,42 @@ def _parse_calibration(path):
         residual_ns=Decimal(value["residual_ns"]),
         link_period_ns=Decimal(value["link_period_ns"]),
         config_sha256=value["config_sha256"],
+        profile=value.get("profile", ""),
+        cxl_link_delay=value.get("cxl_link_delay", ""),
+        profile_manifest_sha256=value.get("profile_manifest_sha256", ""),
+        gem5_microprobe_ns=(
+            Decimal(value["gem5_microprobe_ns"])
+            if "gem5_microprobe_ns" in value else None
+        ),
+        m2ndp_boundary_ns=(
+            Decimal(value["m2ndp_boundary_ns"])
+            if "m2ndp_boundary_ns" in value else None
+        ),
+    )
+
+
+def _bind_calibration_artifact(options, path):
+    if options.profile not in profiles.FROZEN_PROFILE_CONTRACTS:
+        return
+    value = _load_json(path, "calibration artifact")
+    value.update(
+        {
+            "profile": options.profile,
+            "profile_manifest_sha256": _profile_manifest_sha256(options),
+            "cxl_link_delay": options.cxl_link_delay,
+            "gem5_microprobe_ns": value["target_ns"],
+            "m2ndp_boundary_ns": value["measured_ns"],
+        }
+    )
+    artifacts.atomic_write_json(path, value)
+
+
+def _validate_calibration_binding(options, evidence):
+    results.validate_calibration_binding(
+        evidence,
+        profile=_experiment_profile(options),
+        latency=options.cxl_link_delay,
+        profile_manifest_sha256=_profile_manifest_sha256(options),
     )
 
 
@@ -718,6 +810,8 @@ def _publish(options, paths):
         paths.calibration / "calibration.json"
     )
     _validate_calibration_config(paths, calibrated)
+    _validate_calibration_binding(options, calibrated)
+    _validate_trace_binding(options, paths)
     prepare = _load_json(paths.prepare_state, "M2NDP prepare state")
     provenance = results.ProvenanceEvidence(
         graph_sha256=meta.graph_sha256,
@@ -737,6 +831,9 @@ def _publish(options, paths):
         profile=profile,
         latency=options.cxl_link_delay,
         smoke_test=options.smoke_test,
+        profile_manifest_sha256=(
+            _profile_manifest_sha256(options) or None
+        ),
     )
     artifacts.atomic_write_csv(
         paths.summary,
@@ -752,6 +849,8 @@ def _publish(options, paths):
         "csr": paths.csr,
         "m2ndp_patch": PATCH,
         "m2ndp_tools": paths.tools,
+        "funcsim_binary": paths.tools / "bin/FuncSim",
+        "ndpsim_binary": paths.tools / "bin/NDPSim",
         "trace": paths.trace,
         "m2ndp_config": paths.calibration / "config",
         "reference": paths.reference,
@@ -764,6 +863,10 @@ def _publish(options, paths):
         "ndpsim_log": paths.ndpsim_log,
         "summary": paths.summary,
     }
+    if options.profile_manifest is not None:
+        manifest_paths["profile_manifest"] = Path(
+            options.profile_manifest
+        ).resolve()
     manifest = {
         "schema": 1,
         "contract": new_state(options)["contract"],
@@ -788,6 +891,8 @@ def _execute_stage(stage, options, paths, command, log):
         "calibration",
         "ndpsim",
     }:
+        if stage in {"funcsim", "ndpsim"}:
+            _validate_trace_binding(options, paths)
         if stage == "funcsim":
             paths.funcsim_dump.parent.mkdir(parents=True, exist_ok=True)
         cwd = (
@@ -842,12 +947,16 @@ def _execute_stage(stage, options, paths, command, log):
                 reference_path=paths.reference_raw,
             )
         elif stage == "calibration":
+            _bind_calibration_artifact(
+                options, paths.calibration / "calibration.json"
+            )
             calibrated = _parse_calibration(
                 paths.calibration / "calibration.json"
             )
             if not calibrated.passed:
                 raise artifacts.EvidenceError("CXL calibration failed")
             _validate_calibration_config(paths, calibrated)
+            _validate_calibration_binding(options, calibrated)
         elif stage == "ndpsim":
             results.parse_ndpsim(
                 Path(log).read_text(encoding="utf-8", errors="replace"),
@@ -947,10 +1056,19 @@ def run_stage(stage, state, options, paths):
 def _migrate_legacy_g20_contract(state, expected_contract):
     if expected_contract.get("profile") != "g20-2thread-1us":
         return False
-    legacy_contract = dict(expected_contract)
-    for field in ("profile", "graph_sha256", "threads"):
-        legacy_contract.pop(field)
-    if state.get("contract") != legacy_contract:
+    legacy_contracts = []
+    for fields in (
+        ("profile", "graph_sha256", "threads"),
+        (
+            "profile", "graph_sha256", "threads",
+            "profile_manifest", "profile_manifest_sha256",
+        ),
+    ):
+        legacy = dict(expected_contract)
+        for field in fields:
+            legacy.pop(field)
+        legacy_contracts.append(legacy)
+    if state.get("contract") not in legacy_contracts:
         return False
     state["contract"] = expected_contract
     return True
@@ -1024,8 +1142,14 @@ def parse_args(argv=None):
     parser.add_argument("--graph-scale", type=int, default=20)
     parser.add_argument(
         "--profile",
-        choices=tuple(profiles.PROFILES),
+        choices=tuple(
+            sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
+        ),
         default="g20-2thread-1us",
+    )
+    parser.add_argument(
+        "--profile-manifest", "--graph-manifest",
+        dest="profile_manifest", type=Path,
     )
     parser.add_argument("--cxl-link-delay", default="1us")
     parser.add_argument("--cxlmemuring", type=Path, required=True)
@@ -1050,6 +1174,10 @@ def parse_args(argv=None):
         stop_after=args.stop_after,
         profile=args.profile,
         cxl_link_delay=args.cxl_link_delay,
+        profile_manifest=(
+            args.profile_manifest.resolve()
+            if args.profile_manifest is not None else None
+        ),
     )
 
 

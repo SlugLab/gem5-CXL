@@ -362,8 +362,48 @@ def read_trace_meta(path):
     return json.loads(Path(path).read_text())
 
 
+def validate_trace_binding(
+    meta, *, profile, profile_manifest_sha256, cxl_link_delay,
+    vanilla_raw_sha256, directed_edges
+):
+    expected = {
+        "profile": profile.name,
+        "profile_manifest_sha256": profile_manifest_sha256,
+        "cxl_link_delay": cxl_link_delay,
+        "vanilla_raw_sha256": vanilla_raw_sha256,
+        "graph_sha256": profile.graph_sha256,
+        "num_nodes": profile.num_nodes,
+        "num_directed_edges": directed_edges,
+        "trials": profile.trials,
+        "measured_trial": profile.measured_trial,
+        "iterations": profile.page_rank_iterations,
+        "stage_sequence": list(UNIQUE_KERNELS),
+        "measure_marker": "K0_INIT_TRIAL1",
+    }
+    for field, value in expected.items():
+        if meta.get(field) != value:
+            raise artifacts.EvidenceError(
+                f"trace {field}={meta.get(field)!r}, expected {value!r}"
+            )
+    kernels = meta.get("kernel_sha256")
+    if not isinstance(kernels, dict) or set(kernels) != set(UNIQUE_KERNELS):
+        raise artifacts.EvidenceError("trace kernel hash set is incomplete")
+    for name, digest in kernels.items():
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise artifacts.EvidenceError(
+                f"trace kernel hash is invalid for {name}"
+            )
+    return meta
+
+
 def generate_trace(
-    *, bundle, reference, outdir, trials=2, iterations=20
+    *, bundle, reference, outdir, trials=2, iterations=20,
+    profile=None, profile_manifest_sha256=None, cxl_link_delay=None,
+    vanilla_raw_sha256=None,
 ):
     if trials != 2 or iterations != 20:
         raise artifacts.EvidenceError(
@@ -376,6 +416,29 @@ def generate_trace(
         raise artifacts.EvidenceError("reference node count mismatch")
     if reference_header["iterations"] != iterations:
         raise artifacts.EvidenceError("reference iteration count mismatch")
+    if profile is not None:
+        if (
+            profile.graph_sha256 != bundle.meta.graph_sha256
+            or profile.num_nodes != bundle.meta.num_nodes
+            or profile.trials != trials
+            or profile.page_rank_iterations != iterations
+            or profile.measured_trial != 1
+        ):
+            raise artifacts.EvidenceError(
+                "trace inputs do not match the experiment profile"
+            )
+        for value, label in (
+            (profile_manifest_sha256, "profile manifest"),
+            (vanilla_raw_sha256, "Vanilla raw vector"),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise artifacts.EvidenceError(f"{label} SHA-256 is invalid")
+        if not isinstance(cxl_link_delay, str) or not cxl_link_delay:
+            raise artifacts.EvidenceError("trace CXL latency is missing")
 
     outdir = Path(outdir)
     trace_dir = outdir / "0"
@@ -487,6 +550,8 @@ def generate_trace(
         "directed": bundle.meta.directed,
         "iterations": iterations,
         "trials": trials,
+        "measured_trial": 1,
+        "stage_sequence": list(UNIQUE_KERNELS),
         "funcsim_launches": len(functional_names),
         "ndpsim_launches": len(timing_names),
         "measure_marker": "K0_INIT_TRIAL1",
@@ -496,6 +561,14 @@ def generate_trace(
         "damping_bits": f"0x{float32_bits(damping):08x}",
         "base_score_bits": f"0x{float32_bits(base_score):08x}",
         "reference_sha256": reference_header["binary_sha256"],
+        "profile": profile.name if profile is not None else "",
+        "profile_manifest_sha256": profile_manifest_sha256 or "",
+        "cxl_link_delay": cxl_link_delay or "",
+        "vanilla_raw_sha256": vanilla_raw_sha256 or "",
+        "kernel_sha256": {
+            name: artifacts.sha256_file(trace_dir / f"{name}.traceg")
+            for name in UNIQUE_KERNELS
+        },
         "file_sha256": {
             str(path.relative_to(outdir)): artifacts.sha256_file(path)
             for path in sorted(outdir.rglob("*"))
@@ -504,6 +577,15 @@ def generate_trace(
     }
     meta_path = outdir / "trace.meta.json"
     artifacts.atomic_write_json(meta_path, meta)
+    if profile is not None:
+        validate_trace_binding(
+            meta,
+            profile=profile,
+            profile_manifest_sha256=profile_manifest_sha256,
+            cxl_link_delay=cxl_link_delay,
+            vanilla_raw_sha256=vanilla_raw_sha256,
+            directed_edges=edge_count,
+        )
     return TraceResult(
         outdir,
         UNIQUE_KERNELS,

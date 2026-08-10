@@ -386,6 +386,73 @@ class M2NDPResultTest(unittest.TestCase):
                 provenance=bad,
             )
 
+    def test_frozen_profile_calibration_is_profile_latency_bound(self):
+        profile = SimpleNamespace(name="g14-4thread-sweep")
+        calibration = results.CalibrationEvidence(
+            passed=True,
+            request_bytes=64,
+            target_ns=Decimal("2000"),
+            measured_ns=Decimal("2000.125"),
+            residual_ns=Decimal("0.125"),
+            link_period_ns=Decimal("0.5"),
+            config_sha256="c" * 64,
+            profile="g14-4thread-sweep",
+            cxl_link_delay="2us",
+            profile_manifest_sha256="d" * 64,
+            gem5_microprobe_ns=Decimal("2000"),
+            m2ndp_boundary_ns=Decimal("2000.125"),
+        )
+        results.validate_calibration_binding(
+            calibration,
+            profile=profile,
+            latency="2us",
+            profile_manifest_sha256="d" * 64,
+        )
+        for field, value in (
+            ("profile", "g12-4thread-qualification"),
+            ("cxl_link_delay", "1us"),
+            ("profile_manifest_sha256", "e" * 64),
+            ("m2ndp_boundary_ns", Decimal("2000.250")),
+        ):
+            with self.subTest(field=field), self.assertRaises(
+                artifacts.EvidenceError
+            ):
+                results.validate_calibration_binding(
+                    results.CalibrationEvidence(
+                        **{**calibration.__dict__, field: value}
+                    ),
+                    profile=profile,
+                    latency="2us",
+                    profile_manifest_sha256="d" * 64,
+                )
+
+    def test_frozen_calibration_rejects_missing_alias_cleanly(self):
+        profile = SimpleNamespace(name="g14-4thread-sweep")
+        calibration = results.CalibrationEvidence(
+            passed=True,
+            request_bytes=64,
+            target_ns=Decimal("1000"),
+            measured_ns=Decimal("1000.125"),
+            residual_ns=Decimal("0.125"),
+            link_period_ns=Decimal("0.5"),
+            config_sha256="c" * 64,
+            profile=profile.name,
+            cxl_link_delay="1us",
+            profile_manifest_sha256="d" * 64,
+            gem5_microprobe_ns=None,
+            m2ndp_boundary_ns=Decimal("1000.125"),
+        )
+
+        with self.assertRaisesRegex(
+            artifacts.EvidenceError, "gem5 microprobe latency"
+        ):
+            results.validate_calibration_binding(
+                calibration,
+                profile=profile,
+                latency="1us",
+                profile_manifest_sha256="d" * 64,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

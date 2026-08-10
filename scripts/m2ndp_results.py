@@ -49,6 +49,11 @@ class CalibrationEvidence:
     residual_ns: decimal.Decimal
     link_period_ns: decimal.Decimal
     config_sha256: str
+    profile: str = ""
+    cxl_link_delay: str = ""
+    profile_manifest_sha256: str = ""
+    gem5_microprobe_ns: decimal.Decimal | None = None
+    m2ndp_boundary_ns: decimal.Decimal | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,12 +332,53 @@ def parse_gem5_summary(
 
 
 def _require_decimal_positive(value, name, *, allow_zero=False):
-    value = decimal.Decimal(value)
+    try:
+        value = decimal.Decimal(value)
+    except (decimal.InvalidOperation, TypeError, ValueError) as error:
+        raise artifacts.EvidenceError(
+            f"{name} must be a decimal number"
+        ) from error
     if not value.is_finite():
         raise artifacts.EvidenceError(f"{name} must be finite")
     if value < 0 or (not allow_zero and value == 0):
         raise artifacts.EvidenceError(f"{name} must be positive")
     return value
+
+
+def validate_calibration_binding(
+    calibration, *, profile, latency, profile_manifest_sha256
+):
+    if profile.name not in profiles.FROZEN_PROFILE_CONTRACTS:
+        return
+    if calibration.profile != profile.name:
+        raise artifacts.EvidenceError("calibration profile binding mismatch")
+    if calibration.cxl_link_delay != latency:
+        raise artifacts.EvidenceError("calibration latency binding mismatch")
+    if (
+        not _HASH_RE.fullmatch(calibration.profile_manifest_sha256)
+        or calibration.profile_manifest_sha256 != profile_manifest_sha256
+    ):
+        raise artifacts.EvidenceError(
+            "calibration profile manifest binding mismatch"
+        )
+    microprobe = _require_decimal_positive(
+        calibration.gem5_microprobe_ns, "gem5 microprobe latency"
+    )
+    boundary = _require_decimal_positive(
+        calibration.m2ndp_boundary_ns, "M2NDP boundary latency"
+    )
+    if microprobe != calibration.target_ns:
+        raise artifacts.EvidenceError(
+            "calibration gem5 microprobe does not match target"
+        )
+    if boundary != calibration.measured_ns:
+        raise artifacts.EvidenceError(
+            "calibration M2NDP boundary does not match measurement"
+        )
+    if abs(boundary - microprobe) > decimal.Decimal("0.125"):
+        raise artifacts.EvidenceError(
+            "calibration profile-bound residual exceeds 0.125 ns"
+        )
 
 
 def _validate_provenance(
@@ -391,6 +437,7 @@ def build_summary(
     profile=None,
     latency="1us",
     smoke_test=False,
+    profile_manifest_sha256=None,
 ):
     if profile is None:
         profile = profiles.get_profile("g20-2thread-1us")
@@ -421,6 +468,12 @@ def build_summary(
     )
     if not calibration.passed:
         raise artifacts.EvidenceError("CXL calibration failed")
+    validate_calibration_binding(
+        calibration,
+        profile=profile,
+        latency=latency,
+        profile_manifest_sha256=profile_manifest_sha256,
+    )
     if calibration.request_bytes != 64:
         raise artifacts.EvidenceError(
             "CXL calibration request size must be 64 bytes"
@@ -472,17 +525,22 @@ def build_summary(
     return {
         "benchmark": "pr_spmv",
         "profile": profile.name,
+        "profile_manifest_sha256": profile_manifest_sha256 or "",
         "graph_sha256": provenance.graph_sha256,
         "gem5_binary_sha256": provenance.gem5_binary_sha256,
         "m2ndp_patch_sha256": provenance.m2ndp_patch_sha256,
         "m2ndp_config_sha256": provenance.m2ndp_config_sha256,
         "trace_sha256": provenance.trace_sha256,
+        "reference_raw_sha256": provenance.reference_raw_sha256,
+        "funcsim_dump_sha256": provenance.funcsim_dump_sha256,
         "iterations": str(profile.page_rank_iterations),
         "trials": str(profile.trials),
         "measured_trial": str(profile.measured_trial),
         "cores": str(profile.cores),
         "all_memory_cxl": "True",
         "cxl_link_delay": latency,
+        "gem5_microprobe_ns": str(calibration.target_ns),
+        "m2ndp_boundary_ns": str(calibration.measured_ns),
         "verification": "pass",
         "funcsim_strict": "pass",
         "funcsim_compared": str(funcsim.compared),

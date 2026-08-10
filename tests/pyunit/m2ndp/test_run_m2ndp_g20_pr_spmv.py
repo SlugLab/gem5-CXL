@@ -4,6 +4,7 @@
 import dataclasses
 import json
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest import mock
 
 from scripts import m2ndp_artifacts as artifacts
 from scripts import run_m2ndp_g20_pr_spmv as runner
+from scripts import gapbs_pr_experiment_profiles as profiles
 
 
 class OrchestratorTest(unittest.TestCase):
@@ -92,6 +94,60 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(contract["cores"], 4)
         self.assertEqual(contract["threads"], 4)
         self.assertEqual(contract["cxl_link_delay"], "2us")
+
+    def test_manifest_backed_g14_profile_is_bound_to_every_command(self):
+        root = self.outdir.parent
+        graph = root / "g14.sg"
+        generator = root / "converter"
+        nodes = 1 << 14
+        graph.write_bytes(
+            struct.pack("<?qq", False, 1, nodes)
+            + struct.pack(f"<{nodes + 1}q", *([0] * nodes + [1]))
+            + struct.pack("<i", 0)
+        )
+        generator.write_bytes(b"generator")
+        os.chmod(generator, 0o755)
+        manifest = root / "g14.manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "scale": 14,
+                    "graph": str(graph.resolve()),
+                    "graph_sha256": artifacts.sha256_file(graph),
+                    "generator": str(generator.resolve()),
+                    "generator_sha256": artifacts.sha256_file(generator),
+                    "generator_command": [
+                        str(generator.resolve()), "-g", "14", "-b",
+                        str(graph.resolve()),
+                    ],
+                    "num_nodes": nodes,
+                    "directed_edges": 1,
+                }
+            ) + "\n",
+            encoding="utf-8",
+        )
+        options = dataclasses.replace(
+            self.options,
+            graph=graph,
+            graph_scale=14,
+            profile="g14-4thread-sweep",
+            profile_manifest=manifest,
+            cxl_link_delay="500ns",
+        )
+
+        profile = runner._experiment_profile(options)
+        contract = runner.new_state(options)["contract"]
+        command = runner.gem5_command(options, self.paths)
+
+        self.assertEqual(profile.num_nodes, nodes)
+        self.assertEqual(contract["profile_manifest_sha256"],
+                         artifacts.sha256_file(manifest))
+        self.assertIn("--graph-manifest", command)
+        self.assertEqual(
+            command[command.index("--graph-manifest") + 1],
+            str(manifest.resolve()),
+        )
 
     def test_resume_migrates_legacy_g20_contract(self):
         legacy = runner.new_state(self.options)

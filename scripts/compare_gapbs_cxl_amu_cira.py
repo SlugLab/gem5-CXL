@@ -31,9 +31,12 @@ from gapbs_checkpoint import (  # noqa: E402
     write_manifest,
 )
 from gapbs_pr_experiment_profiles import (  # noqa: E402
+    FROZEN_PROFILE_CONTRACTS,
     PROFILES as EXPERIMENT_PROFILES,
     ProfileError,
     get_profile,
+    load_frozen_profile,
+    load_graph_manifest,
     require_latency,
 )
 
@@ -1454,8 +1457,26 @@ def write_summary(path, rows):
             writer.writerow(out)
 
 
+def resolve_checkpoint_profile(args):
+    name = getattr(args, "profile", "g20-2thread-1us")
+    manifest_path = getattr(args, "graph_manifest", None)
+    if name in FROZEN_PROFILE_CONTRACTS:
+        if manifest_path is None:
+            raise ProfileError(f"profile {name} requires --graph-manifest")
+        profile = load_frozen_profile(name, manifest_path)
+        manifest = load_graph_manifest(manifest_path)
+        if Path(manifest.graph).resolve() != Path(args.graph).resolve():
+            raise ProfileError("graph path differs from frozen manifest")
+        return profile
+    if manifest_path is not None:
+        raise ProfileError(
+            "--graph-manifest is only valid for a frozen profile"
+        )
+    return get_profile(name)
+
+
 def validate_checkpoint_profile(args):
-    profile = get_profile(getattr(args, "profile", "g20-2thread-1us"))
+    profile = resolve_checkpoint_profile(args)
     if args.smoke_test:
         return profile
     require_latency(profile, args.cxl_link_delay)
@@ -1521,9 +1542,12 @@ def main():
     parser.add_argument("--graph-scale", type=int)
     parser.add_argument(
         "--profile",
-        choices=tuple(EXPERIMENT_PROFILES),
+        choices=tuple(
+            sorted(set(EXPERIMENT_PROFILES) | set(FROZEN_PROFILE_CONTRACTS))
+        ),
         default="g20-2thread-1us",
     )
+    parser.add_argument("--graph-manifest", type=Path)
     parser.add_argument(
         "--checkpoint-root",
         type=Path,
@@ -1606,6 +1630,8 @@ def main():
         parser.error("--fast-forward-cpu requires --scale 20")
     if args.graph is not None:
         args.graph = args.graph.resolve()
+        if args.graph_manifest is not None:
+            args.graph_manifest = args.graph_manifest.resolve()
         if not args.graph.is_file():
             parser.error(f"--graph does not exist: {args.graph}")
         if args.checkpoint_root is None:
