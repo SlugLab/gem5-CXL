@@ -5,6 +5,8 @@
 """Immutable contracts for formal GAPBS PageRank experiments."""
 
 import dataclasses
+import json
+import struct
 from pathlib import Path
 
 try:
@@ -40,6 +42,38 @@ class ExperimentProfile:
     trials: int = 2
     measured_trial: int = 1
     page_rank_iterations: int = 20
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenGraphManifest:
+    schema: int
+    scale: int
+    graph: str
+    graph_sha256: str
+    generator: str
+    generator_sha256: str
+    generator_command: tuple[str, ...]
+    num_nodes: int
+    directed_edges: int
+
+
+FROZEN_MANIFEST_KEYS = frozenset(
+    {
+        "schema",
+        "scale",
+        "graph",
+        "graph_sha256",
+        "generator",
+        "generator_sha256",
+        "generator_command",
+        "num_nodes",
+        "directed_edges",
+    }
+)
+FROZEN_PROFILE_CONTRACTS = {
+    "g12-4thread-qualification": (12, ("1us",)),
+    "g14-4thread-sweep": (14, ("200ns", "500ns", "1us", "2us")),
+}
 
 
 PROFILES = {
@@ -84,3 +118,146 @@ def require_latency(profile: ExperimentProfile, latency: str) -> int:
             f"latency {latency} is outside profile {profile.name}"
         )
     return LATENCY_TICKS[latency]
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_sha256(value, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ProfileError(f"{label} SHA-256 is invalid")
+    return value
+
+
+def inspect_serialized_graph(path: Path) -> tuple[int, int, bool]:
+    """Return node count, directed-edge count, and directed flag for .sg."""
+    path = Path(path)
+    header_size = struct.calcsize("<?qq")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            header = stream.read(header_size)
+    except OSError as error:
+        raise ProfileError(f"cannot read serialized graph: {error}") from error
+    if len(header) != header_size:
+        raise ProfileError("serialized graph header is truncated")
+    directed, directed_edges, num_nodes = struct.unpack("<?qq", header)
+    if num_nodes <= 0:
+        raise ProfileError("serialized graph node count must be positive")
+    if directed_edges <= 0:
+        raise ProfileError("serialized graph edge count must be positive")
+    csr_size = (num_nodes + 1) * 8 + directed_edges * 4
+    expected_size = header_size + csr_size * (2 if directed else 1)
+    if size != expected_size:
+        raise ProfileError(
+            f"serialized graph size {size} does not match expected "
+            f"{expected_size}"
+        )
+    return num_nodes, directed_edges, directed
+
+
+def load_graph_manifest(path: Path) -> FrozenGraphManifest:
+    path = Path(path)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProfileError(f"invalid frozen graph manifest: {error}") from error
+    if not isinstance(value, dict):
+        raise ProfileError("frozen graph manifest must be a JSON object")
+    if set(value) != FROZEN_MANIFEST_KEYS:
+        missing = sorted(FROZEN_MANIFEST_KEYS - set(value))
+        extra = sorted(set(value) - FROZEN_MANIFEST_KEYS)
+        raise ProfileError(
+            f"frozen graph manifest keys mismatch: missing={missing} extra={extra}"
+        )
+    if value["schema"] != 1 or not _is_int(value["schema"]):
+        raise ProfileError("frozen graph manifest schema must be integer 1")
+    if value["scale"] not in (12, 14) or not _is_int(value["scale"]):
+        raise ProfileError("frozen graph scale must be 12 or 14")
+    if not _is_int(value["num_nodes"]) or value["num_nodes"] <= 0:
+        raise ProfileError("frozen graph node count is invalid")
+    if (
+        not _is_int(value["directed_edges"])
+        or value["directed_edges"] <= 0
+    ):
+        raise ProfileError("frozen graph edge count is invalid")
+    for field in ("graph", "generator"):
+        if not isinstance(value[field], str) or not value[field]:
+            raise ProfileError(f"frozen graph {field} path is invalid")
+        candidate = Path(value[field])
+        if not candidate.is_absolute() or candidate.resolve() != candidate:
+            raise ProfileError(
+                f"frozen graph {field} path must be resolved and absolute"
+            )
+    command = value["generator_command"]
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(argument, str) or not argument for argument in command)
+    ):
+        raise ProfileError("frozen graph generator command is invalid")
+    expected_command = [
+        value["generator"],
+        "-g",
+        str(value["scale"]),
+        "-b",
+        value["graph"],
+    ]
+    if command != expected_command:
+        raise ProfileError("frozen graph generator command is not canonical")
+    _validate_sha256(value["graph_sha256"], "graph")
+    _validate_sha256(value["generator_sha256"], "generator")
+    return FrozenGraphManifest(
+        **{
+            **value,
+            "generator_command": tuple(value["generator_command"]),
+        }
+    )
+
+
+def validate_frozen_graph(manifest: FrozenGraphManifest) -> None:
+    graph = Path(manifest.graph)
+    generator = Path(manifest.generator)
+    if not graph.is_file():
+        raise ProfileError(f"frozen graph does not exist: {graph}")
+    if m2ndp_artifacts.sha256_file(graph) != manifest.graph_sha256:
+        raise ProfileError("graph SHA-256 does not match frozen manifest")
+    if not generator.is_file():
+        raise ProfileError(f"frozen graph generator does not exist: {generator}")
+    if m2ndp_artifacts.sha256_file(generator) != manifest.generator_sha256:
+        raise ProfileError("generator SHA-256 does not match frozen manifest")
+    num_nodes, directed_edges, _ = inspect_serialized_graph(graph)
+    if num_nodes != manifest.num_nodes:
+        raise ProfileError("serialized graph node count does not match manifest")
+    if directed_edges != manifest.directed_edges:
+        raise ProfileError("serialized graph edge count does not match manifest")
+
+
+def load_frozen_profile(name: str, manifest_path: Path) -> ExperimentProfile:
+    try:
+        expected_scale, latencies = FROZEN_PROFILE_CONTRACTS[name]
+    except KeyError as error:
+        raise ProfileError(f"unknown frozen profile: {name}") from error
+    manifest = load_graph_manifest(manifest_path)
+    if manifest.scale != expected_scale:
+        raise ProfileError(
+            f"profile {name} requires scale {expected_scale}, "
+            f"got {manifest.scale}"
+        )
+    if manifest.num_nodes != 1 << expected_scale:
+        raise ProfileError("graph node count does not match scale")
+    validate_frozen_graph(manifest)
+    return ExperimentProfile(
+        name=name,
+        graph_scale=expected_scale,
+        graph_sha256=manifest.graph_sha256,
+        num_nodes=manifest.num_nodes,
+        cores=4,
+        threads=4,
+        latencies=latencies,
+    )
