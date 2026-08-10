@@ -50,6 +50,18 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
         reset = SOURCE[SOURCE.index("ASMC::reset"):]
         self.assertIn("reservedSendSlots = 0", reset)
 
+    def test_backpressured_port_waits_for_real_retry_callback(self):
+        schedule = SOURCE[
+            SOURCE.index("ASMC::scheduleSend"):
+            SOURCE.index("ASMC::trySend")
+        ]
+        self.assertIn("if (retryPkt)\n        return;", schedule)
+        retry = SOURCE[
+            SOURCE.index("ASMC::recvReqRetry"):
+            SOURCE.index("ASMC::completeRequest")
+        ]
+        self.assertIn("schedule(sendEvent, curTick())", retry)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -352,6 +352,9 @@ ASMC::enqueuePacket(PacketPtr pkt)
 void
 ASMC::scheduleSend(Tick when)
 {
+    if (retryPkt)
+        return;
+
     if (sendEvent.scheduled()) {
         if (when < sendEvent.when())
             reschedule(sendEvent, when);
@@ -433,7 +436,11 @@ ASMC::recvTimingResp(PacketPtr pkt)
 void
 ASMC::recvReqRetry()
 {
-    scheduleSend(curTick());
+    panic_if(!retryPkt, "ASMC received a spurious request retry");
+    if (sendEvent.scheduled())
+        reschedule(sendEvent, curTick());
+    else
+        schedule(sendEvent, curTick());
 }
 
 void
