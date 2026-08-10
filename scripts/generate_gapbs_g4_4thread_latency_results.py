@@ -30,6 +30,7 @@ except ImportError:
 
 LATENCIES = ("200ns", "500ns", "1us", "2us")
 SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
+REAL_CXL_FIELDS = m2ndp_results.REAL_CXL_FIELDS
 TICKS_PER_SECOND = decimal.Decimal(10**12)
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 CSV_NAME = "gapbs-g4-4thread-latency-results.csv"
@@ -127,6 +128,45 @@ def recompute_speedup(vanilla_seconds, mechanism_seconds):
     vanilla_seconds = _decimal(vanilla_seconds, "Vanilla latency")
     mechanism_seconds = _decimal(mechanism_seconds, "mechanism latency")
     return vanilla_seconds / mechanism_seconds
+
+
+def validate_vanilla_endpoints(rows, explanation=""):
+    vanilla = {}
+    for row in rows:
+        if row.get("system") != "vanilla":
+            continue
+        latency = row.get("latency")
+        if latency in vanilla:
+            raise PublicationError(f"duplicate Vanilla row for {latency}")
+        vanilla[latency] = row
+    if set(vanilla) != set(LATENCIES):
+        raise PublicationError(
+            "Vanilla endpoint gate requires all four latency rows"
+        )
+    ticks_200ns = _integer(
+        vanilla["200ns"].get("sim_ticks"), "Vanilla 200ns sim_ticks"
+    )
+    ticks_2us = _integer(
+        vanilla["2us"].get("sim_ticks"), "Vanilla 2us sim_ticks"
+    )
+    delta = ticks_2us - ticks_200ns
+    if delta <= 0:
+        raise PublicationError(
+            "Vanilla 2us ROI must be slower than Vanilla 200ns ROI"
+        )
+    explained = isinstance(explanation, str) and bool(explanation.strip())
+    for field in REAL_CXL_FIELDS:
+        values = [
+            _integer(vanilla[latency].get(field), field)
+            for latency in LATENCIES
+        ]
+        relative_range = decimal.Decimal(max(values) - min(values)) / \
+            decimal.Decimal(min(values))
+        if relative_range > decimal.Decimal("0.05") and not explained:
+            raise PublicationError(
+                f"{field} varies by more than 5 percent without explanation"
+            )
+    return delta
 
 
 def _per_core(row, field):
@@ -236,7 +276,7 @@ def _validate_activity(row):
             )
 
 
-def validate_matrix(rows):
+def validate_matrix(rows, *, require_real_cxl=False, explanation=""):
     rows = [dict(row) for row in rows]
     if len(rows) != 16:
         raise PublicationError(
@@ -296,6 +336,9 @@ def validate_matrix(rows):
                 raise PublicationError(
                     f"{latency}/{system} speedup mismatch"
                 )
+
+    if require_real_cxl:
+        validate_vanilla_endpoints(rows, explanation=explanation)
 
     return tuple(
         by_key[(latency, system)][0]

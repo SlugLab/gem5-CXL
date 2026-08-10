@@ -85,6 +85,30 @@ def make_valid_rows():
     return rows
 
 
+def make_g14_vanilla_rows():
+    ticks = {
+        "200ns": "1000000",
+        "500ns": "1200000",
+        "1us": "1100000",
+        "2us": "1800000",
+    }
+    rows = []
+    for index, latency in enumerate(publisher.LATENCIES):
+        rows.append(
+            {
+                "profile": "g14-4thread-sweep",
+                "latency": latency,
+                "system": "vanilla",
+                "sim_ticks": ticks[latency],
+                "mem_ctrl_read_reqs": str(1000 + index * 10),
+                "mem_ctrl_read_bursts": str(990 + index * 10),
+                "mem_ctrl_bytes_read": str(64000 + index * 640),
+                "mem_ctrl_cpu_data_reads": str(900 + index * 9),
+            }
+        )
+    return rows
+
+
 def write_csv(path, row):
     artifacts.atomic_write_csv(path, tuple(row), [row])
 
@@ -249,6 +273,57 @@ class MatrixValidationTest(unittest.TestCase):
         rows = make_valid_rows()[:-1]
         with self.assertRaisesRegex(publisher.PublicationError, "16 rows"):
             publisher.validate_matrix(rows)
+
+    def test_g14_vanilla_endpoints_require_real_cxl_and_positive_sensitivity(self):
+        rows = make_g14_vanilla_rows()
+
+        delta = publisher.validate_vanilla_endpoints(rows)
+
+        self.assertEqual(delta, 800000)
+
+    def test_g14_vanilla_endpoint_gate_rejects_flat_or_reversed_result(self):
+        for ticks in ("1000000", "999999"):
+            with self.subTest(ticks=ticks):
+                rows = make_g14_vanilla_rows()
+                rows[-1]["sim_ticks"] = ticks
+                with self.assertRaisesRegex(
+                    publisher.PublicationError,
+                    "2us ROI must be slower than Vanilla 200ns ROI",
+                ):
+                    publisher.validate_vanilla_endpoints(rows)
+
+    def test_g14_vanilla_endpoint_gate_rejects_each_zero_counter(self):
+        for field in publisher.REAL_CXL_FIELDS:
+            with self.subTest(field=field):
+                rows = make_g14_vanilla_rows()
+                rows[0][field] = "0"
+                with self.assertRaisesRegex(
+                    publisher.PublicationError, field
+                ):
+                    publisher.validate_vanilla_endpoints(rows)
+
+    def test_g14_vanilla_counter_variation_requires_explanation(self):
+        rows = make_g14_vanilla_rows()
+        rows[-1]["mem_ctrl_read_reqs"] = "2000"
+        with self.assertRaisesRegex(
+            publisher.PublicationError, "varies by more than 5 percent"
+        ):
+            publisher.validate_vanilla_endpoints(rows)
+
+        delta = publisher.validate_vanilla_endpoints(
+            rows,
+            explanation="2us run records additional deterministic retries",
+        )
+
+        self.assertEqual(delta, 800000)
+
+    def test_g14_vanilla_intermediate_points_need_not_be_monotonic(self):
+        rows = make_g14_vanilla_rows()
+        self.assertGreater(
+            int(rows[1]["sim_ticks"]), int(rows[2]["sim_ticks"])
+        )
+
+        self.assertEqual(publisher.validate_vanilla_endpoints(rows), 800000)
 
 
 class PublicationTest(unittest.TestCase):
