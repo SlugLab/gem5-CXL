@@ -132,6 +132,32 @@ class GraphBundleTest(unittest.TestCase):
 
 
 class MatchedPageRankSourceTest(unittest.TestCase):
+    def test_copied_gapbs_builder_preserves_generated_scale_node_space(self):
+        builder = importlib.import_module(
+            "scripts.build_gapbs_m2ndp_pr_spmv"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src/builder.h"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "      } else if (cli_.scale() != -1) {\n"
+                "        Generator<NodeID_, DestID_> gen(cli_.scale(), cli_.degree());\n"
+                "        el = gen.GenerateEL(cli_.uniform());\n"
+                "      }\n"
+                "      g = MakeGraphFromEL(el);\n",
+                encoding="utf-8",
+            )
+
+            builder.patch_generated_graph_node_count(root)
+            patched = source.read_text(encoding="utf-8")
+
+        self.assertIn("num_nodes_ = int64_t{1} << cli_.scale();", patched)
+        self.assertLess(
+            patched.index("num_nodes_ = int64_t{1} << cli_.scale();"),
+            patched.index("g = MakeGraphFromEL(el);"),
+        )
+
     def test_fixed_source_has_matched_roi_contract(self):
         source = (
             REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"

@@ -33,6 +33,19 @@ COMMON_FLAGS = (
     "-ffp-contract=off",
     "-fno-fast-math",
 )
+GENERATED_GRAPH_MARKER = (
+    "        el = gen.GenerateEL(cli_.uniform());\n"
+    "      }\n"
+    "      g = MakeGraphFromEL(el);\n"
+)
+GENERATED_GRAPH_REPLACEMENT = (
+    "        el = gen.GenerateEL(cli_.uniform());\n"
+    "        // R-MAT may leave the highest IDs isolated. Preserve the full\n"
+    "        // 2^scale vertex space instead of inferring it from max(edge).\n"
+    "        num_nodes_ = int64_t{1} << cli_.scale();\n"
+    "      }\n"
+    "      g = MakeGraphFromEL(el);\n"
+)
 
 
 def run(command, *, cwd=None):
@@ -91,6 +104,22 @@ def write_experiment_header(path, reference_raw):
     escaped = (
         reference.replace("\\", "\\\\").replace('"', '\\"')
     )
+
+
+def patch_generated_graph_node_count(gapbs_root):
+    builder = Path(gapbs_root) / "src/builder.h"
+    source = builder.read_text(encoding="utf-8")
+    if source.count(GENERATED_GRAPH_REPLACEMENT) == 1:
+        return builder
+    if source.count(GENERATED_GRAPH_MARKER) != 1:
+        raise SystemExit(
+            "GAPBS builder generated-graph marker is missing or ambiguous"
+        )
+    builder.write_text(
+        source.replace(GENERATED_GRAPH_MARKER, GENERATED_GRAPH_REPLACEMENT),
+        encoding="utf-8",
+    )
+    return builder
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "#ifndef M2NDP_EXPERIMENT_CONFIG_H\n"
@@ -137,6 +166,7 @@ def main(argv=None):
     generated_dir = args.outdir / "generated"
     binary_dir.mkdir(parents=True, exist_ok=True)
     gapbs_root = copy_gapbs_source(args.cxlmemuring, args.outdir)
+    patch_generated_graph_node_count(gapbs_root)
     header = generated_dir / "m2ndp_experiment_config.h"
     write_experiment_header(header, args.reference_raw)
 
