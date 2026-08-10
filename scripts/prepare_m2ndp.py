@@ -5,6 +5,7 @@
 """Validate, patch, and build the pinned M2NDP simulator checkout."""
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -18,18 +19,31 @@ except ImportError:
 
 
 REPO = Path(__file__).resolve().parents[1]
-PATCH = REPO / "util/m2ndp/patches/0001-funcsim-strict-sequence.patch"
+PATCH = REPO / "util/m2ndp/patches"
+PATCHES = (
+    PATCH / "0001-funcsim-strict-sequence.patch",
+    PATCH / "0002-cxl-probe-precise-time.patch",
+)
 PATCHED_PATHS = frozenset(
     {
         "CMakeLists.txt",
+        "config/performance/M2NDP/cxl_link.icnt",
+        "extern/intersim2/booksim_config.cpp",
+        "extern/intersim2/interconnect_interface.cpp",
+        "extern/intersim2/interconnect_interface.hpp",
+        "extern/intersim2/intersim_config.cpp",
+        "extern/intersim2/networks/fly.cpp",
         "functional_runner/main.cc",
         "perf_runner/cxl_probe_main.cc",
         "perf_runner/synthetic_traffic.cc",
         "perf_runner/synthetic_traffic.h",
         "src/memory_map.cc",
         "src/memory_map.h",
+        "src/cxl_link.cc",
+        "src/cxl_link.h",
         "src/m2ndp.cc",
         "src/m2ndp_config.cc",
+        "src/m2ndp_config.h",
     }
 )
 
@@ -76,32 +90,53 @@ def validate_upstream(root):
     return commit
 
 
-def _git_apply_check(root, *arguments):
+def _git_apply_check(root, patch, *arguments):
     return subprocess.run(
-        ["git", "-C", str(root), "apply", *arguments, str(PATCH)],
+        ["git", "-C", str(root), "apply", *arguments, str(patch)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
 
 
-def apply_patch(root):
-    if not PATCH.is_file():
-        raise PrepareError(f"strict patch missing: {PATCH}")
-    forward = _git_apply_check(root, "--check")
-    if forward.returncode == 0:
-        subprocess.run(
-            ["git", "-C", str(root), "apply", str(PATCH)],
-            check=True,
+def apply_patches(root):
+    statuses = {}
+    for patch in PATCHES:
+        if not patch.is_file():
+            raise PrepareError(f"strict patch missing: {patch}")
+        forward = _git_apply_check(root, patch, "--check")
+        if forward.returncode == 0:
+            subprocess.run(
+                ["git", "-C", str(root), "apply", str(patch)],
+                check=True,
+            )
+            statuses[patch.name] = "applied"
+            continue
+        reverse = _git_apply_check(root, patch, "--reverse", "--check")
+        if reverse.returncode == 0:
+            statuses[patch.name] = "already-applied"
+            continue
+        raise PrepareError(
+            f"strict patch {patch.name} is neither cleanly applicable nor "
+            "exactly applied: " + forward.stdout.strip()
         )
-        return "applied"
-    reverse = _git_apply_check(root, "--reverse", "--check")
-    if reverse.returncode == 0:
-        return "already-applied"
-    raise PrepareError(
-        "strict patch is neither cleanly applicable nor exactly applied: "
-        + forward.stdout.strip()
-    )
+    return statuses
+
+
+def patch_bundle_sha256(path):
+    path = Path(path)
+    if path.is_file():
+        return artifacts.sha256_file(path)
+    files = [item for item in sorted(path.rglob("*")) if item.is_file()]
+    if not files:
+        raise PrepareError(f"patch bundle is empty: {path}")
+    digest = hashlib.sha256()
+    for item in files:
+        relative = item.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "little"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(artifacts.sha256_file(item)))
+    return digest.hexdigest()
 
 
 def require_executable(path):
@@ -206,7 +241,7 @@ def build_state(
         "schema": 1,
         "m2ndp_root": str(Path(root).resolve()),
         "upstream_commit": commit,
-        "patch_sha256": artifacts.sha256_file(Path(patch)),
+        "patch_sha256": patch_bundle_sha256(patch),
         "tool_path": {
             name: str(path.resolve()) for name, path in tools.items()
         },
@@ -309,7 +344,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     commit = validate_upstream(args.m2ndp_root)
-    patch_status = apply_patch(args.m2ndp_root)
+    patch_status = apply_patches(args.m2ndp_root)
     validate_upstream(args.m2ndp_root)
     if not args.build:
         print(

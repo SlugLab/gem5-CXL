@@ -10,6 +10,12 @@ from scripts import calibrate_m2ndp_cxl as calibration
 
 
 class CalibrationTest(unittest.TestCase):
+    def test_gem5_config_exposes_cxl_boundary_monitor(self):
+        source = calibration.DEFAULT_CONFIG.read_text(encoding="utf-8")
+        self.assertIn("CommMonitor", source)
+        self.assertIn('"--cxl-latency-monitor"', source)
+        self.assertIn("cxl_latency_monitor", source)
+
     def test_selects_closest_link_latency_within_one_clock(self):
         def simulate(link_latency):
             return Decimal("100.0") + Decimal(link_latency) * Decimal("0.125")
@@ -38,11 +44,35 @@ class CalibrationTest(unittest.TestCase):
                 link_period_ns=Decimal("0.125"),
             )
 
+    def test_refines_coarse_link_with_post_memory_host_response_cycles(self):
+        def simulate(link_latency, host_response_extra_latency):
+            return (
+                Decimal("100")
+                + Decimal(link_latency) * Decimal("2")
+                + Decimal(host_response_extra_latency) * Decimal("0.125")
+            )
+
+        result = calibration.refine_host_response_latency(
+            target_ns=Decimal("1100.6"),
+            link_period_ns=Decimal("0.125"),
+            link_candidates=(500, 501),
+            simulate=simulate,
+            max_host_response_extra_latency=16,
+        )
+
+        self.assertEqual(result.link_latency, 500)
+        self.assertEqual(result.host_response_extra_latency, 5)
+        self.assertLessEqual(
+            abs(result.measured_ns - result.target_ns),
+            result.link_period_ns,
+        )
+
     def test_parses_probe_markers_and_core_period(self):
         text = "\n".join(
             (
                 "noise",
                 "M2NDP_CXL_PROBE request_bytes=64 requests=1",
+                "M2NDP_CXL_PROBE_LATENCY_NS 130.125",
                 "Memory request latency: 261",
             )
         )
@@ -52,7 +82,24 @@ class CalibrationTest(unittest.TestCase):
             expected_request_bytes=64,
             core_period_ns=Decimal("0.5"),
         )
-        self.assertEqual(measured, Decimal("130.5"))
+        self.assertEqual(measured, Decimal("130.125"))
+
+    def test_rejects_cycle_only_probe_that_cannot_prove_link_clock_error(self):
+        text = "\n".join(
+            (
+                "M2NDP_CXL_PROBE request_bytes=64 requests=1",
+                "Memory request latency: 261",
+            )
+        )
+        with self.assertRaisesRegex(
+            calibration.CalibrationError, "precise latency marker"
+        ):
+            calibration.parse_m2ndp_probe(
+                text,
+                returncode=0,
+                expected_request_bytes=64,
+                core_period_ns=Decimal("0.5"),
+            )
 
     def test_rejects_duplicate_probe_marker(self):
         text = "\n".join(
@@ -86,6 +133,7 @@ class CalibrationTest(unittest.TestCase):
             )
             (source / "cxl_link.icnt").write_text(
                 "link_latency = 274; // 35ns\n"
+                "host_response_extra_latency = 0;\n"
             )
             for name in (
                 "LPDDR5-config.cfg",
@@ -122,12 +170,14 @@ class CalibrationTest(unittest.TestCase):
                 "simTicks 2100000",
                 "board.cache_hierarchy.membus.transDist::ReadResp 1",
                 "board.cache_hierarchy.membus.transDist::ReadSharedReq 1",
+                "board.cxl_latency_monitor0.readLatencyHist::samples 1",
+                "board.cxl_latency_monitor0.readLatencyHist::mean 2048000",
                 "board.cache_hierarchy.membus.pktCount_"
                 "board.cache_hierarchy.l2-cache-0.mem_side_port::"
-                "board.cxl_mem_link0.cpu_side_port 2",
+                "board.cxl_latency_monitor0-cpu_side_port 2",
                 "board.cache_hierarchy.membus.pktSize_"
                 "board.cache_hierarchy.l2-cache-0.mem_side_port::"
-                "board.cxl_mem_link0.cpu_side_port 64",
+                "board.cxl_latency_monitor0-cpu_side_port 64",
                 "---------- End Simulation Statistics   ----------",
             )
         )
@@ -137,7 +187,29 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual(evidence.response_count, 1)
         self.assertEqual(evidence.round_trip_packets, 2)
         self.assertEqual(evidence.request_bytes, 64)
-        self.assertEqual(evidence.target_ns, Decimal("2100"))
+        self.assertEqual(evidence.target_ticks, 2048000)
+        self.assertEqual(evidence.target_ns, Decimal("2048"))
+
+    def test_rejects_gem5_probe_without_cxl_boundary_latency(self):
+        stats = "\n".join(
+            (
+                "---------- Begin Simulation Statistics ----------",
+                "simTicks 2100000",
+                "board.cache_hierarchy.membus.transDist::ReadResp 1",
+                "board.cache_hierarchy.membus.transDist::ReadSharedReq 1",
+                "board.cache_hierarchy.membus.pktCount_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_latency_monitor0-cpu_side_port 2",
+                "board.cache_hierarchy.membus.pktSize_"
+                "board.cache_hierarchy.l2-cache-0.mem_side_port::"
+                "board.cxl_latency_monitor0-cpu_side_port 64",
+                "---------- End Simulation Statistics   ----------",
+            )
+        )
+        with self.assertRaisesRegex(
+            calibration.CalibrationError, "CXL boundary latency"
+        ):
+            calibration.parse_gem5_probe_stats(stats)
 
     def test_rejects_gem5_probe_without_one_read_response(self):
         stats = "\n".join(
@@ -145,12 +217,14 @@ class CalibrationTest(unittest.TestCase):
                 "---------- Begin Simulation Statistics ----------",
                 "simTicks 2100000",
                 "board.cache_hierarchy.membus.transDist::ReadSharedReq 1",
+                "board.cxl_latency_monitor0.readLatencyHist::samples 1",
+                "board.cxl_latency_monitor0.readLatencyHist::mean 2048000",
                 "board.cache_hierarchy.membus.pktCount_"
                 "board.cache_hierarchy.l2-cache-0.mem_side_port::"
-                "board.cxl_mem_link0.cpu_side_port 2",
+                "board.cxl_latency_monitor0-cpu_side_port 2",
                 "board.cache_hierarchy.membus.pktSize_"
                 "board.cache_hierarchy.l2-cache-0.mem_side_port::"
-                "board.cxl_mem_link0.cpu_side_port 64",
+                "board.cxl_latency_monitor0-cpu_side_port 64",
                 "---------- End Simulation Statistics   ----------",
             )
         )

@@ -36,7 +36,7 @@ except ImportError:
 
 
 REPO = Path(__file__).resolve().parents[1]
-PATCH = REPO / "util/m2ndp/patches/0001-funcsim-strict-sequence.patch"
+PATCH = REPO / "util/m2ndp/patches"
 G20_SHA256 = artifacts.EXPECTED_G20_SHA256
 G20_WORDS = 1 << 20
 TICKS_PER_SECOND = Decimal(10**12)

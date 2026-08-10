@@ -21,7 +21,7 @@ from scripts import generate_gapbs_g20_e2e_table as table
 
 
 REPO = Path(__file__).resolve().parents[3]
-PATCH = REPO / "util/m2ndp/patches/0001-funcsim-strict-sequence.patch"
+PATCH = REPO / "util/m2ndp/patches"
 
 
 def write_json(path, value):
@@ -170,7 +170,7 @@ def write_formal_bundle(root):
         "benchmark": "pr_spmv",
         "graph_sha256": artifacts.EXPECTED_G20_SHA256,
         "gem5_binary_sha256": "d" * 64,
-        "m2ndp_patch_sha256": artifacts.sha256_file(PATCH),
+        "m2ndp_patch_sha256": orchestrator.hash_path(PATCH),
         "m2ndp_config_sha256": config_sha256,
         "trace_sha256": orchestrator.hash_path(trace),
         "iterations": "20",
@@ -223,7 +223,7 @@ def write_formal_bundle(root):
         "m2ndp_upstream_commit": artifacts.EXPECTED_M2NDP_COMMIT,
         "build_binary_sha256": "b" * 64,
         "artifact_sha256": {
-            "m2ndp_patch": artifacts.sha256_file(PATCH),
+            "m2ndp_patch": orchestrator.hash_path(PATCH),
             "trace": orchestrator.hash_path(trace),
             "m2ndp_config": orchestrator.hash_path(config),
             "reference_raw": artifacts.sha256_file(reference_raw),

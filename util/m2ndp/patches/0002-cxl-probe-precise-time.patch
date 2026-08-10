@@ -1,0 +1,211 @@
+diff --git a/perf_runner/synthetic_traffic.cc b/perf_runner/synthetic_traffic.cc
+--- a/perf_runner/synthetic_traffic.cc
++++ b/perf_runner/synthetic_traffic.cc
+@@ -47,6 +47,7 @@ void SyntheticTrafficRunner::run() {
+   int finish_counter = 0;
+   bool push_mem_req = true;
+   uint64_t push_cycle = 0;
++  double push_time_seconds = 0;
+   while (finish_counter < m_num_reqs) {
+     m_m2ndp_config->cycle();
+     m_cxl_link->cycle();
+@@ -59,6 +60,7 @@ void SyntheticTrafficRunner::run() {
+       printf("Push to CXL link time: %d\n", m_m2ndp_config->get_ndp_cycle());
+       m_cxl_link->push_from_host(0, 0, mf);
+       push_cycle = m_m2ndp_config->get_ndp_cycle();
++      push_time_seconds = m_m2ndp_config->get_current_time_seconds();
+       push_mem_req = false;
+     }
+     if (m_cxl_link->top_from_host(0, 0) != NULL) {
+@@ -67,7 +69,11 @@ void SyntheticTrafficRunner::run() {
+       m_cxl_link->pop_from_host(0, 0);
+       delete mf;
+       uint64_t req_cycle = m_m2ndp_config->get_ndp_cycle() - push_cycle;
++      const double request_latency_ns =
++          (m_m2ndp_config->get_current_time_seconds() - push_time_seconds) *
++          1.0e9;
+       printf("Pop CXL link time: %d\n", m_m2ndp_config->get_ndp_cycle());
++      printf("M2NDP_CXL_PROBE_LATENCY_NS %.9f\n", request_latency_ns);
+       spdlog::info("Memory request latency: {}", req_cycle);
+       push_mem_req = true;
+       finish_counter++;
+diff --git a/src/m2ndp_config.cc b/src/m2ndp_config.cc
+--- a/src/m2ndp_config.cc
++++ b/src/m2ndp_config.cc
+@@ -24,6 +24,7 @@ M2NDPConfig::M2NDPConfig(std::string config_path, int num_hosts) {
+   m_core_time = 0;
+   m_dram_time = 0;
+   m_cache_time = 0;
++  m_current_time = 0;
+   #endif
+ }
+ 
+@@ -100,6 +101,7 @@ int M2NDPConfig::next_clock_domain() {
+   double smallest = min3(m_link_time, m_buffer_dram_time, m_buffer_ndp_time);
+   smallest = min3(smallest, m_core_time, m_dram_time);
+   smallest = gs_min2(smallest, m_cache_time);
++  m_current_time = smallest;
+   int mask = 0x00;
+   if (m_link_time <= smallest) {
+     m_link_time += m_link_period;
+diff --git a/src/m2ndp_config.h b/src/m2ndp_config.h
+--- a/src/m2ndp_config.h
++++ b/src/m2ndp_config.h
+@@ -76,6 +76,7 @@ class M2NDPConfig {
+   const uint64_t get_bank_index(uint64_t origin_addr);
+   const unsigned long long get_sim_cycle() { return m_core_cycle; }
+   const unsigned long long get_ndp_cycle() { return m_ndp_cycle; }
++  const double get_current_time_seconds() { return m_current_time; }
+   const unsigned addr_to_ramulator_addr(uint64_t addr);
+   const void cycle() { m_clock_mask = next_clock_domain(); }
+   const bool is_link_cycle();
+@@ -243,6 +244,7 @@ class M2NDPConfig {
+       m_cache_period;
+   double m_core_time, m_dram_time;
+   double m_link_time, m_buffer_dram_time, m_buffer_ndp_time, m_cache_time;
++  double m_current_time;
+ 
+   // Cache config path
+   bool m_skip_l1d = false;
+diff --git a/config/performance/M2NDP/cxl_link.icnt b/config/performance/M2NDP/cxl_link.icnt
+--- a/config/performance/M2NDP/cxl_link.icnt
++++ b/config/performance/M2NDP/cxl_link.icnt
+@@ -27,6 +27,7 @@ wait_for_tail_credit = 0;
+ 
+ // Router architecture
+ link_latency = 274; // 35ns
++host_response_extra_latency = 0;
+ vc_allocator = islip; //separable_input_first;
+ sw_allocator = islip; //separable_input_first;
+ alloc_iters  = 1;
+diff --git a/extern/intersim2/booksim_config.cpp b/extern/intersim2/booksim_config.cpp
+--- a/extern/intersim2/booksim_config.cpp
++++ b/extern/intersim2/booksim_config.cpp
+@@ -137,6 +137,7 @@ BookSimConfig::BookSimConfig( )
+   _int_map["st_prepare_delay"] = 0;
+   _int_map["st_final_delay"]   = 1;
+   _int_map["link_latency"]   = 2;
++  _int_map["host_response_extra_latency"] = 0;
+ 
+   //==== Event-driven =====================================
+ 
+diff --git a/extern/intersim2/interconnect_interface.cpp b/extern/intersim2/interconnect_interface.cpp
+--- a/extern/intersim2/interconnect_interface.cpp
++++ b/extern/intersim2/interconnect_interface.cpp
+@@ -461,6 +461,11 @@ int InterconnectInterface::GetIcntTime() const
+   return _traffic_manager->getTime();
+ }
+ 
++int InterconnectInterface::GetConfigInt(const char* name) const
++{
++  return _icnt_config->GetInt(name);
++}
++
+ Stats* InterconnectInterface::GetIcntStats(const string &name) const
+ {
+   return _traffic_manager->getStats(name);
+diff --git a/extern/intersim2/interconnect_interface.hpp b/extern/intersim2/interconnect_interface.hpp
+--- a/extern/intersim2/interconnect_interface.hpp
++++ b/extern/intersim2/interconnect_interface.hpp
+@@ -79,6 +79,7 @@ public:
+   virtual void Transfer2BoundaryBuffer(int subnet, int output);
+   virtual void IncreaseVCTurn(int deviceID);
+   int GetIcntTime() const;
++  int GetConfigInt(const char* name) const;
+   
+   Stats* GetIcntStats(const string & name) const;
+   
+diff --git a/src/cxl_link.cc b/src/cxl_link.cc
+--- a/src/cxl_link.cc
++++ b/src/cxl_link.cc
+@@ -22,10 +22,15 @@ CxlLink::CxlLink(M2NDPConfig* m2ndp_config) {
+       // m_m2ndp_config->get_links_per_host() / m_m2ndp_config->get_num_m2ndps();
+   m_interconnect_interface->CreateInterconnect(m_host_ports, m_m2ndp_ports);
+   m_interconnect_interface->Init();
++  m_host_response_extra_latency =
++      m_interconnect_interface->GetConfigInt(
++          "host_response_extra_latency");
++  assert(m_host_response_extra_latency >= 0);
+   m_m2ndp_offset =
+       m2ndp_config->get_links_per_host() * m2ndp_config->get_num_hosts();
+   m_from_host_buffers.resize(m_host_ports);
+   m_to_host_buffers.resize(m_host_ports);
++  m_pending_to_host_buffers.resize(m_host_ports);
+   for (int i = 0; i < m_host_ports; i++) {
+     m_from_host_buffers[i].resize(m_m2ndp_ports);
+   }
+@@ -166,7 +171,13 @@ void CxlLink::cycle() {
+   }
+ }
+ 
+-bool CxlLink::is_active() { return m_interconnect_interface->Busy(); }
++bool CxlLink::is_active() {
++  if (m_interconnect_interface->Busy()) return true;
++  for (const auto& pending : m_pending_to_host_buffers) {
++    if (!pending.empty()) return true;
++  }
++  return false;
++}
+ 
+ void CxlLink::display_stats(FILE* fp) {
+   m_interconnect_interface->DisplayStats(fp);
+@@ -197,16 +208,30 @@ void CxlLink::handle_from_host() {
+ 
+ void CxlLink::handle_to_host() {
+   for (int i = 0; i < m_host_ports; i++) {
++    while (!m_pending_to_host_buffers[i].empty() &&
++           m_pending_to_host_buffers[i].front().first <= m_cycles &&
++           m_to_host_buffers[i].size() <
++               m_m2ndp_config->get_cxl_link_buffer_size()) {
++      m_to_host_buffers[i].push_back(
++          m_pending_to_host_buffers[i].front().second);
++      m_pending_to_host_buffers[i].pop_front();
++    }
+     mem_fetch* mf = (mem_fetch*)m_interconnect_interface->Top(i);
+     if (mf == NULL) continue;
+-    if (m_to_host_buffers[i].size() >=
++    if (m_to_host_buffers[i].size() +
++            m_pending_to_host_buffers[i].size() >=
+         m_m2ndp_config->get_cxl_link_buffer_size())
+       continue;
+     if (mf->get_from_dma()) {
+       assert(!mf->is_request());
+       delete mf;
+     } else {
+-      m_to_host_buffers[i].push_back(mf);
++      if (m_host_response_extra_latency == 0) {
++        m_to_host_buffers[i].push_back(mf);
++      } else {
++        m_pending_to_host_buffers[i].emplace_back(
++            m_cycles + m_host_response_extra_latency, mf);
++      }
+     }
+     m_interconnect_interface->Pop(i);
+   }
+diff --git a/src/cxl_link.h b/src/cxl_link.h
+--- a/src/cxl_link.h
++++ b/src/cxl_link.h
+@@ -4,6 +4,7 @@
+ 
+ #include <mutex>
+ #include <string>
++#include <utility>
+ #include "interconnect_interface.hpp"
+ #include "m2ndp_config.h"
+ #include "mem_fetch.h"
+@@ -51,12 +52,15 @@ class CxlLink {
+     int m_num_connections;
+     std::vector<std::vector<std::deque<mem_fetch*>>> m_from_host_buffers;
+     std::vector<std::deque<mem_fetch*>> m_to_host_buffers;
++    std::vector<std::deque<std::pair<uint64_t, mem_fetch*>>>
++        m_pending_to_host_buffers;
+     std::vector<std::vector<std::deque<mem_fetch*>>> m_from_m2ndp_buffers;
+     std::vector<std::deque<mem_fetch*>> m_to_m2ndp_buffers;
+     uint32_t prior_m2ndp_to_host_flits = 0;
+     uint32_t prior_host_to_m2ndp_flits = 0;
+     int to_m2ndp_rr = 0;
+     int to_host_rr = 0;
++    int m_host_response_extra_latency = 0;
+     void handle_from_host();
+     void handle_to_host();
+     void handle_from_m2ndp();

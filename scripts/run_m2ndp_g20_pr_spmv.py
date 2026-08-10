@@ -37,7 +37,7 @@ CONFIG = REPO / "configs/example/gem5_library/x86-gapbs-amu-se.py"
 ROI_CONFIG = (
     REPO / "configs/example/gem5_library/gapbs_roi_state.py"
 )
-PATCH = REPO / "util/m2ndp/patches/0001-funcsim-strict-sequence.patch"
+PATCH = REPO / "util/m2ndp/patches"
 STAGES = (
     "prepare_m2ndp",
     "build_gapbs",

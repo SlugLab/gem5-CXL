@@ -12,14 +12,30 @@ from scripts import prepare_m2ndp as prepare
 
 class PrepareM2NDPTest(unittest.TestCase):
     def test_patch_deduplicates_repeated_timing_kernel_registration(self):
-        patch = prepare.PATCH.read_text()
+        patch = "\n".join(path.read_text() for path in prepare.PATCHES)
         self.assertIn("src/m2ndp.cc", prepare.PATCHED_PATHS)
         self.assertIn(
             "registered->kernel_id == ndp_kernel->kernel_id", patch
         )
         self.assertIn("delete ndp_kernel;", patch)
         self.assertIn("src/m2ndp_config.cc", prepare.PATCHED_PATHS)
+        self.assertIn("src/m2ndp_config.h", prepare.PATCHED_PATHS)
         self.assertIn("m_core_cycle++;", patch)
+        self.assertIn("M2NDP_CXL_PROBE_LATENCY_NS", patch)
+        self.assertIn("host_response_extra_latency", patch)
+        self.assertIn("m_pending_to_host_buffers", patch)
+        self.assertNotIn("ejection_extra_latency", patch)
+
+    def test_patch_bundle_hash_binds_every_patch_name_and_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "0001.patch").write_bytes(b"one")
+            (root / "0002.patch").write_bytes(b"two")
+            first = prepare.patch_bundle_sha256(root)
+            (root / "0002.patch").write_bytes(b"changed")
+            second = prepare.patch_bundle_sha256(root)
+
+        self.assertNotEqual(first, second)
 
     def test_git_output_preserves_porcelain_status_prefix(self):
         with mock.patch.object(

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import m5
-from m5.objects import ASMC, CIRA, Cache, NULL, SerialLink
+from m5.objects import ASMC, CIRA, Cache, CommMonitor, NULL, SerialLink
 
 from gapbs_roi_state import (
     GapbsCheckpointState,
@@ -92,12 +92,16 @@ class CXLSimpleBoard(SimpleBoard):
         *args,
         cxl_memory=False,
         cxl_args=None,
+        cxl_latency_monitor=False,
         cira_to_l2=False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         object.__setattr__(self, "_cxl_memory", cxl_memory)
         object.__setattr__(self, "_cxl_args", cxl_args or {})
+        object.__setattr__(
+            self, "_cxl_latency_monitor", cxl_latency_monitor
+        )
         object.__setattr__(self, "_cxl_mem_ports", None)
         object.__setattr__(self, "_cira_to_l2", cira_to_l2)
 
@@ -111,7 +115,19 @@ class CXLSimpleBoard(SimpleBoard):
                 link = SerialLink(ranges=[addr_range], **self._cxl_args)
                 link.mem_side_port = port
                 setattr(self, f"cxl_mem_link{idx}", link)
-                cxl_mem_ports.append((addr_range, link.cpu_side_port))
+                upstream_port = link.cpu_side_port
+                if self._cxl_latency_monitor:
+                    monitor = CommMonitor(
+                        disable_burst_length_hists=True,
+                        disable_bandwidth_hists=True,
+                        disable_itt_dists=True,
+                        disable_outstanding_hists=True,
+                        disable_transaction_hists=True,
+                    )
+                    monitor.mem_side_port = link.cpu_side_port
+                    setattr(self, f"cxl_latency_monitor{idx}", monitor)
+                    upstream_port = monitor.cpu_side_port
+                cxl_mem_ports.append((addr_range, upstream_port))
             object.__setattr__(self, "_cxl_mem_ports", cxl_mem_ports)
 
         return self._cxl_mem_ports
@@ -188,6 +204,11 @@ parser.add_argument("--cxl-link-speed", type=int, default=32)
 parser.add_argument("--cxl-link-lanes", type=int, default=16)
 parser.add_argument("--cxl-link-req-size", type=int, default=256)
 parser.add_argument("--cxl-link-resp-size", type=int, default=256)
+parser.add_argument(
+    "--cxl-latency-monitor",
+    action="store_true",
+    help="Measure request-to-response latency at the CXL link boundary.",
+)
 parser.add_argument("--cira", action="store_true", help="Enable CIRA model.")
 parser.add_argument(
     "--cira-to-l2",
@@ -319,6 +340,7 @@ board = CXLSimpleBoard(
         "req_size": args.cxl_link_req_size,
         "resp_size": args.cxl_link_resp_size,
     },
+    cxl_latency_monitor=args.cxl_latency_monitor,
     cira_to_l2=args.cira_to_l2,
 )
 board.m5ops_base = 0xFFFF0000

@@ -27,7 +27,8 @@ M5_INCLUDE = REPO / "include"
 M2NDP_CONFIG_RELATIVE = Path("config/performance/M2NDP")
 PACKET_PREFIX = "board.cache_hierarchy.membus.pktCount_"
 BYTE_PREFIX = "board.cache_hierarchy.membus.pktSize_"
-CXL_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
+CXL_SUFFIX = "::board.cxl_latency_monitor0-cpu_side_port"
+CXL_LATENCY_PREFIX = "board.cxl_latency_monitor0.readLatencyHist::"
 
 
 class CalibrationError(RuntimeError):
@@ -39,6 +40,7 @@ class SearchSample:
     link_latency: int
     measured_ns: Decimal
     residual_ns: Decimal
+    host_response_extra_latency: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +50,7 @@ class SearchResult:
     link_latency: int
     measured_ns: Decimal
     samples: tuple
+    host_response_extra_latency: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +69,7 @@ class Gem5ProbeEvidence:
     response_count: int
     round_trip_packets: int
     request_bytes: int
+    target_ticks: int
     target_ns: Decimal
 
 
@@ -99,6 +103,7 @@ def search_link_latency(
     simulate,
     low,
     high,
+    enforce_residual=True,
 ):
     target_ns = _positive_decimal(target_ns, "target latency")
     link_period_ns = _positive_decimal(link_period_ns, "link period")
@@ -142,6 +147,59 @@ def search_link_latency(
         samples,
         key=lambda item: (item.residual_ns, item.link_latency),
     )
+    if enforce_residual:
+        require_residual(
+            target_ns=target_ns,
+            measured_ns=best.measured_ns,
+            link_period_ns=link_period_ns,
+        )
+    return SearchResult(
+        target_ns,
+        link_period_ns,
+        best.link_latency,
+        best.measured_ns,
+        samples,
+    )
+
+
+def refine_host_response_latency(
+    *,
+    target_ns,
+    link_period_ns,
+    link_candidates,
+    simulate,
+    max_host_response_extra_latency,
+):
+    target_ns = _positive_decimal(target_ns, "target latency")
+    link_period_ns = _positive_decimal(link_period_ns, "link period")
+    if max_host_response_extra_latency < 0:
+        raise CalibrationError("negative host-response refinement bound")
+    samples = []
+    for link_latency in sorted(set(link_candidates)):
+        if link_latency < 0:
+            raise CalibrationError("negative link-latency candidate")
+        for extra in range(max_host_response_extra_latency + 1):
+            measured = _positive_decimal(
+                simulate(link_latency, extra), "M2NDP measured latency"
+            )
+            samples.append(
+                SearchSample(
+                    link_latency,
+                    measured,
+                    abs(measured - target_ns),
+                    extra,
+                )
+            )
+    if not samples:
+        raise CalibrationError("host-response refinement has no candidates")
+    best = min(
+        samples,
+        key=lambda item: (
+            item.residual_ns,
+            item.host_response_extra_latency,
+            item.link_latency,
+        ),
+    )
     require_residual(
         target_ns=target_ns,
         measured_ns=best.measured_ns,
@@ -152,7 +210,8 @@ def search_link_latency(
         link_period_ns,
         best.link_latency,
         best.measured_ns,
-        samples,
+        tuple(samples),
+        best.host_response_extra_latency,
     )
 
 
@@ -244,7 +303,13 @@ def _validate_copied_paths(config_path):
             raise CalibrationError(f"{key} target is missing: {resolved}")
 
 
-def derive_config(source_dir, target_dir, *, link_latency):
+def derive_config(
+    source_dir,
+    target_dir,
+    *,
+    link_latency,
+    host_response_extra_latency=0,
+):
     source_dir = Path(source_dir)
     target_dir = Path(target_dir)
     if not source_dir.is_dir():
@@ -259,6 +324,11 @@ def derive_config(source_dir, target_dir, *, link_latency):
             raise CalibrationError(f"required M2NDP config is missing: {path}")
     _replace_assignment(config_path, "max_kernel_launch", "128")
     official = _replace_link_latency(link_path, link_latency)
+    _replace_assignment(
+        link_path,
+        "host_response_extra_latency",
+        f"{int(host_response_extra_latency)};",
+    )
     _validate_copied_paths(config_path)
     core_period_ns, link_period_ns = _parse_frequencies(config_path)
     return DerivedConfig(
@@ -272,6 +342,14 @@ def derive_config(source_dir, target_dir, *, link_latency):
 
 def set_link_latency(link_path, value):
     _replace_link_latency(Path(link_path), int(value))
+
+
+def set_host_response_extra_latency(link_path, value):
+    _replace_assignment(
+        Path(link_path),
+        "host_response_extra_latency",
+        f"{int(value)};",
+    )
 
 
 def parse_m2ndp_probe(
@@ -316,9 +394,30 @@ def parse_m2ndp_probe(
     cycles = int(latency[0])
     if cycles <= 0:
         raise CalibrationError("M2NDP probe latency must be positive")
-    return Decimal(cycles) * _positive_decimal(
+    coarse_ns = Decimal(cycles) * _positive_decimal(
         core_period_ns, "M2NDP core period"
     )
+    precise = re.findall(
+        r"^M2NDP_CXL_PROBE_LATENCY_NS\s+"
+        r"([0-9]+(?:\.[0-9]+)?)\s*$",
+        text,
+        flags=re.MULTILINE,
+    )
+    if len(precise) != 1:
+        raise CalibrationError(
+            "M2NDP precise latency marker count is "
+            f"{len(precise)}, expected 1"
+        )
+    precise_ns = _positive_decimal(
+        precise[0], "M2NDP precise latency"
+    )
+    if abs(coarse_ns - precise_ns) > _positive_decimal(
+        core_period_ns, "M2NDP core period"
+    ):
+        raise CalibrationError(
+            "M2NDP precise latency is inconsistent with cycle count"
+        )
+    return precise_ns
 
 
 def _parse_first_stats_section(text):
@@ -396,13 +495,28 @@ def parse_gem5_probe_stats(text):
         raise CalibrationError(
             f"gem5 directional request bytes is {request_bytes}, expected 64"
         )
+    latency_samples = stats.get(
+        CXL_LATENCY_PREFIX + "samples", Decimal(0)
+    )
+    cxl_latency = stats.get(CXL_LATENCY_PREFIX + "mean")
+    if (
+        latency_samples != 1
+        or cxl_latency is None
+        or cxl_latency <= 0
+        or cxl_latency != cxl_latency.to_integral_value()
+    ):
+        raise CalibrationError(
+            "gem5 CXL boundary latency statistic count/value is invalid"
+        )
+    target_ticks = int(cxl_latency)
     return Gem5ProbeEvidence(
         sim_ticks=sim_ticks,
         request_count=int(request_count),
         response_count=int(response_count),
         round_trip_packets=int(round_trip_packets),
         request_bytes=int(request_bytes),
-        target_ns=Decimal(sim_ticks) / Decimal(1000),
+        target_ticks=target_ticks,
+        target_ns=Decimal(target_ticks) / Decimal(1000),
     )
 
 
@@ -500,6 +614,7 @@ def run_gem5_probe(*, gem5, binary, outdir, cxl_delay):
         "64",
         "--cxl-link-resp-size",
         "64",
+        "--cxl-latency-monitor",
         "--roi-work-events",
         "--no-asmc",
         "--disable-hw-prefetchers",
@@ -522,13 +637,21 @@ def _write_samples(path, samples):
     with Path(path).open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(
             stream,
-            fieldnames=("link_latency", "measured_ns", "residual_ns"),
+            fieldnames=(
+                "link_latency",
+                "host_response_extra_latency",
+                "measured_ns",
+                "residual_ns",
+            ),
         )
         writer.writeheader()
         for sample in samples:
             writer.writerow(
                 {
                     "link_latency": sample.link_latency,
+                    "host_response_extra_latency": (
+                        sample.host_response_extra_latency
+                    ),
                     "measured_ns": str(sample.measured_ns),
                     "residual_ns": str(sample.residual_ns),
                 }
@@ -546,6 +669,9 @@ def main():
     parser.add_argument("--m5-library", type=Path, default=M5_LIBRARY)
     parser.add_argument("--search-low", type=int, default=2)
     parser.add_argument("--search-high", type=int, default=65536)
+    parser.add_argument(
+        "--max-host-response-extra-latency", type=int, default=16
+    )
     args = parser.parse_args()
 
     outdir = args.outdir.resolve()
@@ -579,8 +705,11 @@ def main():
     sample_logs = outdir / "probe_logs"
     sample_logs.mkdir()
 
-    def simulate(link_latency):
+    def simulate(link_latency, host_response_extra_latency=0):
         set_link_latency(derived.link_path, link_latency)
+        set_host_response_extra_latency(
+            derived.link_path, host_response_extra_latency
+        )
         completed = _run(
             [
                 timing_probe,
@@ -592,7 +721,11 @@ def main():
                 "64",
             ],
             cwd=args.m2ndp_root.resolve(),
-            log_path=sample_logs / f"link_latency_{link_latency}.log",
+            log_path=sample_logs
+            / (
+                f"link_latency_{link_latency}_"
+                f"host_response_{host_response_extra_latency}.log"
+            ),
         )
         return parse_m2ndp_probe(
             completed.stdout,
@@ -601,14 +734,34 @@ def main():
             core_period_ns=derived.core_period_ns,
         )
 
-    result = search_link_latency(
+    coarse = search_link_latency(
         target_ns=gem5_evidence.target_ns,
         link_period_ns=derived.link_period_ns,
         simulate=simulate,
         low=args.search_low,
         high=args.search_high,
+        enforce_residual=False,
+    )
+    closest_links = tuple(
+        sample.link_latency
+        for sample in sorted(
+            coarse.samples,
+            key=lambda item: (item.residual_ns, item.link_latency),
+        )[:4]
+    )
+    result = refine_host_response_latency(
+        target_ns=gem5_evidence.target_ns,
+        link_period_ns=derived.link_period_ns,
+        link_candidates=closest_links,
+        simulate=simulate,
+        max_host_response_extra_latency=(
+            args.max_host_response_extra_latency
+        ),
     )
     set_link_latency(derived.link_path, result.link_latency)
+    set_host_response_extra_latency(
+        derived.link_path, result.host_response_extra_latency
+    )
     _write_samples(outdir / "samples.csv", result.samples)
     residual = require_residual(
         target_ns=result.target_ns,
@@ -623,7 +776,8 @@ def main():
         "response_count": gem5_evidence.response_count,
         "round_trip_packets": gem5_evidence.round_trip_packets,
         "cxl_delay": args.cxl_delay,
-        "target_sim_ticks": gem5_evidence.sim_ticks,
+        "probe_roi_ticks": gem5_evidence.sim_ticks,
+        "target_cxl_boundary_ticks": gem5_evidence.target_ticks,
         "target_ns": str(result.target_ns),
         "measured_ns": str(result.measured_ns),
         "measured_core_cycles": str(
@@ -634,6 +788,9 @@ def main():
         "link_period_ns": str(derived.link_period_ns),
         "official_link_latency": derived.official_link_latency,
         "selected_link_latency": result.link_latency,
+        "selected_host_response_extra_latency": (
+            result.host_response_extra_latency
+        ),
         "config_sha256": sha256_config_tree(derived.config_path.parent),
         "source_m2ndp_config_sha256": source_config_sha256,
         "source_cxl_link_config_sha256": source_link_sha256,
