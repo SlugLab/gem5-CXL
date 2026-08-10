@@ -10,6 +10,8 @@ full-system GAPBS resource's KVM requirement.
 """
 
 import argparse
+import hashlib
+import json
 import shlex
 import time
 from pathlib import Path
@@ -52,6 +54,67 @@ from gem5.utils.requires import requires
 
 
 requires(isa_required=ISA.X86)
+
+
+AMU_PDF_SHA256 = (
+    "cba178ece7593b3ede868417a031ded3efddd85d5f7c50672b0a93735187790f"
+)
+CIRA_CSV_SHA256 = (
+    "4e0297da423cee0a742bc2e10656d022bb27776807f2d2ce4cca43e65c634184"
+)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_amu_calibration(path):
+    path = Path(path).resolve()
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            calibration = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read AMU calibration manifest: {path}") from error
+    try:
+        if calibration["schema"] != 1:
+            raise ValueError("AMU calibration manifest schema must be 1")
+        if calibration["sources"]["amu_pdf"]["sha256"] != AMU_PDF_SHA256:
+            raise ValueError("AMU calibration PDF hash is not approved")
+        if calibration["sources"]["cira_csv"]["sha256"] != CIRA_CSV_SHA256:
+            raise ValueError("AMU calibration CIRA CSV hash is not approved")
+        if calibration["amu"]["validation"]["status"] != "PASS":
+            raise ValueError("AMU calibration validation did not pass")
+        profile = calibration["amu"]["formal_profile"]
+        fit_parameters = calibration["amu"]["fit"]["parameters"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("AMU calibration manifest is incomplete") from error
+
+    required = {
+        "spm_bytes": 64 * 1024,
+        "pending_entries_per_state_machine": 32,
+        "id_batch_entries": 32,
+    }
+    for name, expected in required.items():
+        if profile.get(name) != expected:
+            raise ValueError(
+                f"AMU calibration {name} must equal approved value {expected}"
+            )
+    fitted_names = ("metadata_cycles", "id_refill_cycles", "completion_cycles")
+    for name in fitted_names:
+        value = profile.get(name)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value not in {0, 2, 4, 6, 8, 10}
+        ):
+            raise ValueError(f"AMU calibration {name} is outside the fit space")
+        if fit_parameters.get(name) != value:
+            raise ValueError(f"AMU calibration {name} differs from fitted value")
+    return profile, sha256_file(path)
 
 
 class TunablePrivateL1PrivateL2CacheHierarchy(PrivateL1PrivateL2CacheHierarchy):
@@ -210,6 +273,12 @@ parser.add_argument(
     help="Extra workload environment entry, e.g. KEY=VALUE.",
 )
 parser.add_argument("--no-asmc", action="store_true")
+parser.add_argument(
+    "--asmc-profile",
+    choices=("legacy", "paper-calibrated", "paper-sensitivity-256k"),
+    default="legacy",
+)
+parser.add_argument("--asmc-calibration-manifest", type=Path)
 parser.add_argument("--asmc-spm-size", default="256KiB")
 parser.add_argument("--asmc-granularity", type=int, default=8)
 parser.add_argument("--asmc-max-outstanding", type=int, default=256)
@@ -270,6 +339,40 @@ checkpoint_group.add_argument(
 )
 
 args = parser.parse_args()
+
+amu_manifest_sha256 = ""
+amu_profile = {
+    "pending_entries_per_state_machine": 32,
+    "id_batch_entries": 32,
+    "metadata_cycles": 10,
+    "id_refill_cycles": 0,
+    "completion_cycles": 0,
+}
+if args.asmc_profile == "legacy":
+    if args.asmc_calibration_manifest is not None:
+        parser.error("legacy AMU profile cannot bind a calibration manifest")
+elif args.no_asmc:
+    parser.error("a calibrated AMU profile requires ASMC to be enabled")
+else:
+    if args.asmc_calibration_manifest is None:
+        parser.error("calibrated AMU profile requires --asmc-calibration-manifest")
+    try:
+        amu_profile, amu_manifest_sha256 = load_amu_calibration(
+            args.asmc_calibration_manifest
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    required_spm = (
+        "64KiB" if args.asmc_profile == "paper-calibrated" else "256KiB"
+    )
+    if args.asmc_profile == "paper-calibrated" and args.asmc_spm_size != "64KiB":
+        parser.error("paper-calibrated AMU requires --asmc-spm-size 64KiB")
+    if args.asmc_profile == "paper-sensitivity-256k" and args.asmc_spm_size != required_spm:
+        parser.error("paper-sensitivity-256k AMU requires --asmc-spm-size 256KiB")
+    print(
+        "AMU_CALIBRATION "
+        f"profile={args.asmc_profile} manifest_sha256={amu_manifest_sha256}"
+    )
 
 if args.fast_forward_cpu and not args.roi_work_events:
     parser.error("--fast-forward-cpu requires --roi-work-events")
@@ -371,10 +474,19 @@ board.m5ops_base = 0xFFFF0000
 
 if not args.no_asmc:
     board.asmc = ASMC(
+        calibration_profile=args.asmc_profile,
+        calibration_manifest_sha256=amu_manifest_sha256,
         spm_size=args.asmc_spm_size,
         default_granularity=args.asmc_granularity,
         max_outstanding=args.asmc_max_outstanding,
         max_send_queue=args.asmc_max_send_queue,
+        pending_queue_entries=amu_profile[
+            "pending_entries_per_state_machine"
+        ],
+        id_batch_entries=amu_profile["id_batch_entries"],
+        metadata_latency=amu_profile["metadata_cycles"],
+        id_refill_latency=amu_profile["id_refill_cycles"],
+        completion_publish_latency=amu_profile["completion_cycles"],
         issue_latency=args.asmc_issue_latency,
         completion_latency=args.asmc_completion_latency,
         asmc_latency=args.asmc_latency,

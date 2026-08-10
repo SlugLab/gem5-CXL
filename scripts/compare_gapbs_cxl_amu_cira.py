@@ -855,6 +855,8 @@ def append_kind_args(cmd, args, kind):
         cmd.append("--no-asmc")
     elif kind == "amu":
         cmd += [
+            "--asmc-profile",
+            args.asmc_profile,
             "--asmc-spm-size",
             args.asmc_spm_size,
             "--asmc-granularity",
@@ -870,6 +872,11 @@ def append_kind_args(cmd, args, kind):
             "--asmc-latency",
             args.asmc_latency,
         ]
+        if args.asmc_calibration_manifest is not None:
+            cmd += [
+                "--asmc-calibration-manifest",
+                str(args.asmc_calibration_manifest),
+            ]
     elif kind == "cira":
         cmd += [
             "--no-asmc",
@@ -910,6 +917,17 @@ def checkpoint_model_parameters(args, kind):
         parameters.update(
             {
                 "asmc_spm_size": args.asmc_spm_size,
+                "asmc_profile": args.asmc_profile,
+                "asmc_calibration_manifest": (
+                    str(args.asmc_calibration_manifest)
+                    if args.asmc_calibration_manifest is not None
+                    else ""
+                ),
+                "asmc_calibration_manifest_sha256": (
+                    sha256_file(args.asmc_calibration_manifest)
+                    if args.asmc_calibration_manifest is not None
+                    else ""
+                ),
                 "asmc_granularity": args.asmc_granularity,
                 "asmc_max_outstanding": args.asmc_max_outstanding,
                 "asmc_max_send_queue": args.asmc_max_send_queue,
@@ -1570,6 +1588,12 @@ def main():
     parser.add_argument("--l2-mshrs", type=int)
     parser.add_argument("--l2-tgts-per-mshr", type=int)
     parser.add_argument("--asmc-spm-size", default="256KiB")
+    parser.add_argument(
+        "--asmc-profile",
+        choices=("legacy", "paper-calibrated", "paper-sensitivity-256k"),
+        default="legacy",
+    )
+    parser.add_argument("--asmc-calibration-manifest", type=Path)
     parser.add_argument("--asmc-granularity", type=int, default=8)
     parser.add_argument("--asmc-max-outstanding", type=int, default=256)
     parser.add_argument("--asmc-max-send-queue", type=int, default=512)
@@ -1611,6 +1635,26 @@ def main():
         / dt.datetime.now().strftime("%Y%m%d-%H%M%S"),
     )
     args = parser.parse_args()
+
+    if args.asmc_profile == "legacy":
+        if args.asmc_calibration_manifest is not None:
+            parser.error("legacy AMU profile rejects a calibration manifest")
+    else:
+        if args.asmc_calibration_manifest is None:
+            parser.error("calibrated AMU profile requires a calibration manifest")
+        args.asmc_calibration_manifest = args.asmc_calibration_manifest.resolve()
+        if not args.asmc_calibration_manifest.is_file():
+            parser.error(
+                "--asmc-calibration-manifest does not exist: "
+                f"{args.asmc_calibration_manifest}"
+            )
+        required_spm = (
+            "64KiB" if args.asmc_profile == "paper-calibrated" else "256KiB"
+        )
+        if args.asmc_spm_size != required_spm:
+            parser.error(
+                f"{args.asmc_profile} requires --asmc-spm-size {required_spm}"
+            )
 
     if args.iterations <= 0:
         parser.error("--iterations must be positive")

@@ -14,6 +14,9 @@ class ASMC(ClockedObject):
     system = Param.System(Parent.any, "System this ASMC belongs to")
     mem_side_port = RequestPort("Timing request port toward cache/memory")
 
+    calibration_profile = Param.String("legacy", "Bound AMU calibration profile")
+    calibration_manifest_sha256 = Param.String("", "Calibration manifest SHA-256")
+
     spm_size = Param.MemorySize("256KiB", "Modeled ASMC SPM capacity")
     cache_line_size = Param.Unsigned(
         Parent.cache_line_size, "Maximum packet chunk size"

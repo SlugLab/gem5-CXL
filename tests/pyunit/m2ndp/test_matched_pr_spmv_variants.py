@@ -23,36 +23,35 @@ class MatchedVariantSourceTest(unittest.TestCase):
         )
         self.assertNotIn("schedule(dynamic, 16384)", source)
 
-    def test_amu_batches_loads_but_commits_float_adds_in_csr_order(self):
+    def test_amu_rolls_loads_but_commits_float_adds_in_csr_order(self):
         generated = variants.transform_source(
             FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
         )
 
-        node_load = generated.index(
-            "load_values(node_addrs, nodes, amu_count)"
-        )
-        score_load = generated.index(
-            "load_values(score_addrs, scores_batch, amu_count)"
-        )
         node_bounds = generated.index(
             "AMU_INVALID_NODE node=%lld num_nodes=%lld"
         )
-        ordered_add = generated.index(
-            "incoming_total = incoming_total + scores_batch[amu_i]"
+        score_submit = generated.index(
+            "score_window.submit(&outgoing_contrib[node])"
         )
-        self.assertLess(node_load, score_load)
-        self.assertLess(node_load, node_bounds)
-        self.assertLess(node_bounds, score_load)
-        self.assertNotIn("return;", generated[node_bounds:score_load])
-        self.assertLess(score_load, ordered_add)
+        node_submit = generated.index("node_window.submit(&*v_it)")
+        drain_nodes = generated.index("while (!node_window.empty())")
+        drain_scores = generated.index("while (!score_window.empty())")
+        self.assertLess(node_bounds, score_submit)
+        self.assertNotIn("return;", generated[node_bounds:score_submit])
+        self.assertLess(node_submit, drain_nodes)
+        self.assertLess(drain_nodes, drain_scores)
+        self.assertEqual(generated.count("node_window.consume_next()"), 2)
         self.assertEqual(
             generated.count(
-                "incoming_total = incoming_total + scores_batch[amu_i]"
+                "incoming_total = incoming_total + score_window.consume_next()"
             ),
-            1,
+            2,
         )
         self.assertIn("constexpr int kPageRankIterations = 20;", generated)
-        self.assertEqual(generated.count("gapbs_amu::load_values("), 2)
+        self.assertIn("gapbs_amu::AsyncWindow<NodeID>", generated)
+        self.assertIn("gapbs_amu::AsyncWindow<ScoreT>", generated)
+        self.assertNotIn("gapbs_amu::load_values(", generated)
         self.assertNotIn("gapbs_amu::load_value(", generated)
 
     def test_amu_has_no_variant_only_trial_zero_priming(self):

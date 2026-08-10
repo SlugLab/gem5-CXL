@@ -711,6 +711,26 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(parameters["cira_csr_lines_per_turn"], 64)
         self.assertEqual(parameters["cira_max_completed_lines"], 65536)
 
+    def test_amu_forwards_calibrated_profile_and_manifest(self):
+        args = SimpleNamespace(
+            asmc_profile="paper-calibrated",
+            asmc_calibration_manifest=Path("/tmp/amu-calibration.json"),
+            asmc_spm_size="64KiB",
+            asmc_granularity=8,
+            asmc_max_outstanding=256,
+            asmc_max_send_queue=512,
+            asmc_issue_latency="1ns",
+            asmc_completion_latency="0ns",
+            asmc_latency="0ns",
+            env=[],
+        )
+        cmd = []
+        self.runner.append_kind_args(cmd, args, "amu")
+        profile = cmd.index("--asmc-profile")
+        manifest = cmd.index("--asmc-calibration-manifest")
+        self.assertEqual(cmd[profile + 1], "paper-calibrated")
+        self.assertEqual(cmd[manifest + 1], "/tmp/amu-calibration.json")
+
     def test_counts_exact_cpu_switch_markers(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "gem5.log"
