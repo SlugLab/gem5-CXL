@@ -629,20 +629,23 @@ def render_tex(rows):
         "vanilla": "Vanilla CXL",
         "amu": "AMU",
         "cira": "CIRA",
-        "m2ndp": "M2NDP",
+        "m2ndp": r"M$^2$NDP",
     }
     lines = [
         r"\begin{tabular}{llrr}",
         r"\toprule",
-        r"CXL latency & System & Latency (s) & Speedup \\",
+        r"CXL latency & System & ROI ($\mu$s) & Speedup \\",
         r"\midrule",
     ]
     for index, row in enumerate(rows):
         latency = row["latency"].replace("us", r"\,$\mu$s")
+        roi_us = decimal.Decimal(row["latency_seconds"]) * decimal.Decimal(
+            10**6
+        )
+        speedup = decimal.Decimal(row["speedup_vs_vanilla_cxl"])
         lines.append(
             f"{latency} & {labels[row['system']]} & "
-            f"{row['latency_seconds']} & "
-            f"{row['speedup_vs_vanilla_cxl']}\\,$\times$ \\\\" 
+            f"{roi_us:.3f} & {speedup:.3f}\\,$\\times$ \\\\"
         )
         if (index + 1) % len(SYSTEMS) == 0 and index + 1 != len(rows):
             lines.append(r"\midrule")

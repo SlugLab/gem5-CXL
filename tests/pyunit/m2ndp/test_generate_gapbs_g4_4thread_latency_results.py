@@ -290,6 +290,13 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(paths.evidence.name, publisher.EVIDENCE_NAME)
         self.assertEqual(paths.tex.name, publisher.TEX_NAME)
         self.assertIn("AMU", tex)
+        self.assertIn(r"$\times$", tex)
+        self.assertNotIn("\t", tex)
+        self.assertIn(r"ROI ($\mu$s)", tex)
+        self.assertIn(r"M$^2$NDP", tex)
+        self.assertIn(
+            r"200ns & Vanilla CXL & 1.000 & 1.000\,$\times$", tex
+        )
 
     def test_rejected_matrix_preserves_existing_publication(self):
         with tempfile.TemporaryDirectory() as tmp:

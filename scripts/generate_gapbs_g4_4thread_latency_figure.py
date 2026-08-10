@@ -52,6 +52,11 @@ STYLES = {
     "CIRA": {"linestyle": "--", "marker": "s"},
     "M2NDP": {"linestyle": ":", "marker": "^"},
 }
+LABEL_OFFSETS = {
+    "AMU": (7, 0),
+    "CIRA": (7, -8),
+    "M2NDP": (7, 0),
+}
 
 
 class FigureDataError(ValueError):
@@ -178,7 +183,7 @@ def render_figure(rows, *, evidence_sha256):
                 axis.annotate(
                     label,
                     (data.latency_ns[-1], data.series[label][-1]),
-                    xytext=(7, 0),
+                    xytext=LABEL_OFFSETS[label],
                     textcoords="offset points",
                     ha="left",
                     va="center",
@@ -196,7 +201,7 @@ def render_figure(rows, *, evidence_sha256):
             axis.annotate(
                 "Vanilla CXL (1×)",
                 (data.latency_ns[-1], 1.0),
-                xytext=(7, 0),
+                xytext=(7, 6),
                 textcoords="offset points",
                 ha="left",
                 va="center",
