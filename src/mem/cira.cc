@@ -53,6 +53,22 @@ CIRA::MemoryPort::recvReqRetry()
     owner.recvReqRetry(targetCore);
 }
 
+CIRA::CsrMemoryPort::CsrMemoryPort(const std::string &name, CIRA &owner)
+    : RequestPort(name), owner(owner)
+{}
+
+bool
+CIRA::CsrMemoryPort::recvTimingResp(PacketPtr pkt)
+{
+    return owner.recvCsrTimingResp(pkt);
+}
+
+void
+CIRA::CsrMemoryPort::recvReqRetry()
+{
+    owner.recvCsrReqRetry();
+}
+
 CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
     : statistics::Group(parent),
       ADD_STAT(issuedPrefetches, statistics::units::Count::get(),
@@ -97,6 +113,16 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "Timing prefetch packets sent by CIRA"),
       ADD_STAT(readBytes, statistics::units::Byte::get(),
                "Timing prefetch bytes sent by CIRA"),
+      ADD_STAT(csrIndexReadPackets, statistics::units::Count::get(),
+               "Device-side timing CSR index read packets sent"),
+      ADD_STAT(csrIndexReadBytes, statistics::units::Byte::get(),
+               "Device-side timing CSR index bytes sent"),
+      ADD_STAT(completedCsrIndexReads, statistics::units::Count::get(),
+               "CSR index values completed through the timing path"),
+      ADD_STAT(rejectedCsrIndexQueueFull, statistics::units::Count::get(),
+               "CSR index reads blocked by the bounded timing queue"),
+      ADD_STAT(timingCsrTraversalEnabled, statistics::units::Count::get(),
+               "One when timing CSR traversal is enabled"),
       ADD_STAT(totalLatency, statistics::units::Tick::get(),
                "Total CIRA request latency from m5op issue to completion"),
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
@@ -123,18 +149,24 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
 CIRA::CIRA(const Params &p)
     : ClockedObject(p),
       system(p.system),
+      csrMemoryPort(std::make_unique<CsrMemoryPort>(
+          name() + ".csr_mem_side_port", *this)),
       requestorId(system->getRequestorId(this)),
       demandProbeTargets(p.demand_probe_targets),
       cacheLineSize(p.cache_line_size),
       maxSendQueue(p.max_send_queue),
       maxCsrWalkQueue(p.max_csr_walk_queue),
+      maxCsrIndexReads(p.max_csr_index_reads),
       csrLinesPerTurn(p.csr_lines_per_turn),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
       maxOutstanding(p.max_outstanding),
       enabled(p.enabled),
+      timingCsrTraversal(p.timing_csr_traversal),
       sendEvent([this] { trySend(); }, name()),
       csrWalkEvent([this] { processCsrWalk(); }, name() + ".csr_walk"),
+      csrIndexSendEvent(
+          [this] { tryCsrIndexSend(); }, name() + ".csr_index_send"),
       stats(this, p.port_mem_side_ports_connection_count)
 {
     const size_t numCores = p.port_mem_side_ports_connection_count;
@@ -143,6 +175,9 @@ CIRA::CIRA(const Params &p)
              "CIRA %s requires a nonzero CSR walk queue", name());
     panic_if(csrLinesPerTurn == 0,
              "CIRA %s requires a nonzero CSR scheduling quantum", name());
+    panic_if(maxCsrIndexReads == 0,
+             "CIRA %s requires a nonzero CSR index-read limit", name());
+    stats.timingCsrTraversalEnabled = timingCsrTraversal ? 1 : 0;
 
     memSidePorts.reserve(numCores);
     lineTrackers.reserve(numCores);
@@ -172,6 +207,9 @@ CIRA::init()
         panic_if(!memSidePorts[core]->isConnected(),
                  "CIRA memory port %d of %s is not connected", core, name());
     }
+    panic_if(!csrMemoryPort->isConnected(),
+             "CIRA device-side CSR memory port of %s is not connected",
+             name());
     panic_if(!demandProbeTargets.empty() &&
              demandProbeTargets.size() != memSidePorts.size(),
              "CIRA %s has %llu ports but %llu probe targets", name(),
@@ -220,6 +258,7 @@ void
 CIRA::resetStats()
 {
     ClockedObject::resetStats();
+    stats.timingCsrTraversalEnabled = timingCsrTraversal ? 1 : 0;
     for (auto &tracker : lineTrackers)
         tracker.clear();
 }
@@ -231,6 +270,11 @@ CIRA::getPort(const std::string &if_name, PortID idx)
         panic_if(idx == InvalidPortID || idx >= memSidePorts.size(),
                  "CIRA %s invalid memory port index %d", name(), idx);
         return *memSidePorts[idx];
+    }
+    if (if_name == "csr_mem_side_port") {
+        panic_if(idx != InvalidPortID,
+                 "CIRA %s scalar CSR port received index %d", name(), idx);
+        return *csrMemoryPort;
     }
     return ClockedObject::getPort(if_name, idx);
 }
@@ -356,9 +400,187 @@ CIRA::scheduleCsrWalk(Tick when)
     schedule(csrWalkEvent, when);
 }
 
+CIRA::CsrWalkState *
+CIRA::findCsrWalk(PortID targetCore, uint64_t walkId)
+{
+    panic_if(targetCore < 0 || targetCore >= csrWalkQueues.size(),
+             "CIRA invalid CSR walk target core %d", targetCore);
+    for (auto &walk : csrWalkQueues[targetCore]) {
+        if (walk.walkId == walkId)
+            return &walk;
+    }
+    return nullptr;
+}
+
+bool
+CIRA::issueCsrIndexRead(CsrWalkState &walk, uint64_t entry)
+{
+    if (pendingCsrIndexReads.size() >= maxCsrIndexReads) {
+        ++stats.rejectedCsrIndexQueueFull;
+        return false;
+    }
+    if (walk.indexSize != 1 && walk.indexSize != 2 &&
+        walk.indexSize != 4 && walk.indexSize != 8) {
+        ++stats.translationFaults;
+        return true;
+    }
+
+    const Addr indexAddr = walk.recordsBegin +
+        entry * walk.recordStride + walk.indexOffset;
+    std::vector<TranslationChunk> chunks;
+    if (!translate(walk.tc, indexAddr, walk.indexSize, chunks)) {
+        ++stats.translationFaults;
+        return true;
+    }
+
+    const uint64_t id = nextCsrIndexReadId++;
+    PendingCsrIndexRead pending;
+    pending.walkId = walk.walkId;
+    pending.targetCore = walk.targetCore;
+    pending.tc = walk.tc;
+    pending.valuesAddr = walk.valuesAddr;
+    pending.valueSize = walk.valueSize;
+    pending.indexSize = walk.indexSize;
+    pending.pendingPackets = static_cast<uint32_t>(chunks.size());
+    pendingCsrIndexReads.emplace(id, pending);
+    ++walk.pendingIndexReads;
+
+    for (const auto &chunk : chunks) {
+        RequestPtr req = std::make_shared<Request>(
+            chunk.paddr, chunk.size, chunk.flags, requestorId);
+        PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+        pkt->allocate();
+        pkt->senderState = new PacketSenderState(
+            PacketRole::CsrIndexRead, id, walk.targetCore, walk.walkId,
+            entry, chunk.offset);
+        enqueueCsrIndexPacket(pkt);
+    }
+    scheduleCsrIndexSend(curTick());
+    return true;
+}
+
+bool
+CIRA::finishCsrIndexRead(uint64_t id)
+{
+    const auto it = pendingCsrIndexReads.find(id);
+    if (it == pendingCsrIndexReads.end())
+        return true;
+    PendingCsrIndexRead &pending = it->second;
+    if (pending.pendingPackets != 0)
+        return false;
+    if (!hasPrefetchSlot(pending.targetCore))
+        return false;
+
+    uint64_t index = 0;
+    for (uint64_t byte = 0; byte < pending.indexSize; ++byte)
+        index |= static_cast<uint64_t>(pending.data[byte]) << (byte * 8);
+    issuePrefetch(
+        pending.tc,
+        pending.valuesAddr + index * pending.valueSize,
+        pending.valueSize);
+
+    CsrWalkState *walk = findCsrWalk(
+        pending.targetCore, pending.walkId);
+    panic_if(!walk || walk->pendingIndexReads == 0,
+             "CIRA completed CSR index read without owning walk");
+    --walk->pendingIndexReads;
+    ++stats.completedCsrIndexReads;
+    pendingCsrIndexReads.erase(it);
+    return true;
+}
+
+void
+CIRA::enqueueCsrIndexPacket(PacketPtr pkt)
+{
+    csrIndexSendQueue.push_back(pkt);
+}
+
+void
+CIRA::scheduleCsrIndexSend(Tick when)
+{
+    if (csrIndexRetryPkt && !csrIndexRetryReady)
+        return;
+    if (csrIndexSendEvent.scheduled()) {
+        if (when < csrIndexSendEvent.when())
+            reschedule(csrIndexSendEvent, when);
+        return;
+    }
+    schedule(csrIndexSendEvent, when);
+}
+
+void
+CIRA::tryCsrIndexSend()
+{
+    while ((csrIndexRetryPkt && csrIndexRetryReady) ||
+           (!csrIndexRetryPkt && !csrIndexSendQueue.empty())) {
+        PacketPtr pkt = csrIndexRetryPkt;
+        if (!pkt) {
+            pkt = csrIndexSendQueue.front();
+            csrIndexSendQueue.pop_front();
+        }
+        if (!csrMemoryPort->sendTimingReq(pkt)) {
+            csrIndexRetryPkt = pkt;
+            csrIndexRetryReady = false;
+            return;
+        }
+        csrIndexRetryPkt = nullptr;
+        csrIndexRetryReady = false;
+        ++stats.csrIndexReadPackets;
+        stats.csrIndexReadBytes += pkt->req->getSize();
+    }
+}
+
+bool
+CIRA::recvCsrTimingResp(PacketPtr pkt)
+{
+    auto *senderState = dynamic_cast<PacketSenderState *>(pkt->senderState);
+    panic_if(!senderState || senderState->role != PacketRole::CsrIndexRead,
+             "CIRA CSR response without CSR-index sender state");
+    const auto it = pendingCsrIndexReads.find(senderState->id);
+    panic_if(it == pendingCsrIndexReads.end(),
+             "CIRA response for unknown CSR index read %#llx",
+             static_cast<unsigned long long>(senderState->id));
+    PendingCsrIndexRead &pending = it->second;
+    panic_if(pending.walkId != senderState->walkId ||
+             pending.targetCore != senderState->targetCore ||
+             senderState->dataOffset + pkt->getSize() > pending.indexSize ||
+             pending.pendingPackets == 0,
+             "CIRA malformed CSR index response state");
+    std::memcpy(pending.data.data() + senderState->dataOffset,
+                pkt->getConstPtr<uint8_t>(), pkt->getSize());
+    --pending.pendingPackets;
+    const uint64_t id = senderState->id;
+    pkt->senderState = nullptr;
+    delete senderState;
+    delete pkt;
+
+    if (!finishCsrIndexRead(id))
+        scheduleCsrWalk(curTick() + 1);
+    else if (hasCsrWalks())
+        scheduleCsrWalk(curTick() + 1);
+    return true;
+}
+
+void
+CIRA::recvCsrReqRetry()
+{
+    panic_if(!csrIndexRetryPkt,
+             "CIRA CSR retry without a blocked index packet");
+    csrIndexRetryReady = true;
+    scheduleCsrIndexSend(curTick());
+}
+
 void
 CIRA::processCsrWalk()
 {
+    std::vector<uint64_t> readyReads;
+    for (const auto &[id, pending] : pendingCsrIndexReads) {
+        if (pending.pendingPackets == 0)
+            readyReads.push_back(id);
+    }
+    for (uint64_t id : readyReads)
+        finishCsrIndexRead(id);
+
     const PortID numCores = memSidePorts.size();
     const PortID startCore = nextCsrCore;
     bool consumedCandidate = false;
@@ -389,21 +611,15 @@ CIRA::processCsrWalk()
 
             if (walk.prefetchValues && walk.nextEntry < walk.entryCount &&
                 candidatesThisTurn < csrLinesPerTurn &&
-                hasPrefetchSlot(targetCore)) {
-                const uint64_t entry = walk.nextEntry++;
+                hasPrefetchSlot(targetCore) &&
+                pendingCsrIndexReads.size() < maxCsrIndexReads) {
+                const uint64_t entry = walk.nextEntry;
+                if (!issueCsrIndexRead(walk, entry))
+                    break;
+                ++walk.nextEntry;
                 ++candidatesThisTurn;
                 consumedCandidate = true;
                 consumedEntry = true;
-                const Addr indexAddr = walk.recordsBegin +
-                    entry * walk.recordStride + walk.indexOffset;
-                uint64_t index = 0;
-                if (!readIndex(walk.tc, indexAddr, walk.indexSize, index)) {
-                    ++stats.translationFaults;
-                    continue;
-                }
-
-                const Addr target = walk.valuesAddr + index * walk.valueSize;
-                issuePrefetch(walk.tc, target, walk.valueSize);
             }
 
             if (!consumedEntry)
@@ -413,7 +629,9 @@ CIRA::processCsrWalk()
         const bool recordsDone =
             !walk.prefetchRecords || walk.recordLine >= walk.recordsEnd;
         const bool valuesDone =
-            !walk.prefetchValues || walk.nextEntry >= walk.entryCount;
+            !walk.prefetchValues ||
+            (walk.nextEntry >= walk.entryCount &&
+             walk.pendingIndexReads == 0);
         if (recordsDone && valuesDone) {
             DPRINTF(CIRA,
                     "csr walk complete records=[%#llx,%#llx) "
@@ -530,7 +748,8 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
 
         PacketPtr pkt = new Packet(req, MemCmd::SoftPFReq);
         pkt->allocate();
-        pkt->senderState = new PacketSenderState(id, targetCore);
+        pkt->senderState = new PacketSenderState(
+            PacketRole::PrefetchLine, id, targetCore);
         rawState->pendingPackets++;
         enqueuePacket(targetCore, pkt);
     }
@@ -693,6 +912,12 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
             DPRINTF(CIRA, "csr invalid record span descriptor\n");
             return 0;
         }
+        if (prefetchValues && !timingCsrTraversal) {
+            ++stats.rejectedDisabled;
+            DPRINTF(CIRA,
+                    "csr timing traversal disabled for value descriptor\n");
+            return 0;
+        }
 
         const Addr rowRecordAddr = desc.offsetsAddr;
         const uint64_t recordBytes = desc.recordsAddr - desc.offsetsAddr;
@@ -711,6 +936,7 @@ CIRA::issueCsrPrefetch(ThreadContext *tc, Addr offsets_addr,
         stats.csrRowsVisited += desc.rowCount;
 
         CsrWalkState walk;
+        walk.walkId = nextCsrWalkId++;
         walk.tc = tc;
         walk.targetCore = targetCore;
         walk.recordsBegin = rowRecordAddr;
@@ -910,7 +1136,8 @@ bool
 CIRA::recvTimingResp(PortID targetCore, PacketPtr pkt)
 {
     auto *senderState = dynamic_cast<PacketSenderState *>(pkt->senderState);
-    panic_if(!senderState, "CIRA response without CIRA sender state");
+    panic_if(!senderState || senderState->role != PacketRole::PrefetchLine,
+             "CIRA response without prefetch-line sender state");
     panic_if(senderState->targetCore != targetCore,
              "CIRA response returned on core %d for core %d", targetCore,
              senderState->targetCore);
@@ -1090,7 +1317,8 @@ CIRA::cfgRead(ThreadContext *tc, uint64_t reg) const
       case 1:
         return maxOutstanding;
       case 2:
-        return outstanding.size();
+        return outstanding.size() + queuedCsrWalks() +
+            pendingCsrIndexReads.size();
       case 3: {
         const auto it = finished.find(tc);
         return it == finished.end() ? 0 : it->second.size();
@@ -1118,6 +1346,8 @@ CIRA::reset()
         deschedule(sendEvent);
     if (csrWalkEvent.scheduled())
         deschedule(csrWalkEvent);
+    if (csrIndexSendEvent.scheduled())
+        deschedule(csrIndexSendEvent);
 
     for (auto &queue : sendQueues) {
         while (!queue.empty()) {
@@ -1133,6 +1363,14 @@ CIRA::reset()
     std::fill(retryReady.begin(), retryReady.end(), false);
     for (auto &queue : csrWalkQueues)
         queue.clear();
+    while (!csrIndexSendQueue.empty()) {
+        deleteQueuedPacket(csrIndexSendQueue.front());
+        csrIndexSendQueue.pop_front();
+    }
+    deleteQueuedPacket(csrIndexRetryPkt);
+    csrIndexRetryPkt = nullptr;
+    csrIndexRetryReady = false;
+    pendingCsrIndexReads.clear();
     outstanding.clear();
     finished.clear();
     for (auto &tracker : lineTrackers)
@@ -1140,6 +1378,8 @@ CIRA::reset()
     nextSendCore = 0;
     nextCsrCore = 0;
     nextId = 1;
+    nextCsrWalkId = 1;
+    nextCsrIndexReadId = 1;
 }
 
 } // namespace gem5

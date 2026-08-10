@@ -97,6 +97,13 @@ CIRA_COUNTER_STATS = {
     "cira_late": "board.cira.latePrefetches",
     "cira_read_packets": "board.cira.readPackets",
     "cira_read_bytes": "board.cira.readBytes",
+    "cira_csr_index_read_packets": "board.cira.csrIndexReadPackets",
+    "cira_csr_index_read_bytes": "board.cira.csrIndexReadBytes",
+    "cira_completed_csr_index_reads": "board.cira.completedCsrIndexReads",
+    "cira_rejected_csr_index_queue_full": (
+        "board.cira.rejectedCsrIndexQueueFull"
+    ),
+    "cira_timing_csr_traversal": "board.cira.timingCsrTraversalEnabled",
 }
 CIRA_LATENCY_SUMMARY_STATS = {
     "cira_total_latency": "board.cira.totalLatency",
@@ -693,18 +700,78 @@ def validate_config(
     link_mem_port = config_value(
         config, "board.cxl_mem_link0", "mem_side_port", path
     )
-    if link_mem_port != "board.memory.mem_ctrl.port":
+    device_cpu_binding = re.fullmatch(
+        r"board\.cxl_device_xbar0\.cpu_side_ports\[(\d+)\]",
+        link_mem_port,
+    )
+    if device_cpu_binding is None:
         raise ValidationError(
             f"{path}: invalid CXL mem_side_port binding: {link_mem_port}"
+        )
+    device_type = config_value(
+        config, "board.cxl_device_xbar0", "type", path
+    )
+    if device_type != "NoncoherentXBar":
+        raise ValidationError(
+            f"{path}: CXL device xbar type={device_type!r}, "
+            "expected NoncoherentXBar"
+        )
+    device_cpu_ports = config_value(
+        config, "board.cxl_device_xbar0", "cpu_side_ports", path
+    ).split()
+    link_device_index = int(device_cpu_binding.group(1))
+    if (
+        link_device_index >= len(device_cpu_ports)
+        or device_cpu_ports[link_device_index]
+        != "board.cxl_mem_link0.mem_side_port"
+    ):
+        raise ValidationError(
+            f"{path}: CXL link is not attached to the device xbar"
         )
     controller_port = config_value(
         config, "board.memory.mem_ctrl", "port", path
     )
-    if controller_port != "board.cxl_mem_link0.mem_side_port":
+    if controller_port != "board.cxl_device_xbar0.mem_side_ports[0]":
         raise ValidationError(
             f"{path}: memory controller port bypasses CXL: "
             f"{controller_port}"
         )
+    device_mem_ports = config_value(
+        config, "board.cxl_device_xbar0", "mem_side_ports", path
+    ).split()
+    if device_mem_ports != ["board.memory.mem_ctrl.port"]:
+        raise ValidationError(
+            f"{path}: device xbar does not terminate at the controller"
+        )
+    if kind == "cira":
+        if not config.has_section("board.cira"):
+            raise ValidationError(f"{path}: missing CIRA configuration")
+        csr_port = config_value(
+            config, "board.cira", "csr_mem_side_port", path
+        )
+        csr_binding = re.fullmatch(
+            r"board\.cxl_device_xbar0\.cpu_side_ports\[(\d+)\]",
+            csr_port,
+        )
+        if csr_binding is None:
+            raise ValidationError(
+                f"{path}: CIRA CSR walker is not device-side of CXL"
+            )
+        csr_index = int(csr_binding.group(1))
+        if (
+            csr_index >= len(device_cpu_ports)
+            or device_cpu_ports[csr_index]
+            != "board.cira.csr_mem_side_port"
+        ):
+            raise ValidationError(
+                f"{path}: CIRA CSR port binding does not match device xbar"
+            )
+        if config_value(
+            config, "board.cira", "timing_csr_traversal", path
+        ) != "true":
+            raise ValidationError(
+                f"{path}: CIRA timing CSR traversal is not enabled"
+            )
     membus_ports = config_value(
         config, "board.cache_hierarchy.membus", "mem_side_ports", path
     ).split()
@@ -1154,6 +1221,27 @@ def validate_row(row, latency, expected_delay, expected_run_dir):
         if csr <= 0:
             raise ValidationError(
                 f"{context}: cira_csr_prefetches={csr}, expected > 0"
+            )
+        for field in (
+            "cira_csr_index_read_packets",
+            "cira_csr_index_read_bytes",
+            "cira_completed_csr_index_reads",
+        ):
+            if require_summary_counter(row, field, context) <= 0:
+                raise ValidationError(f"{context}: {field} must be positive")
+        rejected = require_summary_counter(
+            row, "cira_rejected_csr_index_queue_full", context
+        )
+        if rejected != 0:
+            raise ValidationError(
+                f"{context}: cira_rejected_csr_index_queue_full={rejected}"
+            )
+        timing = require_summary_counter(
+            row, "cira_timing_csr_traversal", context
+        )
+        if timing != 1:
+            raise ValidationError(
+                f"{context}: cira_timing_csr_traversal={timing}, expected 1"
             )
     else:
         for field in (*CIRA_COUNTER_STATS, *CIRA_LATENCY_SUMMARY_STATS):

@@ -29,6 +29,59 @@ CIRA_MULTICORE_CONFIG = (
 
 
 class CiraUsefulnessTrackerContractTest(unittest.TestCase):
+    def test_csr_timing_walk_has_a_bounded_device_side_read_path(self):
+        cira_py = CIRA_PY.read_text(encoding="utf-8")
+        cira_hh = CIRA_HH.read_text(encoding="utf-8")
+        cira_cc = CIRA_CC.read_text(encoding="utf-8")
+        process = cira_cc[
+            cira_cc.index("CIRA::processCsrWalk()"):
+            cira_cc.index("CIRA::issuePrefetch(")
+        ]
+
+        self.assertNotIn("readIndex(", process)
+        self.assertNotIn("readGuest(", process)
+        self.assertIn("timing_csr_traversal = Param.Bool(", cira_py)
+        self.assertIn("max_csr_index_reads = Param.Unsigned(", cira_py)
+        self.assertIn("csr_mem_side_port = RequestPort(", cira_py)
+        self.assertIn("enum class PacketRole", cira_hh)
+        self.assertIn("PrefetchLine", cira_hh)
+        self.assertIn("CsrIndexRead", cira_hh)
+        self.assertIn("struct PendingCsrIndexRead", cira_hh)
+        self.assertIn("const bool timingCsrTraversal", cira_hh)
+        self.assertIn("const uint64_t maxCsrIndexReads", cira_hh)
+        for stat in (
+            "csrIndexReadPackets",
+            "csrIndexReadBytes",
+            "completedCsrIndexReads",
+            "rejectedCsrIndexQueueFull",
+            "timingCsrTraversalEnabled",
+        ):
+            self.assertIn(stat, cira_hh)
+
+    def test_csr_timing_port_is_device_side_of_cxl_not_in_host_l2(self):
+        config = GAPBS_CONFIG.read_text(encoding="utf-8")
+        self.assertIn("NoncoherentXBar", config)
+        self.assertIn(
+            "link.mem_side_port = device_xbar.cpu_side_ports", config
+        )
+        self.assertIn("device_xbar.mem_side_ports = port", config)
+        self.assertIn(
+            "cira.csr_mem_side_port = "
+            "self._cxl_device_xbars[0].cpu_side_ports",
+            config,
+        )
+        connect_body = config[
+            config.index("def _connect_things"):config.index("parser =")
+        ]
+        self.assertNotIn(
+            "cira.csr_mem_side_port = l2bus", connect_body
+        )
+        self.assertNotIn(
+            "cira.csr_mem_side_port = "
+            "self.cache_hierarchy.get_cpu_side_port()",
+            connect_body,
+        )
+
     def test_cira_filters_lines_already_present_or_pending_in_target_l2(self):
         source = CIRA_CC.read_text(encoding="utf-8")
         issue = source[
@@ -358,7 +411,7 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         ]
         self.assertNotIn("lineTracker.fill", recv_response)
 
-    def test_live_two_core_routing_and_coalescing(self):
+    def test_live_four_core_timing_csr_and_dirty_value_coherence(self):
         self.assertTrue(CIRA_MULTICORE_WORKLOAD.is_file())
         self.assertTrue(CIRA_MULTICORE_CONFIG.is_file())
 
@@ -440,16 +493,32 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
 
             issued = [
                 int(stats[f"board.cira.issuedPrefetchesPerCore::{core}"])
-                for core in range(2)
+                for core in range(4)
             ]
             completed = [
                 int(stats[f"board.cira.completedPrefetchesPerCore::{core}"])
-                for core in range(2)
+                for core in range(4)
             ]
-            self.assertGreater(issued[0], 0)
-            self.assertGreater(issued[1], 0)
+            self.assertTrue(all(value > 0 for value in issued), issued)
             self.assertEqual(completed, issued)
-            self.assertGreater(int(stats["board.cira.coalescedPrefetches"]), 0)
+            self.assertEqual(
+                int(stats["board.cira.csrIndexReadPackets"]),
+                4 * 256,
+            )
+            self.assertEqual(
+                int(stats["board.cira.csrIndexReadBytes"]),
+                4 * 256 * 4,
+            )
+            self.assertEqual(
+                int(stats["board.cira.completedCsrIndexReads"]),
+                4 * 256,
+            )
+            self.assertEqual(
+                int(stats["board.cira.rejectedCsrIndexQueueFull"]), 0
+            )
+            self.assertEqual(
+                int(stats["board.cira.timingCsrTraversalEnabled"]), 1
+            )
             self.assertEqual(
                 int(stats["board.cira.droppedCsrDescriptors"]), 0
             )

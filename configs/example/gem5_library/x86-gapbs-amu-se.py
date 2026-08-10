@@ -15,7 +15,15 @@ import time
 from pathlib import Path
 
 import m5
-from m5.objects import ASMC, CIRA, Cache, CommMonitor, NULL, SerialLink
+from m5.objects import (
+    ASMC,
+    CIRA,
+    Cache,
+    CommMonitor,
+    NoncoherentXBar,
+    NULL,
+    SerialLink,
+)
 
 from gapbs_roi_state import (
     GapbsCheckpointState,
@@ -103,6 +111,7 @@ class CXLSimpleBoard(SimpleBoard):
             self, "_cxl_latency_monitor", cxl_latency_monitor
         )
         object.__setattr__(self, "_cxl_mem_ports", None)
+        object.__setattr__(self, "_cxl_device_xbars", [])
         object.__setattr__(self, "_cira_to_l2", cira_to_l2)
 
     def get_mem_ports(self):
@@ -113,8 +122,17 @@ class CXLSimpleBoard(SimpleBoard):
             cxl_mem_ports = []
             for idx, (addr_range, port) in enumerate(super().get_mem_ports()):
                 link = SerialLink(ranges=[addr_range], **self._cxl_args)
-                link.mem_side_port = port
+                device_xbar = NoncoherentXBar(
+                    width=64,
+                    frontend_latency=1,
+                    forward_latency=1,
+                    response_latency=1,
+                )
+                link.mem_side_port = device_xbar.cpu_side_ports
+                device_xbar.mem_side_ports = port
                 setattr(self, f"cxl_mem_link{idx}", link)
+                setattr(self, f"cxl_device_xbar{idx}", device_xbar)
+                self._cxl_device_xbars.append(device_xbar)
                 upstream_port = link.cpu_side_port
                 if self._cxl_latency_monitor:
                     monitor = CommMonitor(
@@ -137,6 +155,11 @@ class CXLSimpleBoard(SimpleBoard):
         cira = getattr(self, "cira", None)
         if cira is None:
             return
+        if len(self._cxl_device_xbars) != 1:
+            raise RuntimeError(
+                "timing CIRA CSR traversal requires one CXL device xbar"
+            )
+        cira.csr_mem_side_port = self._cxl_device_xbars[0].cpu_side_ports
 
         if self._cira_to_l2 and hasattr(self.cache_hierarchy, "l2buses"):
             cira.demand_probe_targets = [
@@ -218,6 +241,7 @@ parser.add_argument(
 parser.add_argument("--cira-max-outstanding", type=int, default=256)
 parser.add_argument("--cira-max-send-queue", type=int, default=1024)
 parser.add_argument("--cira-max-csr-walk-queue", type=int, default=4096)
+parser.add_argument("--cira-max-csr-index-reads", type=int, default=1024)
 parser.add_argument("--cira-csr-lines-per-turn", type=int, default=64)
 parser.add_argument("--cira-max-completed-lines", type=int, default=65536)
 parser.add_argument("--cira-issue-latency", default="1ns")
@@ -384,6 +408,7 @@ if args.cira:
         max_outstanding=args.cira_max_outstanding,
         max_send_queue=args.cira_max_send_queue,
         max_csr_walk_queue=args.cira_max_csr_walk_queue,
+        max_csr_index_reads=args.cira_max_csr_index_reads,
         csr_lines_per_turn=args.cira_csr_lines_per_turn,
         max_completed_lines=args.cira_max_completed_lines,
         issue_latency=args.cira_issue_latency,

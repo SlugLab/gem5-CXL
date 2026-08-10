@@ -48,6 +48,10 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "asmc_loads,asmc_completed,cira_prefetches,"
             "cira_indexed_prefetches,cira_csr_prefetches,cira_completed,"
             "cira_useful,cira_late,cira_read_packets,cira_read_bytes,"
+            "cira_csr_index_read_packets,cira_csr_index_read_bytes,"
+            "cira_completed_csr_index_reads,"
+            "cira_rejected_csr_index_queue_full,"
+            "cira_timing_csr_traversal,"
             "cxl_packets,cxl_bytes,l1d_demand_misses,l2d_demand_hits,"
             "l2d_demand_misses,l2i_demand_hits,l2i_demand_misses,"
             "cira_total_latency,cira_avg_latency,run_dir"
@@ -213,6 +217,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                             "board.cira.latePrefetches 0",
                             "board.cira.readPackets 16",
                             "board.cira.readBytes 1024",
+                            "board.cira.csrIndexReadPackets 32",
+                            "board.cira.csrIndexReadBytes 128",
+                            "board.cira.completedCsrIndexReads 32",
+                            "board.cira.rejectedCsrIndexQueueFull 0",
+                            "board.cira.timingCsrTraversalEnabled 1",
                             "board.cira.totalLatency 800",
                             "board.cira.avgLatency 100",
                         ]
@@ -257,6 +266,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                             "cira_late": "0",
                             "cira_read_packets": "16" if kind == "cira" else "0",
                             "cira_read_bytes": "1024" if kind == "cira" else "0",
+                            "cira_csr_index_read_packets": "32" if kind == "cira" else "0",
+                            "cira_csr_index_read_bytes": "128" if kind == "cira" else "0",
+                            "cira_completed_csr_index_reads": "32" if kind == "cira" else "0",
+                            "cira_rejected_csr_index_queue_full": "0",
+                            "cira_timing_csr_traversal": "1" if kind == "cira" else "0",
                             "cxl_packets": "137",
                             "cxl_bytes": "2880",
                             "l1d_demand_misses": "10",
@@ -310,9 +324,13 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "issue_latency=1000\n"
             "max_outstanding=256\n"
             "max_send_queue=1024\n"
+            "max_csr_index_reads=1024\n"
+            "timing_csr_traversal=true\n"
             "demand_probe_target=board.cache_hierarchy.l2-cache-0\n"
             "mem_side_port="
             "board.cache_hierarchy.l2buses0.cpu_side_ports[2]\n"
+            "csr_mem_side_port="
+            "board.cxl_device_xbar0.cpu_side_ports[1]\n"
             if kind == "cira"
             else ""
         )
@@ -325,9 +343,18 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             "ranges=0:4294967296\n"
             "cpu_side_port="
             "board.cache_hierarchy.membus.mem_side_ports[0]\n"
-            "mem_side_port=board.memory.mem_ctrl.port\n"
+            "mem_side_port=board.cxl_device_xbar0.cpu_side_ports[0]\n"
+            "[board.cxl_device_xbar0]\n"
+            "type=NoncoherentXBar\n"
+            + (
+                "cpu_side_ports=board.cxl_mem_link0.mem_side_port "
+                "board.cira.csr_mem_side_port\n"
+                if kind == "cira"
+                else "cpu_side_ports=board.cxl_mem_link0.mem_side_port\n"
+            )
+            + "mem_side_ports=board.memory.mem_ctrl.port\n"
             "[board.memory.mem_ctrl]\n"
-            "port=board.cxl_mem_link0.mem_side_port\n"
+            "port=board.cxl_device_xbar0.mem_side_ports[0]\n"
             "[board.memory.mem_ctrl.dram]\n"
             "range=0:4294967296\n"
             "[board.cache_hierarchy.membus]\n"
@@ -447,6 +474,11 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 "board.cira.latePrefetches 0",
                 "board.cira.readPackets 16",
                 "board.cira.readBytes 1024",
+                "board.cira.csrIndexReadPackets 32",
+                "board.cira.csrIndexReadBytes 128",
+                "board.cira.completedCsrIndexReads 32",
+                "board.cira.rejectedCsrIndexQueueFull 0",
+                "board.cira.timingCsrTraversalEnabled 1",
                 "board.cira.totalLatency 800",
                 "board.cira.avgLatency 100",
             ]
@@ -1599,7 +1631,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ),
             (
                 "memory controller port",
-                "port=board.cxl_mem_link0.mem_side_port",
+                "port=board.cxl_device_xbar0.mem_side_ports[0]",
                 "port=board.cache_hierarchy.membus.mem_side_ports",
             ),
             (
@@ -1625,7 +1657,7 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
             ),
             (
                 "mem_side_port binding",
-                "mem_side_port=board.memory.mem_ctrl.port",
+                "mem_side_port=board.cxl_device_xbar0.cpu_side_ports[0]",
                 "mem_side_port=board.cache_hierarchy.membus.cpu_side_ports[0]",
             ),
         )
@@ -1696,6 +1728,50 @@ class GapbsAmuLatencySweepValidatorTest(unittest.TestCase):
                 self.validator.ValidationError, "CIRA endpoint binding"
             ):
                 self.validator.validate_sweep(root)
+
+    def test_rejects_cira_csr_walker_on_host_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_sweep(root)
+            config = root / "200ns" / "bfs" / "cira_pgo" / "config.ini"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "csr_mem_side_port="
+                    "board.cxl_device_xbar0.cpu_side_ports[1]",
+                    "csr_mem_side_port="
+                    "board.cache_hierarchy.l2buses0.cpu_side_ports[3]",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.validator.ValidationError,
+                "CIRA CSR walker is not device-side of CXL",
+            ):
+                self.validator.validate_sweep(root)
+
+    def test_rejects_disabled_or_inactive_timing_csr_traversal(self):
+        mutations = (
+            ("cira_timing_csr_traversal", "0"),
+            ("cira_csr_index_read_packets", "0"),
+            ("cira_completed_csr_index_reads", "0"),
+            ("cira_rejected_csr_index_queue_full", "1"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make_sweep(root)
+                self.mutate_summary(
+                    root,
+                    "200ns",
+                    lambda row: row["benchmark"] == "bfs"
+                    and row["kind"] == "cira",
+                    **{field: value},
+                )
+                with self.assertRaisesRegex(
+                    self.validator.ValidationError, field
+                ):
+                    self.validator.validate_sweep(root)
 
     def test_rejects_summary_amu_and_cira_balance_mismatches(self):
         for kind, field, value in (

@@ -151,6 +151,13 @@ CIRA_EVIDENCE_STATS = {
     "cira_rejected_queue_full": "board.cira.rejectedQueueFull",
     "cira_dropped_csr_descriptors": "board.cira.droppedCsrDescriptors",
     "cira_csr_queue_high_watermark": "board.cira.csrQueueHighWatermark",
+    "cira_csr_index_read_packets": "board.cira.csrIndexReadPackets",
+    "cira_csr_index_read_bytes": "board.cira.csrIndexReadBytes",
+    "cira_completed_csr_index_reads": "board.cira.completedCsrIndexReads",
+    "cira_rejected_csr_index_queue_full": (
+        "board.cira.rejectedCsrIndexQueueFull"
+    ),
+    "cira_timing_csr_traversal": "board.cira.timingCsrTraversalEnabled",
 }
 CIRA_PER_CORE_STATS = {
     "cira_csr_per_core": "board.cira.issuedCsrPrefetchesPerCore",
@@ -204,6 +211,11 @@ SUMMARY_FIELDS = (
     "cira_rejected_queue_full",
     "cira_dropped_csr_descriptors",
     "cira_csr_queue_high_watermark",
+    "cira_csr_index_read_packets",
+    "cira_csr_index_read_bytes",
+    "cira_completed_csr_index_reads",
+    "cira_rejected_csr_index_queue_full",
+    "cira_timing_csr_traversal",
     "cxl_packets",
     "cxl_bytes",
     *REAL_CXL_FIELDS,
@@ -749,8 +761,21 @@ def cira_evidence_failure(evidence, num_cores):
     if (
         evidence["cira_rejected_queue_full"] != 0
         or evidence["cira_dropped_csr_descriptors"] != 0
+        or evidence["cira_rejected_csr_index_queue_full"] != 0
     ):
         return "cira-rejected-work"
+
+    if (
+        evidence["cira_timing_csr_traversal"] != 1
+        or evidence["cira_csr_index_read_packets"] <= 0
+        or evidence["cira_completed_csr_index_reads"] <= 0
+    ):
+        return "cira-invalid-csr-timing-path"
+    if (
+        evidence["cira_csr_index_read_packets"]
+        != evidence["cira_completed_csr_index_reads"]
+    ):
+        return "cira-incomplete-csr-index-reads"
 
     issued = [
         Decimal(value)
@@ -853,6 +878,8 @@ def append_kind_args(cmd, args, kind):
             str(args.cira_max_send_queue),
             "--cira-max-csr-walk-queue",
             str(args.cira_max_csr_walk_queue),
+            "--cira-max-csr-index-reads",
+            str(args.cira_max_csr_index_reads),
             "--cira-csr-lines-per-turn",
             str(args.cira_csr_lines_per_turn),
             "--cira-max-completed-lines",
@@ -894,6 +921,7 @@ def checkpoint_model_parameters(args, kind):
                 "cira_max_outstanding": args.cira_max_outstanding,
                 "cira_max_send_queue": args.cira_max_send_queue,
                 "cira_max_csr_walk_queue": args.cira_max_csr_walk_queue,
+                "cira_max_csr_index_reads": args.cira_max_csr_index_reads,
                 "cira_csr_lines_per_turn": args.cira_csr_lines_per_turn,
                 "cira_max_completed_lines": args.cira_max_completed_lines,
                 "cira_issue_latency": args.cira_issue_latency,
@@ -1527,6 +1555,7 @@ def main():
     parser.add_argument("--cira-max-outstanding", type=int, default=256)
     parser.add_argument("--cira-max-send-queue", type=int, default=1024)
     parser.add_argument("--cira-max-csr-walk-queue", type=int, default=4096)
+    parser.add_argument("--cira-max-csr-index-reads", type=int, default=1024)
     parser.add_argument("--cira-csr-lines-per-turn", type=int, default=64)
     parser.add_argument("--cira-max-completed-lines", type=int, default=65536)
     parser.add_argument("--cira-issue-latency", default="1ns")

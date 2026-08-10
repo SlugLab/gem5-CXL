@@ -19,7 +19,7 @@
 namespace
 {
 
-constexpr int NumCores = 2;
+constexpr int NumCores = 4;
 constexpr int NumRecords = 256;
 constexpr int NumValues = 128;
 constexpr size_t WorkerStackSize = 1U << 20;
@@ -32,7 +32,7 @@ struct Record
 
 alignas(4096) Record records[NumCores][NumRecords];
 alignas(4096) uint64_t values[NumCores][NumValues];
-alignas(4096) unsigned char workerStack[WorkerStackSize];
+alignas(4096) unsigned char workerStacks[NumCores - 1][WorkerStackSize];
 
 void
 drainCira()
@@ -54,24 +54,25 @@ drainCira()
 
 int failures = 0;
 int workerDone = 0;
+int workersReady = 0;
+int workersGo = 0;
+int workerIds[NumCores - 1] = {1, 2, 3};
 
 void
-runCore(int core)
+dirtyFutureValues(int core)
 {
-    cira_indexed_prefetch_desc indexed = {};
-    indexed.base_addr = reinterpret_cast<uint64_t>(&values[core][0]);
-    indexed.records_addr = reinterpret_cast<uint64_t>(&records[core][0]);
-    indexed.count = NumRecords;
-    indexed.record_stride = sizeof(Record);
-    indexed.index_offset = 0;
-    indexed.index_size = sizeof(records[core][0].index);
-    indexed.value_size = sizeof(values[core][0]);
+    // Dirty another core's future values and retain them in this core's host
+    // cache.  The owning core's CIRA prefetch must observe these exact bytes
+    // through coherence after its device-side timing index reads complete.
+    const int target = (core + 1) % NumCores;
+    for (int i = 0; i < NumValues; ++i)
+        values[target][i] = (target + 1) * 1000 + i;
+    _mm_mfence();
+}
 
-    // Repeated indices and repeated descriptors deliberately map many
-    // candidates to the same physical cache line.
-    for (int repeat = 0; repeat < 4; ++repeat)
-        cira_prefetch_indexed(&indexed);
-
+void
+issueAndCheck(int core)
+{
     cira_csr_prefetch_desc csr = {};
     csr.offsets_addr = reinterpret_cast<uint64_t>(&records[core][0]);
     csr.records_addr =
@@ -99,10 +100,15 @@ runCore(int core)
 }
 
 int
-runWorker(void *)
+runWorker(void *argument)
 {
-    runCore(1);
-    __atomic_store_n(&workerDone, 1, __ATOMIC_RELEASE);
+    int *core = static_cast<int *>(argument);
+    dirtyFutureValues(*core);
+    __atomic_fetch_add(&workersReady, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&workersGo, __ATOMIC_ACQUIRE) == 0)
+        asm volatile("pause" ::: "memory");
+    issueAndCheck(*core);
+    __atomic_fetch_add(&workerDone, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -117,10 +123,10 @@ main()
             records[core][i].padding = 0;
         }
         for (int i = 0; i < NumValues; ++i)
-            values[core][i] = (core + 1) * 1000 + i;
+            values[core][i] = 0;
     }
 
-    // Force the target lines out of both private cache hierarchies so this
+    // Force the target lines out of all private cache hierarchies so this
     // routing test exercises real CIRA timing requests instead of the
     // resident-line suppression path.
     for (size_t offset = 0; offset < sizeof(records); offset += 64)
@@ -134,12 +140,22 @@ main()
 
     const int cloneFlags = CLONE_VM | CLONE_FS | CLONE_FILES |
         CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
-    const int worker = clone(
-        runWorker, workerStack + WorkerStackSize, cloneFlags, nullptr);
-    if (worker < 0)
-        m5_fail(0, 1);
-    runCore(0);
-    while (__atomic_load_n(&workerDone, __ATOMIC_ACQUIRE) == 0) {
+    for (int worker = 0; worker < NumCores - 1; ++worker) {
+        const int tid = clone(
+            runWorker, workerStacks[worker] + WorkerStackSize,
+            cloneFlags, &workerIds[worker]);
+        if (tid < 0)
+            m5_fail(0, 1);
+    }
+    // Core 0 participates in the same dirty-data barrier without blocking
+    // before all clone workers have reached it.
+    dirtyFutureValues(0);
+    __atomic_fetch_add(&workersReady, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&workersReady, __ATOMIC_ACQUIRE) != NumCores)
+        asm volatile("pause" ::: "memory");
+    __atomic_store_n(&workersGo, 1, __ATOMIC_RELEASE);
+    issueAndCheck(0);
+    while (__atomic_load_n(&workerDone, __ATOMIC_ACQUIRE) != NumCores - 1) {
         asm volatile("pause" ::: "memory");
     }
 

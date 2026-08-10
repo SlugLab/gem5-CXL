@@ -614,6 +614,11 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "board.cira.rejectedQueueFull": Decimal(0),
             "board.cira.droppedCsrDescriptors": Decimal(0),
             "board.cira.csrQueueHighWatermark": Decimal(8),
+            "board.cira.csrIndexReadPackets": Decimal(1024),
+            "board.cira.csrIndexReadBytes": Decimal(4096),
+            "board.cira.completedCsrIndexReads": Decimal(1024),
+            "board.cira.rejectedCsrIndexQueueFull": Decimal(0),
+            "board.cira.timingCsrTraversalEnabled": Decimal(1),
         }
         evidence = self.runner.extract_cira_evidence(stats, "cira", 2)
         self.assertEqual(
@@ -625,6 +630,8 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(evidence["cira_csr_per_core"], "5;6")
         self.assertEqual(evidence["cira_coalesced"], Decimal(500))
         self.assertEqual(evidence["cira_csr_queue_high_watermark"], Decimal(8))
+        self.assertEqual(evidence["cira_csr_index_read_packets"], Decimal(1024))
+        self.assertEqual(evidence["cira_completed_csr_index_reads"], Decimal(1024))
 
         for field in ("cira_csr_per_core",):
             with self.subTest(field=field):
@@ -645,6 +652,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         for field in (
             "cira_rejected_queue_full",
             "cira_dropped_csr_descriptors",
+            "cira_rejected_csr_index_queue_full",
         ):
             with self.subTest(field=field):
                 candidate = dict(evidence)
@@ -654,11 +662,32 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                     "cira-rejected-work",
                 )
 
+        for field, value in (
+            ("cira_timing_csr_traversal", Decimal(0)),
+            ("cira_csr_index_read_packets", Decimal(0)),
+            ("cira_completed_csr_index_reads", Decimal(0)),
+        ):
+            with self.subTest(field=field):
+                candidate = dict(evidence)
+                candidate[field] = value
+                self.assertEqual(
+                    self.runner.cira_evidence_failure(candidate, 2),
+                    "cira-invalid-csr-timing-path",
+                )
+
+        candidate = dict(evidence)
+        candidate["cira_completed_csr_index_reads"] -= 1
+        self.assertEqual(
+            self.runner.cira_evidence_failure(candidate, 2),
+            "cira-incomplete-csr-index-reads",
+        )
+
     def test_cira_forwards_bounded_scheduler_parameters(self):
         args = SimpleNamespace(
             cira_max_outstanding=256,
             cira_max_send_queue=1024,
             cira_max_csr_walk_queue=4096,
+            cira_max_csr_index_reads=1024,
             cira_csr_lines_per_turn=64,
             cira_max_completed_lines=65536,
             cira_issue_latency="1ns",
@@ -669,6 +698,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.runner.append_kind_args(cmd, args, "cira")
         for option, value in (
             ("--cira-max-csr-walk-queue", "4096"),
+            ("--cira-max-csr-index-reads", "1024"),
             ("--cira-csr-lines-per-turn", "64"),
             ("--cira-max-completed-lines", "65536"),
         ):
@@ -677,6 +707,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
 
         parameters = self.runner.checkpoint_model_parameters(args, "cira")
         self.assertEqual(parameters["cira_max_csr_walk_queue"], 4096)
+        self.assertEqual(parameters["cira_max_csr_index_reads"], 1024)
         self.assertEqual(parameters["cira_csr_lines_per_turn"], 64)
         self.assertEqual(parameters["cira_max_completed_lines"], 65536)
 
@@ -992,6 +1023,11 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "cira_late",
             "cira_read_packets",
             "cira_read_bytes",
+            "cira_csr_index_read_packets",
+            "cira_csr_index_read_bytes",
+            "cira_completed_csr_index_reads",
+            "cira_rejected_csr_index_queue_full",
+            "cira_timing_csr_traversal",
             "cxl_packets",
             "cxl_bytes",
             "mem_ctrl_read_reqs",

@@ -15,6 +15,9 @@ class CIRA(ClockedObject):
     mem_side_ports = VectorRequestPort(
         "Per-core timing prefetch ports toward private L2s"
     )
+    csr_mem_side_port = RequestPort(
+        "Device-side timing port for CIRA CSR index reads"
+    )
     demand_probe_targets = VectorParam.SimObject(
         [], "Private L2s used for target-local CIRA usefulness attribution"
     )
@@ -31,6 +34,9 @@ class CIRA(ClockedObject):
     max_csr_walk_queue = Param.Unsigned(
         4096, "Maximum total queued CIRA CSR descriptors"
     )
+    max_csr_index_reads = Param.Unsigned(
+        1024, "Maximum queued plus in-flight CIRA CSR index reads"
+    )
     csr_lines_per_turn = Param.Unsigned(
         64, "Maximum unique line candidates expanded per scheduling turn"
     )
@@ -44,3 +50,6 @@ class CIRA(ClockedObject):
         "0ns", "Fixed CIRA completion delay after memory responses return"
     )
     enabled = Param.Bool(True, "Enable CIRA timing prefetch requests")
+    timing_csr_traversal = Param.Bool(
+        True, "Use bounded device-side timing reads for CSR indices"
+    )

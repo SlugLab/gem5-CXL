@@ -1,7 +1,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Run the deterministic two-core CIRA routing/coalescing workload."""
+"""Run the deterministic four-core CIRA timing-CSR workload."""
 
 import argparse
 import runpy
@@ -28,13 +28,16 @@ sys.argv = [
     "--iterations",
     "1",
     "--cores",
-    "2",
+    "4",
     "--cpu",
     "timing",
     "--mem-size",
     "4GiB",
     "--disable-hw-prefetchers",
     "--no-asmc",
+    "--cxl-memory",
+    "--cxl-link-delay",
+    "200ns",
     "--cira",
     "--cira-to-l2",
     "--cira-max-outstanding",
@@ -43,6 +46,8 @@ sys.argv = [
     "1024",
     "--cira-max-csr-walk-queue",
     "64",
+    "--cira-max-csr-index-reads",
+    "1024",
     "--cira-csr-lines-per-turn",
     "8",
     "--cira-max-completed-lines",

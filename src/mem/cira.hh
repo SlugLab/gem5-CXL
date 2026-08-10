@@ -6,6 +6,7 @@
 #ifndef __MEM_CIRA_HH__
 #define __MEM_CIRA_HH__
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -83,14 +84,39 @@ class CIRA : public ClockedObject
         uint32_t pendingPackets = 0;
     };
 
+    enum class PacketRole
+    {
+        PrefetchLine,
+        CsrIndexRead
+    };
+
     struct PacketSenderState : public Packet::SenderState
     {
-        PacketSenderState(uint64_t request_id, PortID target_core)
-            : id(request_id), targetCore(target_core)
+        PacketSenderState(PacketRole packet_role, uint64_t request_id,
+                          PortID target_core, uint64_t walk_id = 0,
+                          uint64_t entry_id = 0, uint64_t data_offset = 0)
+            : role(packet_role), id(request_id), targetCore(target_core),
+              walkId(walk_id), entry(entry_id), dataOffset(data_offset)
         {}
 
+        PacketRole role;
         uint64_t id;
         PortID targetCore;
+        uint64_t walkId;
+        uint64_t entry;
+        uint64_t dataOffset;
+    };
+
+    struct PendingCsrIndexRead
+    {
+        uint64_t walkId = 0;
+        PortID targetCore = InvalidPortID;
+        ThreadContext *tc = nullptr;
+        Addr valuesAddr = 0;
+        uint64_t valueSize = 0;
+        uint64_t indexSize = 0;
+        uint32_t pendingPackets = 0;
+        std::array<uint8_t, 8> data = {};
     };
 
     struct IndexedPrefetchDesc
@@ -121,6 +147,7 @@ class CIRA : public ClockedObject
 
     struct CsrWalkState
     {
+        uint64_t walkId = 0;
         ThreadContext *tc = nullptr;
         PortID targetCore = InvalidPortID;
         Addr recordsBegin = 0;
@@ -133,6 +160,7 @@ class CIRA : public ClockedObject
         uint64_t valueSize = 0;
         uint64_t entryCount = 0;
         uint64_t nextEntry = 0;
+        uint64_t pendingIndexReads = 0;
         uint64_t rowStart = 0;
         uint64_t rowCount = 0;
         bool prefetchRecords = false;
@@ -152,6 +180,19 @@ class CIRA : public ClockedObject
       private:
         CIRA &owner;
         const PortID targetCore;
+    };
+
+    class CsrMemoryPort : public RequestPort
+    {
+      public:
+        CsrMemoryPort(const std::string &name, CIRA &owner);
+
+      protected:
+        bool recvTimingResp(PacketPtr pkt) override;
+        void recvReqRetry() override;
+
+      private:
+        CIRA &owner;
     };
 
     enum class CacheProbeEvent
@@ -205,6 +246,11 @@ class CIRA : public ClockedObject
         statistics::Scalar translationFaults;
         statistics::Scalar readPackets;
         statistics::Scalar readBytes;
+        statistics::Scalar csrIndexReadPackets;
+        statistics::Scalar csrIndexReadBytes;
+        statistics::Scalar completedCsrIndexReads;
+        statistics::Scalar rejectedCsrIndexQueueFull;
+        statistics::Scalar timingCsrTraversalEnabled;
         statistics::Scalar totalLatency;
         statistics::Formula avgLatency;
     };
@@ -221,6 +267,14 @@ class CIRA : public ClockedObject
     size_t queuedCsrWalks() const;
     void scheduleCsrWalk(Tick when);
     void processCsrWalk();
+    bool issueCsrIndexRead(CsrWalkState &walk, uint64_t entry);
+    bool finishCsrIndexRead(uint64_t id);
+    CsrWalkState *findCsrWalk(PortID targetCore, uint64_t walkId);
+    void enqueueCsrIndexPacket(PacketPtr pkt);
+    void scheduleCsrIndexSend(Tick when);
+    void tryCsrIndexSend();
+    bool recvCsrTimingResp(PacketPtr pkt);
+    void recvCsrReqRetry();
     void enqueuePacket(PortID targetCore, PacketPtr pkt);
     void scheduleSend(Tick when);
     void trySend();
@@ -237,6 +291,7 @@ class CIRA : public ClockedObject
 
     System *system;
     std::vector<std::unique_ptr<MemoryPort>> memSidePorts;
+    std::unique_ptr<CsrMemoryPort> csrMemoryPort;
     const RequestorID requestorId;
     const std::vector<SimObject *> demandProbeTargets;
     std::vector<BaseCache *> targetCaches;
@@ -245,13 +300,17 @@ class CIRA : public ClockedObject
     std::vector<CiraLineUsefulnessTracker> lineTrackers;
     const uint64_t maxSendQueue;
     const uint64_t maxCsrWalkQueue;
+    const uint64_t maxCsrIndexReads;
     const uint64_t csrLinesPerTurn;
     const Tick issueLatency;
     const Tick completionLatency;
 
     uint64_t maxOutstanding;
     bool enabled;
+    const bool timingCsrTraversal;
     uint64_t nextId = 1;
+    uint64_t nextCsrWalkId = 1;
+    uint64_t nextCsrIndexReadId = 1;
 
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;
@@ -263,6 +322,11 @@ class CIRA : public ClockedObject
     std::vector<std::deque<CsrWalkState>> csrWalkQueues;
     PortID nextCsrCore = 0;
     EventFunctionWrapper csrWalkEvent;
+    std::unordered_map<uint64_t, PendingCsrIndexRead> pendingCsrIndexReads;
+    std::deque<PacketPtr> csrIndexSendQueue;
+    PacketPtr csrIndexRetryPkt = nullptr;
+    bool csrIndexRetryReady = false;
+    EventFunctionWrapper csrIndexSendEvent;
     std::vector<std::unique_ptr<CacheProbeListener>> probeListeners;
 
     CIRAStats stats;
