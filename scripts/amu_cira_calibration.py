@@ -6,6 +6,7 @@
 
 import csv
 import hashlib
+import itertools
 import math
 from pathlib import Path
 
@@ -46,6 +47,12 @@ AMU_TABLE4 = {
 
 _CIRA_REQUIRED_MODES = ("baseline", "A", "B", "C", "ABC")
 _CIRA_VERIFIED_MODES = ("baseline", "A", "B", "C")
+
+AMU_SEARCH_SPACE = {
+    "metadata_cycles": (0, 2, 4, 6, 8, 10),
+    "id_refill_cycles": (0, 2, 4, 6, 8, 10),
+    "completion_cycles": (0, 2, 4, 6, 8, 10),
+}
 
 
 class CalibrationError(RuntimeError):
@@ -279,3 +286,245 @@ def load_cira_source(path):
             "Original fallback and confidence-interval fields are preserved.",
         ],
     }
+
+
+def _measurement_key(row):
+    latency = float(row["latency_us"])
+    latency_text = str(int(latency)) if latency.is_integer() else str(latency)
+    return f"{row['workload']}@{latency_text}"
+
+
+def _validated_measurements(measurements):
+    validated = []
+    seen = set()
+    count_fields = (
+        "metadata_accesses",
+        "id_batch_refills",
+        "completions",
+    )
+    number_fields = (
+        "latency_us",
+        "simulated_normalized_time",
+        "normalizer_cycles",
+        "target",
+        "weight",
+    )
+    for index, source in enumerate(measurements):
+        if not isinstance(source, dict):
+            raise CalibrationError(f"measurement {index} is not an object")
+        row = dict(source)
+        if not row.get("workload"):
+            raise CalibrationError(f"measurement {index} has no workload")
+        for field in number_fields:
+            try:
+                row[field] = float(row[field])
+            except (KeyError, TypeError, ValueError) as error:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                ) from error
+            if not math.isfinite(row[field]):
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                )
+        if row["latency_us"] <= 0:
+            raise CalibrationError(f"measurement {index}: invalid latency_us")
+        if row["simulated_normalized_time"] < 0:
+            raise CalibrationError(
+                f"measurement {index}: invalid simulated_normalized_time"
+            )
+        for field in ("normalizer_cycles", "target", "weight"):
+            if row[field] <= 0:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                )
+        for field in count_fields:
+            try:
+                numeric = float(row[field])
+                value = int(numeric)
+            except (KeyError, TypeError, ValueError) as error:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                ) from error
+            if value < 0 or not math.isfinite(numeric) or value != numeric:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                )
+            row[field] = value
+        key = _measurement_key(row)
+        if key in seen:
+            raise CalibrationError(f"duplicate measurement {key}")
+        seen.add(key)
+        validated.append(row)
+    if len(validated) < 2:
+        raise CalibrationError("at least two AMU measurements are required")
+    return validated
+
+
+def predict_normalized_time(row, parameters):
+    overhead_cycles = (
+        row["metadata_accesses"] * parameters["metadata_cycles"]
+        + row["id_batch_refills"] * parameters["id_refill_cycles"]
+        + row["completions"] * parameters["completion_cycles"]
+    )
+    return row["simulated_normalized_time"] + (
+        overhead_cycles / row["normalizer_cycles"]
+    )
+
+
+def _residual_record(row, prediction):
+    residual = prediction - row["target"]
+    return {
+        "target": row["target"],
+        "prediction": prediction,
+        "residual": residual,
+        "relative_error": abs(residual) / row["target"],
+    }
+
+
+def fit_amu_control_costs(measurements, holdout):
+    rows = _validated_measurements(measurements)
+    try:
+        holdout_workload = str(holdout["workload"])
+        holdout_latency = float(holdout["latency_us"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CalibrationError("invalid AMU holdout identity") from error
+
+    held = [
+        row
+        for row in rows
+        if row["workload"] == holdout_workload
+        and row["latency_us"] == holdout_latency
+    ]
+    if len(held) != 1:
+        raise CalibrationError("AMU holdout must match exactly one measurement")
+    training = [row for row in rows if row is not held[0]]
+
+    candidates = []
+    names = tuple(AMU_SEARCH_SPACE)
+    for values in itertools.product(*(AMU_SEARCH_SPACE[name] for name in names)):
+        parameters = dict(zip(names, values))
+        error = math.fsum(
+            row["weight"]
+            * (predict_normalized_time(row, parameters) - row["target"]) ** 2
+            for row in training
+        )
+        candidates.append((error, values, parameters))
+    weighted_sse, _, selected = min(candidates)
+
+    training_residuals = {
+        _measurement_key(row): _residual_record(
+            row, predict_normalized_time(row, selected)
+        )
+        for row in training
+    }
+    holdout_residuals = {
+        _measurement_key(row): _residual_record(
+            row, predict_normalized_time(row, selected)
+        )
+        for row in held
+    }
+    return {
+        "objective": "normalized_time_weighted_sse",
+        "search_space": {name: list(values) for name, values in AMU_SEARCH_SPACE.items()},
+        "parameters": selected,
+        "weighted_sse": weighted_sse,
+        "training_points": sorted(training_residuals),
+        "training_residuals": training_residuals,
+        "holdout_points": sorted(holdout_residuals),
+        "holdout_residuals": holdout_residuals,
+    }
+
+
+def synthetic_measurements_for_test():
+    return [
+        {
+            "workload": "gups",
+            "latency_us": 1.0,
+            "simulated_normalized_time": 0.5,
+            "normalizer_cycles": 100,
+            "metadata_accesses": 10,
+            "id_batch_refills": 0,
+            "completions": 0,
+            "target": 0.9,
+            "weight": 1.0,
+        },
+        {
+            "workload": "hj",
+            "latency_us": 1.0,
+            "simulated_normalized_time": 0.5,
+            "normalizer_cycles": 100,
+            "metadata_accesses": 0,
+            "id_batch_refills": 10,
+            "completions": 0,
+            "target": 1.1,
+            "weight": 1.0,
+        },
+        {
+            "workload": "stream",
+            "latency_us": 1.0,
+            "simulated_normalized_time": 0.5,
+            "normalizer_cycles": 100,
+            "metadata_accesses": 0,
+            "id_batch_refills": 0,
+            "completions": 10,
+            "target": 0.7,
+            "weight": 1.0,
+        },
+        {
+            "workload": "stream",
+            "latency_us": 2.0,
+            "simulated_normalized_time": 0.5,
+            "normalizer_cycles": 100,
+            "metadata_accesses": 5,
+            "id_batch_refills": 5,
+            "completions": 5,
+            "target": 1.1,
+            "weight": 1.0,
+        },
+    ]
+
+
+def paper_measurements_for_test():
+    counts = {
+        "gups": (1000, 0, 0),
+        "hj": (0, 1000, 0),
+        "stream": (0, 0, 1000),
+    }
+    known = {
+        "metadata_cycles": 4,
+        "id_refill_cycles": 6,
+        "completion_cycles": 2,
+    }
+    rows = []
+    for workload, observations in AMU_TABLE4.items():
+        metadata, refills, completions = counts[workload]
+        overhead = (
+            metadata * known["metadata_cycles"]
+            + refills * known["id_refill_cycles"]
+            + completions * known["completion_cycles"]
+        ) / 100000
+        for latency_text, targets in observations.items():
+            latency = float(latency_text)
+            checksum = f"{workload}-{latency_text}-checksum"
+            rows.append(
+                {
+                    "workload": workload,
+                    "latency_us": latency,
+                    "simulated_normalized_time": targets["amu"] - overhead,
+                    "normalizer_cycles": 100000,
+                    "metadata_accesses": metadata,
+                    "id_batch_refills": refills,
+                    "completions": completions,
+                    "target": targets["amu"],
+                    "paper_baseline_normalized": targets["baseline"],
+                    "weight": 1.0,
+                    "average_mlp": (
+                        131.0
+                        if workload == "gups" and latency == 5.0
+                        else 16.0
+                    ),
+                    "baseline_checksum": checksum,
+                    "amu_checksum": checksum,
+                }
+            )
+    return rows
