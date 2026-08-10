@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts import gapbs_pr_experiment_profiles as profiles
 from scripts import m2ndp_artifacts as artifacts
@@ -200,6 +201,67 @@ class M2NDPResultTest(unittest.TestCase):
         )
 
         self.assertEqual(ticks, 240000)
+
+    def test_g14_gem5_row_requires_positive_real_cxl_evidence(self):
+        profile = SimpleNamespace(
+            name="g14-4thread-sweep",
+            graph_scale=14,
+            graph_sha256="1" * 64,
+            cores=4,
+            trials=2,
+            measured_trial=1,
+            latencies=("200ns", "500ns", "1us", "2us"),
+        )
+        row = dict(
+            self.gem5_pass.row,
+            graph_sha256=profile.graph_sha256,
+            scale="14",
+            cores="4",
+            cxl_link_delay="2us",
+            mem_ctrl_read_reqs="31",
+            mem_ctrl_read_bursts="29",
+            mem_ctrl_bytes_read="1856",
+            mem_ctrl_cpu_data_reads="29",
+        )
+
+        self.assertEqual(
+            results.validate_gem5_row(row, profile=profile, latency="2us"),
+            240000,
+        )
+        for field in results.REAL_CXL_FIELDS:
+            with self.subTest(field=field):
+                invalid = dict(row, **{field: "0"})
+                with self.assertRaisesRegex(
+                    artifacts.EvidenceError, field
+                ):
+                    results.validate_gem5_row(
+                        invalid, profile=profile, latency="2us"
+                    )
+
+    def test_validate_real_cxl_row_rejects_missing_and_fractional_values(self):
+        valid = {
+            "mem_ctrl_read_reqs": "31",
+            "mem_ctrl_read_bursts": "29",
+            "mem_ctrl_bytes_read": "1856",
+            "mem_ctrl_cpu_data_reads": "29",
+        }
+        self.assertEqual(
+            results.validate_real_cxl_row(valid),
+            {field: Decimal(value) for field, value in valid.items()},
+        )
+        for field in results.REAL_CXL_FIELDS:
+            with self.subTest(field=field):
+                missing = dict(valid)
+                del missing[field]
+                with self.assertRaisesRegex(
+                    artifacts.EvidenceError, field
+                ):
+                    results.validate_real_cxl_row(missing)
+                fractional = dict(valid, **{field: "1.5"})
+                with self.assertRaisesRegex(
+                    artifacts.EvidenceError, field
+                ):
+                    results.validate_real_cxl_row(fractional)
 
     def test_g4_summary_records_profile_cores_and_latency(self):
         profile = profiles.get_profile("g4-4thread-sweep")

@@ -31,6 +31,13 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
 
     def stats(self):
         return {
+            "board.memory.mem_ctrl.readReqs": Decimal(31),
+            "board.memory.mem_ctrl.readBursts": Decimal(29),
+            "board.memory.mem_ctrl.bytesReadSys": Decimal(1856),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores.core.data"
+            ): Decimal(29),
             (
                 "board.cache_hierarchy.membus.pktCount_l2.mem_side_port::"
                 "board.cxl_mem_link0.cpu_side_port"
@@ -137,6 +144,17 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
 
     def two_core_stats(self):
         stats = {
+            "board.memory.mem_ctrl.readReqs": Decimal(31),
+            "board.memory.mem_ctrl.readBursts": Decimal(29),
+            "board.memory.mem_ctrl.bytesReadSys": Decimal(1856),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores0.core.data"
+            ): Decimal(13),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores1.core.data"
+            ): Decimal(16),
             (
                 "board.cache_hierarchy.membus.pktCount_"
                 "board.cache_hierarchy.l2-cache-0.mem_side_port::"
@@ -223,6 +241,133 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
                 "cira_avg_latency": 100.0,
             },
         )
+
+    def test_legacy_diagnostics_do_not_require_real_cxl_fields(self):
+        stats = self.stats()
+        for name in tuple(stats):
+            if name.startswith("board.memory.mem_ctrl."):
+                del stats[name]
+
+        metrics = self.runner.extract_diagnostic_metrics(stats, "baseline")
+
+        self.assertNotIn("mem_ctrl_read_reqs", metrics)
+        self.assertEqual(metrics["cxl_packets"], Decimal(137))
+
+    def test_extracts_exact_real_cxl_controller_metrics(self):
+        stats = {
+            "board.memory.mem_ctrl.readReqs": Decimal(31),
+            "board.memory.mem_ctrl.readBursts": Decimal(29),
+            "board.memory.mem_ctrl.bytesReadSys": Decimal(1856),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores0.core.data"
+            ): Decimal(7),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores1.core.data"
+            ): Decimal(8),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores2.core.data"
+            ): Decimal(6),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores3.core.data"
+            ): Decimal(8),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores0.core.inst"
+            ): Decimal(1000),
+        }
+
+        metrics = self.runner.extract_real_cxl_metrics(stats, num_cores=4)
+
+        self.assertEqual(
+            metrics,
+            {
+                "mem_ctrl_read_reqs": Decimal(31),
+                "mem_ctrl_read_bursts": Decimal(29),
+                "mem_ctrl_bytes_read": Decimal(1856),
+                "mem_ctrl_cpu_data_reads": Decimal(29),
+            },
+        )
+        self.runner.require_real_cxl(metrics)
+
+    def test_real_cxl_gate_rejects_missing_or_zero_evidence(self):
+        base = {
+            "mem_ctrl_read_reqs": Decimal(31),
+            "mem_ctrl_read_bursts": Decimal(29),
+            "mem_ctrl_bytes_read": Decimal(1856),
+            "mem_ctrl_cpu_data_reads": Decimal(29),
+        }
+        for field in base:
+            with self.subTest(field=field):
+                missing = dict(base)
+                del missing[field]
+                with self.assertRaisesRegex(
+                    self.runner.StatsError, field
+                ):
+                    self.runner.require_real_cxl(missing)
+                zero = dict(base, **{field: Decimal(0)})
+                with self.assertRaisesRegex(
+                    self.runner.StatsError, field
+                ):
+                    self.runner.require_real_cxl(zero)
+
+    def test_real_cxl_gate_rejects_instruction_only_or_ambiguous_data(self):
+        stats = {
+            "board.memory.mem_ctrl.readReqs": Decimal(31),
+            "board.memory.mem_ctrl.readBursts": Decimal(29),
+            "board.memory.mem_ctrl.bytesReadSys": Decimal(1856),
+            (
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores0.core.inst"
+            ): Decimal(29),
+        }
+        metrics = self.runner.extract_real_cxl_metrics(stats, num_cores=4)
+        self.assertEqual(metrics["mem_ctrl_cpu_data_reads"], Decimal(0))
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "mem_ctrl_cpu_data_reads"
+        ):
+            self.runner.require_real_cxl(metrics)
+
+        stats[
+            "board.memory.mem_ctrl.requestorReadAccesses::"
+            "processor.cores0.core.data.extra"
+        ] = Decimal(29)
+        with self.assertRaisesRegex(
+            self.runner.StatsError, "ambiguous CPU data requestor"
+        ):
+            self.runner.extract_real_cxl_metrics(stats, num_cores=4)
+
+    def test_real_cxl_uses_only_first_roi_and_preserves_large_integers(self):
+        large = 9007199254740993
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stats.txt"
+            path.write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                f"board.memory.mem_ctrl.readReqs {large}\n"
+                f"board.memory.mem_ctrl.readBursts {large}\n"
+                f"board.memory.mem_ctrl.bytesReadSys {large}\n"
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                f"processor.cores.core.data {large}\n"
+                "---------- End Simulation Statistics   ----------\n"
+                "---------- Begin Simulation Statistics ----------\n"
+                "board.memory.mem_ctrl.readReqs 0\n"
+                "board.memory.mem_ctrl.readBursts 0\n"
+                "board.memory.mem_ctrl.bytesReadSys 0\n"
+                "board.memory.mem_ctrl.requestorReadAccesses::"
+                "processor.cores.core.data 0\n"
+                "---------- End Simulation Statistics   ----------\n",
+                encoding="utf-8",
+            )
+
+            metrics = self.runner.extract_real_cxl_metrics(
+                self.runner.parse_stats(path), num_cores=1
+            )
+
+        self.assertEqual(metrics["mem_ctrl_read_reqs"], Decimal(large))
+        self.assertEqual(metrics["mem_ctrl_cpu_data_reads"], Decimal(large))
 
     def test_fast_forward_selects_only_timing_switch_requestor(self):
         metrics = self.runner.extract_diagnostic_metrics(
@@ -650,6 +795,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
     def test_run_one_forwards_the_configured_core_count(self):
         source = inspect.getsource(self.runner.run_one)
         self.assertIn("num_cores=args.cores", source)
+        self.assertIn("extract_real_cxl_metrics", source)
 
     def test_two_core_rejects_missing_directional_core_cell(self):
         stats = self.two_core_stats()
@@ -848,6 +994,10 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             "cira_read_bytes",
             "cxl_packets",
             "cxl_bytes",
+            "mem_ctrl_read_reqs",
+            "mem_ctrl_read_bursts",
+            "mem_ctrl_bytes_read",
+            "mem_ctrl_cpu_data_reads",
             "l1d_demand_misses",
             "l2d_demand_hits",
             "l2d_demand_misses",

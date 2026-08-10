@@ -63,6 +63,12 @@ class ProvenanceEvidence:
 
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+REAL_CXL_FIELDS = (
+    "mem_ctrl_read_reqs",
+    "mem_ctrl_read_bursts",
+    "mem_ctrl_bytes_read",
+    "mem_ctrl_cpu_data_reads",
+)
 
 
 def expected_gem5_contract(profile, latency):
@@ -271,7 +277,26 @@ def validate_gem5_row(row, *, profile, latency, smoke_test=False):
     ticks = int(ticks_text)
     if ticks <= 0:
         raise artifacts.EvidenceError("gem5 sim_ticks must be positive")
+    if not smoke_test and profile.name in profiles.FROZEN_PROFILE_CONTRACTS:
+        validate_real_cxl_row(row)
     return ticks
+
+
+def validate_real_cxl_row(row):
+    evidence = {}
+    for field in REAL_CXL_FIELDS:
+        value = row.get(field)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+            raise artifacts.EvidenceError(
+                f"gem5 {field} is not a positive integer: {value!r}"
+            )
+        parsed = decimal.Decimal(value)
+        if parsed <= 0:
+            raise artifacts.EvidenceError(
+                f"gem5 {field} must be positive in measured ROI"
+            )
+        evidence[field] = parsed
+    return evidence
 
 
 def parse_gem5_summary(
@@ -461,6 +486,9 @@ def build_summary(
         "verification": "pass",
         "funcsim_strict": "pass",
         "funcsim_compared": str(funcsim.compared),
+        **{
+            field: gem5.row.get(field, "") for field in REAL_CXL_FIELDS
+        },
         "gem5_sim_ticks": str(sim_ticks),
         "ndpsim_start_cycle": str(ndpsim.start_cycle),
         "ndpsim_end_cycle": str(ndpsim.end_cycle),

@@ -49,6 +49,20 @@ CHECKPOINT_CONFIG_DEPENDENCIES = (
 CXL_PACKET_STAT_PREFIX = "board.cache_hierarchy.membus.pktCount_"
 CXL_BYTE_STAT_PREFIX = "board.cache_hierarchy.membus.pktSize_"
 CXL_STAT_SUFFIX = "::board.cxl_mem_link0.cpu_side_port"
+MEM_CTRL_EXACT_STATS = {
+    "mem_ctrl_read_reqs": "board.memory.mem_ctrl.readReqs",
+    "mem_ctrl_read_bursts": "board.memory.mem_ctrl.readBursts",
+    "mem_ctrl_bytes_read": "board.memory.mem_ctrl.bytesReadSys",
+}
+REAL_CXL_FIELDS = (
+    "mem_ctrl_read_reqs",
+    "mem_ctrl_read_bursts",
+    "mem_ctrl_bytes_read",
+    "mem_ctrl_cpu_data_reads",
+)
+MEM_CTRL_REQUESTOR_PREFIX = (
+    "board.memory.mem_ctrl.requestorReadAccesses::"
+)
 DIAGNOSTIC_STATS = {
     "l1d_demand_misses": (
         "board.cache_hierarchy.l1d-cache-0.demandMisses::total"
@@ -192,6 +206,7 @@ SUMMARY_FIELDS = (
     "cira_csr_queue_high_watermark",
     "cxl_packets",
     "cxl_bytes",
+    *REAL_CXL_FIELDS,
     "l1d_demand_misses",
     "l2d_demand_hits",
     "l2d_demand_misses",
@@ -331,6 +346,53 @@ def directional_stat_pair(stats, num_cores=1, kind="baseline"):
             f"{packet_cell!r} != {byte_cell!r}"
         )
     return packets, byte_count
+
+
+def _counter(stats, name):
+    if name not in stats:
+        raise StatsError(f"missing required ROI statistic: {name}")
+    value = Decimal(str(stats[name]))
+    if not value.is_finite() or value < 0 or value != value.to_integral_value():
+        raise StatsError(f"ROI counter {name} is not a nonnegative integer")
+    return value
+
+
+def extract_real_cxl_metrics(stats, num_cores=1):
+    if num_cores < 1:
+        raise StatsError(f"num_cores must be positive; got {num_cores}")
+    metrics = {
+        field: _counter(stats, stat_name)
+        for field, stat_name in MEM_CTRL_EXACT_STATS.items()
+    }
+    if num_cores == 1:
+        accepted = {
+            "processor.cores.core.data",
+            "processor.cores0.core.data",
+        }
+    else:
+        accepted = {
+            f"processor.cores{core}.core.data" for core in range(num_cores)
+        }
+    cpu_data_reads = Decimal(0)
+    for name in stats:
+        if not name.startswith(MEM_CTRL_REQUESTOR_PREFIX):
+            continue
+        requestor = name[len(MEM_CTRL_REQUESTOR_PREFIX):]
+        if requestor in accepted:
+            cpu_data_reads += _counter(stats, name)
+        elif requestor.startswith("processor.cores") and ".core.data" in requestor:
+            raise StatsError(f"ambiguous CPU data requestor: {name}")
+    metrics["mem_ctrl_cpu_data_reads"] = cpu_data_reads
+    return metrics
+
+
+def require_real_cxl(metrics):
+    for field in REAL_CXL_FIELDS:
+        if field not in metrics:
+            raise StatsError(f"{field} is missing from real-CXL evidence")
+        value = Decimal(str(metrics[field]))
+        if not value.is_finite() or value <= 0:
+            raise StatsError(f"{field} must be positive in measured ROI")
 
 
 def cache_demand_vector(stats, cache_root, family, field):
@@ -1298,6 +1360,9 @@ def run_one(args, benchmark, label, binary_dir, kind):
         fast_forward=bool(args.fast_forward_cpu),
         num_cores=args.cores,
     )
+    real_cxl_metrics = extract_real_cxl_metrics(
+        stats, num_cores=args.cores
+    )
     if (
         kind == "cira"
         and proc.returncode == 0
@@ -1334,6 +1399,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         **owned_metrics,
         **cira_evidence,
         **diagnostic_metrics,
+        **real_cxl_metrics,
         "run_dir": str(run_dir),
     }
 
