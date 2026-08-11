@@ -68,6 +68,7 @@ class ASMC : public ClockedObject
     {
         SpmRead,
         MemoryAccess,
+        SpmAcquire,
         SpmWriteback,
     };
 
@@ -85,6 +86,7 @@ class ASMC : public ClockedObject
         std::vector<uint8_t> data;
         std::vector<TranslationChunk> memoryChunks;
         std::vector<TranslationChunk> spmChunks;
+        std::vector<PacketPtr> spmWritebacks;
         uint32_t pendingPackets = 0;
         uint32_t reservedFarPackets = 0;
         uint32_t reservedSpmPackets = 0;
@@ -94,9 +96,13 @@ class ASMC : public ClockedObject
     {
         PacketSenderState(uint64_t request_id, RequestPhase request_phase,
                           PortID target_core, Addr byte_offset,
-                          unsigned packet_size, bool is_read)
+                          unsigned packet_size, bool is_read,
+                          unsigned fragment_offset = 0,
+                          unsigned fragment_size = 0)
             : id(request_id), phase(request_phase), targetCore(target_core),
-              byteOffset(byte_offset), size(packet_size), read(is_read)
+              byteOffset(byte_offset), size(packet_size), read(is_read),
+              fragmentOffset(fragment_offset),
+              fragmentSize(fragment_size ? fragment_size : packet_size)
         {}
 
         uint64_t id;
@@ -105,6 +111,8 @@ class ASMC : public ClockedObject
         Addr byteOffset;
         unsigned size;
         bool read;
+        unsigned fragmentOffset;
+        unsigned fragmentSize;
     };
 
     class MemoryPort : public RequestPort
@@ -168,12 +176,14 @@ class ASMC : public ClockedObject
                            RequestPhase phase);
     void enqueueSpmPackets(RequestState &state, MemCmd command,
                            RequestPhase phase);
+    void enqueueSpmAcquirePackets(RequestState &state);
     void startInitialAccess(uint64_t id);
     void startCompletionService(uint64_t id);
     void activateCompletionService(uint64_t id);
     void finishCompletionService(uint64_t id);
     void startMemoryWrite(RequestState &state);
     void startSpmWriteback(RequestState &state);
+    void startSpmLineWrites(RequestState &state);
     void enqueueFarPacket(PacketPtr pkt);
     void enqueueSpmPacket(PortID target_core, PacketPtr pkt);
     void scheduleFarSend(Tick when);

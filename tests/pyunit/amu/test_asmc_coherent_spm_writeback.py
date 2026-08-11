@@ -24,12 +24,15 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
 
     def test_request_state_records_all_routes_and_exact_payload_offsets(self):
         self.assertIn("SpmRead", HEADER)
+        self.assertIn("SpmAcquire", HEADER)
         self.assertIn("MemoryAccess", HEADER)
         self.assertIn("SpmWriteback", HEADER)
         self.assertIn("unsigned targetCore = 0", HEADER)
         self.assertIn("std::vector<TranslationChunk> memoryChunks", HEADER)
         self.assertIn("std::vector<TranslationChunk> spmChunks", HEADER)
         self.assertIn("Addr byteOffset", HEADER)
+        self.assertIn("unsigned fragmentOffset", HEADER)
+        self.assertIn("unsigned fragmentSize", HEADER)
         self.assertIn("unsigned size", HEADER)
 
     def test_far_and_spm_paths_have_independent_backpressure_state(self):
@@ -56,7 +59,7 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
         self.assertIn("reservedFarSendSlots", issue)
         self.assertIn("reservedSpmSendSlots[target_core]", issue)
 
-    def test_aload_routes_far_read_then_flagged_local_spm_write(self):
+    def test_aload_acquires_each_spm_line_before_coherent_writeback(self):
         start = SOURCE[
             SOURCE.index("ASMC::startInitialAccess"):
             SOURCE.index("ASMC::startCompletionService")
@@ -68,8 +71,19 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             SOURCE.index("ASMC::recvTimingResp")
         ]
         self.assertIn("state.spmChunks", writeback)
-        self.assertIn("MemCmd::WriteReq", writeback)
-        self.assertIn("RequestPhase::SpmWriteback", writeback)
+        self.assertIn("enqueueSpmAcquirePackets", writeback)
+        self.assertIn("MemCmd::ReadExReq", SOURCE)
+        self.assertIn("RequestPhase::SpmAcquire", writeback)
+
+        response = SOURCE[
+            SOURCE.index("ASMC::recvTimingResp"):
+            SOURCE.index("ASMC::recvReqRetry")
+        ]
+        self.assertIn("MemCmd::WriteLineReq", response)
+        self.assertIn("sender_state->fragmentOffset", response)
+        self.assertIn("sender_state->fragmentSize", response)
+        self.assertIn("state.spmWritebacks", response)
+        self.assertIn("startSpmLineWrites", response)
 
     def test_astore_routes_flagged_local_spm_read_then_far_write(self):
         start = SOURCE[

@@ -325,6 +325,40 @@ ASMC::enqueueSpmPackets(RequestState &state, MemCmd command,
     }
 }
 
+void
+ASMC::enqueueSpmAcquirePackets(RequestState &state)
+{
+    for (const auto &chunk : state.spmChunks) {
+        Addr chunk_offset = 0;
+        while (chunk_offset < chunk.size) {
+            const Addr address = chunk.paddr + chunk_offset;
+            const Addr line_address = address & ~(cacheLineSize - 1);
+            const unsigned fragment_offset = address - line_address;
+            const auto fragment_size = static_cast<unsigned>(std::min<uint64_t>(
+                chunk.size - chunk_offset,
+                cacheLineSize - fragment_offset));
+
+            Request::Flags flags = chunk.flags;
+            flags.set(Request::SPM_ACCESS);
+            RequestPtr req = std::make_shared<Request>(
+                line_address, cacheLineSize, flags, requestorId);
+            panic_if(!req->isSpmAccess(),
+                     "ASMC SPM acquire lost the partition flag");
+            req->taskId(context_switch_task_id::DMA);
+
+            PacketPtr pkt = new Packet(req, MemCmd::ReadExReq);
+            pkt->allocate();
+            pkt->senderState = new PacketSenderState(
+                state.id, RequestPhase::SpmAcquire, state.targetCore,
+                chunk.offset + chunk_offset, cacheLineSize, true,
+                fragment_offset, fragment_size);
+            state.pendingPackets++;
+            enqueueSpmPacket(state.targetCore, pkt);
+            chunk_offset += fragment_size;
+        }
+    }
+}
+
 uint64_t
 ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
 {
@@ -368,13 +402,15 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
 
     const uint32_t memory_packets = countPackets(memory_chunks);
     const uint32_t spm_packets = countPackets(spm_chunks);
+    const uint32_t reserved_spm_packets =
+        type == ReqType::Load ? 2 * spm_packets : spm_packets;
     const uint64_t far_occupied = farSendQueue.size() +
         (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
     const uint64_t spm_occupied = spmSendQueues[target_core].size() +
         (spmRetryPkts[target_core] ? 1 : 0) +
         reservedSpmSendSlots[target_core];
     if (far_occupied + memory_packets > maxSendQueue ||
-        spm_occupied + spm_packets > spmSendQueueSize) {
+        spm_occupied + reserved_spm_packets > spmSendQueueSize) {
         ++stats.rejectedQueueFull;
         return 0;
     }
@@ -395,7 +431,7 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     state->memoryChunks = std::move(memory_chunks);
     state->spmChunks = std::move(spm_chunks);
     state->reservedFarPackets = memory_packets;
-    state->reservedSpmPackets = spm_packets;
+    state->reservedSpmPackets = reserved_spm_packets;
 
     updateOccupancyIntegral();
     spmUsed += state->size;
@@ -404,7 +440,7 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
         outstanding.size(),
         static_cast<size_t>(stats.maxObservedOutstanding.value()));
     reservedFarSendSlots += memory_packets;
-    reservedSpmSendSlots[target_core] += spm_packets;
+    reservedSpmSendSlots[target_core] += reserved_spm_packets;
     metadataPending++;
 
     Tick service_delay = issueLatency + cyclesToTicks(metadataLatency);
@@ -569,18 +605,44 @@ ASMC::startSpmWriteback(RequestState &state)
     panic_if(state.pendingPackets != 0,
              "ASMC SPM writeback started with %u memory packets pending",
              state.pendingPackets);
+    const uint32_t acquire_packets = countPackets(state.spmChunks);
     panic_if(state.targetCore >= reservedSpmSendSlots.size() ||
-             state.reservedSpmPackets != countPackets(state.spmChunks) ||
+             state.reservedSpmPackets != 2 * acquire_packets ||
              reservedSpmSendSlots[state.targetCore] <
                 state.reservedSpmPackets,
              "ASMC invalid SPM writeback reservation for request %#llx",
              static_cast<unsigned long long>(state.id));
 
+    state.phase = RequestPhase::SpmAcquire;
+    reservedSpmSendSlots[state.targetCore] -= acquire_packets;
+    state.reservedSpmPackets -= acquire_packets;
+    enqueueSpmAcquirePackets(state);
+    scheduleSpmSend(state.targetCore, curTick());
+}
+
+void
+ASMC::startSpmLineWrites(RequestState &state)
+{
+    panic_if(state.type != ReqType::Load ||
+             state.phase != RequestPhase::SpmAcquire ||
+             state.pendingPackets != 0,
+             "ASMC invalid SPM line-write transition for request %#llx",
+             static_cast<unsigned long long>(state.id));
+    panic_if(state.spmWritebacks.empty() ||
+             state.reservedSpmPackets != state.spmWritebacks.size() ||
+             reservedSpmSendSlots[state.targetCore] <
+                state.reservedSpmPackets,
+             "ASMC invalid SPM line-write reservation for request %#llx",
+             static_cast<unsigned long long>(state.id));
+
     state.phase = RequestPhase::SpmWriteback;
     reservedSpmSendSlots[state.targetCore] -= state.reservedSpmPackets;
     state.reservedSpmPackets = 0;
-    enqueueSpmPackets(state, MemCmd::WriteReq,
-                      RequestPhase::SpmWriteback);
+    for (PacketPtr pkt : state.spmWritebacks) {
+        state.pendingPackets++;
+        enqueueSpmPacket(state.targetCore, pkt);
+    }
+    state.spmWritebacks.clear();
     scheduleSpmSend(state.targetCore, curTick());
 }
 
@@ -726,17 +788,57 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
         panic_if(state.phase != sender_state->phase,
                  "ASMC stale phase response for request %#llx",
                  static_cast<unsigned long long>(id));
+        panic_if(pkt->isError(),
+                 "ASMC error response for request %#llx",
+                 static_cast<unsigned long long>(id));
         panic_if(sender_state->size != pkt->getSize() ||
-                 sender_state->byteOffset + sender_state->size >
-                    state.data.size(),
+                 sender_state->fragmentOffset +
+                    sender_state->fragmentSize > sender_state->size ||
+                 sender_state->byteOffset +
+                    sender_state->fragmentSize > state.data.size(),
                  "ASMC response payload bounds mismatch for request %#llx",
                  static_cast<unsigned long long>(id));
         panic_if(state.pendingPackets == 0,
                  "ASMC response underflow for request %#llx",
                  static_cast<unsigned long long>(id));
+
+        if (state.phase == RequestPhase::SpmAcquire) {
+            panic_if(!sender_state->read || target_core == InvalidPortID ||
+                     sender_state->size != cacheLineSize,
+                     "ASMC invalid SPM acquire response for request %#llx",
+                     static_cast<unsigned long long>(id));
+
+            PacketPtr writeback = new Packet(
+                pkt->req, MemCmd::WriteLineReq);
+            writeback->allocate();
+            std::memcpy(writeback->getPtr<uint8_t>(),
+                        pkt->getConstPtr<uint8_t>(), cacheLineSize);
+            std::memcpy(
+                writeback->getPtr<uint8_t>() + sender_state->fragmentOffset,
+                state.data.data() + sender_state->byteOffset,
+                sender_state->fragmentSize);
+            writeback->senderState = new PacketSenderState(
+                id, RequestPhase::SpmWriteback, target_core,
+                sender_state->byteOffset, cacheLineSize, false,
+                sender_state->fragmentOffset,
+                sender_state->fragmentSize);
+            state.spmWritebacks.push_back(writeback);
+            state.pendingPackets--;
+            const bool acquired_all = state.pendingPackets == 0;
+
+            pkt->senderState = nullptr;
+            delete sender_state;
+            delete pkt;
+            if (acquired_all)
+                startSpmLineWrites(state);
+            return true;
+        }
+
         if (sender_state->read) {
             std::memcpy(state.data.data() + sender_state->byteOffset,
-                        pkt->getConstPtr<uint8_t>(), sender_state->size);
+                        pkt->getConstPtr<uint8_t>() +
+                            sender_state->fragmentOffset,
+                        sender_state->fragmentSize);
         }
         state.pendingPackets--;
 
@@ -749,7 +851,9 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
                     sender_state->phase == RequestPhase::SpmRead ?
                         "spm-read" :
                     sender_state->phase == RequestPhase::MemoryAccess ?
-                        "memory" : "spm-writeback",
+                        "memory" :
+                    sender_state->phase == RequestPhase::SpmAcquire ?
+                        "spm-acquire" : "spm-writeback",
                     static_cast<unsigned long long>(payload),
                     state.pendingPackets);
         }
@@ -816,7 +920,8 @@ ASMC::completeRequest(uint64_t id)
     RequestState &state = *it->second;
     panic_if(state.pendingPackets != 0 ||
              state.reservedFarPackets != 0 ||
-             state.reservedSpmPackets != 0,
+             state.reservedSpmPackets != 0 ||
+             !state.spmWritebacks.empty(),
              "ASMC completed request %#llx with pending packet state",
              static_cast<unsigned long long>(id));
     panic_if(state.type == ReqType::Load &&
@@ -958,6 +1063,12 @@ ASMC::reset()
         spmRetryPkts[core] = nullptr;
         spmRetryReady[core] = false;
         reservedSpmSendSlots[core] = 0;
+    }
+    for (auto &entry : outstanding) {
+        auto &state = entry.second;
+        for (PacketPtr pkt : state->spmWritebacks)
+            deleteQueuedPacket(pkt);
+        state->spmWritebacks.clear();
     }
     outstanding.clear();
     finished.clear();
