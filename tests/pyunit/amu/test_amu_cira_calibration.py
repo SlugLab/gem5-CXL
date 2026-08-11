@@ -301,6 +301,76 @@ class CalibrationRunnerTest(unittest.TestCase):
                         runner.run_collect(options)
                     run.assert_not_called()
 
+    def test_collect_rejects_dangling_output_symlinks_lexically(self):
+        for artifact in ("outdir", "collection_manifest"):
+            with self.subTest(
+                artifact=artifact
+            ), tempfile.TemporaryDirectory() as temporary:
+                options = self._collect_options(temporary)
+                link = getattr(options, artifact)
+                foreign = Path(temporary) / f"foreign-{artifact}"
+                link.symlink_to(
+                    foreign, target_is_directory=artifact == "outdir"
+                )
+                original_link = os.readlink(link)
+
+                with mock.patch.object(
+                    runner, "_git_provenance",
+                    return_value={
+                        "commit": "5" * 40,
+                        "branch": "freeze",
+                        "clean": True,
+                    },
+                ), mock.patch.object(runner.subprocess, "run") as run:
+                    with self.assertRaisesRegex(
+                        calibration.CalibrationError, "already exists"
+                    ):
+                        runner.run_collect(options)
+
+                run.assert_not_called()
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(os.readlink(link), original_link)
+                self.assertFalse(foreign.exists())
+
+    def test_collect_rejects_bidirectional_output_ancestor_collisions(self):
+        cases = (
+            "manifest_owns_outdir",
+            "measurements_owns_outdir",
+            "file_owns_file",
+        )
+        for case in cases:
+            with self.subTest(
+                case=case
+            ), tempfile.TemporaryDirectory() as temporary:
+                options = self._collect_options(temporary)
+                root = Path(temporary)
+                if case == "manifest_owns_outdir":
+                    options.collection_manifest = root / "collision"
+                    options.outdir = options.collection_manifest / "evidence"
+                elif case == "measurements_owns_outdir":
+                    options.measurements = root / "collision"
+                    options.outdir = options.measurements / "evidence"
+                else:
+                    options.measurements = root / "collision"
+                    options.collection_manifest = (
+                        options.measurements / "collection.json"
+                    )
+
+                with mock.patch.object(
+                    runner, "_git_provenance",
+                    return_value={
+                        "commit": "6" * 40,
+                        "branch": "freeze",
+                        "clean": True,
+                    },
+                ), mock.patch.object(runner.subprocess, "run") as run:
+                    with self.assertRaisesRegex(
+                        calibration.CalibrationError, "output paths overlap"
+                    ):
+                        runner.run_collect(options)
+
+                run.assert_not_called()
+
     def test_collect_atomically_rejects_concurrently_claimed_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             options = self._collect_options(temporary)

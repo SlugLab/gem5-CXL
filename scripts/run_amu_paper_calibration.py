@@ -714,7 +714,7 @@ def _collection_manifest_path(options):
         raise calibration.CalibrationError(
             "collect requires an explicit collection manifest"
         )
-    return Path(configured).resolve()
+    return Path(configured)
 
 
 def _terminal_path(manifest_path, status):
@@ -1297,34 +1297,33 @@ def run_collect(options):
         return 0
 
     git = _git_provenance()
-    manifest_path = _collection_manifest_path(options)
-    complete_path = _terminal_path(manifest_path, "complete")
-    failed_path = _terminal_path(manifest_path, "failed")
-    outdir = Path(options.outdir).resolve()
-    measurements = Path(options.measurements).resolve()
-    if (
-        outdir == manifest_path
-        or outdir in manifest_path.parents
-        or outdir == measurements
-        or outdir in measurements.parents
-    ):
-        raise calibration.CalibrationError(
-            "collection manifest and measurements must be outside evidence root"
-        )
-    targets = {
-        "evidence output directory": outdir,
-        "measurements file": measurements,
-        "collection manifest": manifest_path,
-        "complete terminal": complete_path,
-        "failed terminal": failed_path,
+    lexical_manifest = _collection_manifest_path(options)
+    lexical_targets = {
+        "evidence output directory": Path(options.outdir),
+        "measurements file": Path(options.measurements),
+        "collection manifest": lexical_manifest,
+        "complete terminal": _terminal_path(lexical_manifest, "complete"),
+        "failed terminal": _terminal_path(lexical_manifest, "failed"),
     }
-    resolved_targets = [Path(path).resolve() for path in targets.values()]
-    if len(set(resolved_targets)) != len(resolved_targets):
-        raise calibration.CalibrationError(
-            "collection output paths must be distinct"
-        )
-    for label, path in targets.items():
+    for label, path in lexical_targets.items():
         _reject_existing(path, label)
+    targets = {
+        label: path.resolve() for label, path in lexical_targets.items()
+    }
+    target_items = list(targets.items())
+    for index, (left_label, left) in enumerate(target_items):
+        for right_label, right in target_items[index + 1:]:
+            if left == right or left in right.parents or right in left.parents:
+                raise calibration.CalibrationError(
+                    "collection output paths overlap: "
+                    f"{left_label}={left} {right_label}={right}"
+                )
+
+    outdir = targets["evidence output directory"]
+    measurements = targets["measurements file"]
+    manifest_path = targets["collection manifest"]
+    complete_path = targets["complete terminal"]
+    failed_path = targets["failed terminal"]
 
     origins = _collection_origins(options)
     compiler = _compiler_identity(options.cxx)
