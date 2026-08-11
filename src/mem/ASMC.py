@@ -13,6 +13,9 @@ class ASMC(ClockedObject):
 
     system = Param.System(Parent.any, "System this ASMC belongs to")
     mem_side_port = RequestPort("Timing request port toward cache/memory")
+    spm_side_ports = VectorRequestPort(
+        "Per-core coherent private-L2 SPM ports"
+    )
 
     calibration_profile = Param.String("legacy", "Bound AMU calibration profile")
     calibration_manifest_sha256 = Param.String("", "Calibration manifest SHA-256")
@@ -29,6 +32,9 @@ class ASMC(ClockedObject):
     )
     max_send_queue = Param.Unsigned(
         512, "Maximum queued memory packets waiting for the cache port"
+    )
+    spm_send_queue_size = Param.Unsigned(
+        512, "Packets queued per SPM port"
     )
     pending_queue_entries = Param.Unsigned(32, "Entries per internal service stage")
     id_batch_entries = Param.Unsigned(32, "AMART IDs obtained per metadata refill")

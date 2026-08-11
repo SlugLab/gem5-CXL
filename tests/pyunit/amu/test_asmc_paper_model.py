@@ -63,11 +63,11 @@ class AsmcPaperModelTest(unittest.TestCase):
     def test_internal_pending_queue_does_not_replace_amart_limit(self):
         issue = SOURCE[
             SOURCE.index("ASMC::issue(ThreadContext") :
-            SOURCE.index("ASMC::startSpmWriteback")
+            SOURCE.index("ASMC::startInitialAccess")
         ]
         self.assertIn("outstanding.size() >= maxOutstanding", issue)
         self.assertIn("metadataPending >= pendingQueueEntries", issue)
-        self.assertIn("startMemoryAccess", HEADER + SOURCE)
+        self.assertIn("startInitialAccess", HEADER + SOURCE)
         self.assertIn("metadataPending--", SOURCE)
 
     def test_id_batches_refill_only_at_batch_boundary(self):
