@@ -39,6 +39,7 @@ Import('*')
 
 SimObject('PartitioningPolicies.py', sim_objects=[
     'PartitionManager',
+    'SpmPartitionManager',
     'BasePartitioningPolicy',
     'MaxCapacityPartitioningPolicy',
     'WayPolicyAllocation',
@@ -50,3 +51,4 @@ Source('max_capacity_pp.cc')
 Source('way_allocation.cc')
 Source('way_pp.cc')
 Source('partition_manager.cc')
+Source('spm_partition_manager.cc')

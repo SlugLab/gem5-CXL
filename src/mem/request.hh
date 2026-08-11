@@ -160,6 +160,9 @@ class Request : public Extensible<Request>
         /** This request is a read which will be followed by a write. */
         READ_MODIFY_WRITE           = 0x0020000000000000,
 
+        /** The request allocates in the AMU scratchpad partition. */
+        SPM_ACCESS                  = 0x0002000000000000,
+
         /** The request is a prefetch. */
         PREFETCH                    = 0x01000000,
         /** The request should be prefetched into the exclusive state. */
@@ -1020,6 +1023,7 @@ class Request : public Extensible<Request>
     bool isUncacheable() const { return _flags.isSet(UNCACHEABLE); }
     bool isStrictlyOrdered() const { return _flags.isSet(STRICT_ORDER); }
     bool isInstFetch() const { return _flags.isSet(INST_FETCH); }
+    bool isSpmAccess() const { return _flags.isSet(SPM_ACCESS); }
     bool hasNoAddr() const { return _flags.isSet(HAS_NO_ADDR); }
     bool
     isPrefetch() const

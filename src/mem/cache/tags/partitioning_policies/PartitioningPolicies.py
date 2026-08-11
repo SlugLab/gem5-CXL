@@ -54,6 +54,18 @@ class PartitionManager(SimObject):
     )
 
 
+class SpmPartitionManager(PartitionManager):
+    type = "SpmPartitionManager"
+    cxx_header = (
+        "mem/cache/tags/partitioning_policies/spm_partition_manager.hh"
+    )
+    cxx_class = "gem5::partitioning_policy::SpmPartitionManager"
+
+    spm_partition_id = Param.UInt64(
+        1, "Partition ID selected by SPM_ACCESS requests"
+    )
+
+
 class BasePartitioningPolicy(SimObject):
     type = "BasePartitioningPolicy"
     cxx_header = "mem/cache/tags/partitioning_policies/base_pp.hh"
