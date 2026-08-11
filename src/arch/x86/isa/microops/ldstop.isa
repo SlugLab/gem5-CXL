@@ -612,8 +612,11 @@ let {{
                             { "code": code,
                               "complete_code": completeCode,
                               "ea_code": calculateEA,
-                              "memDataSize": "dataSize",
-                              "memDataArg": "Mem" if has_data else "nullptr" })
+                              "memDataSize": "dataSize" })
+        # Template-only values must not be part of the snippets dictionary:
+        # InstObjParams scans every snippet for operands, and treating the
+        # standalone string "Mem" as code incorrectly marks stores as loads.
+        iop.memDataArg = "Mem" if has_data else "nullptr"
         header_output += MicroLdStOpDeclare.subst(iop)
         exec_output += MicroStoreExecute.subst(iop)
         exec_output += MicroStoreInitiateAcc.subst(iop)
@@ -684,8 +687,8 @@ let {{
                             { "code": code,
                               "complete_code": completeCode,
                               "ea_code": calculateEA,
-                              "memDataSize": "2 * dataSize",
-                              "memDataArg": "Mem_u2qw" })
+                              "memDataSize": "2 * dataSize" })
+        iop.memDataArg = "Mem"
 
         header_output += MicroLdStSplitOpDeclare.subst(iop)
         decoder_output += MicroLdStSplitOpConstructor.subst(iop)
