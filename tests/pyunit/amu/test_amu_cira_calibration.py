@@ -273,16 +273,111 @@ class CalibrationRunnerTest(unittest.TestCase):
                         runner.run_collect(options)
                     run.assert_not_called()
 
+    def test_collect_does_not_overwrite_manifest_created_by_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            plan = runner.collect_plan(options)
+            foreign_manifest = b"created concurrently by proxy build\n"
+            simulations = []
+
+            def fake_run(command, **kwargs):
+                if command == plan["build"]:
+                    binary = Path(command[-1])
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"frozen proxy binary\n")
+                    options.collection_manifest.write_bytes(foreign_manifest)
+                else:
+                    simulations.append(command)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "e" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object(
+                runner.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                runner, "_materialize_register_checksum"
+            ), mock.patch.object(
+                runner,
+                "_measurement_rows",
+                return_value=calibration.paper_measurements_for_test(),
+            ):
+                with self.assertRaisesRegex(
+                    calibration.CalibrationError,
+                    "collection manifest already exists",
+                ):
+                    runner.run_collect(options)
+
+            self.assertEqual(
+                options.collection_manifest.read_bytes(), foreign_manifest
+            )
+            self.assertEqual(simulations, [])
+
+    def test_collect_does_not_overwrite_measurements_created_during_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            plan = runner.collect_plan(options)
+            foreign_measurements = b"created concurrently during collection\n"
+            simulations = 0
+
+            def fake_run(command, **kwargs):
+                nonlocal simulations
+                if command == plan["build"]:
+                    binary = Path(command[-1])
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"frozen proxy binary\n")
+                else:
+                    simulations += 1
+                    if simulations == 36:
+                        options.measurements.write_bytes(foreign_measurements)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "f" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object(
+                runner.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                runner, "_materialize_register_checksum"
+            ), mock.patch.object(
+                runner,
+                "_measurement_rows",
+                return_value=calibration.paper_measurements_for_test(),
+            ):
+                with self.assertRaisesRegex(
+                    calibration.CalibrationError,
+                    "measurements file already exists",
+                ):
+                    runner.run_collect(options)
+
+            self.assertEqual(
+                options.measurements.read_bytes(), foreign_measurements
+            )
+            manifest = runner.load_json(options.collection_manifest)
+            self.assertEqual(manifest["status"], "failed")
+            self.assertIn(
+                "measurements file already exists",
+                manifest["failure_reason"],
+            )
+
     def test_collect_freezes_and_completes_manifest_after_input_rehash(self):
         with tempfile.TemporaryDirectory() as temporary:
             options = self._collect_options(temporary)
             seen_statuses = []
             real_atomic_write = runner.atomic_write_json
 
-            def record_manifest(path, value):
+            def record_manifest(path, value, **kwargs):
                 if Path(path) == options.collection_manifest:
                     seen_statuses.append(value["status"])
-                real_atomic_write(path, value)
+                real_atomic_write(path, value, **kwargs)
 
             def fake_run(command, **kwargs):
                 if command == runner.collect_plan(options)["build"]:

@@ -51,7 +51,19 @@ M5SUM_RE = re.compile(
 )
 
 
-def atomic_write_json(path, value):
+def _publish_temporary(temporary, path, *, replace, label):
+    if replace:
+        os.replace(temporary, path)
+        return
+    try:
+        os.link(temporary, path)
+    except FileExistsError as error:
+        raise calibration.CalibrationError(
+            f"{label} already exists: {path}"
+        ) from error
+
+
+def atomic_write_json(path, value, *, replace=True, label="JSON file"):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(
@@ -66,7 +78,9 @@ def atomic_write_json(path, value):
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _publish_temporary(
+            temporary, path, replace=replace, label=label
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -82,7 +96,9 @@ def load_json(path):
     return value
 
 
-def write_measurements(path, rows):
+def write_measurements(
+    path, rows, *, replace=True, label="measurements file"
+):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -102,7 +118,9 @@ def write_measurements(path, rows):
                 writer.writerow({field: row[field] for field in MEASUREMENT_FIELDS})
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _publish_temporary(
+            temporary, path, replace=replace, label=label
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1161,7 +1179,13 @@ def run_collect(options):
         raise calibration.CalibrationError(
             "collection plan does not contain exactly 36 simulations"
         )
-    atomic_write_json(manifest_path, manifest)
+    _reject_existing(manifest_path, "collection manifest")
+    atomic_write_json(
+        manifest_path,
+        manifest,
+        replace=False,
+        label="collection manifest",
+    )
     frozen_manifest_sha256 = calibration.sha256_file(manifest_path)
 
     completed_runs = 0
@@ -1190,7 +1214,8 @@ def run_collect(options):
             )
         _verify_collection_inputs(inputs)
         _verify_collection_manifest(manifest_path, frozen_manifest_sha256)
-        write_measurements(measurements, rows)
+        _reject_existing(measurements, "measurements file")
+        write_measurements(measurements, rows, replace=False)
         manifest["status"] = "complete"
         manifest["timestamps"]["completed_utc"] = _utc_now()
         manifest["actual"] = {
