@@ -25,6 +25,9 @@ from m5.objects import (
     NoncoherentXBar,
     NULL,
     SerialLink,
+    SpmPartitionManager,
+    WayPartitioningPolicy,
+    WayPolicyAllocation,
 )
 
 from gapbs_roi_state import (
@@ -117,6 +120,38 @@ def load_amu_calibration(path):
     return profile, sha256_file(path)
 
 
+def configure_amu_l2_spm(l2):
+    if int(l2.assoc) != 8:
+        raise RuntimeError("calibrated AMU requires an exactly 8-way private L2")
+    l2.partitioning_manager = SpmPartitionManager(
+        partitioning_policies=[
+            WayPartitioningPolicy(
+                allocations=[
+                    WayPolicyAllocation(
+                        partition_id=0, ways=[0, 1, 2, 3, 4, 5]
+                    ),
+                    WayPolicyAllocation(partition_id=1, ways=[6, 7]),
+                ]
+            )
+        ],
+        spm_partition_id=1,
+    )
+
+
+def validate_amu_spm_cardinality(num_cores, num_l2_buses):
+    if num_l2_buses != num_cores:
+        raise RuntimeError(
+            "calibrated AMU requires one private L2 bus per timing core: "
+            f"cores={num_cores}, l2_buses={num_l2_buses}"
+        )
+
+
+def connect_asmc_spm_ports(asmc, l2buses, num_cores):
+    validate_amu_spm_cardinality(num_cores, len(l2buses))
+    for l2bus in l2buses:
+        asmc.spm_side_ports = l2bus.cpu_side_ports
+
+
 class TunablePrivateL1PrivateL2CacheHierarchy(PrivateL1PrivateL2CacheHierarchy):
     def __init__(
         self,
@@ -126,6 +161,8 @@ class TunablePrivateL1PrivateL2CacheHierarchy(PrivateL1PrivateL2CacheHierarchy):
         l1_tgts_per_mshr=None,
         l2_mshrs=None,
         l2_tgts_per_mshr=None,
+        l2_assoc=None,
+        amu_l2_spm_partition=False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -134,6 +171,8 @@ class TunablePrivateL1PrivateL2CacheHierarchy(PrivateL1PrivateL2CacheHierarchy):
         self._l1_tgts_per_mshr = l1_tgts_per_mshr
         self._l2_mshrs = l2_mshrs
         self._l2_tgts_per_mshr = l2_tgts_per_mshr
+        self._l2_assoc_override = l2_assoc
+        self._amu_l2_spm_partition = amu_l2_spm_partition
 
     def incorporate_cache(self, board):
         super().incorporate_cache(board)
@@ -142,6 +181,10 @@ class TunablePrivateL1PrivateL2CacheHierarchy(PrivateL1PrivateL2CacheHierarchy):
             l1i = getattr(self, f"l1i-cache-{idx}")
             l1d = getattr(self, f"l1d-cache-{idx}")
             l2 = getattr(self, f"l2-cache-{idx}")
+            if self._l2_assoc_override is not None:
+                l2.assoc = self._l2_assoc_override
+            if self._amu_l2_spm_partition:
+                configure_amu_l2_spm(l2)
             for cache in (l1i, l1d):
                 if self._disable_hw_prefetchers:
                     cache.prefetcher = NULL
@@ -165,6 +208,7 @@ class CXLSimpleBoard(SimpleBoard):
         cxl_args=None,
         cxl_latency_monitor=False,
         cira_to_l2=False,
+        amu_l2_spm_partition=False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -176,6 +220,9 @@ class CXLSimpleBoard(SimpleBoard):
         object.__setattr__(self, "_cxl_mem_ports", None)
         object.__setattr__(self, "_cxl_device_xbars", [])
         object.__setattr__(self, "_cira_to_l2", cira_to_l2)
+        object.__setattr__(
+            self, "_amu_l2_spm_partition", amu_l2_spm_partition
+        )
 
     def get_mem_ports(self):
         if not self._cxl_memory:
@@ -215,6 +262,18 @@ class CXLSimpleBoard(SimpleBoard):
 
     def _connect_things(self):
         super()._connect_things()
+        asmc = getattr(self, "asmc", None)
+        if asmc is not None:
+            if not hasattr(self.cache_hierarchy, "l2buses"):
+                raise RuntimeError(
+                    "ASMC coherent SPM requires private per-core L2 buses"
+                )
+            connect_asmc_spm_ports(
+                asmc,
+                self.cache_hierarchy.l2buses,
+                self.get_processor().get_num_cores(),
+            )
+
         cira = getattr(self, "cira", None)
         if cira is None:
             return
@@ -374,6 +433,8 @@ else:
         f"profile={args.asmc_profile} manifest_sha256={amu_manifest_sha256}"
     )
 
+amu_l2_spm_partition = args.asmc_profile != "legacy"
+
 if args.fast_forward_cpu and not args.roi_work_events:
     parser.error("--fast-forward-cpu requires --roi-work-events")
 if args.fast_forward_cpu and args.cpu != "timing":
@@ -437,6 +498,8 @@ else:
         l1_tgts_per_mshr=args.l1_tgts_per_mshr,
         l2_mshrs=args.l2_mshrs,
         l2_tgts_per_mshr=args.l2_tgts_per_mshr,
+        l2_assoc=8 if amu_l2_spm_partition else None,
+        amu_l2_spm_partition=amu_l2_spm_partition,
     )
 memory = SingleChannelDDR4_2400(size=args.mem_size)
 if args.fast_forward_cpu:
@@ -469,6 +532,7 @@ board = CXLSimpleBoard(
     },
     cxl_latency_monitor=args.cxl_latency_monitor,
     cira_to_l2=args.cira_to_l2,
+    amu_l2_spm_partition=amu_l2_spm_partition,
 )
 board.m5ops_base = 0xFFFF0000
 
