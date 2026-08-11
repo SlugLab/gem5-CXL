@@ -155,7 +155,7 @@ class CalibrationRunnerTest(unittest.TestCase):
         for token in (
             'workload == "gups"',
             'workload == "hj"',
-            'workload == "stream"',
+            'workload != "stream"',
             "kHashBuckets = 16000",
             "static_assert(sizeof(HashNode) == 48",
             "kStreamGranularity = 512",
@@ -163,7 +163,12 @@ class CalibrationRunnerTest(unittest.TestCase):
             "m5_work_end",
             "amu_aload",
             "amu_astore",
+            "prepareAndPrime",
+            "runKernel",
+            "checksum",
             "PROXY_CHECKSUM",
+            "kChecksumMagic = 0x414d5531",
+            "m5_sum",
         ):
             self.assertIn(token, source)
 
@@ -198,6 +203,7 @@ class CalibrationRunnerTest(unittest.TestCase):
                 self.assertIn("--cores", command)
                 self.assertIn("--cxl-memory", command)
                 self.assertIn("--roi-work-events", command)
+                self.assertIn("--debug-flags=PseudoInst", command)
                 self.assertIn("--disable-hw-prefetchers", command)
                 self.assertIn("64KiB", command)
                 self.assertIn(run["latency"], command)
@@ -205,6 +211,36 @@ class CalibrationRunnerTest(unittest.TestCase):
                     self.assertIn("--no-asmc", command)
                 else:
                     self.assertNotIn("--no-asmc", command)
+
+    def test_register_checksum_transport_is_tagged_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            raw = run_dir / "checksum.u64"
+            record = {
+                "run_dir": str(run_dir),
+                "raw": str(raw),
+                "workload": "stream",
+                "kind": "amu",
+            }
+            marker = (
+                "7: global: pseudo_inst::m5sum(0xb0232525, "
+                "0x6b7b0b31, 0x414d5531, 0x3, 0x1, 0)\n"
+            )
+            (run_dir / "gem5.log").write_text(marker, encoding="utf-8")
+            self.assertEqual(
+                runner._materialize_register_checksum(record),
+                "6b7b0b31b0232525",
+            )
+            self.assertEqual(
+                raw.read_bytes(), bytes.fromhex("252523b0310b7b6b")
+            )
+
+            for bad in (marker + marker, marker.replace("0x3", "0x2", 1)):
+                (run_dir / "gem5.log").write_text(bad, encoding="utf-8")
+                with self.assertRaises(calibration.CalibrationError):
+                    runner._materialize_register_checksum(record)
 
     def test_fit_cli_writes_hash_bound_deterministic_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

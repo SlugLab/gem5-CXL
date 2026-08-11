@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -39,6 +40,11 @@ WORKLOADS = ("gups", "hj", "stream")
 LATENCIES = ("0.1us", "0.2us", "0.5us", "1us", "2us", "5us")
 REPO = Path(__file__).resolve().parents[1]
 PROXY_SOURCE = REPO / "util/amu/amu_paper_profile.cc"
+CHECKSUM_MAGIC = 0x414D5531
+WORKLOAD_TAGS = {"gups": 1, "hj": 2, "stream": 3}
+M5SUM_RE = re.compile(
+    r"m5sum\(" + r",\s*".join([r"(0x[0-9a-fA-F]+|0)"] * 6) + r"\)"
+)
 
 
 def atomic_write_json(path, value):
@@ -351,6 +357,7 @@ def collect_plan(options):
                 )
                 command = [
                     str(options.gem5),
+                    "--debug-flags=PseudoInst",
                     f"--outdir={run_dir}",
                     str(options.config),
                     "--binary",
@@ -400,6 +407,55 @@ def collect_plan(options):
                     }
                 )
     return {"build": build, "binary": str(binary), "runs": runs}
+
+
+def _materialize_register_checksum(record):
+    log_path = Path(record["run_dir"]) / "gem5.log"
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="strict")
+    except OSError as error:
+        raise calibration.CalibrationError(
+            f"cannot read checksum transport log {log_path}"
+        ) from error
+    markers = []
+    for match in M5SUM_RE.finditer(text):
+        values = tuple(int(value, 0) for value in match.groups())
+        if values[2] == CHECKSUM_MAGIC:
+            markers.append(values)
+    if len(markers) != 1:
+        raise calibration.CalibrationError(
+            f"expected one register checksum marker in {log_path}, "
+            f"got {len(markers)}"
+        )
+    low, high, _, workload_tag, kind_tag, reserved = markers[0]
+    expected_workload = WORKLOAD_TAGS[record["workload"]]
+    expected_kind = 1 if record["kind"] == "amu" else 0
+    if (
+        low > 0xFFFFFFFF
+        or high > 0xFFFFFFFF
+        or workload_tag != expected_workload
+        or kind_tag != expected_kind
+        or reserved != 0
+    ):
+        raise calibration.CalibrationError(
+            f"register checksum marker metadata mismatch in {log_path}"
+        )
+    payload = struct.pack("<Q", (high << 32) | low)
+    raw_path = Path(record["raw"])
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{raw_path.name}.", dir=raw_path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, raw_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return f"{(high << 32) | low:016x}"
 
 
 def _require_file(path, label):
@@ -511,6 +567,7 @@ def run_collect(options):
             subprocess.run(
                 record["command"], stdout=log, stderr=subprocess.STDOUT, check=True
             )
+        _materialize_register_checksum(record)
     write_measurements(options.measurements, _measurement_rows(plan))
     print(f"AMU_PAPER_COLLECTION_PASS measurements={options.measurements}")
     return 0
