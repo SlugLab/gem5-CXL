@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -709,9 +710,18 @@ def _git_provenance(repo=REPO):
 
 def _collection_manifest_path(options):
     configured = getattr(options, "collection_manifest", None)
-    if configured is not None:
-        return Path(configured)
-    return Path(options.outdir) / "collection_manifest.json"
+    if configured is None:
+        raise calibration.CalibrationError(
+            "collect requires an explicit collection manifest"
+        )
+    return Path(configured).resolve()
+
+
+def _terminal_path(manifest_path, status):
+    manifest_path = Path(manifest_path)
+    return manifest_path.with_name(
+        f"{manifest_path.stem}.{status}{manifest_path.suffix}"
+    )
 
 
 def _reject_existing(path, label):
@@ -720,39 +730,108 @@ def _reject_existing(path, label):
         raise calibration.CalibrationError(f"{label} already exists: {path}")
 
 
-def _collection_input_manifest(options, proxy=None):
-    inputs = {}
+def _collection_origins(options):
     sources = (
         ("gem5", options.gem5, "gem5 binary"),
         ("config", options.config, "gem5 config"),
+        (
+            "gapbs_roi_state",
+            Path(options.config).parent / "gapbs_roi_state.py",
+            "GAPBS ROI state dependency",
+        ),
         ("m5_library", options.m5_library, "m5 library"),
         ("amu_pdf", options.pdf, "AMU PDF"),
         ("cira_csv", options.cira_csv, "hardware CSV"),
     )
-    if proxy is not None:
-        sources = (*sources, ("proxy", proxy, "proxy binary"))
+    inputs = {}
     for key, path, label in sources:
         resolved = _require_file(path, label).resolve()
         inputs[key] = {
-            "path": str(resolved),
-            "sha256": calibration.sha256_file(resolved),
+            "origin_path": str(resolved),
+            "origin_sha256": calibration.sha256_file(resolved),
         }
     return inputs
 
 
+def _compiler_identity(value):
+    candidate = shutil.which(str(value))
+    if candidate is None:
+        path = Path(value).expanduser()
+        candidate = str(path) if path.is_file() else None
+    if candidate is None:
+        raise calibration.CalibrationError(f"cannot resolve compiler: {value}")
+    path = _require_file(candidate, "compiler").resolve()
+    if not os.access(path, os.X_OK):
+        raise calibration.CalibrationError(f"compiler is not executable: {path}")
+    return {
+        "path": str(path),
+        "sha256": calibration.sha256_file(path),
+    }
+
+
+def _claim_evidence_root(path):
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(exist_ok=False)
+    except FileExistsError as error:
+        raise calibration.CalibrationError(
+            f"evidence root already exists: {path}"
+        ) from error
+    return path
+
+
+def _snapshot_collection_inputs(origins, outdir):
+    names = {
+        "gem5": "gem5",
+        "config": "config.py",
+        "gapbs_roi_state": "gapbs_roi_state.py",
+        "m5_library": "libm5.a",
+        "amu_pdf": "amu.pdf",
+        "cira_csv": "hardware.csv",
+    }
+    directory = Path(outdir) / "inputs"
+    directory.mkdir()
+    snapshots = {}
+    for key, origin in origins.items():
+        source = Path(origin["origin_path"])
+        destination = (directory / names[key]).resolve()
+        shutil.copyfile(source, destination)
+        current_hash = calibration.sha256_file(source)
+        if current_hash != origin["origin_sha256"]:
+            raise calibration.CalibrationError(
+                f"collection origin changed while snapshotting: {key}"
+            )
+        destination.chmod(0o555 if key == "gem5" else 0o444)
+        snapshots[key] = {
+            **origin,
+            "frozen_path": str(destination),
+            "frozen_sha256": calibration.sha256_file(destination),
+        }
+    return snapshots
+
+
 def _verify_collection_inputs(inputs):
     for key, frozen in inputs.items():
-        if not isinstance(frozen, dict) or set(frozen) != {"path", "sha256"}:
+        required = {
+            "origin_path",
+            "origin_sha256",
+            "frozen_path",
+            "frozen_sha256",
+        }
+        if not isinstance(frozen, dict) or set(frozen) != required:
             raise calibration.CalibrationError(
                 f"invalid frozen collection input: {key}"
             )
-        path = _require_file(frozen["path"], f"frozen {key}").resolve()
+        path = _require_file(
+            frozen["frozen_path"], f"frozen {key}"
+        ).resolve()
         if (
-            str(path) != frozen["path"]
-            or calibration.sha256_file(path) != frozen["sha256"]
+            str(path) != frozen["frozen_path"]
+            or calibration.sha256_file(path) != frozen["frozen_sha256"]
         ):
             raise calibration.CalibrationError(
-                f"collection input changed: {key}"
+                f"frozen input changed: {key}"
             )
 
 
@@ -773,8 +852,43 @@ def _utc_now():
     )
 
 
-def _collection_manifest(options, plan, git, inputs, manifest_path):
+def _host_information():
     uname = platform.uname()
+    return {
+        "hostname": socket.gethostname(),
+        "platform": f"{uname.system}-{uname.release}-{uname.machine}",
+        "machine": uname.machine,
+        "python": platform.python_version(),
+    }
+
+
+def _owner_manifest(options, git, origins, compiler, manifest_path):
+    return {
+        "schema": "amu-paper-calibration-owner",
+        "version": 1,
+        "status": "claimed",
+        "git": git,
+        "origins": origins,
+        "compiler": compiler,
+        "host": _host_information(),
+        "claimed_utc": _utc_now(),
+        "outputs": {
+            "outdir": str(Path(options.outdir).resolve()),
+            "measurements": str(Path(options.measurements).resolve()),
+            "collection_manifest": str(Path(manifest_path).resolve()),
+            "complete_terminal": str(
+                _terminal_path(manifest_path, "complete").resolve()
+            ),
+            "failed_terminal": str(
+                _terminal_path(manifest_path, "failed").resolve()
+            ),
+        },
+    }
+
+
+def _collection_manifest(
+    options, plan, git, inputs, compiler, manifest_path, execution_cwd
+):
     runs = [
         {
             "workload": record["workload"],
@@ -782,6 +896,7 @@ def _collection_manifest(options, plan, git, inputs, manifest_path):
             "kind": record["kind"],
             "run_dir": str(Path(record["run_dir"]).resolve()),
             "argv": list(record["command"]),
+            "cwd": str(execution_cwd),
         }
         for record in plan["runs"]
     ]
@@ -791,26 +906,57 @@ def _collection_manifest(options, plan, git, inputs, manifest_path):
         "status": "in_progress",
         "git": git,
         "inputs": inputs,
+        "compiler": compiler,
         "plan": {
             "build_argv": list(plan["build"]),
+            "build_cwd": str(execution_cwd),
             "runs": runs,
             "expected_simulations": len(WORKLOADS) * len(LATENCIES) * 2,
             "expected_measurement_rows": len(WORKLOADS) * len(LATENCIES),
         },
-        "host": {
-            "hostname": socket.gethostname(),
-            "platform": f"{uname.system}-{uname.release}-{uname.machine}",
-            "machine": uname.machine,
-            "python": platform.python_version(),
-        },
+        "host": _host_information(),
         "timestamps": {"started_utc": _utc_now()},
         "outputs": {
             "outdir": str(Path(options.outdir).resolve()),
             "measurements": str(Path(options.measurements).resolve()),
             "collection_manifest": str(Path(manifest_path).resolve()),
+            "complete_terminal": str(
+                _terminal_path(manifest_path, "complete").resolve()
+            ),
+            "failed_terminal": str(
+                _terminal_path(manifest_path, "failed").resolve()
+            ),
         },
-        "actual": {"completed_simulations": 0, "measurement_rows": 0},
     }
+
+
+def _terminal_record(
+    status,
+    immutable_path,
+    immutable_sha256,
+    completed_simulations,
+    measurement_rows,
+    failure_reason=None,
+):
+    record = {
+        "schema": "amu-paper-calibration-terminal",
+        "version": 1,
+        "status": status,
+        "terminal_utc": _utc_now(),
+        "failure_reason": failure_reason,
+        "immutable_manifest_path": str(Path(immutable_path).resolve()),
+        "immutable_manifest_sha256": immutable_sha256,
+        "actual": {
+            "completed_simulations": completed_simulations,
+            "measurement_rows": measurement_rows,
+        },
+    }
+    return record
+
+
+def _publish_terminal(path, record, label):
+    _reject_existing(path, label)
+    atomic_write_json(path, record, replace=False, label=label)
 
 
 def _verify_execution_input_manifest(inputs):
@@ -1145,21 +1291,34 @@ def _measurement_rows(plan):
 
 
 def run_collect(options):
-    plan = collect_plan(options)
     if options.dry_run:
+        plan = collect_plan(options)
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
 
     git = _git_provenance()
     manifest_path = _collection_manifest_path(options)
-    outdir = Path(options.outdir)
-    measurements = Path(options.measurements)
+    complete_path = _terminal_path(manifest_path, "complete")
+    failed_path = _terminal_path(manifest_path, "failed")
+    outdir = Path(options.outdir).resolve()
+    measurements = Path(options.measurements).resolve()
+    if (
+        outdir == manifest_path
+        or outdir in manifest_path.parents
+        or outdir == measurements
+        or outdir in measurements.parents
+    ):
+        raise calibration.CalibrationError(
+            "collection manifest and measurements must be outside evidence root"
+        )
     targets = {
         "evidence output directory": outdir,
         "measurements file": measurements,
         "collection manifest": manifest_path,
+        "complete terminal": complete_path,
+        "failed terminal": failed_path,
     }
-    resolved_targets = [path.resolve() for path in targets.values()]
+    resolved_targets = [Path(path).resolve() for path in targets.values()]
     if len(set(resolved_targets)) != len(resolved_targets):
         raise calibration.CalibrationError(
             "collection output paths must be distinct"
@@ -1167,31 +1326,82 @@ def run_collect(options):
     for label, path in targets.items():
         _reject_existing(path, label)
 
-    prebuild_inputs = _collection_input_manifest(options)
-    Path(plan["binary"]).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(plan["build"], check=True)
-    _verify_collection_inputs(prebuild_inputs)
-    inputs = _collection_input_manifest(options, plan["binary"])
-    manifest = _collection_manifest(
-        options, plan, git, inputs, manifest_path
+    origins = _collection_origins(options)
+    compiler = _compiler_identity(options.cxx)
+    outdir = _claim_evidence_root(outdir)
+    options.outdir = outdir
+    owner_path = outdir / "collection-owner.json"
+    owner = _owner_manifest(
+        options, git, origins, compiler, manifest_path
     )
-    if len(plan["runs"]) != manifest["plan"]["expected_simulations"]:
-        raise calibration.CalibrationError(
-            "collection plan does not contain exactly 36 simulations"
-        )
-    _reject_existing(manifest_path, "collection manifest")
     atomic_write_json(
-        manifest_path,
-        manifest,
-        replace=False,
-        label="collection manifest",
+        owner_path, owner, replace=False, label="collection owner"
     )
-    frozen_manifest_sha256 = calibration.sha256_file(manifest_path)
-
+    owner_path.chmod(0o444)
+    immutable_path = owner_path
+    immutable_sha256 = calibration.sha256_file(owner_path)
     completed_runs = 0
+    measurement_rows = 0
     rows = []
+
     try:
+        inputs = _snapshot_collection_inputs(origins, outdir)
+        execution_options = argparse.Namespace(**vars(options))
+        execution_options.gem5 = Path(inputs["gem5"]["frozen_path"])
+        execution_options.config = Path(inputs["config"]["frozen_path"])
+        execution_options.m5_library = Path(
+            inputs["m5_library"]["frozen_path"]
+        )
+        execution_options.pdf = Path(inputs["amu_pdf"]["frozen_path"])
+        execution_options.cira_csv = Path(inputs["cira_csv"]["frozen_path"])
+        execution_options.cxx = compiler["path"]
+        execution_options.outdir = outdir
+        plan = collect_plan(execution_options)
+        if len(plan["runs"]) != len(WORKLOADS) * len(LATENCIES) * 2:
+            raise calibration.CalibrationError(
+                "collection plan does not contain exactly 36 simulations"
+            )
+        execution_cwd = REPO.resolve()
+        Path(plan["binary"]).parent.mkdir()
+        _verify_collection_inputs(inputs)
+        subprocess.run(
+            plan["build"], check=True, cwd=str(execution_cwd)
+        )
+        _verify_collection_inputs(inputs)
+        proxy = _require_file(plan["binary"], "proxy binary").resolve()
+        proxy.chmod(0o555)
+        inputs["proxy"] = {
+            "origin_path": str(PROXY_SOURCE.resolve()),
+            "origin_sha256": calibration.sha256_file(PROXY_SOURCE),
+            "frozen_path": str(proxy),
+            "frozen_sha256": calibration.sha256_file(proxy),
+        }
+        _verify_collection_inputs(inputs)
+        manifest = _collection_manifest(
+            execution_options,
+            plan,
+            git,
+            inputs,
+            compiler,
+            manifest_path,
+            execution_cwd,
+        )
+        _reject_existing(manifest_path, "collection manifest")
+        atomic_write_json(
+            manifest_path,
+            manifest,
+            replace=False,
+            label="collection manifest",
+        )
+        manifest_path.chmod(0o444)
+        immutable_path = manifest_path
+        immutable_sha256 = calibration.sha256_file(manifest_path)
+
         for record in plan["runs"]:
+            _verify_collection_inputs(inputs)
+            _verify_collection_manifest(
+                manifest_path, immutable_sha256
+            )
             run_dir = Path(record["run_dir"])
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "command.txt").write_text(
@@ -1200,11 +1410,13 @@ def run_collect(options):
             with (run_dir / "gem5.log").open("w", encoding="utf-8") as log:
                 subprocess.run(
                     record["command"], stdout=log,
-                    stderr=subprocess.STDOUT, check=True
+                    stderr=subprocess.STDOUT, check=True,
+                    cwd=str(execution_cwd),
                 )
             _materialize_register_checksum(record)
+            _verify_collection_inputs(inputs)
             _verify_collection_manifest(
-                manifest_path, frozen_manifest_sha256
+                manifest_path, immutable_sha256
             )
             completed_runs += 1
         rows = _measurement_rows(plan)
@@ -1213,30 +1425,39 @@ def run_collect(options):
                 "collection did not produce exactly 18 measurement rows"
             )
         _verify_collection_inputs(inputs)
-        _verify_collection_manifest(manifest_path, frozen_manifest_sha256)
+        _verify_collection_manifest(manifest_path, immutable_sha256)
         _reject_existing(measurements, "measurements file")
         write_measurements(measurements, rows, replace=False)
-        manifest["status"] = "complete"
-        manifest["timestamps"]["completed_utc"] = _utc_now()
-        manifest["actual"] = {
-            "completed_simulations": completed_runs,
-            "measurement_rows": len(rows),
-        }
-        atomic_write_json(manifest_path, manifest)
+        measurement_rows = len(rows)
+        _verify_collection_inputs(inputs)
+        _verify_collection_manifest(manifest_path, immutable_sha256)
+        complete = _terminal_record(
+            "complete",
+            immutable_path,
+            immutable_sha256,
+            completed_runs,
+            measurement_rows,
+        )
+        _publish_terminal(complete_path, complete, "complete terminal")
     except Exception as error:
-        manifest["status"] = "failed"
-        manifest["failure_reason"] = f"{type(error).__name__}: {error}"
-        manifest["timestamps"]["failed_utc"] = _utc_now()
-        manifest["actual"] = {
-            "completed_simulations": completed_runs,
-            "measurement_rows": len(rows),
-        }
+        reason = f"{type(error).__name__}: {error}"
+        failed = _terminal_record(
+            "failed",
+            immutable_path,
+            immutable_sha256,
+            completed_runs,
+            measurement_rows,
+            failure_reason=reason,
+        )
         try:
-            atomic_write_json(manifest_path, manifest)
+            _publish_terminal(failed_path, failed, "failed terminal")
         except Exception:
             pass
         raise
-    print(f"AMU_PAPER_COLLECTION_PASS measurements={options.measurements}")
+    print(
+        "AMU_PAPER_COLLECTION_PASS "
+        f"measurements={measurements} terminal={complete_path}"
+    )
     return 0
 
 
@@ -1252,7 +1473,7 @@ def parse_args(argv=None):
     collect.add_argument("--cxx", default=os.environ.get("CXX", "g++"))
     collect.add_argument("--outdir", type=Path, required=True)
     collect.add_argument("--measurements", type=Path, required=True)
-    collect.add_argument("--collection-manifest", type=Path)
+    collect.add_argument("--collection-manifest", type=Path, required=True)
     collect.add_argument("--iterations", type=int, default=1)
     collect.add_argument("--dry-run", action="store_true")
     gate = subparsers.add_parser("gate")
