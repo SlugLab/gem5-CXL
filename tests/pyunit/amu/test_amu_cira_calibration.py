@@ -3,9 +3,12 @@
 
 import math
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from scripts import amu_cira_calibration as calibration
 from scripts import run_amu_paper_calibration as runner
@@ -150,6 +153,285 @@ class CalibrationFitTest(unittest.TestCase):
 
 
 class CalibrationRunnerTest(unittest.TestCase):
+    def _collect_options(self, root):
+        root = Path(root)
+        inputs = root / "inputs"
+        inputs.mkdir()
+        paths = {}
+        for name in (
+            "gem5",
+            "config.py",
+            "libm5.a",
+            "paper.pdf",
+            "hardware.csv",
+        ):
+            path = inputs / name
+            path.write_bytes(f"frozen {name}\n".encode("utf-8"))
+            paths[name] = path
+        return SimpleNamespace(
+            command="collect",
+            gem5=paths["gem5"],
+            config=paths["config.py"],
+            m5_library=paths["libm5.a"],
+            pdf=paths["paper.pdf"],
+            cira_csv=paths["hardware.csv"],
+            cxx="g++",
+            outdir=root / "evidence",
+            measurements=root / "measurements.csv",
+            collection_manifest=root / "collection.json",
+            iterations=1,
+            dry_run=False,
+        )
+
+    def test_collect_cli_requires_pdf_and_hardware_csv(self):
+        common = [
+            "collect",
+            "--gem5",
+            "gem5.opt",
+            "--config",
+            "config.py",
+            "--m5-library",
+            "libm5.a",
+            "--outdir",
+            "evidence",
+            "--measurements",
+            "measurements.csv",
+        ]
+        with self.assertRaises(SystemExit):
+            runner.parse_args(common)
+        parsed = runner.parse_args(
+            [*common, "--pdf", "paper.pdf", "--cira-csv", "hardware.csv"]
+        )
+        self.assertEqual(parsed.pdf, Path("paper.pdf"))
+        self.assertEqual(parsed.cira_csv, Path("hardware.csv"))
+
+    def test_git_provenance_captures_clean_commit_and_rejects_dirty_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "freeze-test"], cwd=repo,
+                check=True, stdout=subprocess.DEVNULL
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Calibration Test"],
+                cwd=repo, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=repo, check=True
+            )
+            tracked = repo / "tracked"
+            tracked.write_text("frozen\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "freeze"], cwd=repo,
+                check=True, stdout=subprocess.DEVNULL
+            )
+            expected_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo,
+                check=True, text=True, stdout=subprocess.PIPE
+            ).stdout.strip()
+
+            provenance = runner._git_provenance(repo)
+            self.assertEqual(
+                provenance,
+                {
+                    "commit": expected_commit,
+                    "branch": "freeze-test",
+                    "clean": True,
+                },
+            )
+            (repo / "untracked").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                calibration.CalibrationError, "dirty worktree"
+            ):
+                runner._git_provenance(repo)
+
+    def test_collect_rejects_reused_artifacts_before_build(self):
+        for artifact in ("outdir", "measurements", "collection_manifest"):
+            with self.subTest(
+                artifact=artifact
+            ), tempfile.TemporaryDirectory() as temporary:
+                options = self._collect_options(temporary)
+                target = getattr(options, artifact)
+                if artifact == "outdir":
+                    target.mkdir()
+                else:
+                    target.write_text("existing\n", encoding="utf-8")
+                with mock.patch.object(
+                    runner, "_git_provenance",
+                    return_value={
+                        "commit": "a" * 40,
+                        "branch": "test",
+                        "clean": True,
+                    },
+                ), mock.patch.object(runner.subprocess, "run") as run:
+                    with self.assertRaisesRegex(
+                        calibration.CalibrationError, "already exists"
+                    ):
+                        runner.run_collect(options)
+                    run.assert_not_called()
+
+    def test_collect_freezes_and_completes_manifest_after_input_rehash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            seen_statuses = []
+            real_atomic_write = runner.atomic_write_json
+
+            def record_manifest(path, value):
+                if Path(path) == options.collection_manifest:
+                    seen_statuses.append(value["status"])
+                real_atomic_write(path, value)
+
+            def fake_run(command, **kwargs):
+                if command == runner.collect_plan(options)["build"]:
+                    binary = Path(command[-1])
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"frozen proxy binary\n")
+                return subprocess.CompletedProcess(command, 0)
+
+            rows = calibration.paper_measurements_for_test()
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "b" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object( \
+                runner, "atomic_write_json", side_effect=record_manifest
+            ), \
+                 mock.patch.object(runner.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(runner, "_materialize_register_checksum"), \
+                 mock.patch.object(runner, "_measurement_rows", return_value=rows):
+                self.assertEqual(runner.run_collect(options), 0)
+
+            self.assertEqual(seen_statuses, ["in_progress", "complete"])
+            manifest = runner.load_json(options.collection_manifest)
+            self.assertEqual(
+                manifest["schema"], "amu-paper-calibration-collection"
+            )
+            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["git"]["commit"], "b" * 40)
+            self.assertTrue(manifest["git"]["clean"])
+            self.assertEqual(
+                set(manifest["inputs"]),
+                {
+                    "gem5",
+                    "config",
+                    "m5_library",
+                    "amu_pdf",
+                    "cira_csv",
+                    "proxy",
+                },
+            )
+            self.assertEqual(len(manifest["plan"]["runs"]), 36)
+            self.assertEqual(manifest["plan"]["expected_simulations"], 36)
+            self.assertEqual(manifest["plan"]["expected_measurement_rows"], 18)
+            self.assertEqual(manifest["actual"]["completed_simulations"], 36)
+            self.assertEqual(manifest["actual"]["measurement_rows"], 18)
+            self.assertIn("started_utc", manifest["timestamps"])
+            self.assertIn("completed_utc", manifest["timestamps"])
+            self.assertIn("platform", manifest["host"])
+            for planned, actual in zip(
+                manifest["plan"]["runs"], runner.collect_plan(options)["runs"]
+            ):
+                self.assertEqual(planned["argv"], actual["command"])
+
+    def test_collect_marks_manifest_failed_when_frozen_input_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            plan = runner.collect_plan(options)
+            simulation_started = False
+
+            def fake_run(command, **kwargs):
+                nonlocal simulation_started
+                if command == plan["build"]:
+                    binary = Path(command[-1])
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"frozen proxy binary\n")
+                elif not simulation_started:
+                    simulation_started = True
+                    options.config.write_text(
+                        "changed during collection\n", encoding="utf-8"
+                    )
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "c" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object(runner.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(runner, "_materialize_register_checksum"), \
+                 mock.patch.object(
+                     runner, "_measurement_rows",
+                     return_value=calibration.paper_measurements_for_test(),
+                 ):
+                with self.assertRaisesRegex(
+                    calibration.CalibrationError, "input changed"
+                ):
+                    runner.run_collect(options)
+
+            self.assertFalse(options.measurements.exists())
+            manifest = runner.load_json(options.collection_manifest)
+            self.assertEqual(manifest["status"], "failed")
+            self.assertIn("input changed", manifest["failure_reason"])
+            self.assertNotIn("completed_utc", manifest["timestamps"])
+
+    def test_collect_fails_if_in_progress_manifest_is_modified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            plan = runner.collect_plan(options)
+            simulation_started = False
+
+            def fake_run(command, **kwargs):
+                nonlocal simulation_started
+                if command == plan["build"]:
+                    binary = Path(command[-1])
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"frozen proxy binary\n")
+                elif not simulation_started:
+                    simulation_started = True
+                    manifest = runner.load_json(options.collection_manifest)
+                    self.assertEqual(manifest["status"], "in_progress")
+                    options.collection_manifest.write_text(
+                        '{"status":"tampered"}\n', encoding="utf-8"
+                    )
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "d" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object(
+                runner.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                runner, "_materialize_register_checksum"
+            ), mock.patch.object(
+                runner,
+                "_measurement_rows",
+                return_value=calibration.paper_measurements_for_test(),
+            ):
+                with self.assertRaisesRegex(
+                    calibration.CalibrationError,
+                    "collection manifest changed",
+                ):
+                    runner.run_collect(options)
+
+            manifest = runner.load_json(options.collection_manifest)
+            self.assertEqual(manifest["status"], "failed")
+            self.assertIn(
+                "collection manifest changed", manifest["failure_reason"]
+            )
+
     def test_proxy_source_has_paper_workloads_and_bit_checks(self):
         source = PROXY.read_text(encoding="utf-8")
         for token in (
@@ -188,6 +470,10 @@ class CalibrationRunnerTest(unittest.TestCase):
                     ),
                     "--m5-library",
                     str(REPO / "util/m5/build/x86/out/libm5.a"),
+                    "--pdf",
+                    str(PDF),
+                    "--cira-csv",
+                    str(CSV),
                     "--outdir",
                     str(root / "runs"),
                     "--measurements",

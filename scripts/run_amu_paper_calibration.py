@@ -6,10 +6,13 @@
 
 import argparse
 import csv
+import datetime
 import json
 import os
+import platform
 import re
 import shlex
+import socket
 import struct
 import subprocess
 import tempfile
@@ -652,6 +655,146 @@ def _execution_input_manifest(gem5, config, m5_library):
     return inputs
 
 
+def _git_provenance(repo=REPO):
+    repo = Path(repo).resolve()
+
+    def git_output(arguments, label):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), *arguments],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise calibration.CalibrationError(
+                f"cannot capture git {label} for {repo}"
+            ) from error
+        return result.stdout.strip()
+
+    status = git_output(
+        ["status", "--porcelain", "--untracked-files=all"], "status"
+    )
+    if status:
+        raise calibration.CalibrationError(
+            f"dirty worktree rejected: {repo}\n{status}"
+        )
+    commit = git_output(["rev-parse", "HEAD"], "commit")
+    branch = git_output(["rev-parse", "--abbrev-ref", "HEAD"], "branch")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or not branch:
+        raise calibration.CalibrationError(
+            f"invalid git provenance for {repo}"
+        )
+    return {"commit": commit, "branch": branch, "clean": True}
+
+
+def _collection_manifest_path(options):
+    configured = getattr(options, "collection_manifest", None)
+    if configured is not None:
+        return Path(configured)
+    return Path(options.outdir) / "collection_manifest.json"
+
+
+def _reject_existing(path, label):
+    path = Path(path)
+    if os.path.lexists(path):
+        raise calibration.CalibrationError(f"{label} already exists: {path}")
+
+
+def _collection_input_manifest(options, proxy=None):
+    inputs = {}
+    sources = (
+        ("gem5", options.gem5, "gem5 binary"),
+        ("config", options.config, "gem5 config"),
+        ("m5_library", options.m5_library, "m5 library"),
+        ("amu_pdf", options.pdf, "AMU PDF"),
+        ("cira_csv", options.cira_csv, "hardware CSV"),
+    )
+    if proxy is not None:
+        sources = (*sources, ("proxy", proxy, "proxy binary"))
+    for key, path, label in sources:
+        resolved = _require_file(path, label).resolve()
+        inputs[key] = {
+            "path": str(resolved),
+            "sha256": calibration.sha256_file(resolved),
+        }
+    return inputs
+
+
+def _verify_collection_inputs(inputs):
+    for key, frozen in inputs.items():
+        if not isinstance(frozen, dict) or set(frozen) != {"path", "sha256"}:
+            raise calibration.CalibrationError(
+                f"invalid frozen collection input: {key}"
+            )
+        path = _require_file(frozen["path"], f"frozen {key}").resolve()
+        if (
+            str(path) != frozen["path"]
+            or calibration.sha256_file(path) != frozen["sha256"]
+        ):
+            raise calibration.CalibrationError(
+                f"collection input changed: {key}"
+            )
+
+
+def _verify_collection_manifest(path, frozen_sha256):
+    path = Path(path)
+    if (
+        not path.is_file()
+        or calibration.sha256_file(path) != frozen_sha256
+    ):
+        raise calibration.CalibrationError(
+            f"in-progress collection manifest changed: {path}"
+        )
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _collection_manifest(options, plan, git, inputs, manifest_path):
+    uname = platform.uname()
+    runs = [
+        {
+            "workload": record["workload"],
+            "latency": record["latency"],
+            "kind": record["kind"],
+            "run_dir": str(Path(record["run_dir"]).resolve()),
+            "argv": list(record["command"]),
+        }
+        for record in plan["runs"]
+    ]
+    return {
+        "schema": "amu-paper-calibration-collection",
+        "version": 1,
+        "status": "in_progress",
+        "git": git,
+        "inputs": inputs,
+        "plan": {
+            "build_argv": list(plan["build"]),
+            "runs": runs,
+            "expected_simulations": len(WORKLOADS) * len(LATENCIES) * 2,
+            "expected_measurement_rows": len(WORKLOADS) * len(LATENCIES),
+        },
+        "host": {
+            "hostname": socket.gethostname(),
+            "platform": f"{uname.system}-{uname.release}-{uname.machine}",
+            "machine": uname.machine,
+            "python": platform.python_version(),
+        },
+        "timestamps": {"started_utc": _utc_now()},
+        "outputs": {
+            "outdir": str(Path(options.outdir).resolve()),
+            "measurements": str(Path(options.measurements).resolve()),
+            "collection_manifest": str(Path(manifest_path).resolve()),
+        },
+        "actual": {"completed_simulations": 0, "measurement_rows": 0},
+    }
+
+
 def _verify_execution_input_manifest(inputs):
     required = {"gem5", "config", "m5_library"}
     if not isinstance(inputs, dict) or set(inputs) != required:
@@ -988,21 +1131,86 @@ def run_collect(options):
     if options.dry_run:
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
-    _require_file(options.gem5, "gem5 binary")
-    _require_file(options.config, "gem5 config")
-    _require_file(options.m5_library, "m5 library")
+
+    git = _git_provenance()
+    manifest_path = _collection_manifest_path(options)
+    outdir = Path(options.outdir)
+    measurements = Path(options.measurements)
+    targets = {
+        "evidence output directory": outdir,
+        "measurements file": measurements,
+        "collection manifest": manifest_path,
+    }
+    resolved_targets = [path.resolve() for path in targets.values()]
+    if len(set(resolved_targets)) != len(resolved_targets):
+        raise calibration.CalibrationError(
+            "collection output paths must be distinct"
+        )
+    for label, path in targets.items():
+        _reject_existing(path, label)
+
+    prebuild_inputs = _collection_input_manifest(options)
     Path(plan["binary"]).parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(plan["build"], check=True)
-    for record in plan["runs"]:
-        run_dir = Path(record["run_dir"])
-        run_dir.mkdir(parents=True, exist_ok=True)
-        Path(record["raw"]).unlink(missing_ok=True)
-        with (run_dir / "gem5.log").open("w", encoding="utf-8") as log:
-            subprocess.run(
-                record["command"], stdout=log, stderr=subprocess.STDOUT, check=True
+    _verify_collection_inputs(prebuild_inputs)
+    inputs = _collection_input_manifest(options, plan["binary"])
+    manifest = _collection_manifest(
+        options, plan, git, inputs, manifest_path
+    )
+    if len(plan["runs"]) != manifest["plan"]["expected_simulations"]:
+        raise calibration.CalibrationError(
+            "collection plan does not contain exactly 36 simulations"
+        )
+    atomic_write_json(manifest_path, manifest)
+    frozen_manifest_sha256 = calibration.sha256_file(manifest_path)
+
+    completed_runs = 0
+    rows = []
+    try:
+        for record in plan["runs"]:
+            run_dir = Path(record["run_dir"])
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "command.txt").write_text(
+                shlex.join(record["command"]) + "\n", encoding="utf-8"
             )
-        _materialize_register_checksum(record)
-    write_measurements(options.measurements, _measurement_rows(plan))
+            with (run_dir / "gem5.log").open("w", encoding="utf-8") as log:
+                subprocess.run(
+                    record["command"], stdout=log,
+                    stderr=subprocess.STDOUT, check=True
+                )
+            _materialize_register_checksum(record)
+            _verify_collection_manifest(
+                manifest_path, frozen_manifest_sha256
+            )
+            completed_runs += 1
+        rows = _measurement_rows(plan)
+        if len(rows) != manifest["plan"]["expected_measurement_rows"]:
+            raise calibration.CalibrationError(
+                "collection did not produce exactly 18 measurement rows"
+            )
+        _verify_collection_inputs(inputs)
+        _verify_collection_manifest(manifest_path, frozen_manifest_sha256)
+        write_measurements(measurements, rows)
+        manifest["status"] = "complete"
+        manifest["timestamps"]["completed_utc"] = _utc_now()
+        manifest["actual"] = {
+            "completed_simulations": completed_runs,
+            "measurement_rows": len(rows),
+        }
+        atomic_write_json(manifest_path, manifest)
+    except Exception as error:
+        manifest["status"] = "failed"
+        manifest["failure_reason"] = f"{type(error).__name__}: {error}"
+        manifest["timestamps"]["failed_utc"] = _utc_now()
+        manifest["actual"] = {
+            "completed_simulations": completed_runs,
+            "measurement_rows": len(rows),
+        }
+        try:
+            atomic_write_json(manifest_path, manifest)
+        except Exception:
+            pass
+        raise
     print(f"AMU_PAPER_COLLECTION_PASS measurements={options.measurements}")
     return 0
 
@@ -1014,9 +1222,12 @@ def parse_args(argv=None):
     collect.add_argument("--gem5", type=Path, required=True)
     collect.add_argument("--config", type=Path, required=True)
     collect.add_argument("--m5-library", type=Path, required=True)
+    collect.add_argument("--pdf", type=Path, required=True)
+    collect.add_argument("--cira-csv", type=Path, required=True)
     collect.add_argument("--cxx", default=os.environ.get("CXX", "g++"))
     collect.add_argument("--outdir", type=Path, required=True)
     collect.add_argument("--measurements", type=Path, required=True)
+    collect.add_argument("--collection-manifest", type=Path)
     collect.add_argument("--iterations", type=int, default=1)
     collect.add_argument("--dry-run", action="store_true")
     gate = subparsers.add_parser("gate")
