@@ -61,12 +61,16 @@ ASMC::ASMCStats::ASMCStats(ASMC &owner, size_t num_cores)
                "Far-memory timing write packets sent by ASMC"),
       ADD_STAT(farRetries, statistics::units::Count::get(),
                "Far-memory timing packets rejected and retried"),
+      ADD_STAT(farSpmFlagPackets, statistics::units::Count::get(),
+               "Far-memory packets that incorrectly carried SPM_ACCESS"),
       ADD_STAT(spmReadPackets, statistics::units::Count::get(),
                "Coherent SPM timing read packets sent per core"),
       ADD_STAT(spmWritePackets, statistics::units::Count::get(),
                "Coherent SPM timing write packets sent per core"),
       ADD_STAT(spmRetries, statistics::units::Count::get(),
                "Coherent SPM timing packets rejected per core"),
+      ADD_STAT(spmMissingFlagPackets, statistics::units::Count::get(),
+               "SPM packets that incorrectly lacked SPM_ACCESS"),
       ADD_STAT(totalLatency, statistics::units::Tick::get(),
                "Total AMU request latency from m5op issue to finish queue"),
       ADD_STAT(outstandingIntegral, statistics::units::Count::get(),
@@ -266,11 +270,17 @@ ASMC::enqueueFarPackets(RequestState &state, MemCmd command,
             const auto pkt_size = static_cast<unsigned>(
                 std::min(remaining, line_remaining));
 
+            Request::Flags flags = chunk.flags;
+            if (is_read)
+                flags.set(Request::UNCACHEABLE);
             RequestPtr req = std::make_shared<Request>(
-                chunk.paddr + chunk_offset, pkt_size, chunk.flags,
-                requestorId);
-            panic_if(req->isSpmAccess(),
-                     "ASMC far-memory packet carried the SPM flag");
+                chunk.paddr + chunk_offset, pkt_size, flags, requestorId);
+            if (req->isSpmAccess()) {
+                ++stats.farSpmFlagPackets;
+                panic("ASMC far-memory packet carried the SPM flag");
+            }
+            panic_if(req->isUncacheable() != is_read,
+                     "ASMC far-memory packet has invalid cacheability");
             req->taskId(context_switch_task_id::DMA);
 
             PacketPtr pkt = new Packet(req, command);
@@ -306,8 +316,10 @@ ASMC::enqueueSpmPackets(RequestState &state, MemCmd command,
             flags.set(Request::SPM_ACCESS);
             RequestPtr req = std::make_shared<Request>(
                 chunk.paddr + chunk_offset, pkt_size, flags, requestorId);
-            panic_if(!req->isSpmAccess(),
-                     "ASMC SPM packet lost the partition flag");
+            if (!req->isSpmAccess()) {
+                ++stats.spmMissingFlagPackets;
+                panic("ASMC SPM packet lost the partition flag");
+            }
             req->taskId(context_switch_task_id::DMA);
 
             PacketPtr pkt = new Packet(req, command);
@@ -342,8 +354,10 @@ ASMC::enqueueSpmAcquirePackets(RequestState &state)
             flags.set(Request::SPM_ACCESS);
             RequestPtr req = std::make_shared<Request>(
                 line_address, cacheLineSize, flags, requestorId);
-            panic_if(!req->isSpmAccess(),
-                     "ASMC SPM acquire lost the partition flag");
+            if (!req->isSpmAccess()) {
+                ++stats.spmMissingFlagPackets;
+                panic("ASMC SPM acquire lost the partition flag");
+            }
             req->taskId(context_switch_task_id::DMA);
 
             PacketPtr pkt = new Packet(req, MemCmd::ReadExReq);
@@ -933,7 +947,9 @@ ASMC::completeRequest(uint64_t id)
              "ASMC store request %#llx completed before far-memory write",
              static_cast<unsigned long long>(id));
 
-    finished[state.tc].push_back(id);
+    ThreadContext *tc = state.tc;
+    auto &queue = finished[tc];
+    queue.push_back(id);
     spmUsed -= state.size;
     stats.totalLatency += curTick() - state.issueTick;
 
@@ -949,6 +965,16 @@ ASMC::completeRequest(uint64_t id)
 
     updateOccupancyIntegral();
     outstanding.erase(it);
+
+    constexpr size_t completionWakeBatch = 4;
+    const bool has_outstanding = std::any_of(
+        outstanding.begin(), outstanding.end(),
+        [tc](const auto &entry) { return entry.second->tc == tc; });
+    if (completionWaiters.count(tc) != 0 &&
+        (queue.size() >= completionWakeBatch || !has_outstanding)) {
+        completionWaiters.erase(tc);
+        tc->activate();
+    }
 }
 
 void
@@ -982,6 +1008,25 @@ ASMC::getFinished(ThreadContext *tc)
         pollWaitStart.erase(wait);
     }
     return id;
+}
+
+bool
+ASMC::quiesceUntilCompletion(ThreadContext *tc)
+{
+    const auto ready = finished.find(tc);
+    if (ready != finished.end() && !ready->second.empty())
+        return false;
+
+    const bool has_outstanding = std::any_of(
+        outstanding.begin(), outstanding.end(),
+        [tc](const auto &entry) { return entry.second->tc == tc; });
+    if (!has_outstanding)
+        return false;
+
+    const bool inserted = completionWaiters.insert(tc).second;
+    panic_if(!inserted, "ASMC tried to quiesce an existing waiter");
+    tc->quiesce();
+    return true;
 }
 
 uint64_t
@@ -1072,6 +1117,9 @@ ASMC::reset()
     }
     outstanding.clear();
     finished.clear();
+    for (ThreadContext *tc : completionWaiters)
+        tc->activate();
+    completionWaiters.clear();
     spmUsed = 0;
     reservedFarSendSlots = 0;
     metadataPending = 0;

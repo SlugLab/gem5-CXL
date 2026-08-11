@@ -371,10 +371,13 @@ struct Slot { size_t op; uint64_t id; SlotPhase phase; /* payload */ };
 struct IdOwner { uint16_t slot; SlotPhase expected; bool live; };
 ```
 
-On completion, validate ID range, live ownership, slot ID, and expected phase
-in O(1), advance only that slot, and refill a newly free slot immediately while
-unissued operations remain. Never drain all loads before beginning stores.
-Cap live request IDs at 256 and panic on duplicate or stale completions.
+On completion, use a fixed 128-set, four-way owner table to validate the live
+15-bit token, full ID, slot ID, and expected phase with exactly four probes;
+fail closed on duplicate tokens or a full set. Advance only that slot and
+refill a newly free slot immediately while unissued operations remain. Do not
+zero completion-slot buffers whose consumed elements are always overwritten.
+Never drain all loads before beginning stores. Cap live request IDs at 256 and
+panic on duplicate or stale completions.
 
 - [ ] **Step 4: Preserve deterministic operation order**
 
@@ -427,23 +430,53 @@ git commit -m "benchmarks: keep AMU paper windows continuously occupied"
 
 **Files:**
 - Modify if needed: `scripts/run_amu_paper_calibration.py`
+- Modify: `include/gem5/asm/generic/m5ops.h`
+- Modify: `include/gem5/m5ops.h`
+- Modify: `src/sim/pseudo_inst.hh`
+- Modify: `src/sim/pseudo_inst.cc`
+- Modify: `util/amu/amu_paper_profile.cc`
+- Create: `tests/pyunit/amu/test_amu_batch_completion.py`
 - Create: `tests/pyunit/amu/test_amu_gups_gate.py`
 - Runtime evidence: `/mnt/disk0/gem5-CXL-g14-eval/coherent-l2-spm-gate/`
 
-- [ ] **Step 1: Add a fail-closed gate test**
+- [x] **Step 1: Add a fail-closed gate test**
 
 The gate consumes baseline and AMU `stats.txt`, stdout, raw output, config, and
 binary hashes. It must reject missing stats, `delay != 5000000`, checksum
 mismatch, average MLP `<= 130`, peak MLP `> 256`, mixed binaries, wrong core
 count, any far packet carrying `SPM_ACCESS`, or any SPM packet lacking it.
 
-- [ ] **Step 2: Run a fresh baseline and AMU GUPS 5 us pair**
+- [x] **Step 1a: Batch completion dequeue after scalar proof fails**
+
+Fresh bit-exact variants with direct O(1) ownership, inlined m5ops, and no
+redundant store fence plateaued at 125.24 average outstanding requests. Add
+`AMU_GETFIN_BATCH` as a narrowly scoped external-ISA amendment: it drains at
+most four IDs from the existing completion FIFO and packs their low 15-bit
+tokens plus an explicit count into RAX. The guest owner table enforces token
+uniqueness across the 256-entry live window and fails closed on a collision;
+it recovers the full owner entry and still checks the complete ID, slot, and
+phase. The ASMC request issue/completion timing, FIFO
+order, and 256-request cap remain unchanged. Rebuild both gem5 and `libm5`.
+Run the O3 batch smoke across multiple batches, and reject the change if any
+token repeats, any full owner check fails, or any workload checksum differs.
+Keep GETFIN_BATCH nonblocking. If it returns no token, execute a separate
+`AMU_WAITFIN` m5op and activate that timing context only when ASMC has published
+four real completions, or when no per-thread request remains outstanding and
+the FIFO holds a final one-to-three-entry tail. Mark only WAITFIN as an X86 `IsQuiesce` instruction
+so fetch stops before younger instructions enter O3. If a completion races
+before WAITFIN executes, use the standard one-cycle quiesce wake. Do not
+schedule an artificial completion wakeup or change request timing. The O3
+smoke must call GETFIN_BATCH before its first request completes, enter WAITFIN,
+and prove that execution resumes with that exact token. Reset paths must
+activate and remove registered waiters.
+
+- [x] **Step 2: Run a fresh baseline and AMU GUPS 5 us pair**
 
 Use a new output root and the runner's existing `collect --workload gups
 --latency 5us` selection. Do not copy or symlink old `stats.txt` files. Record
 the exact invocation in `command.txt` and SHA-256 all binaries/configs/results.
 
-- [ ] **Step 3: Independently recompute the gate**
+- [x] **Step 3: Independently recompute the gate**
 
 From raw stats, calculate:
 
@@ -459,7 +492,13 @@ Expected: `Verification: PASS`, byte-identical output, and the unchanged metric
 above 130. If any condition fails, stop here and return to the responsible
 task; do not tune the threshold or launch the 36-run suite.
 
-- [ ] **Step 4: Commit only code/test corrections**
+Fresh proof: `fresh-v21/proof.json` reports average outstanding
+`138.209597135`, peak `256`, 65,536 issued/completed loads and stores, and
+checksum `ec583e483e862325`. Independent division of the raw integral by raw
+occupancy ticks reproduced the reported average; the baseline and AMU checksum
+files share SHA-256 `83159f219a84e0eb22fc77737df91862b645a1e030f4029078a346194f0a86ff`.
+
+- [x] **Step 4: Commit only code/test corrections**
 
 Do not commit bulky simulator output. Commit runner/test changes and a compact
 hash/proof manifest only after independent validation.

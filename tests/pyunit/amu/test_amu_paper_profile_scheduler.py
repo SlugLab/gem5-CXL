@@ -81,7 +81,19 @@ class AmuPaperProfileSchedulerTest(unittest.TestCase):
         self.assertIn("ReadyToStore", SOURCE)
         self.assertIn("StorePending", SOURCE)
         self.assertIn("struct IdOwner", SOURCE)
-        self.assertIn("std::unordered_map<uint64_t, IdOwner>", SOURCE)
+        self.assertIn("constexpr size_t kOwnerSets = 128", SOURCE)
+        self.assertIn("constexpr size_t kOwnerWays = 4", SOURCE)
+        self.assertIn("constexpr size_t kOwnerEntries", SOURCE)
+        self.assertIn("std::array<IdOwner, kOwnerEntries> idOwners", SOURCE)
+        self.assertIn("findOwner", SOURCE)
+        self.assertIn("eraseOwner", SOURCE)
+        self.assertIn("insertOwner", SOURCE)
+        self.assertNotIn("std::vector<IdOwner> idOwners", SOURCE)
+        self.assertNotIn("std::unordered_map<uint64_t, IdOwner>", SOURCE)
+        self.assertNotIn("idOwners.find", SOURCE)
+        self.assertNotIn("idOwners.erase", SOURCE)
+        self.assertNotIn("overflowOwners", SOURCE)
+        self.assertNotIn("overflowCounts", SOURCE)
         self.assertNotIn("std::find", SOURCE)
         self.assertIn("expected != entry.phase", SOURCE)
 
@@ -95,6 +107,34 @@ class AmuPaperProfileSchedulerTest(unittest.TestCase):
         next_wait = completion.find("waitCompletion", refill)
         self.assertGreater(next_wait, refill)
 
+    def test_store_transition_uses_non_speculative_inline_m5op_ordering(self):
+        issue_store = SOURCE[
+            SOURCE.index("void issueStore"):
+            SOURCE.index("size_t waitCompletion")
+        ]
+        self.assertIn("profileAstore", issue_store)
+        self.assertNotIn("_mm_sfence()", issue_store)
+        self.assertNotIn("_mm_mfence()", issue_store)
+        profile_store = SOURCE[
+            SOURCE.index("profileAstore"):
+            SOURCE.index("profileGetfin")
+        ]
+        self.assertIn('asm volatile(".byte 0x0f, 0x04', profile_store)
+        self.assertIn(': "memory")', profile_store)
+
+    def test_roi_m5ops_are_inlined_without_call_return_wrappers(self):
+        for helper in ("profileAload", "profileAstore", "profileGetfin"):
+            self.assertIn(helper, SOURCE)
+        self.assertIn('asm volatile(".byte 0x0f, 0x04', SOURCE)
+        scheduler = SOURCE[
+            SOURCE.index("class PersistentScheduler"):
+            SOURCE.index("void\nprimeSpm")
+        ]
+        self.assertIn("profileAload", scheduler)
+        self.assertIn("profileAstore", scheduler)
+        self.assertIn("profileGetfin", scheduler)
+        self.assertNotIn("amu_getfin()", scheduler)
+
     def test_priming_precedes_roi_and_checksum_follows_roi(self):
         main = SOURCE[SOURCE.index("main(int argc") :]
         self.assertIn("prepareAndPrime", main)
@@ -104,6 +144,25 @@ class AmuPaperProfileSchedulerTest(unittest.TestCase):
         self.assertIn("primeSpm", SOURCE)
         self.assertIn("prepareAndPrime", before_roi)
         self.assertIn("AMU_CFG_OUTSTANDING", SOURCE)
+
+    def test_far_working_sets_are_flushed_before_spm_priming_and_roi(self):
+        prepare = SOURCE[
+            SOURCE.index("prepareAndPrime"):
+            SOURCE.index("runGupsBaseline")
+        ]
+        self.assertIn("flushFarWorkingSet", prepare)
+        self.assertLess(
+            prepare.index("flushFarWorkingSet"), prepare.index("primeSpm")
+        )
+        flush = SOURCE[
+            SOURCE.index("flushFarWorkingSet"):
+            SOURCE.index("prepareAndPrime")
+        ]
+        for member in (
+            "state.gupsTable", "state.hashNodes", "state.streamA",
+            "state.streamB", "state.streamC",
+        ):
+            self.assertIn(member, flush)
 
     def test_checksum_uses_a_tagged_register_transport(self):
         main = SOURCE[SOURCE.index("uint64_t digest = checksum") :]

@@ -81,6 +81,8 @@ using namespace X86ISA;
 }};
 
 output decoder {{
+#include <gem5/asm/generic/m5ops.h>
+
 #include <algorithm>
 
 #include "arch/x86/decoder.hh"

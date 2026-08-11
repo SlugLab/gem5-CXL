@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import re
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -410,6 +411,26 @@ def collect_plan(options):
 
 
 def _materialize_register_checksum(record):
+    value = _register_checksum(record)
+    payload = struct.pack("<Q", value)
+    raw_path = Path(record["raw"])
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{raw_path.name}.", dir=raw_path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, raw_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return f"{value:016x}"
+
+
+def _register_checksum(record):
     log_path = Path(record["run_dir"]) / "gem5.log"
     try:
         text = log_path.read_text(encoding="utf-8", errors="strict")
@@ -440,22 +461,435 @@ def _materialize_register_checksum(record):
         raise calibration.CalibrationError(
             f"register checksum marker metadata mismatch in {log_path}"
         )
-    payload = struct.pack("<Q", (high << 32) | low)
-    raw_path = Path(record["raw"])
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{raw_path.name}.", dir=raw_path.parent
-    )
-    temporary = Path(temporary_name)
+    return (high << 32) | low
+
+
+def _ini_sections(path):
+    sections = {}
+    current = None
+    for lineno, line in enumerate(
+        Path(path).read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            if current in sections:
+                raise calibration.CalibrationError(
+                    f"duplicate config section {current}: {path}:{lineno}"
+                )
+            sections[current] = {}
+        elif current is not None and "=" in line:
+            key, value = line.split("=", 1)
+            if key in sections[current]:
+                raise calibration.CalibrationError(
+                    f"duplicate config key {current}.{key}: {path}:{lineno}"
+                )
+            sections[current][key] = value
+    return sections
+
+
+def _gate_config(record, binary):
+    config_path = Path(record["run_dir"]) / "config.ini"
+    sections = _ini_sections(_require_file(config_path, "gate config"))
+    links = [
+        (name, values)
+        for name, values in sections.items()
+        if re.fullmatch(r"board\.cxl_mem_link\d+", name)
+    ]
+    if len(links) != 1 or links[0][1].get("delay") != "5000000":
+        raise calibration.CalibrationError(
+            f"GUPS gate requires exactly one 5us CXL link: {config_path}"
+        )
+    link_name, link = links[0]
+    cores = [
+        name
+        for name in sections
+        if re.fullmatch(r"board\.processor\.cores\d*\.core", name)
+    ]
+    if len(cores) != 1:
+        raise calibration.CalibrationError(
+            f"GUPS gate requires exactly one CPU core: {config_path}"
+        )
+    workloads = [
+        values
+        for name, values in sections.items()
+        if re.fullmatch(
+            r"board\.processor\.cores\d*\.core\.workload", name
+        )
+    ]
+    executables = {values.get("executable") for values in workloads}
+    expected_binary = str(Path(binary).resolve())
+    if executables != {expected_binary}:
+        raise calibration.CalibrationError(
+            f"GUPS gate binary mismatch in {config_path}"
+        )
+    commands = [values.get("cmd", "") for values in workloads]
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, raw_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return f"{(high << 32) | low:016x}"
+        command = shlex.split(commands[0]) if len(commands) == 1 else []
+    except ValueError as error:
+        raise calibration.CalibrationError(
+            f"GUPS gate cannot parse workload command in {config_path}"
+        ) from error
+    workload_positions = [
+        index for index, value in enumerate(command) if value == "--workload"
+    ]
+    if (
+        len(workload_positions) != 1
+        or workload_positions[0] + 1 >= len(command)
+        or command[workload_positions[0] + 1] != "gups"
+    ):
+        raise calibration.CalibrationError(
+            f"GUPS gate workload mismatch in {config_path}"
+        )
+    has_amu = "--amu" in command
+    if has_amu != (record["kind"] == "amu"):
+        raise calibration.CalibrationError(
+            f"GUPS gate kind mismatch in {config_path}"
+        )
+    if record["kind"] == "amu":
+        asmc = sections.get("board.asmc", {})
+        adapter = sections.get("board.asmc_io_cache", {})
+        membus = sections.get("board.cache_hierarchy.membus", {})
+        if (
+            asmc.get("mem_side_port") != "board.asmc_io_cache.cpu_side"
+            or adapter.get("cpu_side") != "board.asmc.mem_side_port"
+        ):
+            raise calibration.CalibrationError(
+                f"GUPS gate ASMC adapter topology mismatch in {config_path}"
+            )
+        adapter_match = re.fullmatch(
+            r"board\.cache_hierarchy\.membus\.cpu_side_ports\[(\d+)\]",
+            adapter.get("mem_side", ""),
+        )
+        membus_cpu = membus.get("cpu_side_ports", "").split()
+        if (
+            adapter_match is None
+            or int(adapter_match.group(1)) >= len(membus_cpu)
+            or membus_cpu[int(adapter_match.group(1))]
+                != "board.asmc_io_cache.mem_side"
+        ):
+            raise calibration.CalibrationError(
+                f"GUPS gate ASMC-to-membus topology mismatch in {config_path}"
+            )
+        link_match = re.fullmatch(
+            r"board\.cache_hierarchy\.membus\.mem_side_ports\[(\d+)\]",
+            link.get("cpu_side_port", ""),
+        )
+        membus_mem = membus.get("mem_side_ports", "").split()
+        if (
+            link_match is None
+            or int(link_match.group(1)) >= len(membus_mem)
+            or membus_mem[int(link_match.group(1))]
+                != f"{link_name}.cpu_side_port"
+        ):
+            raise calibration.CalibrationError(
+                f"GUPS gate membus-to-CXL topology mismatch in {config_path}"
+            )
+        device_match = re.fullmatch(
+            r"(board\.cxl_device_xbar\d+)\.cpu_side_ports\[(\d+)\]",
+            link.get("mem_side_port", ""),
+        )
+        if device_match is None:
+            raise calibration.CalibrationError(
+                f"GUPS gate CXL device topology mismatch in {config_path}"
+            )
+        device = sections.get(device_match.group(1), {})
+        device_cpu = device.get("cpu_side_ports", "").split()
+        device_index = int(device_match.group(2))
+        if (
+            device_index >= len(device_cpu)
+            or device_cpu[device_index] != f"{link_name}.mem_side_port"
+            or not device.get("mem_side_ports", "").split()
+        ):
+            raise calibration.CalibrationError(
+                f"GUPS gate CXL-to-memory topology mismatch in {config_path}"
+            )
+    return config_path
+
+
+def _gate_stat(stats, suffix):
+    matches = [value for name, value in stats.items() if name.endswith(suffix)]
+    if len(matches) != 1:
+        raise calibration.CalibrationError(
+            f"GUPS gate expected one stat ending {suffix}, got {len(matches)}"
+        )
+    return matches[0]
+
+
+def _gate_stat_or_zero(stats, suffix):
+    matches = [value for name, value in stats.items() if name.endswith(suffix)]
+    if len(matches) > 1:
+        raise calibration.CalibrationError(
+            f"GUPS gate expected at most one stat ending {suffix}, "
+            f"got {len(matches)}"
+        )
+    return matches[0] if matches else 0
+
+
+def _gate_stats(record):
+    try:
+        from scripts import compare_gapbs_cxl_amu_cira as comparison
+    except ImportError:
+        import compare_gapbs_cxl_amu_cira as comparison
+    stats_path = Path(record["run_dir"]) / "stats.txt"
+    try:
+        return comparison.parse_stats(stats_path)
+    except comparison.StatsError as error:
+        raise calibration.CalibrationError(str(error)) from error
+
+
+def _execution_input_manifest(gem5, config, m5_library):
+    inputs = {}
+    for label, path in (
+        ("gem5", gem5),
+        ("config", config),
+        ("m5_library", m5_library),
+    ):
+        resolved = _require_file(path, label.replace("_", " ")).resolve()
+        inputs[label] = {
+            "path": str(resolved),
+            "sha256": calibration.sha256_file(resolved),
+        }
+    return inputs
+
+
+def _verify_execution_input_manifest(inputs):
+    required = {"gem5", "config", "m5_library"}
+    if not isinstance(inputs, dict) or set(inputs) != required:
+        raise calibration.CalibrationError(
+            "GUPS gate execution-input manifest is incomplete"
+        )
+    for label in sorted(required):
+        record = inputs[label]
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            raise calibration.CalibrationError(
+                f"GUPS gate execution-input record is invalid: {label}"
+            )
+        path = _require_file(record["path"], label.replace("_", " ")).resolve()
+        if str(path) != record["path"] or calibration.sha256_file(path) != record["sha256"]:
+            raise calibration.CalibrationError(
+                f"GUPS gate execution input changed: {label}"
+            )
+
+
+def validate_gups_gate(baseline, amu, binary, *, execution_inputs):
+    _verify_execution_input_manifest(execution_inputs)
+    binary = _require_file(binary, "gate binary").resolve()
+    binary_hash = calibration.sha256_file(binary)
+    evidence = {}
+    checksums = {}
+    for record in (baseline, amu):
+        kind = record["kind"]
+        if kind not in {"baseline", "amu"}:
+            raise calibration.CalibrationError("invalid GUPS gate kind")
+        config_path = _gate_config(record, binary)
+        log_path = _require_file(
+            Path(record["run_dir"]) / "gem5.log", "gate log"
+        )
+        log = log_path.read_text(encoding="utf-8", errors="strict")
+        if (
+            "Verification: PASS" not in log
+            or "GAPBS_VERIFICATION_EXIT_CAUSE cause=m5_exit instruction encountered"
+            not in log
+        ):
+            raise calibration.CalibrationError(
+                f"GUPS gate verification marker missing: {log_path}"
+            )
+        raw_path = _require_file(record["raw"], "gate checksum")
+        payload = raw_path.read_bytes()
+        if len(payload) != 8:
+            raise calibration.CalibrationError(
+                f"GUPS gate checksum is not 8 bytes: {raw_path}"
+            )
+        raw_value = struct.unpack("<Q", payload)[0]
+        register_value = _register_checksum(record)
+        if raw_value != register_value:
+            raise calibration.CalibrationError(
+                f"GUPS gate raw/register checksum mismatch: {raw_path}"
+            )
+        checksums[kind] = raw_value
+        stats_path = Path(record["run_dir"]) / "stats.txt"
+        command_path = _require_file(
+            Path(record["run_dir"]) / "command.txt", "gate command"
+        )
+        stats = _gate_stats(record)
+        if _gate_stat(stats, "simTicks") <= 0:
+            raise calibration.CalibrationError("GUPS gate ROI has no ticks")
+        evidence[kind] = {
+            "config_sha256": calibration.sha256_file(config_path),
+            "stats_sha256": calibration.sha256_file(stats_path),
+            "log_sha256": calibration.sha256_file(log_path),
+            "command_sha256": calibration.sha256_file(command_path),
+            "checksum_sha256": calibration.sha256_file(raw_path),
+            "checksum": f"{raw_value:016x}",
+        }
+    if checksums["baseline"] != checksums["amu"]:
+        raise calibration.CalibrationError(
+            "GUPS gate baseline/AMU checksum mismatch"
+        )
+
+    stats = _gate_stats(amu)
+    issued_loads = _gate_stat(stats, ".issuedLoads")
+    issued_stores = _gate_stat(stats, ".issuedStores")
+    completed_loads = _gate_stat(stats, ".completedLoads")
+    completed_stores = _gate_stat(stats, ".completedStores")
+    if (
+        issued_loads != 65536
+        or issued_stores != 65536
+        or issued_loads != completed_loads
+        or issued_stores != completed_stores
+    ):
+        raise calibration.CalibrationError(
+            "GUPS gate issued/completed accounting mismatch"
+        )
+    integral = _gate_stat(stats, ".outstandingIntegral")
+    occupancy_ticks = _gate_stat(stats, ".occupancyTicks")
+    if occupancy_ticks <= 0:
+        raise calibration.CalibrationError(
+            "GUPS gate occupancyTicks must be positive"
+        )
+    average = float(integral / occupancy_ticks)
+    reported_average = float(_gate_stat(stats, ".avgOutstanding"))
+    if abs(average - reported_average) > max(abs(average), 1) * 1e-6:
+        raise calibration.CalibrationError(
+            "GUPS gate avgOutstanding does not match raw integral"
+        )
+    peak = _gate_stat(stats, ".maxObservedOutstanding")
+    if average <= 130:
+        raise calibration.CalibrationError(
+            "GUPS 5us average outstanding must be greater than 130"
+        )
+    if peak > 256:
+        raise calibration.CalibrationError(
+            "GUPS 5us peak outstanding exceeds 256"
+        )
+    for suffix in (".rejectedQueueFull", ".rejectedSpmFull", ".translationFaults"):
+        if _gate_stat(stats, suffix) != 0:
+            raise calibration.CalibrationError(
+                f"GUPS gate nonzero failure counter {suffix}"
+            )
+    if _gate_stat(stats, ".farSpmFlagPackets") != 0:
+        raise calibration.CalibrationError(
+            "GUPS gate observed SPM_ACCESS on the far route"
+        )
+    if _gate_stat(stats, ".spmMissingFlagPackets") != 0:
+        raise calibration.CalibrationError(
+            "GUPS gate observed an unflagged SPM packet"
+        )
+    expected_route_counts = {
+        ".farReadPackets": issued_loads,
+        ".farWritePackets": issued_stores,
+        ".spmReadPackets": issued_loads + issued_stores,
+        ".spmWritePackets": issued_loads,
+    }
+    for suffix, expected in expected_route_counts.items():
+        observed = _gate_stat(stats, suffix)
+        if observed != expected:
+            raise calibration.CalibrationError(
+                f"GUPS gate route count mismatch {suffix}: "
+                f"expected {expected:g}, got {observed:g}"
+            )
+    read_uncacheable = _gate_stat(
+        stats, ".asmc_io_cache.ReadReq.mshrUncacheable::asmc"
+    )
+    read_cached = sum(
+        _gate_stat_or_zero(stats, suffix)
+        for suffix in (
+            ".asmc_io_cache.ReadReq.hits::asmc",
+            ".asmc_io_cache.ReadReq.misses::asmc",
+            ".asmc_io_cache.ReadReq.accesses::asmc",
+        )
+    )
+    write_hits = _gate_stat_or_zero(
+        stats, ".asmc_io_cache.WriteReq.hits::asmc"
+    )
+    write_misses = _gate_stat(
+        stats, ".asmc_io_cache.WriteReq.misses::asmc"
+    )
+    write_accesses = _gate_stat(
+        stats, ".asmc_io_cache.WriteReq.accesses::asmc"
+    )
+    if read_uncacheable != issued_loads or read_cached != 0:
+        raise calibration.CalibrationError(
+            "GUPS gate far adapter cached ReadReq traffic"
+        )
+    if (
+        write_hits != 0
+        or write_misses != issued_stores
+        or write_accesses != issued_stores
+    ):
+        raise calibration.CalibrationError(
+            "GUPS gate far adapter cached WriteReq traffic"
+        )
+    return {
+        "schema": 1,
+        "status": "PASS",
+        "workload": "gups",
+        "latency_ticks": 5000000,
+        "cores": 1,
+        "binary": str(binary),
+        "binary_sha256": binary_hash,
+        "execution_inputs": execution_inputs,
+        "checksum": f"{checksums['amu']:016x}",
+        "average_outstanding": float(average),
+        "peak_outstanding": int(peak),
+        "issued_loads": int(issued_loads),
+        "issued_stores": int(issued_stores),
+        "evidence": evidence,
+    }
+
+
+def run_gate(options):
+    plan = collect_plan(options)
+    plan["runs"] = [
+        record
+        for record in plan["runs"]
+        if record["workload"] == "gups" and record["latency"] == "5us"
+    ]
+    if options.dry_run:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 0
+    _require_file(options.gem5, "gem5 binary")
+    _require_file(options.config, "gem5 config")
+    _require_file(options.m5_library, "m5 library")
+    if options.proof.exists():
+        raise calibration.CalibrationError(
+            f"GUPS gate proof already exists: {options.proof}"
+        )
+    if options.outdir.exists() and any(options.outdir.iterdir()):
+        raise calibration.CalibrationError(
+            f"GUPS gate output directory is not empty: {options.outdir}"
+        )
+    execution_inputs = _execution_input_manifest(
+        options.gem5, options.config, options.m5_library
+    )
+    Path(plan["binary"]).parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(plan["build"], check=True)
+    records = {}
+    for record in plan["runs"]:
+        run_dir = Path(record["run_dir"])
+        run_dir.mkdir(parents=True, exist_ok=True)
+        Path(record["raw"]).unlink(missing_ok=True)
+        (run_dir / "command.txt").write_text(
+            shlex.join(record["command"]) + "\n", encoding="utf-8"
+        )
+        with (run_dir / "gem5.log").open("w", encoding="utf-8") as log:
+            subprocess.run(
+                record["command"], stdout=log,
+                stderr=subprocess.STDOUT, check=True
+            )
+        _materialize_register_checksum(record)
+        records[record["kind"]] = record
+    proof = validate_gups_gate(
+        records["baseline"], records["amu"], plan["binary"],
+        execution_inputs=execution_inputs,
+    )
+    atomic_write_json(options.proof, proof)
+    print(
+        "AMU_GUPS_5US_GATE_PASS "
+        f"average_outstanding={proof['average_outstanding']:.6f} "
+        f"peak={proof['peak_outstanding']} proof={options.proof}"
+    )
+    return 0
 
 
 def _require_file(path, label):
@@ -585,6 +1019,15 @@ def parse_args(argv=None):
     collect.add_argument("--measurements", type=Path, required=True)
     collect.add_argument("--iterations", type=int, default=1)
     collect.add_argument("--dry-run", action="store_true")
+    gate = subparsers.add_parser("gate")
+    gate.add_argument("--gem5", type=Path, required=True)
+    gate.add_argument("--config", type=Path, required=True)
+    gate.add_argument("--m5-library", type=Path, required=True)
+    gate.add_argument("--cxx", default=os.environ.get("CXX", "g++"))
+    gate.add_argument("--outdir", type=Path, required=True)
+    gate.add_argument("--proof", type=Path, required=True)
+    gate.add_argument("--iterations", type=int, default=1)
+    gate.add_argument("--dry-run", action="store_true")
     fit = subparsers.add_parser("fit")
     fit.add_argument("--measurements", type=Path, required=True)
     fit.add_argument("--pdf", type=Path, required=True)
@@ -597,9 +1040,12 @@ def parse_args(argv=None):
 
 def main(argv=None):
     options = parse_args(argv)
-    if options.command == "collect":
+    if options.command in {"collect", "gate"}:
         if options.iterations <= 0:
             raise calibration.CalibrationError("iterations must be positive")
+    if options.command == "gate":
+        return run_gate(options)
+    if options.command == "collect":
         return run_collect(options)
     manifest = build_manifest(options)
     atomic_write_json(options.output, manifest)

@@ -63,6 +63,20 @@ def template BasicConstructor {{
     }
 }};
 
+// The batch completion m5op may block on a modeled ASMC event. Mark only
+// that immediate as quiescing so O3 fetch stops before younger instructions
+// enter the pipeline. Other m5ops retain their existing behavior.
+def template AmuWaitConstructor {{
+    %(class_name)s::%(class_name)s(ExtMachInst machInst) :
+        %(base_class)s("%(mnemonic)s", machInst, %(op_class)s)
+    {
+        %(set_reg_idx_arr)s;
+        %(constructor)s;
+        if (machInst.immediate == M5OP_AMU_WAITFIN)
+            flags[IsQuiesce] = true;
+    }
+}};
+
 // Basic instruction class execute method template.
 def template BasicExecute {{
         Fault %(class_name)s::execute(ExecContext *xc,
@@ -97,6 +111,14 @@ def format BasicOperate(code, *flags) {{
         iop = InstObjParams(name, Name, 'X86ISA::X86StaticInst', code, flags)
         header_output = BasicDeclare.subst(iop)
         decoder_output = BasicConstructor.subst(iop)
+        decode_block = BasicDecode.subst(iop)
+        exec_output = BasicExecute.subst(iop)
+}};
+
+def format AmuWaitOperate(code, *flags) {{
+        iop = InstObjParams(name, Name, 'X86ISA::X86StaticInst', code, flags)
+        header_output = BasicDeclare.subst(iop)
+        decoder_output = AmuWaitConstructor.subst(iop)
         decode_block = BasicDecode.subst(iop)
         exec_output = BasicExecute.subst(iop)
 }};

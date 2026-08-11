@@ -111,7 +111,8 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             SOURCE.index("ASMC::enqueueFarPackets"):
             SOURCE.index("ASMC::enqueueSpmPackets")
         ]
-        self.assertIn("panic_if(req->isSpmAccess()", far)
+        self.assertIn("if (req->isSpmAccess())", far)
+        self.assertIn("++stats.farSpmFlagPackets", far)
         self.assertNotIn("Request::SPM_ACCESS", far)
 
     def test_astore_timing_path_has_no_functional_payload_fallback(self):
@@ -139,9 +140,11 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             "farReadPackets",
             "farWritePackets",
             "farRetries",
+            "farSpmFlagPackets",
             "spmReadPackets",
             "spmWritePackets",
             "spmRetries",
+            "spmMissingFlagPackets",
         ):
             self.assertIn(token, HEADER)
             self.assertIn(token, SOURCE)
@@ -170,6 +173,21 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             "cache_hierarchy.get_cpu_side_port()",
             CONFIG,
         )
+
+    def test_far_reads_bypass_adapter_cache_but_writes_remain_coherent(self):
+        far = SOURCE[
+            SOURCE.index("ASMC::enqueueFarPackets"):
+            SOURCE.index("ASMC::enqueueSpmPackets")
+        ]
+        spm = SOURCE[
+            SOURCE.index("ASMC::enqueueSpmPackets"):
+            SOURCE.index("ASMC::enqueueSpmAcquirePackets")
+        ]
+        self.assertIn("if (is_read)", far)
+        self.assertIn("flags.set(Request::UNCACHEABLE)", far)
+        self.assertIn("req->isUncacheable()", far)
+        self.assertIn("req->isUncacheable() != is_read", far)
+        self.assertNotIn("Request::UNCACHEABLE", spm)
 
     def test_io_cache_ranges_are_bound_after_workload_initializes_board(self):
         workload = CONFIG.index("board.set_se_binary_workload(")

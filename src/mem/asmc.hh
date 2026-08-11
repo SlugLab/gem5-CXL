@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "arch/generic/mmu.hh"
@@ -46,6 +47,7 @@ class ASMC : public ClockedObject
     uint64_t issueAload(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
     uint64_t issueAstore(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
     uint64_t getFinished(ThreadContext *tc);
+    bool quiesceUntilCompletion(ThreadContext *tc);
     uint64_t cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value);
     uint64_t cfgRead(ThreadContext *tc, uint64_t reg) const;
 
@@ -148,9 +150,11 @@ class ASMC : public ClockedObject
         statistics::Scalar farReadPackets;
         statistics::Scalar farWritePackets;
         statistics::Scalar farRetries;
+        statistics::Scalar farSpmFlagPackets;
         statistics::Vector spmReadPackets;
         statistics::Vector spmWritePackets;
         statistics::Vector spmRetries;
+        statistics::Scalar spmMissingFlagPackets;
         statistics::Scalar totalLatency;
         statistics::Scalar outstandingIntegral;
         statistics::Scalar occupancyTicks;
@@ -229,6 +233,7 @@ class ASMC : public ClockedObject
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;
     std::unordered_map<ThreadContext *, Tick> pollWaitStart;
+    std::unordered_set<ThreadContext *> completionWaiters;
     std::deque<uint64_t> completionWaitQueue;
     std::deque<PacketPtr> farSendQueue;
     PacketPtr farRetryPkt = nullptr;

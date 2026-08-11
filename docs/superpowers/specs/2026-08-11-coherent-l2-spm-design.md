@@ -80,9 +80,56 @@ then accepts its next update. The scheduler immediately refills a completed
 slot until all updates are issued, so it does not drain the complete load
 window before starting stores.
 
-Request ID lookup is O(1): an ID-indexed table stores the owning slot and
-expected phase. Every returned ID is range-, ownership-, and phase-checked.
-Linear `std::find()` completion scans are forbidden.
+Request ID lookup is bounded O(1): a 128-set, four-way table stores the full
+ID, owning slot, and expected phase. A token checks exactly four ways; a fifth
+live owner in one set or a duplicate live 15-bit token fails closed. Every
+returned token is range-, full-owner-, slot-, and phase-checked. Linear
+`std::find()` and overflow-table completion scans are forbidden. Completion
+slot buffers are left uninitialized because every consumed element is written
+before use.
+
+Fresh bit-exact 5 us experiments showed that scalar `AMU_GETFIN` remained the
+steady-state limiter after coherent routing was fixed: direct O(1) ownership,
+inlined m5ops, and removal of the redundant store fence reached only
+125.24 average outstanding requests while all 65,536 far reads and writes
+reached CXL. The interface therefore adds `AMU_GETFIN_BATCH`, a minimal
+completion-only m5op amendment. One invocation removes up to four finished IDs
+from the same FIFO and returns their 15-bit completion tokens plus an explicit
+count in RAX. The guest enforces uniqueness of the low 15 bits across its at
+most 256 live IDs and fails closed before issuing a colliding owner. It uses
+each token to recover the owning entry, then checks the entry's complete 64-bit
+ID, slot, and expected phase before advancing it. It does not merge, reorder,
+or retime AMU requests and does not change the
+256-request limit. Scalar `AMU_GETFIN` remains available for compatibility,
+but the calibrated proxy uses only the packed batch operation in its measured
+kernel.
+
+`AMU_GETFIN_BATCH` itself is nonblocking and does not stop O3 fetch. When it
+returns an empty count, the guest executes `AMU_WAITFIN`, a separate m5op that
+does not consume or return a completion. The X86 decoder marks only WAITFIN as
+`IsQuiesce`, so fetch stops before younger instructions enter the pipeline and
+older instructions drain because the operation is non-speculative. If that
+thread still owns an outstanding request and its FIFO remains empty, WAITFIN
+quiesces the timing context. ASMC coalesces notification until that thread's
+completion FIFO contains four real entries; if no request for the thread
+remains outstanding, it immediately wakes any final one-to-three-entry tail.
+This preserves FIFO order and prevents a short final batch from deadlocking.
+If a completion races between GETFIN_BATCH and WAITFIN, WAITFIN observes the
+nonempty FIFO and uses the standard one-cycle wake instead. This removes empty
+polling without penalizing successful batches, performing a full-pipeline
+squash, or completing, merging, or reordering requests. The only deliberate
+delay is consumer notification for the first three completions in a full
+batch; the underlying completion events and timestamps are unchanged. A reset must
+also activate and remove any registered waiter so no context remains stranded.
+
+A guest-array encoding was rejected by live O3 tests. Functional writes from
+the pseudo instruction did not replace an already cached result line, while
+flushing that line made completion transport itself traverse all-CXL memory.
+The register encoding has no guest-memory or CXL data access. A real O3 smoke
+test must observe every token exactly once across multiple batches, recover
+all full owners, and compare every loaded SPM value. It must also issue one
+request and call the batch operation before that request completes, proving
+the context resumes only after the completion event publishes the token.
 
 HJ and STREAM preserve their published access granularities and deterministic
 operation order while using the same persistent SPM and completion machinery.
@@ -118,7 +165,8 @@ Implementation follows test-driven development:
    tests.
 2. Implement per-core coherent SPM ports and separate queue state.
 3. Implement the persistent coroutine scheduler and O(1) ID mapping.
-4. Rebuild gem5 and `libm5`, then run focused ASMC tests.
+4. Add the FIFO completion-batch m5op, rebuild gem5 and `libm5`, then run
+   focused ASMC and pseudo-instruction tests.
 5. Run only GUPS 5 us baseline/AMU first. Reject the implementation unless it
    is bit-exact and average MLP exceeds 130.
 6. On success, discard the old measurements and rerun all 36 calibration

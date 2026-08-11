@@ -52,6 +52,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "base/cprintf.hh"
@@ -139,6 +140,7 @@ struct AmuState
 };
 
 std::unordered_map<ThreadContext *, AmuState> amuStates;
+std::unordered_set<ThreadContext *> amuBatchWaiters;
 
 PortProxy &
 virtProxy(ThreadContext *tc, std::unique_ptr<TranslatingPortProxy> &fsProxy,
@@ -181,6 +183,11 @@ completeAmuRequest(ThreadContext *tc, uint64_t id)
 
     state.outstanding.erase(reqIt);
     state.finished.push_back(id);
+    if (amuBatchWaiters.count(tc) != 0 &&
+        (state.finished.size() >= 4 || state.outstanding.empty())) {
+        amuBatchWaiters.erase(tc);
+        tc->activate();
+    }
     DPRINTF(PseudoInst, "AMU complete id=%#llx\n",
             static_cast<unsigned long long>(id));
 }
@@ -634,6 +641,55 @@ amuGetfin(ThreadContext *tc)
 }
 
 uint64_t
+amuGetfinBatch(ThreadContext *tc)
+{
+    constexpr unsigned countBits = 3;
+    constexpr unsigned tokenBits = 15;
+    constexpr unsigned batchSize = 4;
+    constexpr uint64_t tokenMask = (UINT64_C(1) << tokenBits) - 1;
+    uint64_t packed = 0;
+    unsigned count = 0;
+    auto *asmc = ASMC::get(tc->getSystemPtr());
+    if (asmc) {
+        while (count < batchSize) {
+            const uint64_t id = asmc->getFinished(tc);
+            if (id == 0)
+                break;
+            packed |= (id & tokenMask) << (countBits + count * tokenBits);
+            ++count;
+        }
+    } else {
+        while (count < batchSize) {
+            const uint64_t id = amuGetfin(tc);
+            if (id == 0)
+                break;
+            packed |= (id & tokenMask) << (countBits + count * tokenBits);
+            ++count;
+        }
+    }
+    return packed | count;
+}
+
+void
+amuWaitfin(ThreadContext *tc)
+{
+    if (auto *asmc = ASMC::get(tc->getSystemPtr())) {
+        if (!asmc->quiesceUntilCompletion(tc))
+            tc->quiesceTick(tc->getCpuPtr()->nextCycle() + 1);
+        return;
+    }
+
+    AmuState &state = amuStates[tc];
+    if (!state.finished.empty() || state.outstanding.empty()) {
+        tc->quiesceTick(tc->getCpuPtr()->nextCycle() + 1);
+        return;
+    }
+    const bool inserted = amuBatchWaiters.insert(tc).second;
+    panic_if(!inserted, "AMU tried to quiesce an existing batch waiter");
+    tc->quiesce();
+}
+
+uint64_t
 amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
 {
     if (auto *asmc = ASMC::get(tc->getSystemPtr()))
@@ -655,6 +711,8 @@ amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
         state.outstanding.clear();
         state.finished.clear();
         state.nextId = 1;
+        if (amuBatchWaiters.erase(tc) != 0)
+            tc->activate();
         break;
       default:
         return 0;
