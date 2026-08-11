@@ -436,6 +436,56 @@ class CalibrationRunnerTest(unittest.TestCase):
                 calibration.sha256_file(owner),
             )
 
+    def test_compiler_identity_verification_rejects_hash_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            compiler = Path(temporary) / "compiler"
+            compiler.write_bytes(b"frozen compiler\n")
+            compiler.chmod(0o755)
+            identity = runner._compiler_identity(compiler)
+
+            runner._verify_compiler_identity(identity)
+            compiler.write_bytes(b"changed compiler\n")
+            with self.assertRaisesRegex(
+                calibration.CalibrationError, "compiler changed"
+            ):
+                runner._verify_compiler_identity(identity)
+
+    def test_collect_rejects_copy_restore_snapshot_mismatch_before_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            original = options.config.read_bytes()
+            real_copyfile = runner.shutil.copyfile
+
+            def copy_changed_then_restored(source, destination):
+                if Path(source).resolve() == options.config.resolve():
+                    options.config.write_bytes(b"transient changed origin\n")
+                    try:
+                        return real_copyfile(source, destination)
+                    finally:
+                        options.config.write_bytes(original)
+                return real_copyfile(source, destination)
+
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "7" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object(
+                runner.shutil,
+                "copyfile",
+                side_effect=copy_changed_then_restored,
+            ), mock.patch.object(runner.subprocess, "run") as run:
+                with self.assertRaisesRegex(
+                    calibration.CalibrationError, "snapshot hash mismatch"
+                ):
+                    runner.run_collect(options)
+
+            run.assert_not_called()
+            failed = runner.load_json(self._terminal_path(options, "failed"))
+            self.assertEqual(failed["status"], "failed")
+
     def test_collect_does_not_overwrite_manifest_created_by_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             options = self._collect_options(temporary)
@@ -566,6 +616,15 @@ class CalibrationRunnerTest(unittest.TestCase):
             )
             self.assertEqual(complete["actual"]["completed_simulations"], 36)
             self.assertEqual(complete["actual"]["measurement_rows"], 18)
+            self.assertEqual(
+                complete["measurements"]["path"],
+                str(options.measurements.resolve()),
+            )
+            self.assertEqual(
+                complete["measurements"]["sha256"],
+                calibration.sha256_file(options.measurements),
+            )
+            self.assertFalse(options.measurements.stat().st_mode & 0o222)
             self.assertIn("terminal_utc", complete)
             self.assertEqual(manifest["git"]["commit"], "b" * 40)
             self.assertEqual(
@@ -606,6 +665,57 @@ class CalibrationRunnerTest(unittest.TestCase):
                 self.assertTrue(Path(planned["cwd"]).is_absolute())
                 self.assertTrue(Path(planned["argv"][0]).is_absolute())
                 self.assertTrue(Path(planned["argv"][3]).is_absolute())
+
+    def test_collect_rejects_measurements_mutated_before_complete_terminal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            real_write_measurements = runner.write_measurements
+
+            def fake_run(command, **kwargs):
+                if self._is_build(command, options):
+                    Path(command[-1]).write_bytes(b"frozen proxy binary\n")
+                return subprocess.CompletedProcess(command, 0)
+
+            def write_then_mutate(path, rows, **kwargs):
+                expected_sha256 = real_write_measurements(
+                    path, rows, **kwargs
+                )
+                Path(path).chmod(0o644)
+                with Path(path).open("ab") as stream:
+                    stream.write(b"mutated after publication\n")
+                return expected_sha256
+
+            with mock.patch.object(
+                runner, "_git_provenance",
+                return_value={
+                    "commit": "8" * 40,
+                    "branch": "freeze",
+                    "clean": True,
+                },
+            ), mock.patch.object(
+                runner.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                runner, "_materialize_register_checksum"
+            ), mock.patch.object(
+                runner,
+                "_measurement_rows",
+                return_value=calibration.paper_measurements_for_test(),
+            ), mock.patch.object(
+                runner,
+                "write_measurements",
+                side_effect=write_then_mutate,
+            ):
+                with self.assertRaisesRegex(
+                    calibration.CalibrationError,
+                    "published measurements changed",
+                ):
+                    runner.run_collect(options)
+
+            self.assertFalse(
+                self._terminal_path(options, "complete").exists()
+            )
+            failed = runner.load_json(self._terminal_path(options, "failed"))
+            self.assertEqual(failed["status"], "failed")
 
     def test_collect_stops_before_next_run_if_frozen_input_changes(self):
         with tempfile.TemporaryDirectory() as temporary:

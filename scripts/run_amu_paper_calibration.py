@@ -119,9 +119,11 @@ def write_measurements(
                 writer.writerow({field: row[field] for field in MEASUREMENT_FIELDS})
             stream.flush()
             os.fsync(stream.fileno())
+        expected_sha256 = calibration.sha256_file(temporary)
         _publish_temporary(
             temporary, path, replace=replace, label=label
         )
+        return expected_sha256
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -769,6 +771,17 @@ def _compiler_identity(value):
     }
 
 
+def _verify_compiler_identity(identity):
+    if not isinstance(identity, dict) or set(identity) != {"path", "sha256"}:
+        raise calibration.CalibrationError("invalid compiler identity")
+    path = _require_file(identity["path"], "compiler").resolve()
+    if (
+        str(path) != identity["path"]
+        or calibration.sha256_file(path) != identity["sha256"]
+    ):
+        raise calibration.CalibrationError(f"compiler changed: {path}")
+
+
 def _claim_evidence_root(path):
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -802,11 +815,16 @@ def _snapshot_collection_inputs(origins, outdir):
             raise calibration.CalibrationError(
                 f"collection origin changed while snapshotting: {key}"
             )
+        frozen_hash = calibration.sha256_file(destination)
+        if frozen_hash != origin["origin_sha256"]:
+            raise calibration.CalibrationError(
+                f"collection snapshot hash mismatch: {key}"
+            )
         destination.chmod(0o555 if key == "gem5" else 0o444)
         snapshots[key] = {
             **origin,
             "frozen_path": str(destination),
-            "frozen_sha256": calibration.sha256_file(destination),
+            "frozen_sha256": frozen_hash,
         }
     return snapshots
 
@@ -843,6 +861,17 @@ def _verify_collection_manifest(path, frozen_sha256):
     ):
         raise calibration.CalibrationError(
             f"in-progress collection manifest changed: {path}"
+        )
+
+
+def _verify_published_measurements(path, expected_sha256):
+    path = Path(path)
+    if (
+        not path.is_file()
+        or calibration.sha256_file(path) != expected_sha256
+    ):
+        raise calibration.CalibrationError(
+            f"published measurements changed: {path}"
         )
 
 
@@ -937,6 +966,7 @@ def _terminal_record(
     completed_simulations,
     measurement_rows,
     failure_reason=None,
+    measurements=None,
 ):
     record = {
         "schema": "amu-paper-calibration-terminal",
@@ -951,6 +981,8 @@ def _terminal_record(
             "measurement_rows": measurement_rows,
         },
     }
+    if measurements is not None:
+        record["measurements"] = measurements
     return record
 
 
@@ -1363,9 +1395,11 @@ def run_collect(options):
         execution_cwd = REPO.resolve()
         Path(plan["binary"]).parent.mkdir()
         _verify_collection_inputs(inputs)
+        _verify_compiler_identity(compiler)
         subprocess.run(
             plan["build"], check=True, cwd=str(execution_cwd)
         )
+        _verify_compiler_identity(compiler)
         _verify_collection_inputs(inputs)
         proxy = _require_file(plan["binary"], "proxy binary").resolve()
         proxy.chmod(0o555)
@@ -1426,16 +1460,29 @@ def run_collect(options):
         _verify_collection_inputs(inputs)
         _verify_collection_manifest(manifest_path, immutable_sha256)
         _reject_existing(measurements, "measurements file")
-        write_measurements(measurements, rows, replace=False)
+        measurements_sha256 = write_measurements(
+            measurements, rows, replace=False
+        )
+        measurements.chmod(0o444)
+        _verify_published_measurements(
+            measurements, measurements_sha256
+        )
         measurement_rows = len(rows)
         _verify_collection_inputs(inputs)
         _verify_collection_manifest(manifest_path, immutable_sha256)
+        _verify_published_measurements(
+            measurements, measurements_sha256
+        )
         complete = _terminal_record(
             "complete",
             immutable_path,
             immutable_sha256,
             completed_runs,
             measurement_rows,
+            measurements={
+                "path": str(measurements),
+                "sha256": measurements_sha256,
+            },
         )
         _publish_terminal(complete_path, complete, "complete terminal")
     except Exception as error:
