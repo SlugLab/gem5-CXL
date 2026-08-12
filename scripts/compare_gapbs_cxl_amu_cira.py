@@ -33,11 +33,14 @@ from gapbs_checkpoint import (  # noqa: E402
 from gapbs_pr_experiment_profiles import (  # noqa: E402
     FROZEN_PROFILE_CONTRACTS,
     PROFILES as EXPERIMENT_PROFILES,
+    SCALING_PROFILE_NAME,
     ProfileError,
     get_profile,
     load_frozen_profile,
     load_graph_manifest,
+    load_scaling_profile,
     require_latency,
+    validate_scaling_profile,
 )
 
 
@@ -137,6 +140,11 @@ CIRA_LATENCY_STATS = {
 OWNED_COUNTER_STATS = {
     "asmc_loads": ("amu", "board.asmc.issuedLoads"),
     "asmc_completed": ("amu", "board.asmc.completedLoads"),
+    "asmc_queue_full_errors": ("amu", "board.asmc.rejectedQueueFull"),
+    "asmc_spm_full_errors": ("amu", "board.asmc.rejectedSpmFull"),
+    "asmc_translation_errors": ("amu", "board.asmc.translationFaults"),
+    "asmc_pending_errors": ("amu", "board.asmc.pendingQueueFull"),
+    "asmc_spm_flag_errors": ("amu", "board.asmc.spmMissingFlagPackets"),
     "cira_prefetches": ("cira", "board.cira.issuedPrefetches"),
     "cira_completed": ("cira", "board.cira.completedPrefetches"),
     "cira_indexed_prefetches": (
@@ -193,11 +201,19 @@ SUMMARY_FIELDS = (
     "checkpoint_manifest",
     "checkpoint_binary_sha256",
     "checkpoint_restores",
+    "checkpoint_boundary",
+    "warmup_execution",
+    "measured_interval",
     "sim_ticks",
     "sim_insts",
     "speedup_vs_cxl",
     "asmc_loads",
     "asmc_completed",
+    "asmc_queue_full_errors",
+    "asmc_spm_full_errors",
+    "asmc_translation_errors",
+    "asmc_pending_errors",
+    "asmc_spm_flag_errors",
     "cira_prefetches",
     "cira_completed",
     "cira_indexed_prefetches",
@@ -1193,6 +1209,9 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         "checkpoint_id": checkpoint_id,
         "checkpoint_manifest": str(manifest_path),
         "checkpoint_binary_sha256": identity["binary_sha256"],
+        "checkpoint_boundary": "trial0_entry",
+        "warmup_execution": "full_cxl_trial0",
+        "measured_interval": "trial1_init_through_final_drain",
     }
     if args.dry_run:
         return {
@@ -1478,6 +1497,16 @@ def write_summary(path, rows):
 def resolve_checkpoint_profile(args):
     name = getattr(args, "profile", "g20-2thread-1us")
     manifest_path = getattr(args, "graph_manifest", None)
+    if name == SCALING_PROFILE_NAME:
+        if manifest_path is None:
+            raise ProfileError(f"profile {name} requires --graph-manifest")
+        profile = validate_scaling_profile(
+            load_scaling_profile(manifest_path)
+        )
+        manifest = load_graph_manifest(manifest_path)
+        if Path(manifest.graph).resolve() != Path(args.graph).resolve():
+            raise ProfileError("graph path differs from frozen manifest")
+        return profile
     if name in FROZEN_PROFILE_CONTRACTS:
         if manifest_path is None:
             raise ProfileError(f"profile {name} requires --graph-manifest")
@@ -1562,6 +1591,7 @@ def main():
         "--profile",
         choices=tuple(
             sorted(set(EXPERIMENT_PROFILES) | set(FROZEN_PROFILE_CONTRACTS))
+            + [SCALING_PROFILE_NAME]
         ),
         default="g20-2thread-1us",
     )

@@ -19,6 +19,7 @@ G4_SHA256 = (
     "f234532690f6cfc30e993c4d9a1839e65002a618e7da20ea6a4242818b9c6c3d"
 )
 SCALING_SCALES = (4, 12, 14, 20)
+SCALING_PROFILE_NAME = "pr-scaling-4thread-1us"
 SCALING_GRAPH_HASHES = {
     4: G4_SHA256,
     20: m2ndp_artifacts.EXPECTED_G20_SHA256,
@@ -51,7 +52,7 @@ class ExperimentProfile:
 
 @dataclasses.dataclass(frozen=True)
 class ScalingExperimentProfile:
-    name: str = "pr-scaling-4thread-1us"
+    name: str = SCALING_PROFILE_NAME
     scales: tuple[int, ...] = SCALING_SCALES
     cores: int = 4
     threads: int = 4
@@ -293,6 +294,41 @@ def load_scaling_graphs(paths):
         load_any_frozen_graph(path) for path in paths
     )
     return validate_scaling_endpoint_hashes(manifests)
+
+
+def load_scaling_profile(manifest_path: Path) -> ExperimentProfile:
+    manifest = load_any_frozen_graph(manifest_path)
+    expected_hash = SCALING_GRAPH_HASHES.get(manifest.scale)
+    if expected_hash is not None and manifest.graph_sha256 != expected_hash:
+        raise ProfileError(
+            f"g{manifest.scale} graph SHA-256 does not match formal input"
+        )
+    return ExperimentProfile(
+        name=SCALING_PROFILE_NAME,
+        graph_scale=manifest.scale,
+        graph_sha256=manifest.graph_sha256,
+        num_nodes=manifest.num_nodes,
+        cores=4,
+        threads=4,
+        latencies=("1us",),
+    )
+
+
+def validate_scaling_profile(profile: ExperimentProfile) -> ExperimentProfile:
+    actual = (
+        profile.name,
+        profile.graph_scale in SCALING_SCALES,
+        profile.cores,
+        profile.threads,
+        profile.latencies,
+        profile.trials,
+        profile.measured_trial,
+        profile.page_rank_iterations,
+    )
+    expected = (SCALING_PROFILE_NAME, True, 4, 4, ("1us",), 2, 1, 20)
+    if actual != expected:
+        raise ProfileError(f"formal scaling profile differs: {actual}")
+    return profile
 
 
 def load_frozen_profile(name: str, manifest_path: Path) -> ExperimentProfile:

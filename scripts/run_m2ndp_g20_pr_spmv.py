@@ -155,7 +155,20 @@ def _stage_record():
 
 
 def _experiment_profile(options):
-    if options.profile in profiles.FROZEN_PROFILE_CONTRACTS:
+    if options.profile == profiles.SCALING_PROFILE_NAME:
+        if options.profile_manifest is None:
+            raise profiles.ProfileError(
+                f"profile {options.profile} requires --graph-manifest"
+            )
+        profile = profiles.validate_scaling_profile(
+            profiles.load_scaling_profile(options.profile_manifest)
+        )
+        manifest = profiles.load_graph_manifest(options.profile_manifest)
+        if Path(manifest.graph).resolve() != Path(options.graph).resolve():
+            raise profiles.ProfileError(
+                "graph path differs from frozen profile manifest"
+            )
+    elif options.profile in profiles.FROZEN_PROFILE_CONTRACTS:
         if options.profile_manifest is None:
             raise profiles.ProfileError(
                 f"profile {options.profile} requires --graph-manifest"
@@ -208,6 +221,9 @@ def new_state(options):
             "all_memory_cxl": True,
             "cxl_link_delay": options.cxl_link_delay,
             "smoke_test": options.smoke_test,
+            "checkpoint_boundary": "trial0_entry",
+            "warmup_execution": "full_cxl_trial0",
+            "measured_interval": "trial1_init_through_final_drain",
         },
         "stages": {stage: _stage_record() for stage in STAGES},
     }
@@ -835,6 +851,11 @@ def _publish(options, paths):
             _profile_manifest_sha256(options) or None
         ),
     )
+    row.update(
+        checkpoint_boundary="trial0_entry",
+        warmup_execution="full_cxl_trial0",
+        measured_interval="trial1_init_through_final_drain",
+    )
     artifacts.atomic_write_csv(
         paths.summary,
         tuple(row),
@@ -1063,6 +1084,15 @@ def _migrate_legacy_g20_contract(state, expected_contract):
             "profile", "graph_sha256", "threads",
             "profile_manifest", "profile_manifest_sha256",
         ),
+        (
+            "profile", "graph_sha256", "threads",
+            "checkpoint_boundary", "warmup_execution", "measured_interval",
+        ),
+        (
+            "profile", "graph_sha256", "threads",
+            "profile_manifest", "profile_manifest_sha256",
+            "checkpoint_boundary", "warmup_execution", "measured_interval",
+        ),
     ):
         legacy = dict(expected_contract)
         for field in fields:
@@ -1144,6 +1174,7 @@ def parse_args(argv=None):
         "--profile",
         choices=tuple(
             sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
+            + [profiles.SCALING_PROFILE_NAME]
         ),
         default="g20-2thread-1us",
     )

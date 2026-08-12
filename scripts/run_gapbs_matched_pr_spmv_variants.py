@@ -28,6 +28,14 @@ class VariantRunError(RuntimeError):
 def resolve_profile(options):
     name = getattr(options, "profile", "g20-2thread-1us")
     manifest = getattr(options, "graph_manifest", None)
+    if name == profiles.SCALING_PROFILE_NAME:
+        if manifest is None:
+            raise VariantRunError(
+                f"profile {name} requires --graph-manifest"
+            )
+        return profiles.validate_scaling_profile(
+            profiles.load_scaling_profile(manifest)
+        )
     if name in profiles.FROZEN_PROFILE_CONTRACTS:
         if manifest is None:
             raise VariantRunError(
@@ -64,6 +72,8 @@ def make_compare_args(options):
         graph=Path(options.graph).resolve(),
         graph_scale=graph_scale,
         checkpoint_root=Path(options.checkpoint_root).resolve(),
+        checkpoint_boundary="trial0_entry",
+        warmup_execution="full_cxl_trial0",
         reuse_checkpoints=True,
         smoke_test=smoke_test,
         cxl_link_delay=cxl_link_delay,
@@ -138,6 +148,11 @@ def validate_row(
         "all_memory_cxl": True,
         "checkpoint_restores": 1,
     }
+    if profile.name == profiles.SCALING_PROFILE_NAME:
+        expected.update(
+            checkpoint_boundary="trial0_entry",
+            warmup_execution="full_cxl_trial0",
+        )
     for field, value in expected.items():
         if row.get(field) != value:
             raise VariantRunError(
@@ -158,6 +173,17 @@ def validate_row(
     if kind == "amu":
         issued = _integer(row, "asmc_loads")
         completed = _integer(row, "asmc_completed")
+        errors = sum(_integer(row, field) for field in (
+            "asmc_queue_full_errors",
+            "asmc_spm_full_errors",
+            "asmc_translation_errors",
+            "asmc_pending_errors",
+            "asmc_spm_flag_errors",
+        ))
+        if errors:
+            raise VariantRunError(
+                f"AMU error counters are nonzero: {errors}"
+            )
         if issued <= 0 or issued != completed:
             raise VariantRunError(
                 f"AMU issued/completed load mismatch: {issued}/{completed}"
@@ -264,6 +290,7 @@ def parse_args(argv=None):
         "--profile",
         choices=tuple(
             sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
+            + [profiles.SCALING_PROFILE_NAME]
         ),
         default="g20-2thread-1us",
     )

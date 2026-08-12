@@ -545,6 +545,11 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             {
                 "board.asmc.issuedLoads": Decimal(7),
                 "board.asmc.completedLoads": Decimal(7),
+                "board.asmc.rejectedQueueFull": Decimal(0),
+                "board.asmc.rejectedSpmFull": Decimal(0),
+                "board.asmc.translationFaults": Decimal(0),
+                "board.asmc.pendingQueueFull": Decimal(0),
+                "board.asmc.spmMissingFlagPackets": Decimal(0),
                 "board.cira.issuedPrefetches": Decimal(8),
                 "board.cira.completedPrefetches": Decimal(8),
                 "board.cira.issuedIndexedPrefetches": Decimal(3),
@@ -558,6 +563,11 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         amu = self.runner.extract_owned_metrics(stats, "amu")
         self.assertEqual(amu["asmc_loads"], Decimal(7))
         self.assertEqual(amu["asmc_completed"], Decimal(7))
+        self.assertEqual(amu["asmc_queue_full_errors"], Decimal(0))
+        self.assertEqual(amu["asmc_spm_full_errors"], Decimal(0))
+        self.assertEqual(amu["asmc_translation_errors"], Decimal(0))
+        self.assertEqual(amu["asmc_pending_errors"], Decimal(0))
+        self.assertEqual(amu["asmc_spm_flag_errors"], Decimal(0))
         self.assertEqual(amu["cira_prefetches"], 0)
         cira = self.runner.extract_owned_metrics(stats, "cira")
         self.assertEqual(cira["asmc_loads"], 0)

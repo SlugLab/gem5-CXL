@@ -118,6 +118,47 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         self.assertEqual(args.iterations, 2)
         self.assertIn("OMP_NUM_THREADS=4", args.env)
 
+    def test_scaling_profile_uses_manifest_scale_and_full_cxl_warmup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "g12.sg"
+            generator = root / "converter"
+            nodes = 1 << 12
+            graph.write_bytes(
+                struct.pack("<?qq", False, 1, nodes)
+                + struct.pack(f"<{nodes + 1}q", *([0] * nodes + [1]))
+                + struct.pack("<i", 0)
+            )
+            generator.write_bytes(b"generator")
+            os.chmod(generator, 0o755)
+            from scripts import m2ndp_artifacts as artifacts
+            manifest = root / "g12.manifest.json"
+            manifest.write_text(json.dumps({
+                "schema": 1, "scale": 12,
+                "graph": str(graph.resolve()),
+                "graph_sha256": artifacts.sha256_file(graph),
+                "generator": str(generator.resolve()),
+                "generator_sha256": artifacts.sha256_file(generator),
+                "generator_command": [str(generator.resolve()), "-g", "12", "-b", str(graph.resolve())],
+                "num_nodes": nodes, "directed_edges": 1,
+            }) + "\n", encoding="utf-8")
+            options = SimpleNamespace(
+                profile="pr-scaling-4thread-1us", graph_manifest=manifest,
+                gem5=root / "gem5.opt", config=root / "config.py",
+                graph=graph, graph_scale=12, cxl_link_delay="1us",
+                checkpoint_root=root / "checkpoints", outdir=root / "run",
+                timeout=0,
+            )
+            profile = runner.resolve_profile(options)
+            args = runner.make_compare_args(options)
+
+        self.assertEqual(profile.graph_scale, 12)
+        self.assertEqual((profile.cores, profile.threads), (4, 4))
+        self.assertEqual(args.iterations, 2)
+        self.assertEqual(args.measure_trial, 1)
+        self.assertEqual(args.checkpoint_boundary, "trial0_entry")
+        self.assertEqual(args.warmup_execution, "full_cxl_trial0")
+
     def test_g4_row_rejects_two_core_result(self):
         row = self.valid_row("cira")
         row.update(
@@ -183,6 +224,13 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             runner.VariantRunError, "AMU issued/completed"
         ):
+            runner.validate_row(row, "amu", smoke_test=False)
+
+    def test_amu_row_rejects_any_queue_or_translation_error(self):
+        row = self.valid_row("amu")
+        row["asmc_pending_errors"] = 1
+
+        with self.assertRaisesRegex(runner.VariantRunError, "AMU error"):
             runner.validate_row(row, "amu", smoke_test=False)
 
     def test_cira_row_requires_a_real_descriptor_and_completion(self):
@@ -255,6 +303,11 @@ class MatchedVariantRunnerTest(unittest.TestCase):
             "sim_ticks": 123,
             "asmc_loads": 32 if kind == "amu" else 0,
             "asmc_completed": 32 if kind == "amu" else 0,
+            "asmc_queue_full_errors": 0,
+            "asmc_spm_full_errors": 0,
+            "asmc_translation_errors": 0,
+            "asmc_pending_errors": 0,
+            "asmc_spm_flag_errors": 0,
             "cira_prefetches": 64 if kind == "cira" else 0,
             "cira_completed": 64 if kind == "cira" else 0,
             "cira_indexed_prefetches": 0,

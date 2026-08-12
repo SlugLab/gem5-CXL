@@ -149,6 +149,43 @@ class OrchestratorTest(unittest.TestCase):
             str(manifest.resolve()),
         )
 
+    def test_scaling_profile_records_trial0_entry_and_full_cxl_warmup(self):
+        root = self.outdir.parent
+        graph = root / "g14-scaling.sg"
+        generator = root / "scaling-converter"
+        nodes = 1 << 14
+        graph.write_bytes(
+            struct.pack("<?qq", False, 1, nodes)
+            + struct.pack(f"<{nodes + 1}q", *([0] * nodes + [1]))
+            + struct.pack("<i", 0)
+        )
+        generator.write_bytes(b"generator")
+        os.chmod(generator, 0o755)
+        manifest = root / "g14-scaling.manifest.json"
+        manifest.write_text(json.dumps({
+            "schema": 1, "scale": 14,
+            "graph": str(graph.resolve()),
+            "graph_sha256": artifacts.sha256_file(graph),
+            "generator": str(generator.resolve()),
+            "generator_sha256": artifacts.sha256_file(generator),
+            "generator_command": [str(generator.resolve()), "-g", "14", "-b", str(graph.resolve())],
+            "num_nodes": nodes, "directed_edges": 1,
+        }) + "\n", encoding="utf-8")
+        options = dataclasses.replace(
+            self.options, graph=graph, graph_scale=14,
+            profile="pr-scaling-4thread-1us",
+            profile_manifest=manifest, cxl_link_delay="1us",
+        )
+
+        contract = runner.new_state(options)["contract"]
+        command = runner.gem5_command(options, self.paths)
+
+        self.assertEqual(contract["cores"], 4)
+        self.assertEqual(contract["threads"], 4)
+        self.assertEqual(contract["checkpoint_boundary"], "trial0_entry")
+        self.assertEqual(contract["warmup_execution"], "full_cxl_trial0")
+        self.assertNotIn("--smoke-test", command)
+
     def test_resume_migrates_legacy_g20_contract(self):
         legacy = runner.new_state(self.options)
         for field in ("profile", "graph_sha256", "threads"):
