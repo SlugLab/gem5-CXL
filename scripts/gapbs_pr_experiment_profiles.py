@@ -18,6 +18,11 @@ except ImportError:
 G4_SHA256 = (
     "f234532690f6cfc30e993c4d9a1839e65002a618e7da20ea6a4242818b9c6c3d"
 )
+SCALING_SCALES = (4, 12, 14, 20)
+SCALING_GRAPH_HASHES = {
+    4: G4_SHA256,
+    20: m2ndp_artifacts.EXPECTED_G20_SHA256,
+}
 LATENCY_TICKS = {
     "200ns": 200_000,
     "500ns": 500_000,
@@ -39,6 +44,18 @@ class ExperimentProfile:
     cores: int
     threads: int
     latencies: tuple[str, ...]
+    trials: int = 2
+    measured_trial: int = 1
+    page_rank_iterations: int = 20
+
+
+@dataclasses.dataclass(frozen=True)
+class ScalingExperimentProfile:
+    name: str = "pr-scaling-4thread-1us"
+    scales: tuple[int, ...] = SCALING_SCALES
+    cores: int = 4
+    threads: int = 4
+    latencies: tuple[str, ...] = ("1us",)
     trials: int = 2
     measured_trial: int = 1
     page_rank_iterations: int = 20
@@ -96,6 +113,10 @@ PROFILES = {
         latencies=("200ns", "500ns", "1us", "2us"),
     ),
 }
+
+
+def get_scaling_profile() -> ScalingExperimentProfile:
+    return ScalingExperimentProfile()
 
 
 def get_profile(name: str) -> ExperimentProfile:
@@ -177,8 +198,8 @@ def load_graph_manifest(path: Path) -> FrozenGraphManifest:
         )
     if value["schema"] != 1 or not _is_int(value["schema"]):
         raise ProfileError("frozen graph manifest schema must be integer 1")
-    if value["scale"] not in (12, 14) or not _is_int(value["scale"]):
-        raise ProfileError("frozen graph scale must be 12 or 14")
+    if value["scale"] not in SCALING_SCALES or not _is_int(value["scale"]):
+        raise ProfileError("frozen graph scale must be 4, 12, 14, or 20")
     if not _is_int(value["num_nodes"]) or value["num_nodes"] <= 0:
         raise ProfileError("frozen graph node count is invalid")
     if (
@@ -236,6 +257,42 @@ def validate_frozen_graph(manifest: FrozenGraphManifest) -> None:
         raise ProfileError("serialized graph node count does not match manifest")
     if directed_edges != manifest.directed_edges:
         raise ProfileError("serialized graph edge count does not match manifest")
+
+
+def load_any_frozen_graph(path: Path) -> FrozenGraphManifest:
+    manifest = load_graph_manifest(path)
+    if manifest.num_nodes != 1 << manifest.scale:
+        raise ProfileError("graph node count does not match scale")
+    validate_frozen_graph(manifest)
+    return manifest
+
+
+def validate_scaling_sequence(manifests):
+    manifests = tuple(manifests)
+    if tuple(row.scale for row in manifests) != SCALING_SCALES:
+        raise ProfileError("scaling graph manifests must be g4,g12,g14,g20")
+    for row in manifests:
+        if row.num_nodes != 1 << row.scale:
+            raise ProfileError("graph node count does not match scale")
+    return manifests
+
+
+def validate_scaling_endpoint_hashes(manifests):
+    manifests = validate_scaling_sequence(manifests)
+    for row in manifests:
+        expected = SCALING_GRAPH_HASHES.get(row.scale)
+        if expected is not None and row.graph_sha256 != expected:
+            raise ProfileError(
+                f"g{row.scale} graph SHA-256 does not match formal input"
+            )
+    return manifests
+
+
+def load_scaling_graphs(paths):
+    manifests = validate_scaling_sequence(
+        load_any_frozen_graph(path) for path in paths
+    )
+    return validate_scaling_endpoint_hashes(manifests)
 
 
 def load_frozen_profile(name: str, manifest_path: Path) -> ExperimentProfile:

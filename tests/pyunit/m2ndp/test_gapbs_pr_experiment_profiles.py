@@ -28,6 +28,31 @@ def write_generator(path, payload=b"generator-v1"):
 
 
 class ExperimentProfileTest(unittest.TestCase):
+    def make_manifest(self, root, scale, *, edges=3):
+        graph = root / f"g{scale}.sg"
+        generator = root / f"generator-{scale}"
+        manifest_path = root / f"g{scale}.manifest.json"
+        write_serialized_graph(graph, nodes=1 << scale, edges=edges)
+        write_generator(generator)
+        value = {
+            "schema": 1,
+            "scale": scale,
+            "graph": str(graph.resolve()),
+            "graph_sha256": artifacts.sha256_file(graph),
+            "generator": str(generator.resolve()),
+            "generator_sha256": artifacts.sha256_file(generator),
+            "generator_command": [
+                str(generator.resolve()), "-g", str(scale), "-b",
+                str(graph.resolve()),
+            ],
+            "num_nodes": 1 << scale,
+            "directed_edges": edges,
+        }
+        manifest_path.write_text(
+            json.dumps(value, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return manifest_path, value
+
     def test_g4_profile_is_four_thread_four_latency_contract(self):
         profile = profiles.get_profile("g4-4thread-sweep")
         self.assertEqual(profile.graph_scale, 4)
@@ -39,6 +64,17 @@ class ExperimentProfileTest(unittest.TestCase):
             profile.latencies,
             ("200ns", "500ns", "1us", "2us"),
         )
+
+    def test_scaling_profile_is_four_thread_one_microsecond_contract(self):
+        profile = profiles.get_scaling_profile()
+        self.assertEqual(profile.name, "pr-scaling-4thread-1us")
+        self.assertEqual(profile.scales, (4, 12, 14, 20))
+        self.assertEqual(profile.cores, 4)
+        self.assertEqual(profile.threads, 4)
+        self.assertEqual(profile.latencies, ("1us",))
+        self.assertEqual(profile.trials, 2)
+        self.assertEqual(profile.measured_trial, 1)
+        self.assertEqual(profile.page_rank_iterations, 20)
 
     def test_graph_hash_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,6 +190,39 @@ class ExperimentProfileTest(unittest.TestCase):
                 profiles.load_frozen_profile(
                     "g12-4thread-qualification", manifest_path
                 )
+
+    def test_any_frozen_graph_supports_all_scaling_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = []
+            for scale in (4, 12, 14, 20):
+                path, _ = self.make_manifest(root, scale)
+                rows.append(profiles.load_any_frozen_graph(path))
+            self.assertEqual(tuple(row.scale for row in rows), (4, 12, 14, 20))
+            self.assertEqual(tuple(row.num_nodes for row in rows),
+                             tuple(1 << scale for scale in (4, 12, 14, 20)))
+
+    def test_scaling_sequence_rejects_reordered_manifests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = []
+            for scale in (4, 12, 14, 20):
+                path, _ = self.make_manifest(root, scale)
+                rows.append(profiles.load_any_frozen_graph(path))
+            with self.assertRaisesRegex(profiles.ProfileError, "g4,g12,g14,g20"):
+                profiles.validate_scaling_sequence(
+                    (rows[0], rows[2], rows[1], rows[3])
+                )
+
+    def test_scaling_endpoint_hashes_are_fixed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = []
+            for scale in (4, 12, 14, 20):
+                path, _ = self.make_manifest(root, scale)
+                rows.append(profiles.load_any_frozen_graph(path))
+            with self.assertRaisesRegex(profiles.ProfileError, "g4 graph SHA-256"):
+                profiles.validate_scaling_endpoint_hashes(rows)
 
 
 if __name__ == "__main__":
