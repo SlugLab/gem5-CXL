@@ -22,6 +22,9 @@ enum amu_cfg_reg
     AMU_CFG_RESET = 3,
     AMU_CFG_OUTSTANDING = 3,
     AMU_CFG_FINISHED = 4,
+    AMU_CFG_FAR_SEND_QUEUE_PACKETS = 7,
+    AMU_CFG_SPM_SEND_QUEUE_PACKETS = 8,
+    AMU_CFG_CACHE_LINE_BYTES = 9,
 };
 
 static inline uint64_t

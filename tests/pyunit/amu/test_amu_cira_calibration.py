@@ -195,6 +195,50 @@ class CalibrationRunnerTest(unittest.TestCase):
             options.outdir / "bin/amu_paper_profile"
         ).resolve()
 
+    def test_measurement_parser_rejects_nonzero_amu_failure_counters(self):
+        clean_stats = {
+            "simTicks": 1000,
+            "board.asmc.metadataAccesses": 6,
+            "board.asmc.idBatchRefills": 1,
+            "board.asmc.completedLoads": 2,
+            "board.asmc.completedStores": 1,
+            "board.asmc.avgOutstanding": 2.5,
+            "board.asmc.rejectedQueueFull": 0,
+            "board.asmc.rejectedSpmFull": 0,
+            "board.asmc.translationFaults": 0,
+            "board.asmc.pendingQueueFull": 0,
+            "board.asmc.farSpmFlagPackets": 0,
+            "board.asmc.spmMissingFlagPackets": 0,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            raw = run_dir / "checksum.raw"
+            raw.write_bytes(b"\0" * 8)
+            record = {
+                "run_dir": str(run_dir),
+                "raw": str(raw),
+                "kind": "amu",
+            }
+            for suffix in (
+                "rejectedQueueFull",
+                "rejectedSpmFull",
+                "translationFaults",
+                "pendingQueueFull",
+                "farSpmFlagPackets",
+                "spmMissingFlagPackets",
+            ):
+                stats = dict(clean_stats)
+                stats[f"board.asmc.{suffix}"] = 1
+                with self.subTest(counter=suffix), mock.patch(
+                    "scripts.compare_gapbs_cxl_amu_cira.parse_stats",
+                    return_value=stats,
+                ):
+                    with self.assertRaisesRegex(
+                        calibration.CalibrationError,
+                        f"nonzero AMU failure counter .{suffix}",
+                    ):
+                        runner._parse_run(record)
+
     def test_collect_cli_requires_pdf_and_hardware_csv(self):
         common = [
             "collect",

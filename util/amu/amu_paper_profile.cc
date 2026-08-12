@@ -101,6 +101,7 @@ static_assert((kOwnerSets & (kOwnerSets - 1)) == 0,
               "owner set count must be a power of two");
 
 alignas(64) std::array<uint8_t, kSpmBytes> spmArena{};
+size_t queueSafeSlots = 0;
 
 Options
 parseOptions(int argc, char **argv)
@@ -142,6 +143,36 @@ size_t
 activeSlotCount(size_t granularity)
 {
     return std::min(kWindowSlots, kSpmBytes / slotStride(granularity));
+}
+
+size_t
+queueSafeSlotCount(size_t granularity)
+{
+    const size_t cache_line_bytes =
+        amu_cfgrd(AMU_CFG_CACHE_LINE_BYTES);
+    const size_t far_queue_packets =
+        amu_cfgrd(AMU_CFG_FAR_SEND_QUEUE_PACKETS);
+    const size_t spm_queue_packets =
+        amu_cfgrd(AMU_CFG_SPM_SEND_QUEUE_PACKETS);
+    if (cache_line_bytes == 0 || far_queue_packets == 0 ||
+        spm_queue_packets == 0) {
+        throw std::runtime_error("AMU queue geometry is unavailable");
+    }
+    if (cache_line_bytes != kCacheLineBytes) {
+        throw std::runtime_error(
+            "AMU paper proxy requires 64-byte cache lines");
+    }
+
+    // Far vectors are not guaranteed to be cache-line aligned. A range can
+    // therefore touch one more line than its aligned SPM slot. An aload owns
+    // reservations for both the coherent acquire and line-write SPM phases.
+    const size_t max_far_packets =
+        (granularity + 2 * cache_line_bytes - 2) / cache_line_bytes;
+    const size_t spm_packets =
+        (granularity + cache_line_bytes - 1) / cache_line_bytes;
+    const size_t reserved_spm_packets = 2 * spm_packets;
+    return std::min(far_queue_packets / max_far_packets,
+                    spm_queue_packets / reserved_spm_packets);
 }
 
 void
@@ -227,7 +258,8 @@ class PersistentScheduler
   public:
     explicit PersistentScheduler(size_t granularity)
         : granularity(granularity), stride(slotStride(granularity)),
-          activeSlots(activeSlotCount(granularity))
+          activeSlots(std::min(activeSlotCount(granularity),
+                               queueSafeSlots))
     {
         if (activeSlots == 0)
             throw std::runtime_error("SPM arena has no usable slots");
@@ -553,6 +585,7 @@ prepareAndPrime(const Options &options, BenchmarkState &state)
 
     if (options.amu) {
         flushFarWorkingSet(options, state);
+        queueSafeSlots = queueSafeSlotCount(workloadGranularity(options));
         primeSpm(workloadGranularity(options));
     }
 }

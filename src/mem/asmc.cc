@@ -1070,6 +1070,12 @@ ASMC::cfgRead(ThreadContext *tc, uint64_t reg) const
         return spmSize;
       case 6:
         return spmUsed;
+      case 7:
+        return maxSendQueue;
+      case 8:
+        return spmSendQueueSize;
+      case 9:
+        return cacheLineSize;
       default:
         return 0;
     }

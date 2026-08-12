@@ -16,6 +16,7 @@ SOURCE = (REPO / "src/mem/asmc.cc").read_text(encoding="utf-8")
 
 def write_stats(path, *, amu, average=200, peak=256, requests=65536,
                 far_flag=0, missing_flag=0, io_write_hits=0,
+                pending_queue_full=0,
                 far_reads=None, far_writes=None,
                 spm_reads=None, spm_writes=None):
     far_reads = requests if far_reads is None else far_reads
@@ -36,6 +37,7 @@ def write_stats(path, *, amu, average=200, peak=256, requests=65536,
                 "board.asmc.rejectedQueueFull 0",
                 "board.asmc.rejectedSpmFull 0",
                 "board.asmc.translationFaults 0",
+                f"board.asmc.pendingQueueFull {pending_queue_full}",
                 f"board.asmc.farReadPackets {far_reads}",
                 f"board.asmc.farWritePackets {far_writes}",
                 f"board.asmc.spmReadPackets {spm_reads}",
@@ -180,6 +182,7 @@ class AmuGupsGateTest(unittest.TestCase):
             "checksum",
             "average",
             "peak",
+            "pending_queue_full",
             "mixed_binary",
             "cores",
             "far_flag",
@@ -205,6 +208,8 @@ class AmuGupsGateTest(unittest.TestCase):
                     stats_options["average"] = 130
                 elif mutation == "peak":
                     stats_options["peak"] = 257
+                elif mutation == "pending_queue_full":
+                    stats_options["pending_queue_full"] = 1
                 elif mutation == "far_flag":
                     stats_options["far_flag"] = 1
                 elif mutation == "missing_flag":

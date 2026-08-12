@@ -9,6 +9,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 SOURCE = (REPO / "util/amu/amu_paper_profile.cc").read_text(encoding="utf-8")
+AMU_API = (REPO / "util/amu/amu.h").read_text(encoding="utf-8")
+ASMC_SOURCE = (REPO / "src/mem/asmc.cc").read_text(encoding="utf-8")
 
 
 @dataclass
@@ -69,6 +71,67 @@ def run_host_pipeline(order):
 
 
 class AmuPaperProfileSchedulerTest(unittest.TestCase):
+    def test_multiline_window_is_bounded_by_route_packet_reservations(self):
+        cache_line_bytes = 64
+        far_queue_packets = 512
+        spm_queue_packets = 512
+        stream_bytes = 512
+        maximum_far_packets = (
+            stream_bytes + 2 * cache_line_bytes - 2
+        ) // cache_line_bytes
+        aligned_spm_packets = (
+            stream_bytes + cache_line_bytes - 1
+        ) // cache_line_bytes
+        safe_slots = min(
+            far_queue_packets // maximum_far_packets,
+            spm_queue_packets // (2 * aligned_spm_packets),
+        )
+        self.assertEqual(maximum_far_packets, 9)
+        self.assertEqual(aligned_spm_packets, 8)
+        self.assertEqual(safe_slots, 32)
+
+        for token in (
+            "AMU_CFG_FAR_SEND_QUEUE_PACKETS = 7",
+            "AMU_CFG_SPM_SEND_QUEUE_PACKETS = 8",
+            "AMU_CFG_CACHE_LINE_BYTES = 9",
+        ):
+            self.assertIn(token, AMU_API)
+        cfg_read = ASMC_SOURCE[
+            ASMC_SOURCE.index("ASMC::cfgRead"):
+            ASMC_SOURCE.index("ASMC::deleteQueuedPacket")
+        ]
+        self.assertIn("return maxSendQueue", cfg_read)
+        self.assertIn("return spmSendQueueSize", cfg_read)
+        self.assertIn("return cacheLineSize", cfg_read)
+
+        self.assertIn("queueSafeSlotCount", SOURCE)
+        scheduler = SOURCE[
+            SOURCE.index("PersistentScheduler(size_t granularity)"):
+            SOURCE.index("size_t capacity() const")
+        ]
+        self.assertIn("queueSafeSlots", scheduler)
+        self.assertNotIn("queueSafeSlotCount", scheduler)
+        queue_window = SOURCE[
+            SOURCE.index("queueSafeSlotCount"):
+            SOURCE.index("void\nflushRange")
+        ]
+        self.assertIn("AMU_CFG_FAR_SEND_QUEUE_PACKETS", queue_window)
+        self.assertIn("AMU_CFG_SPM_SEND_QUEUE_PACKETS", queue_window)
+        self.assertIn("AMU_CFG_CACHE_LINE_BYTES", queue_window)
+        self.assertIn("cache_line_bytes != kCacheLineBytes", queue_window)
+        self.assertIn("2 * spm_packets", queue_window)
+
+        prepare = SOURCE[
+            SOURCE.index("prepareAndPrime"):
+            SOURCE.index("runGupsBaseline")
+        ]
+        self.assertIn(
+            "queueSafeSlots = queueSafeSlotCount(workloadGranularity(options))",
+            prepare,
+        )
+        main = SOURCE[SOURCE.index("main(int argc") :]
+        self.assertLess(main.index("prepareAndPrime"), main.index("m5_work_begin"))
+
     def test_source_uses_one_persistent_aligned_arena_and_fixed_slots(self):
         self.assertIn("constexpr size_t kSpmBytes = 64 * 1024", SOURCE)
         self.assertIn("constexpr size_t kWindowSlots = 256", SOURCE)

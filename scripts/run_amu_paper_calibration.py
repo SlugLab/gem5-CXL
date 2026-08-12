@@ -1101,7 +1101,12 @@ def validate_gups_gate(baseline, amu, binary, *, execution_inputs):
         raise calibration.CalibrationError(
             "GUPS 5us peak outstanding exceeds 256"
         )
-    for suffix in (".rejectedQueueFull", ".rejectedSpmFull", ".translationFaults"):
+    for suffix in (
+        ".rejectedQueueFull",
+        ".rejectedSpmFull",
+        ".translationFaults",
+        ".pendingQueueFull",
+    ):
         if _gate_stat(stats, suffix) != 0:
             raise calibration.CalibrationError(
                 f"GUPS gate nonzero failure counter {suffix}"
@@ -1259,6 +1264,20 @@ def _parse_run(record):
         stats = comparison.parse_stats(run_dir / "stats.txt")
     except comparison.StatsError as error:
         raise calibration.CalibrationError(str(error)) from error
+    if record["kind"] == "amu":
+        for suffix in (
+            ".rejectedQueueFull",
+            ".rejectedSpmFull",
+            ".translationFaults",
+            ".pendingQueueFull",
+            ".farSpmFlagPackets",
+            ".spmMissingFlagPackets",
+        ):
+            value = _stat_by_suffix(stats, suffix)
+            if value != 0:
+                raise calibration.CalibrationError(
+                    f"nonzero AMU failure counter {suffix}: {value:g}"
+                )
     raw = _require_file(record["raw"], "proxy checksum")
     payload = raw.read_bytes()
     if len(payload) != 8:
