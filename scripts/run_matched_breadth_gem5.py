@@ -841,7 +841,11 @@ def _write_lazy_initial_memory_map(bundle, path):
 
 
 def _write_lazy_boundary_map(bundle, path):
+    commitments = bundle.meta.get("boundary_commitments")
+    if not isinstance(commitments, dict) or not commitments:
+        raise ReplayError("lazy trace raw output boundary mapping is missing")
     rows = []
+    selected = set()
     sequence = 0
     with lazy.MappedState(bundle) as state:
         for invocation in bundle.invocations:
@@ -854,12 +858,16 @@ def _write_lazy_boundary_map(bundle, path):
             if commit is None:
                 raise ReplayError("lazy invocation has no COMMIT")
             for name, bits, count, base in npb.invocation_boundary_specs(bundle, invocation):
+                if name not in commitments:
+                    continue
+                if name in selected:
+                    raise ReplayError(f"duplicate lazy boundary mapping: {name}")
                 step = bits // 8
                 rows.append((name, bits, tuple(
                     (base + index * step, commit) for index in range(count)
                 )))
-    commitments = bundle.meta.get("boundary_commitments")
-    if not isinstance(commitments, dict) or set(commitments) != {row[0] for row in rows}:
+                selected.add(name)
+    if set(commitments) != selected:
         raise ReplayError("lazy trace raw output boundary mapping is missing")
     lines = [_BOUNDARY_MAGIC, str(len(rows))]
     for name, bits, probes in rows:

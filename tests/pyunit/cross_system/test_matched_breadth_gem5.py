@@ -1032,6 +1032,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
              }},
             (), (invocation,), {"primitive_records": 4},
         )
+
         binary = replay.build_replay_binary(self.root / "drift-build", native=True)
         stream = self.root / "drift.stream"
         replay.write_lazy_replay_stream(trace, stream)
@@ -1072,6 +1073,47 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             got = hashlib.sha256(struct.pack("<Q", *row["raw_words"])).hexdigest()
             if got != bundle.meta["boundary_commitments"]["scalar.result.divide.iter1"]:
                 raise replay.ReplayError("stream replay boundary differs")
+
+    def test_lazy_boundary_map_selects_only_native_committed_boundaries(self):
+        trace = self.root / "npb-cg-native-boundary-subset"
+        trace.mkdir()
+        raw_two = 0x4000000000000000
+        raw_four = 0x4010000000000000
+        invocations = (
+            lazy.Invocation(
+                0, 103, "npb_cg_divide", 1, 1,
+                {"numerator": "numerator", "denominator": "denominator",
+                 "result": "uncommitted"},
+            ),
+            lazy.Invocation(
+                1, 103, "npb_cg_divide", 2, 1,
+                {"numerator": "numerator", "denominator": "denominator",
+                 "result": "kept"},
+            ),
+        )
+        kept_name = "scalar.kept.divide.iter2"
+        lazy.write_bundle(
+            trace,
+            {"schema": 2, "workload": "npb_cg",
+             "source_sha256": _digest("subset-source"),
+             "binary_sha256": _digest("subset-binary"),
+             "config_sha256": _digest("subset-config"),
+             "initial_scalars": {"numerator": raw_four,
+                                 "denominator": raw_two,
+                                 "uncommitted": 0, "kept": 0},
+             "boundary_commitments": {
+                 kept_name: hashlib.sha256(
+                     struct.pack("<Q", raw_two)
+                 ).hexdigest(),
+             }},
+            (), invocations, {"primitive_records": 8},
+        )
+        boundary_map = replay._write_lazy_boundary_map(
+            lazy.read_bundle(trace), self.root / "subset-boundary-map.txt"
+        )
+        lines = boundary_map.read_text(encoding="ascii").splitlines()
+        self.assertEqual(lines[1], "1")
+        self.assertEqual(bytes.fromhex(lines[2].split()[0]).decode(), kept_name)
 
     def test_window_evidence_keeps_positive_fixed_roi_ticks_separate(self):
         dynamic = {"sim_ticks": 12345, "verification": "pass"}
