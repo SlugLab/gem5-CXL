@@ -70,7 +70,6 @@ struct BenchmarkState {
     std::vector<StreamBlock> streamA;
     std::vector<StreamBlock> streamB;
     std::vector<StreamBlock> streamC;
-    std::vector<StreamBlock> streamStagedB;
 };
 
 enum class SlotPhase {
@@ -573,7 +572,6 @@ prepareAndPrime(const Options &options, BenchmarkState &state)
         state.streamA.resize(kStreamBlocks);
         state.streamB.resize(kStreamBlocks);
         state.streamC.resize(kStreamBlocks);
-        state.streamStagedB.resize(kStreamBlocks);
         for (size_t block = 0; block < kStreamBlocks; ++block) {
             for (size_t word = 0; word < 64; ++word) {
                 state.streamB[block].words[word] = block * 64 + word;
@@ -751,14 +749,44 @@ runStreamBaseline(const Options &options, BenchmarkState &state)
 }
 
 bool
-refillStreamSlot(PersistentScheduler &scheduler, BenchmarkState &state,
-                 size_t &next_block, size_t slot_index)
+refillStreamPair(PersistentScheduler &scheduler, BenchmarkState &state,
+                 size_t &next_block, size_t pair)
 {
     if (next_block == kStreamBlocks)
         return false;
     const size_t block = next_block++;
-    scheduler.issueLoad(slot_index, block, &state.streamB[block], 0);
+    scheduler.issueLoad(2 * pair, block, &state.streamB[block], 0);
+    scheduler.issueLoad(2 * pair + 1, block, &state.streamC[block], 1);
     return true;
+}
+
+void
+startStreamStoreIfReady(PersistentScheduler &scheduler,
+                        BenchmarkState &state, size_t pair)
+{
+    const size_t bSlotIndex = 2 * pair;
+    const size_t cSlotIndex = 2 * pair + 1;
+    Slot &bSlot = scheduler.slot(bSlotIndex);
+    Slot &cSlot = scheduler.slot(cSlotIndex);
+    if (bSlot.phase != SlotPhase::LoadPending ||
+        cSlot.phase != SlotPhase::LoadPending ||
+        bSlot.stage != 0 || cSlot.stage != 1 ||
+        bSlot.op != cSlot.op) {
+        throw std::runtime_error("STREAM pair ownership/phase mismatch");
+    }
+    if (bSlot.id != 0 || cSlot.id != 0)
+        return;
+
+    StreamBlock *bValue = scheduler.payload<StreamBlock>(bSlotIndex);
+    StreamBlock *cValue = scheduler.payload<StreamBlock>(cSlotIndex);
+    for (size_t word = 0; word < 64; ++word) {
+        cValue->words[word] =
+            bValue->words[word] + 3 * cValue->words[word];
+    }
+    const size_t block = cSlot.op;
+    scheduler.release(bSlotIndex);
+    scheduler.readyToStore(cSlotIndex, &state.streamA[block]);
+    scheduler.issueStore(cSlotIndex);
 }
 
 void
@@ -768,50 +796,43 @@ runStreamAmu(const Options &options, BenchmarkState &state)
         PersistentScheduler scheduler(sizeof(StreamBlock));
         size_t nextBlock = 0;
         size_t completed = 0;
-        for (size_t slot = 0; slot < scheduler.capacity(); ++slot)
-            refillStreamSlot(scheduler, state, nextBlock, slot);
+        const size_t pairCount = scheduler.capacity() / 2;
+        if (pairCount == 0)
+            throw std::runtime_error("STREAM requires two scheduler slots");
+        for (size_t pair = 0; pair < pairCount; ++pair)
+            refillStreamPair(scheduler, state, nextBlock, pair);
 
         while (completed != kStreamBlocks) {
             std::array<size_t, kCompletionBatch> completedSlots;
             const size_t completionCount =
                 scheduler.waitCompletionBatch(completedSlots);
+            // waitCompletionBatch clears every completed ID before returning.
+            // Classify the whole batch before changing either slot in a pair:
+            // B and C can both occur in one batch, and transitioning on B
+            // would otherwise make C look like the newly issued store.
+            std::array<bool, kWindowSlots / 2> completedLoadPairs{};
             for (size_t completionIndex = 0;
                  completionIndex < completionCount; ++completionIndex) {
                 const size_t slot_index = completedSlots[completionIndex];
                 Slot &slot = scheduler.slot(slot_index);
-                const size_t block = slot.op;
-                if (slot.phase == SlotPhase::LoadPending && slot.stage == 0) {
-                    std::memcpy(&state.streamStagedB[block],
-                                scheduler.payload<StreamBlock>(slot_index),
-                                sizeof(StreamBlock));
-                    scheduler.release(slot_index);
-                    scheduler.issueLoad(
-                        slot_index, block, &state.streamC[block], 1);
-                } else if (slot.phase == SlotPhase::LoadPending &&
-                           slot.stage == 1) {
-                    StreamBlock value{};
-                    std::memcpy(
-                        &value, scheduler.payload<StreamBlock>(slot_index),
-                        sizeof(value));
-                    for (size_t word = 0; word < 64; ++word) {
-                        value.words[word] =
-                            state.streamStagedB[block].words[word] +
-                            3 * value.words[word];
-                    }
-                    std::memcpy(scheduler.payload<StreamBlock>(slot_index),
-                                &value, sizeof(value));
-                    scheduler.readyToStore(
-                        slot_index, &state.streamA[block]);
-                    scheduler.issueStore(slot_index);
+                if (slot.phase == SlotPhase::LoadPending) {
+                    completedLoadPairs[slot_index / 2] = true;
                 } else if (slot.phase == SlotPhase::StorePending) {
+                    if ((slot_index & 1) == 0 || slot.stage != 1)
+                        throw std::runtime_error(
+                            "STREAM store completed outside a C slot");
+                    const size_t pair = slot_index / 2;
                     scheduler.release(slot_index);
                     ++completed;
-                    refillStreamSlot(
-                        scheduler, state, nextBlock, slot_index);
+                    refillStreamPair(scheduler, state, nextBlock, pair);
                 } else {
                     throw std::runtime_error(
                         "STREAM slot completed in wrong phase");
                 }
+            }
+            for (size_t pair = 0; pair < pairCount; ++pair) {
+                if (completedLoadPairs[pair])
+                    startStreamStoreIfReady(scheduler, state, pair);
             }
         }
         scheduler.requireDrained();

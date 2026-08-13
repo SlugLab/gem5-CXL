@@ -70,6 +70,41 @@ def run_host_pipeline(order):
     return table, reference
 
 
+def run_host_stream_pairs(load_order, store_order):
+    blocks = 8
+    words = 64
+    stream_b = [
+        [block * words + word for word in range(words)]
+        for block in range(blocks)
+    ]
+    stream_c = [
+        [0x100000001 + block + word for word in range(words)]
+        for block in range(blocks)
+    ]
+    reference = [
+        [stream_b[block][word] + 3 * stream_c[block][word]
+         for word in range(words)]
+        for block in range(blocks)
+    ]
+    spm = {}
+    ready = {block: set() for block in range(blocks)}
+    output = [None] * blocks
+    for block in range(blocks):
+        spm[(block, "b")] = list(stream_b[block])
+        spm[(block, "c")] = list(stream_c[block])
+    for block, operand in load_order:
+        ready[block].add(operand)
+        if ready[block] == {"b", "c"}:
+            spm[(block, "c")] = [
+                spm[(block, "b")][word] +
+                3 * spm[(block, "c")][word]
+                for word in range(words)
+            ]
+    for block in store_order:
+        output[block] = list(spm[(block, "c")])
+    return output, reference
+
+
 class AmuPaperProfileSchedulerTest(unittest.TestCase):
     def test_multiline_window_is_bounded_by_route_packet_reservations(self):
         cache_line_bytes = 64
@@ -245,6 +280,53 @@ class AmuPaperProfileSchedulerTest(unittest.TestCase):
         self.assertEqual(shuffled, shuffled_reference)
         self.assertEqual(forward, reverse)
         self.assertEqual(forward, shuffled)
+
+    def test_stream_pairs_keep_b_and_c_in_spm_until_both_complete(self):
+        loads = [
+            (block, operand)
+            for block in range(8)
+            for operand in ("b", "c")
+        ]
+        random.Random(19).shuffle(loads)
+        stores = list(range(8))
+        random.Random(23).shuffle(stores)
+        output, reference = run_host_stream_pairs(loads, stores)
+        self.assertEqual(output, reference)
+
+        stream = SOURCE[
+            SOURCE.index("refillStreamPair"):
+            SOURCE.index("void\nrunKernel")
+        ]
+        state = SOURCE[
+            SOURCE.index("struct BenchmarkState"):
+            SOURCE.index("enum class SlotPhase")
+        ]
+        self.assertNotIn("streamStagedB", state)
+        self.assertNotIn("streamStagedB", stream)
+        self.assertIn("scheduler.capacity() / 2", stream)
+        self.assertIn("2 * pair", stream)
+        self.assertIn("2 * pair + 1", stream)
+        self.assertIn("&state.streamB[block]", stream)
+        self.assertIn("&state.streamC[block]", stream)
+        self.assertIn("bSlot.id != 0 || cSlot.id != 0", stream)
+        self.assertIn("bValue->words[word]", stream)
+        self.assertIn("cValue->words[word]", stream)
+
+    def test_stream_defers_pair_transition_until_batch_is_classified(self):
+        stream = SOURCE[
+            SOURCE.index("runStreamAmu"):
+            SOURCE.index("void\nrunKernel")
+        ]
+        self.assertIn(
+            "std::array<bool, kWindowSlots / 2> completedLoadPairs{}",
+            stream,
+        )
+        self.assertIn(
+            "completedLoadPairs[slot_index / 2] = true", stream
+        )
+        mark = stream.index("completedLoadPairs[slot_index / 2] = true")
+        transition = stream.index("startStreamStoreIfReady")
+        self.assertLess(mark, transition)
 
     def test_host_model_rejects_wrong_owner_phase_and_stale_id(self):
         for mutation in ("owner", "phase", "stale"):
