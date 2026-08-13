@@ -335,6 +335,27 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(materialized.measure_start_item, 0)
         self.assertEqual(materialized.fixed_event_records, 4)
         self.assertEqual(bundle.meta["source_schema"], 2)
+        stream = self.root / "lazy-stream.bin"
+        stream_evidence = replay.write_lazy_replay_stream(trace, stream)
+        self.assertEqual(stream_evidence["trace_records"], 6)
+        self.assertEqual(stream_evidence["commit_order"], [2, 5])
+        self.assertEqual(stream_evidence["raw_outputs"], [0, 0])
+        self.assertRegex(stream_evidence["operations_sha256"], r"^[0-9a-f]{64}$")
+        self.assertFalse((trace / "trace.bin").exists())
+        binary = replay.build_replay_binary(
+            self.root / "lazy-stream-build", native=True
+        )
+        result_path = self.root / "lazy-stream-result.json"
+        subprocess.run([
+            str(binary), "--system", "vanilla", "--trace", str(stream),
+            "--result", str(result_path), "--mode", "functional",
+            "--stream", "1",
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+           text=True)
+        replayed = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(replayed["trace_records"], 6)
+        self.assertEqual(replayed["commit_order"], [2, 5])
+        self.assertEqual(replayed["raw_outputs"], [0, 0])
 
     def test_window_materialization_rejects_trace_or_phase_drift(self):
         operations = (

@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -111,43 +112,51 @@ bitCast(From value)
 class Memory
 {
   public:
+    Memory() = default;
+
     explicit Memory(const std::vector<TraceRecord> &records)
     {
-        std::unordered_map<uint64_t, std::array<unsigned char, 64>> initial;
-        std::unordered_map<uint64_t, bool> written;
+        prepare(records);
+    }
+
+    void prepare(const std::vector<TraceRecord> &records)
+    {
         for (const auto &record : records) {
             const auto opcode = static_cast<Opcode>(record.opcode);
-            if (isLoad(opcode) && !written[record.address]) {
-                const uint64_t line = lineAddress(record.address);
-                auto &bytes = initial[line];
-                storeRaw(bytes.data() + lineOffset(record.address),
-                         width(opcode), record.result);
-            }
-            if (isStore(opcode))
-                written[record.address] = true;
             if (isMemory(opcode)) {
                 const uint64_t line = lineAddress(record.address);
                 if (lineIndices.count(line) == 0) {
                     lineIndices.emplace(line, lineAddresses.size());
                     lineAddresses.push_back(line);
+                    lines.push_back(std::make_unique<DataLine>());
                 }
+                const size_t lineIndex = lineIndices.at(line);
                 if (trackerIndices.count(record.address) == 0) {
                     trackerIndices.emplace(
                         record.address, trackerAddresses.size());
                     trackerAddresses.push_back(record.address);
+                    trackers.push_back(
+                        std::make_unique<std::atomic<uint64_t>>(NoStore));
+                }
+                const uint32_t bytes = width(opcode);
+                if (isLoad(opcode)) {
+                    std::array<unsigned char, sizeof(uint64_t)> raw{};
+                    std::memcpy(raw.data(), &record.result, bytes);
+                    auto *destination = static_cast<unsigned char *>(
+                        pointer(record.address));
+                    for (uint32_t offset = 0; offset < bytes; ++offset) {
+                        const uint64_t logical = record.address + offset;
+                        if (initializedBytes.insert(logical).second &&
+                            writtenBytes.count(logical) == 0) {
+                            destination[offset] = raw[offset];
+                            preparedLines.insert(lineIndex);
+                        }
+                    }
+                } else {
+                    for (uint32_t offset = 0; offset < bytes; ++offset)
+                        writtenBytes.insert(record.address + offset);
                 }
             }
-        }
-        lines = std::make_unique<DataLine[]>(lineAddresses.size());
-        for (size_t index = 0; index < lineAddresses.size(); ++index) {
-            const auto found = initial.find(lineAddresses[index]);
-            if (found != initial.end())
-                lines[index].bytes = found->second;
-        }
-        trackers = std::make_unique<std::atomic<uint64_t>[]>(
-            trackerAddresses.size());
-        for (size_t index = 0; index < trackerAddresses.size(); ++index) {
-            trackers[index].store(NoStore, std::memory_order_relaxed);
         }
     }
 
@@ -191,7 +200,7 @@ class Memory
         const auto found = lineIndices.find(lineAddress(logical));
         if (found == lineIndices.end())
             throw std::runtime_error("logical address is not mapped");
-        return lines[found->second].bytes.data() + lineOffset(logical);
+        return lines[found->second]->bytes.data() + lineOffset(logical);
     }
 
     uint64_t load(uint64_t logical, uint32_t bytes)
@@ -212,10 +221,20 @@ class Memory
     void flushForRoi()
     {
         for (size_t index = 0; index < lineAddresses.size(); ++index) {
-            __asm__ volatile("clflush (%0)" : : "r"(&lines[index])
+            __asm__ volatile("clflush (%0)" : : "r"(lines[index].get())
                              : "memory");
         }
         __asm__ volatile("mfence" : : : "memory");
+    }
+
+    void flushPrepared()
+    {
+        for (const size_t index : preparedLines) {
+            __asm__ volatile("clflush (%0)" : : "r"(lines[index].get())
+                             : "memory");
+        }
+        __asm__ volatile("mfence" : : : "memory");
+        preparedLines.clear();
     }
 
     void waitForStore(uint64_t logical, uint64_t sequence)
@@ -255,15 +274,18 @@ class Memory
         const auto found = trackerIndices.find(logical);
         if (found == trackerIndices.end())
             throw std::runtime_error("logical address is not mapped");
-        return trackers[found->second];
+        return *trackers[found->second];
     }
 
     std::vector<uint64_t> lineAddresses;
     std::unordered_map<uint64_t, size_t> lineIndices;
-    std::unique_ptr<DataLine[]> lines;
+    std::vector<std::unique_ptr<DataLine>> lines;
     std::vector<uint64_t> trackerAddresses;
     std::unordered_map<uint64_t, size_t> trackerIndices;
-    std::unique_ptr<std::atomic<uint64_t>[]> trackers;
+    std::vector<std::unique_ptr<std::atomic<uint64_t>>> trackers;
+    std::unordered_set<uint64_t> initializedBytes;
+    std::unordered_set<uint64_t> writtenBytes;
+    std::unordered_set<size_t> preparedLines;
 };
 
 class Accessor
@@ -586,6 +608,79 @@ readTrace(const std::string &path)
     return records;
 }
 
+bool
+readExact(int descriptor, void *destination, size_t bytes, bool allowEof)
+{
+    auto *payload = static_cast<unsigned char *>(destination);
+    for (size_t offset = 0; offset < bytes; offset += 64)
+        __asm__ volatile("clflush (%0)" : : "r"(payload + offset) : "memory");
+    __asm__ volatile("mfence" : : : "memory");
+    size_t received = 0;
+    while (received < bytes) {
+        const ssize_t count = ::read(
+            descriptor, payload + received, bytes - received);
+        if (count < 0)
+            throw std::runtime_error("canonical stream read failed");
+        if (count == 0) {
+            if (allowEof && received == 0)
+                return false;
+            throw std::runtime_error("canonical stream is truncated");
+        }
+        received += size_t(count);
+    }
+    return true;
+}
+
+std::vector<TraceRecord>
+readStreamFrame(int descriptor, uint64_t &expectedSequence, bool &finished)
+{
+    struct Header
+    {
+        std::array<unsigned char, 8> magic;
+        uint64_t records;
+        uint64_t flags;
+    };
+    static_assert(sizeof(Header) == 24, "stream header ABI differs");
+    constexpr std::array<unsigned char, 8> magic = {
+        'M', 'T', 'R', 'C', 'V', '2', 0, 0
+    };
+    alignas(64) Header header{};
+    if (!readExact(descriptor, &header, sizeof(header), true))
+        throw std::runtime_error("canonical stream has no final frame");
+    if (header.magic != magic || header.flags > 1 ||
+        header.records > 4096 ||
+        (header.flags == 1 && header.records != 0) ||
+        (header.flags == 0 && header.records == 0)) {
+        throw std::runtime_error("canonical stream frame header differs");
+    }
+    if (header.flags == 1) {
+        finished = true;
+        return {};
+    }
+    const size_t bytes = size_t(header.records) * sizeof(TraceRecord);
+    void *rawPayload = nullptr;
+    if (posix_memalign(&rawPayload, 64, bytes) != 0)
+        throw std::runtime_error("canonical stream staging allocation failed");
+    try {
+        readExact(descriptor, rawPayload, bytes, false);
+    } catch (...) {
+        std::free(rawPayload);
+        throw;
+    }
+    std::vector<TraceRecord> records(size_t(header.records));
+    std::memcpy(records.data(), rawPayload, bytes);
+    std::free(rawPayload);
+    for (const auto &record : records) {
+        if (record.sequence != expectedSequence++ || record.reserved != 0)
+            throw std::runtime_error("canonical stream sequence differs");
+        if (record.opcode < static_cast<uint16_t>(Opcode::LOAD_U32) ||
+            record.opcode > static_cast<uint16_t>(Opcode::F64_ABS)) {
+            throw std::runtime_error("canonical stream opcode differs");
+        }
+    }
+    return records;
+}
+
 std::unique_ptr<Accessor>
 makeAccessor(const std::string &system, Memory &memory)
 {
@@ -648,12 +743,34 @@ captureAccessorStats(Accessor &accessor, ReplayStats &stats)
 }
 
 void
+accumulateStats(ReplayStats &total, const ReplayStats &observed)
+{
+    total.issuedLoads += observed.issuedLoads;
+    total.completedLoads += observed.completedLoads;
+    total.drains += observed.drains;
+    total.maxObservedOutstanding = std::max(
+        total.maxObservedOutstanding, observed.maxObservedOutstanding);
+    for (size_t core = 0; core < 4; ++core) {
+        total.issuedPerCore[core] += observed.issuedPerCore[core];
+        total.completedPerCore[core] += observed.completedPerCore[core];
+        total.workerThreads[core] =
+            total.workerThreads[core] || observed.workerThreads[core];
+    }
+}
+
+void
 executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
              Accessor &accessor, Memory &memory,
-             const std::vector<uint64_t> &previousStore,
-             const std::vector<size_t> &commitSlots,
+             const std::unordered_map<uint64_t, uint64_t> &previousStore,
+             const std::unordered_map<uint64_t, size_t> &commitSlots,
              std::vector<Commit> &commits)
 {
+    const auto waitForPreviousStore = [&](const TraceRecord &operation) {
+        const auto found = previousStore.find(operation.sequence);
+        memory.waitForStore(
+            operation.address,
+            found == previousStore.end() ? Memory::NoStore : found->second);
+    };
     size_t index = 0;
     while (index < group.recordIndices.size()) {
         const auto *record = &records[group.recordIndices[index]];
@@ -675,9 +792,7 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                 if (Memory::isLoad(candidateOpcode)) {
                     if (requests.size() == 32)
                         break;
-                    memory.waitForStore(
-                        candidate->address,
-                        previousStore[candidate->sequence]);
+                    waitForPreviousStore(*candidate);
                     requests.push_back(accessor.load(
                         candidate->address, Memory::width(candidateOpcode),
                         candidate->sequence));
@@ -710,18 +825,17 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
 
         uint64_t observed = record->result;
         if (Memory::isStore(opcode)) {
-            memory.waitForStore(record->address,
-                                previousStore[record->sequence]);
+            waitForPreviousStore(*record);
             accessor.store(record->address, Memory::width(opcode),
                            record->result);
             memory.publishStore(record->address, record->sequence);
         } else {
             observed = evaluate(*record);
             if (opcode == Opcode::COMMIT) {
-                const size_t slot = commitSlots[record->sequence];
-                if (slot == size_t(-1))
+                const auto found = commitSlots.find(record->sequence);
+                if (found == commitSlots.end())
                     throw std::runtime_error("commit slot is missing");
-                commits[slot] =
+                commits[found->second] =
                     Commit{record->sequence, record->address, observed};
             }
         }
@@ -737,8 +851,8 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
 ReplayStats
 executeTrace(const std::string &system, const std::vector<Phase> &phases,
              const std::vector<TraceRecord> &records, Memory &memory,
-             const std::vector<uint64_t> &previousStore,
-             const std::vector<size_t> &commitSlots,
+             const std::unordered_map<uint64_t, uint64_t> &previousStore,
+             const std::unordered_map<uint64_t, size_t> &commitSlots,
              std::vector<Commit> &commits)
 {
     ReplayStats total;
@@ -779,21 +893,8 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
         }
         if (failed)
             throw std::runtime_error(failure);
-        for (const auto &stats : threadStats) {
-            total.issuedLoads += stats.issuedLoads;
-            total.completedLoads += stats.completedLoads;
-            total.drains += stats.drains;
-            total.maxObservedOutstanding = std::max(
-                total.maxObservedOutstanding,
-                stats.maxObservedOutstanding);
-            for (size_t core = 0; core < 4; ++core) {
-                total.issuedPerCore[core] += stats.issuedPerCore[core];
-                total.completedPerCore[core] +=
-                    stats.completedPerCore[core];
-                total.workerThreads[core] =
-                    total.workerThreads[core] || stats.workerThreads[core];
-            }
-        }
+        for (const auto &stats : threadStats)
+            accumulateStats(total, stats);
     }
     return total;
 }
@@ -817,7 +918,7 @@ selectGroups(const std::vector<Phase> &phases, uint64_t measureStart,
 
 void
 writeResult(const std::string &path, const std::string &system,
-            const std::vector<TraceRecord> &records,
+            size_t traceRecords,
             const std::vector<Commit> &commits, size_t allocatedBytes,
             size_t phases, const ReplayStats &stats, const std::string &mode)
 {
@@ -865,10 +966,70 @@ writeResult(const std::string &path, const std::string &system,
         stream << core;
         first = false;
     }
-    stream << "],\"trace_records\":" << records.size()
+    stream << "],\"trace_records\":" << traceRecords
            << ",\"verification\":\"pass\"}\n";
     if (!stream)
         throw std::runtime_error("replay result write failed");
+}
+
+void
+executeStreamFile(const std::string &path, const std::string &system,
+                  const std::string &resultPath)
+{
+    const int descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0)
+        throw std::runtime_error("cannot open canonical stream");
+    Memory memory;
+    ReplayStats total;
+    std::vector<Commit> commits;
+    std::unordered_map<uint64_t, uint64_t> lastStore;
+    uint64_t expectedSequence = 0;
+    size_t phaseExecutions = 0;
+    bool finished = false;
+    try {
+        while (!finished) {
+            auto records = readStreamFrame(
+                descriptor, expectedSequence, finished);
+            if (finished)
+                break;
+            memory.prepare(records);
+            memory.flushPrepared();
+            std::unordered_map<uint64_t, uint64_t> previousStore;
+            std::unordered_map<uint64_t, size_t> commitSlots;
+            for (const auto &record : records) {
+                const auto opcode = static_cast<Opcode>(record.opcode);
+                if (Memory::isLoad(opcode) || Memory::isStore(opcode)) {
+                    const auto prior = lastStore.find(record.address);
+                    if (prior != lastStore.end())
+                        previousStore.emplace(record.sequence, prior->second);
+                    if (Memory::isStore(opcode))
+                        lastStore[record.address] = record.sequence;
+                }
+                if (opcode == Opcode::COMMIT) {
+                    commitSlots.emplace(record.sequence, commits.size());
+                    commits.push_back({});
+                }
+            }
+            const auto phases = buildPhases(records);
+            phaseExecutions += phases.size();
+            const auto observed = executeTrace(
+                system, phases, records, memory, previousStore,
+                commitSlots, commits);
+            accumulateStats(total, observed);
+        }
+    } catch (...) {
+        ::close(descriptor);
+        throw;
+    }
+    if (::close(descriptor) != 0)
+        throw std::runtime_error("canonical stream close failed");
+    std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
+              << memory.allocatedBytes() << " allocated_bytes="
+              << memory.allocatedBytes()
+              << " all_memory_cxl=true" << std::endl;
+    writeResult(resultPath, system, size_t(expectedSequence), commits,
+                memory.allocatedBytes(), phaseExecutions, total,
+                "functional");
 }
 
 } // anonymous namespace
@@ -888,6 +1049,7 @@ main(int argc, char **argv)
         bool hasPhase = false;
         bool hasWindowIndex = false;
         bool hasMeasureStartItem = false;
+        bool streamMode = false;
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
             if (index + 1 >= argc)
@@ -911,6 +1073,11 @@ main(int argc, char **argv)
             } else if (option == "--measure-start-item") {
                 measureStartItem = std::stoull(argv[++index]);
                 hasMeasureStartItem = true;
+            } else if (option == "--stream") {
+                const std::string value = argv[++index];
+                if (value != "0" && value != "1")
+                    throw std::runtime_error("stream mode value is invalid");
+                streamMode = value == "1";
             }
             else
                 throw std::runtime_error("unknown replay option: " + option);
@@ -919,6 +1086,8 @@ main(int argc, char **argv)
             throw std::runtime_error("replay options are incomplete");
         if (mode != "functional" && mode != "window")
             throw std::runtime_error("replay mode is invalid");
+        if (streamMode && mode != "functional")
+            throw std::runtime_error("stream replay must be functional");
         if (mode == "functional" &&
             (!windowManifest.empty() || hasPhase || hasWindowIndex ||
              hasMeasureStartItem)) {
@@ -938,6 +1107,14 @@ main(int argc, char **argv)
         (void)windowIndex;
 #endif
 
+        if (streamMode) {
+            executeStreamFile(tracePath, system, resultPath);
+#ifndef TRACE_REPLAY_NATIVE
+            m5_exit(0);
+#endif
+            return 0;
+        }
+
         const auto records = readTrace(tracePath);
         Memory memory(records);
         std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
@@ -945,21 +1122,21 @@ main(int argc, char **argv)
                   << memory.allocatedBytes()
                   << " all_memory_cxl=true" << std::endl;
         const auto phases = buildPhases(records);
-        std::vector<uint64_t> previousStore(records.size(), Memory::NoStore);
+        std::unordered_map<uint64_t, uint64_t> previousStore;
         std::unordered_map<uint64_t, uint64_t> lastStore;
-        std::vector<size_t> commitSlots(records.size(), size_t(-1));
+        std::unordered_map<uint64_t, size_t> commitSlots;
         size_t commitCount = 0;
         for (const auto &record : records) {
             const auto opcode = static_cast<Opcode>(record.opcode);
             if (Memory::isLoad(opcode) || Memory::isStore(opcode)) {
                 const auto found = lastStore.find(record.address);
                 if (found != lastStore.end())
-                    previousStore[record.sequence] = found->second;
+                    previousStore.emplace(record.sequence, found->second);
                 if (Memory::isStore(opcode))
                     lastStore[record.address] = record.sequence;
             }
             if (opcode == Opcode::COMMIT)
-                commitSlots[record.sequence] = commitCount++;
+                commitSlots.emplace(record.sequence, commitCount++);
         }
         std::vector<Commit> commits(commitCount);
         memory.flushForRoi();
@@ -987,7 +1164,7 @@ main(int argc, char **argv)
             stats = executeTrace(system, phases, records, memory,
                                  previousStore, commitSlots, commits);
         }
-        writeResult(resultPath, system, records, commits,
+        writeResult(resultPath, system, records.size(), commits,
                     memory.allocatedBytes(), measuredPhases, stats, mode);
 #ifndef TRACE_REPLAY_NATIVE
         m5_exit(0);

@@ -13,8 +13,10 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 try:
@@ -53,6 +55,9 @@ _NPB_PHASE_NAMES = {
     204: "mg_interp",
     205: "mg_norm2u3",
 }
+_STREAM_MAGIC = b"MTRCV2\0\0"
+_STREAM_HEADER = struct.Struct("<8sQQ")
+_STREAM_CHUNK_RECORDS = 4096
 
 
 class ReplayError(RuntimeError):
@@ -311,6 +316,82 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         Path(outdir).resolve(), source_schema, source_sha256, phase,
         phase_name, warmup_items, measured_items, warmup_items, state["fixed"],
     )
+
+
+def _emit_lazy_replay_stream(trace, stream):
+    bundle = lazy.read_bundle(trace)
+    operation_digest = hashlib.sha256()
+    stream_digest = hashlib.sha256()
+    commits = []
+    chunk = bytearray()
+    chunk_records = 0
+    total_records = 0
+
+    def write(payload):
+        stream.write(payload)
+        stream_digest.update(payload)
+
+    def flush_chunk():
+        nonlocal chunk, chunk_records
+        if chunk_records == 0:
+            return
+        write(_STREAM_HEADER.pack(_STREAM_MAGIC, chunk_records, 0))
+        write(chunk)
+        chunk = bytearray()
+        chunk_records = 0
+
+    for operation in lazy.iter_operations(
+        bundle, npb.EXPANDERS, batch_work_items=1024
+    ):
+        payload = canonical.TRACE_STRUCT.pack(
+            operation.phase, int(operation.opcode), 0,
+            operation.work_item, operation.sequence, operation.address,
+            operation.operand0, operation.operand1, operation.result,
+        )
+        operation_digest.update(payload)
+        chunk.extend(payload)
+        chunk_records += 1
+        total_records += 1
+        if operation.opcode == canonical.Opcode.COMMIT:
+            commits.append((operation.sequence, operation.result))
+        if chunk_records == _STREAM_CHUNK_RECORDS:
+            flush_chunk()
+    flush_chunk()
+    write(_STREAM_HEADER.pack(_STREAM_MAGIC, 0, 1))
+    return {
+        "schema": 1,
+        "source_schema": 2,
+        "source_trace_sha256": trace_identity_sha256(trace),
+        "trace_records": total_records,
+        "operations_sha256": operation_digest.hexdigest(),
+        "stream_sha256": stream_digest.hexdigest(),
+        "commit_order": [sequence for sequence, _ in commits],
+        "raw_outputs": [result for _, result in commits],
+    }
+
+
+def write_lazy_replay_stream(trace, path):
+    """Write a framed schema-2 stream without materializing an eager trace."""
+    path = Path(path).resolve()
+    if path.exists():
+        raise ReplayError(f"lazy replay stream already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            evidence = _emit_lazy_replay_stream(trace, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise ReplayError(f"lazy replay stream already exists: {path}") from error
+        return evidence
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def build_replay_binary(outdir, *, native=False, cxx="g++"):
@@ -608,15 +689,15 @@ def command_for(options):
     if options.mode not in {"functional", "window"}:
         raise ReplayError(f"unsupported replay mode: {options.mode}")
     trace = Path(options.trace).resolve()
-    trace_file = Path(
-        getattr(options, "replay_trace", trace / "trace.bin")
-    ).resolve()
+    trace_file = Path(getattr(options, "replay_trace", trace / "trace.bin"))
     binary_args = [
         "--system", options.system,
         "--trace", str(trace_file),
         "--result", str((Path(options.outdir).resolve() / "result.json")),
         "--mode", options.mode,
     ]
+    if getattr(options, "stream_mode", False):
+        binary_args.extend(("--stream", "1"))
     if options.mode == "functional":
         if any(
             value is not None
@@ -716,23 +797,35 @@ def _required_shadow_bytes(bundle):
     })
 
 
-def collect_run_evidence(run_dir, *, system, trace, config):
+def collect_run_evidence(run_dir, *, system, trace, config,
+                         expected=None, required_bytes=None):
     """Join bit-exact program output with gem5-owned causal statistics."""
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
     run_dir = Path(run_dir).resolve()
-    bundle = canonical.read_bundle(Path(trace).resolve())
+    bundle = None
+    if expected is None:
+        bundle = canonical.read_bundle(Path(trace).resolve())
+        expected_order, expected_raw = _expected_commits(bundle)
+        required_bytes = _required_shadow_bytes(bundle)
+    else:
+        expected_order = expected["commit_order"]
+        expected_raw = expected["raw_outputs"]
+        if required_bytes is None:
+            raise ReplayError("stream replay required allocation is missing")
     result = _load_json(run_dir / "result.json", "replay result")
-    expected_order, expected_raw = _expected_commits(bundle)
     if result.get("commit_order") != expected_order:
         raise ReplayError("replay commit order differs from canonical trace")
     if result.get("raw_outputs") != expected_raw:
         raise ReplayError("replay raw output differs from canonical trace")
+    if expected is not None and result.get("trace_records") != expected[
+        "trace_records"
+    ]:
+        raise ReplayError("stream replay record count differs")
     if result.get("verification") != "pass":
         raise ReplayError("replay program verification did not pass")
 
     topology = validate_config_ini(config)
-    required_bytes = _required_shadow_bytes(bundle)
     allocation = (
         parse_allocation_log(run_dir / "simout", required_bytes=required_bytes)
         if required_bytes
@@ -852,6 +945,11 @@ def run(options):
             raise ReplayError(f"replay {label} is missing: {path}")
     trace = Path(options.trace).resolve()
     materialized = None
+    lazy_bundle = None
+    producer_thread = None
+    producer_evidence = {}
+    producer_errors = []
+    pipe_read = None
     replay_trace = trace
     if options.mode == "window":
         materialized = materialize_window_trace(
@@ -863,9 +961,7 @@ def run(options):
         )
         replay_trace = materialized.root
     elif (trace / "trace.v2.json").is_file():
-        raise ReplayError(
-            "schema-2 functional replay requires the bounded streaming engine"
-        )
+        lazy_bundle = lazy.read_bundle(trace)
     else:
         try:
             canonical.read_bundle(trace)
@@ -878,12 +974,35 @@ def run(options):
         if not manifest.is_file():
             raise ReplayError(f"window manifest is missing: {manifest}")
     run_options = argparse.Namespace(**vars(options))
-    run_options.replay_trace = replay_trace / "trace.bin"
+    if lazy_bundle is not None:
+        pipe_read, pipe_write = os.pipe()
+        run_options.replay_trace = Path(
+            f"/proc/{os.getpid()}/fd/{pipe_read}"
+        )
+        run_options.stream_mode = True
+
+        def produce():
+            try:
+                with os.fdopen(pipe_write, "wb", buffering=0) as stream:
+                    producer_evidence.update(
+                        _emit_lazy_replay_stream(trace, stream)
+                    )
+            except BaseException as error:
+                producer_errors.append(error)
+
+        producer_thread = threading.Thread(
+            target=produce, name="matched-lazy-trace-producer", daemon=True
+        )
+        producer_thread.start()
+    else:
+        run_options.replay_trace = replay_trace / "trace.bin"
     if materialized is not None:
         run_options.measure_start_item = materialized.measure_start_item
     command = command_for(run_options)
     outdir.parent.mkdir(parents=True, exist_ok=True)
     driver_log = outdir.with_suffix(".driver.log")
+    completed = None
+    launch_error = None
     try:
         with driver_log.open("x", encoding="utf-8") as stream:
             completed = subprocess.run(
@@ -895,15 +1014,38 @@ def run(options):
                 timeout=None if options.timeout == 0 else options.timeout,
             )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise ReplayError(f"gem5 replay launch failed: {error}") from error
+        launch_error = error
+    finally:
+        if pipe_read is not None:
+            os.close(pipe_read)
+        if producer_thread is not None:
+            producer_thread.join(timeout=60)
+    if launch_error is not None:
+        raise ReplayError(f"gem5 replay launch failed: {launch_error}") from launch_error
+    if producer_thread is not None and producer_thread.is_alive():
+        raise ReplayError("lazy replay producer did not terminate")
+    if producer_errors:
+        raise ReplayError(f"lazy replay producer failed: {producer_errors[0]}")
     if completed.returncode != 0:
         raise ReplayError(
             f"gem5 replay exited {completed.returncode}; see {driver_log}"
         )
-    row = collect_run_evidence(
-        outdir, system=options.system, trace=replay_trace,
-        config=outdir / "config.ini",
-    )
+    if lazy_bundle is None:
+        row = collect_run_evidence(
+            outdir, system=options.system, trace=replay_trace,
+            config=outdir / "config.ini",
+        )
+    else:
+        widths = {"u32": 4, "u64": 8, "f32": 4, "f64": 8}
+        required_bytes = sum(
+            array.count * widths[array.element_type]
+            for array in lazy_bundle.arrays
+        )
+        row = collect_run_evidence(
+            outdir, system=options.system, trace=None,
+            config=outdir / "config.ini", expected=producer_evidence,
+            required_bytes=required_bytes,
+        )
     source_descriptor = (
         trace / "trace.v2.json"
         if (trace / "trace.v2.json").is_file()
@@ -929,6 +1071,8 @@ def run(options):
             "root": str(materialized.root),
             "trace_sha256": _sha256_file(replay_trace / "trace.bin"),
         }
+    if lazy_bundle is not None:
+        evidence["functional_stream"] = producer_evidence
     (outdir / "evidence.json").write_text(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
