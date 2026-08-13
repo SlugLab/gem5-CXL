@@ -62,6 +62,14 @@ def _store(invocation, work_item, address, value):
     )
 
 
+def _store_scalar(state, invocation, work_item, name, raw):
+    state.store_scalar(name, raw)
+    return canonical.Operation(
+        invocation.phase, canonical.Opcode.STORE_F64,
+        work_item, 0, state.scalar_address(name), raw, 0, raw,
+    )
+
+
 def _unary(invocation, opcode, work_item, operand, result):
     return canonical.Operation(
         invocation.phase, opcode, work_item, 0, 0,
@@ -224,7 +232,8 @@ def expand_cg_dot(state, invocation, _batch_work_items):
         invocation, canonical.Opcode.F64_ADD,
         invocation.work_items + 2, merge_left, merge_right, result,
     )
-    state.store_scalar(parameters["result"], raw_f64(result))
+    yield _store_scalar(state, invocation, invocation.work_items + 3,
+                        parameters["result"], raw_f64(result))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -245,7 +254,8 @@ def expand_cg_divide(state, invocation, _batch_work_items):
         invocation, canonical.Opcode.F64_DIV,
         0, numerator, denominator, result,
     )
-    state.store_scalar(parameters["result"], raw_f64(result))
+    yield _store_scalar(state, invocation, 1, parameters["result"],
+                        raw_f64(result))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -347,7 +357,8 @@ def expand_cg_update_zr(state, invocation, _batch_work_items):
         except StopIteration as stop:
             rho = stop.value
             break
-    state.store_scalar(parameters["result"], raw_f64(rho))
+    yield _store_scalar(state, invocation, invocation.work_items + 3,
+                        parameters["result"], raw_f64(rho))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -439,7 +450,8 @@ def expand_cg_residual_norm(state, invocation, _batch_work_items):
         invocation, canonical.Opcode.F64_SQRT,
         invocation.work_items + 3, total, result,
     )
-    state.store_scalar(parameters["result"], raw_f64(result))
+    yield _store_scalar(state, invocation, invocation.work_items + 4,
+                        parameters["result"], raw_f64(result))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -565,8 +577,10 @@ def expand_cg_outer_dots(state, invocation, _batch_work_items):
         except StopIteration as stop:
             result_zz = stop.value
             break
-    state.store_scalar(parameters["result_xz"], raw_f64(result_xz))
-    state.store_scalar(parameters["result_zz"], raw_f64(result_zz))
+    yield _store_scalar(state, invocation, invocation.work_items + 6,
+                        parameters["result_xz"], raw_f64(result_xz))
+    yield _store_scalar(state, invocation, invocation.work_items + 7,
+                        parameters["result_zz"], raw_f64(result_zz))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -596,7 +610,8 @@ def expand_cg_normalize(state, invocation, batch_work_items):
         invocation, canonical.Opcode.F64_DIV,
         1, 1.0, square_root, norm3,
     )
-    state.store_scalar(parameters["norm3"], raw_f64(norm3))
+    yield _store_scalar(state, invocation, 2, parameters["norm3"],
+                        raw_f64(norm3))
     if parameters["write_zeta"]:
         if norm1 == 0.0:
             raise lazy.LazyTraceError("CG zeta dot product is zero")
@@ -611,7 +626,8 @@ def expand_cg_normalize(state, invocation, batch_work_items):
             invocation, canonical.Opcode.F64_ADD,
             3, shift, reciprocal, zeta,
         )
-        state.store_scalar(parameters["zeta"], raw_f64(zeta))
+        yield _store_scalar(state, invocation, 4, parameters["zeta"],
+                            raw_f64(zeta))
     for first in range(0, invocation.work_items, batch_work_items):
         last = min(first + batch_work_items, invocation.work_items)
         for index in range(first, last):
@@ -644,13 +660,14 @@ def expand_cg_prepare_iteration(state, invocation, _batch_work_items):
     yield _unary(
         invocation, canonical.Opcode.F64_MOV, 0, source, source,
     )
-    state.store_scalar(parameters["snapshot"], source_raw)
+    yield _store_scalar(state, invocation, 1, parameters["snapshot"], source_raw)
     for work_item, name in enumerate(parameters["zero"], start=1):
         yield _unary(
             invocation, canonical.Opcode.F64_MOV,
             work_item, 0.0, 0.0,
         )
-        state.store_scalar(name, raw_f64(0.0))
+        yield _store_scalar(state, invocation, work_item + 2, name,
+                            raw_f64(0.0))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -992,8 +1009,10 @@ def expand_mg_norm2u3(state, invocation, _batch_work_items):
         invocation, canonical.Opcode.F64_SQRT,
         invocation.work_items + 7, quotient, rnm2,
     )
-    state.store_scalar(parameters["rnm2"], raw_f64(rnm2))
-    state.store_scalar(parameters["rnmu"], raw_f64(maximum))
+    yield _store_scalar(state, invocation, invocation.work_items + 8,
+                        parameters["rnm2"], raw_f64(rnm2))
+    yield _store_scalar(state, invocation, invocation.work_items + 9,
+                        parameters["rnmu"], raw_f64(maximum))
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
@@ -1605,6 +1624,48 @@ EXPANDERS = {
     "npb_mg_interp": expand_mg_interp,
     "npb_mg_zero3": expand_mg_zero3,
 }
+
+
+def invocation_boundary_specs(bundle, invocation):
+    """Return ordered runtime-memory boundaries at one invocation COMMIT."""
+    arrays = {array.name: array for array in bundle.arrays}
+
+    def point():
+        for prefix in ("npb_cg_", "npb_mg_"):
+            if invocation.kernel.startswith(prefix):
+                return invocation.kernel.removeprefix(prefix)
+        return invocation.kernel.removeprefix("npb_")
+
+    parameters = invocation.parameters
+    boundary_arrays = []
+    destination = parameters.get("destination")
+    if destination is not None:
+        boundary_arrays.append(destination)
+    boundary_arrays.extend(parameters.get("boundaries", []))
+    counts = parameters.get("boundary_counts", {})
+    result = []
+    for name in boundary_arrays:
+        array = arrays[name]
+        count = counts.get(name)
+        if name == destination:
+            count = parameters.get("destination_count", count)
+        if count is None:
+            count = array.count
+        result.append((
+            f"{name}.{point()}.iter{invocation.iteration}",
+            32 if array.element_type in {"u32", "f32"} else 64,
+            count, array.logical_base,
+        ))
+    scalar_names = []
+    if parameters.get("result") is not None:
+        scalar_names.append(parameters["result"])
+    scalar_names.extend(parameters.get("results", []))
+    for name in scalar_names:
+        result.append((
+            f"scalar.{name}.{point()}.iter{invocation.iteration}",
+            64, 1, bundle.meta["scalar_addresses"][name],
+        ))
+    return tuple(result)
 
 
 def expanded_evidence(bundle, *, batch_work_items=1,

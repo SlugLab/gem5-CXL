@@ -58,7 +58,8 @@ _NPB_PHASE_NAMES = {
 _STREAM_MAGIC = b"MTRCV2\0\0"
 _STREAM_HEADER = struct.Struct("<8sQQ")
 _STREAM_CHUNK_RECORDS = 4096
-_BOUNDARY_MAGIC = "MTRBND1"
+_BOUNDARY_MAGIC = "MTRBND2"
+_INITIAL_MEMORY_MAGIC = "MTRINI1"
 
 
 class ReplayError(RuntimeError):
@@ -259,6 +260,64 @@ def _write_partitioned_payload(dynamic_root, fixed_root, operations):
     )
 
 
+def _write_sparse_initial(root, words):
+    """Bind only first-use words required by one materialized partition."""
+    root = Path(root)
+    records = {}
+    rows = sorted((address, bits, value) for address, (bits, value) in words.items())
+    segments = []
+    for address, bits, value in rows:
+        width = bits // 8
+        if segments and segments[-1][1] == bits and address == segments[-1][0] + width * len(segments[-1][2]):
+            segments[-1][2].append(value)
+        else:
+            segments.append([address, bits, [value]])
+    for index, (base, bits, values) in enumerate(segments):
+        suffix = "u32" if bits == 32 else "u64"
+        relative = Path("initial") / f"segment-{index}.{suffix}"
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        code = "I" if bits == 32 else "Q"
+        target.write_bytes(struct.pack(f"<{len(values)}{code}", *values))
+        records[f"segment-{index}"] = {
+            "path": relative.as_posix(), "sha256": _sha256_file(target),
+            "logical_base": base, "word_bits": bits,
+            "count": len(values), "byte_count": len(values) * (bits // 8),
+        }
+    return records
+
+
+def _remember_initial(words, operation):
+    widths = {
+        canonical.Opcode.LOAD_U32: 32, canonical.Opcode.LOAD_F32: 32,
+        canonical.Opcode.STORE_U32: 32, canonical.Opcode.STORE_F32: 32,
+        canonical.Opcode.LOAD_U64: 64, canonical.Opcode.LOAD_F64: 64,
+        canonical.Opcode.STORE_U64: 64, canonical.Opcode.STORE_F64: 64,
+    }
+    bits = widths.get(operation.opcode)
+    if bits is None or operation.address in words:
+        return
+    initial = operation.operand0 if operation.opcode.name.startswith("LOAD") else 0
+    words[operation.address] = (bits, initial)
+
+
+def _eager_initial_word(bundle, root, address, bits):
+    width = bits // 8
+    for record in bundle.meta.get("initial_memory", {}).values():
+        if record["word_bits"] != bits:
+            continue
+        base = record["logical_base"]
+        limit = base + record["byte_count"]
+        if base <= address and address + width <= limit:
+            with (Path(root) / record["path"]).open("rb") as stream:
+                stream.seek(address - base)
+                payload = stream.read(width)
+            if len(payload) != width:
+                raise ReplayError("eager initial image is truncated")
+            return int.from_bytes(payload, "little")
+    raise ReplayError("eager window address lacks initial authority")
+
+
 def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
     """Stream one canonical warmup+measure window into a bounded schema-1 trace."""
     trace = Path(trace).resolve()
@@ -275,20 +334,57 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         )
 
         def partitioned_operations():
+            dynamic_initial = {}
+            fixed_initial = {}
+            overlay = {}
             for operation in source.operations:
                 if operation.phase != phase:
+                    if operation.opcode.name.startswith("STORE_"):
+                        bits = 32 if operation.opcode in {
+                            canonical.Opcode.STORE_U32,
+                            canonical.Opcode.STORE_F32,
+                        } else 64
+                        overlay[operation.address] = (bits, operation.operand0)
                     continue
                 if operation.opcode in {
                     canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
                 }:
                     state["fixed"] += 1
+                    _remember_initial(fixed_initial, operation)
                     yield True, operation
                     continue
                 if window.warmup_start <= operation.work_item < window.measure_stop:
+                    if operation.opcode.name.startswith(
+                        ("LOAD_", "STORE_")
+                    ) and operation.address not in dynamic_initial:
+                        bits = 32 if operation.opcode in {
+                            canonical.Opcode.LOAD_U32,
+                            canonical.Opcode.LOAD_F32,
+                            canonical.Opcode.STORE_U32,
+                            canonical.Opcode.STORE_F32,
+                        } else 64
+                        value = overlay.get(operation.address)
+                        if value is not None and value[0] != bits:
+                            raise ReplayError(
+                                "eager window memory width changes at one address"
+                            )
+                        if value is None:
+                            value = (bits, _eager_initial_word(
+                                source, trace, operation.address, bits
+                            ))
+                        dynamic_initial[operation.address] = value
                     yield False, dataclasses.replace(
                         operation,
                         work_item=operation.work_item - window.warmup_start,
                     )
+                if operation.opcode.name.startswith("STORE_"):
+                    bits = 32 if operation.opcode in {
+                        canonical.Opcode.STORE_U32,
+                        canonical.Opcode.STORE_F32,
+                    } else 64
+                    overlay[operation.address] = (bits, operation.operand0)
+            state["dynamic_initial"] = dynamic_initial
+            state["fixed_initial"] = fixed_initial
 
         source_meta = source.meta
         operations = partitioned_operations()
@@ -304,6 +400,8 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         def partitioned_operations():
             phase_base = 0
             expanded = 0
+            dynamic_initial = {}
+            fixed_initial = {}
             with lazy.MappedState(source) as mapped:
                 for invocation in source.invocations:
                     try:
@@ -324,10 +422,12 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                             canonical.Opcode.COMMIT,
                         }:
                             state["fixed"] += 1
+                            _remember_initial(fixed_initial, operation)
                             yield True, operation
                             continue
                         if operation.work_item >= invocation.work_items:
                             state["fixed"] += 1
+                            _remember_initial(fixed_initial, operation)
                             yield True, dataclasses.replace(
                                 operation,
                                 work_item=phase_base + operation.work_item,
@@ -335,6 +435,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                             continue
                         global_item = phase_base + operation.work_item
                         if window.warmup_start <= global_item < window.measure_stop:
+                            _remember_initial(dynamic_initial, operation)
                             yield False, dataclasses.replace(
                                 operation,
                                 work_item=global_item - window.warmup_start,
@@ -347,6 +448,8 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                 raise ReplayError("lazy dynamic primitive count differs")
             if phase_base != phase_items:
                 raise ReplayError("lazy phase work count changed during expansion")
+            state["dynamic_initial"] = dynamic_initial
+            state["fixed_initial"] = fixed_initial
 
         source_meta = source.meta
         operations = partitioned_operations()
@@ -355,6 +458,13 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
     dynamic_record, fixed_record = _write_partitioned_payload(
         outdir, fixed_outdir, operations
     )
+    if source_schema in (1, 2):
+        state["initial_memory"] = _write_sparse_initial(
+            outdir, state["dynamic_initial"]
+        )
+        state["fixed_initial_memory"] = _write_sparse_initial(
+            fixed_outdir, state["fixed_initial"]
+        )
     trace_sha256, trace_records = dynamic_record
     fixed_trace_sha256, fixed_trace_records = fixed_record
     warmup_items = window.measure_start - window.warmup_start
@@ -383,6 +493,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         "trace_record_bytes": canonical.TRACE_STRUCT.size,
         "trace_records": trace_records,
         "outputs": {},
+        "initial_memory": state.get("initial_memory", {}),
     }
     contract.atomic_write_json(Path(outdir) / "trace.meta.json", meta)
     fixed_meta = {
@@ -393,6 +504,9 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         "trace_sha256": fixed_trace_sha256,
         "trace_records": fixed_trace_records,
         "fixed_component": True,
+        "initial_memory": state.get(
+            "fixed_initial_memory", meta["initial_memory"]
+        ),
     }
     contract.atomic_write_json(fixed_outdir / "trace.meta.json", fixed_meta)
     canonical.read_bundle(outdir)
@@ -426,22 +540,28 @@ def _emit_lazy_replay_stream(trace, stream):
         chunk = bytearray()
         chunk_records = 0
 
-    for operation in lazy.iter_operations(
-        bundle, npb.EXPANDERS, batch_work_items=1024
-    ):
-        payload = canonical.TRACE_STRUCT.pack(
-            operation.phase, int(operation.opcode), 0,
-            operation.work_item, operation.sequence, operation.address,
-            operation.operand0, operation.operand1, operation.result,
-        )
-        operation_digest.update(payload)
-        chunk.extend(payload)
-        chunk_records += 1
-        total_records += 1
-        if operation.opcode == canonical.Opcode.COMMIT:
-            commits.append((operation.sequence, operation.result))
-        if chunk_records == _STREAM_CHUNK_RECORDS:
+    with lazy.MappedState(bundle) as state:
+        for invocation in bundle.invocations:
+            for operation in npb.EXPANDERS[invocation.kernel](state, invocation, 1024):
+                lazy._validate_expanded_operation(bundle, invocation, operation)
+                operation = dataclasses.replace(operation, sequence=total_records)
+                payload = canonical.TRACE_STRUCT.pack(
+                    operation.phase, int(operation.opcode), 0,
+                    operation.work_item, operation.sequence, operation.address,
+                    operation.operand0, operation.operand1, operation.result,
+                )
+                operation_digest.update(payload)
+                chunk.extend(payload)
+                chunk_records += 1
+                total_records += 1
+                if operation.opcode == canonical.Opcode.COMMIT:
+                    commits.append((operation.sequence, operation.result))
+                if chunk_records == _STREAM_CHUNK_RECORDS:
+                    flush_chunk()
             flush_chunk()
+            write(_STREAM_HEADER.pack(_STREAM_MAGIC, 0, 2))
+    if total_records != bundle.dynamic_work["primitive_records"]:
+        raise ReplayError("lazy dynamic primitive count differs")
     flush_chunk()
     write(_STREAM_HEADER.pack(_STREAM_MAGIC, 0, 1))
     return {
@@ -453,11 +573,18 @@ def _emit_lazy_replay_stream(trace, stream):
         "stream_sha256": stream_digest.hexdigest(),
         "commit_order": [sequence for sequence, _ in commits],
         "raw_outputs": [result for _, result in commits],
+        "boundary_commitments": bundle.meta.get("boundary_commitments", {}),
     }
 
 
 def write_lazy_replay_stream(trace, path):
     """Write a framed schema-2 stream without materializing an eager trace."""
+    bundle = lazy.read_bundle(trace)
+    if bundle.dynamic_work["primitive_records"] > 1_000_000:
+        raise ReplayError(
+            "diagnostic lazy stream materialization exceeds record ceiling; "
+            "use bounded pipe replay"
+        )
     path = Path(path).resolve()
     if path.exists():
         raise ReplayError(f"lazy replay stream already exists: {path}")
@@ -558,7 +685,7 @@ def _boundary_contract(bundle):
             raise ReplayError(f"output boundary {name} metadata is invalid")
         word_bits = specification.get("word_bits")
         count = specification.get("count")
-        sequences = specification.get("operation_sequences")
+        probes = specification.get("probes")
         if word_bits not in (32, 64):
             raise ReplayError(f"output boundary {name} word width is invalid")
         if (
@@ -566,27 +693,36 @@ def _boundary_contract(bundle):
             or count < 0 or len(bundle.outputs[name]) != count
         ):
             raise ReplayError(f"output boundary {name} count is invalid")
-        if not isinstance(sequences, list) or len(sequences) != count:
+        if not isinstance(probes, list) or len(probes) != count:
             raise ReplayError(
-                f"output boundary {name} operation mapping is missing"
+                f"output boundary {name} address mapping is missing"
             )
         checked = []
-        for index, sequence in enumerate(sequences):
+        for index, probe in enumerate(probes):
+            if not isinstance(probe, dict):
+                raise ReplayError(
+                    f"output boundary {name} probe {index} is invalid"
+                )
+            address = probe.get("address")
+            after_sequence = probe.get("after_sequence")
             if (
-                isinstance(sequence, bool) or not isinstance(sequence, int)
-                or sequence < 0 or sequence >= len(bundle.operations)
+                isinstance(address, bool) or not isinstance(address, int)
+                or address < 0 or address >= 1 << 64
             ):
                 raise ReplayError(
-                    f"output boundary {name} operation mapping {index} "
+                    f"output boundary {name} address mapping {index} "
                     "is invalid"
                 )
-            raw = bundle.operations[sequence].result
-            if raw >= 1 << word_bits:
+            if (
+                isinstance(after_sequence, bool)
+                or not isinstance(after_sequence, int)
+                or after_sequence < 0
+                or after_sequence >= len(bundle.operations)
+            ):
                 raise ReplayError(
-                    f"output boundary {name} operation mapping {index} "
-                    f"exceeds uint{word_bits}"
+                    f"output boundary {name} after-sequence {index} is invalid"
                 )
-            checked.append(sequence)
+            checked.append((address, after_sequence))
         rows.append((name, word_bits, tuple(checked)))
     return tuple(rows)
 
@@ -595,16 +731,7 @@ def _validate_lazy_functional_boundaries(bundle):
     commitments = bundle.meta.get("boundary_commitments")
     if not isinstance(commitments, dict) or not commitments:
         raise ReplayError("lazy trace raw output boundary mapping is missing")
-    mappings = bundle.meta.get("output_boundary_mappings")
-    outputs = bundle.meta.get("output_boundaries")
-    if (
-        not isinstance(mappings, dict) or not isinstance(outputs, dict)
-        or set(mappings) != set(commitments) or set(outputs) != set(commitments)
-    ):
-        raise ReplayError("lazy trace raw output boundary mapping is missing")
-    raise ReplayError(
-        "lazy trace raw output boundary replay is not implemented"
-    )
+    return commitments
 
 
 def _write_boundary_map(bundle, path):
@@ -615,14 +742,94 @@ def _write_boundary_map(bundle, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = _boundary_contract(bundle)
     lines = [_BOUNDARY_MAGIC, str(len(rows))]
-    for name, word_bits, sequences in rows:
+    for name, word_bits, probes in rows:
         encoded_name = name.encode("utf-8").hex()
         lines.append(" ".join((
-            encoded_name, str(word_bits), str(len(sequences)),
-            *(str(sequence) for sequence in sequences),
+            encoded_name, str(word_bits), str(len(probes)),
+            *(str(value) for probe in probes for value in probe),
         )))
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
     return path
+
+
+def _write_initial_memory_map(bundle, root, path):
+    path = Path(path).resolve()
+    if path.exists():
+        raise ReplayError(f"fresh initial memory map required: {path}")
+    records = bundle.meta.get("initial_memory")
+    if not isinstance(records, dict):
+        raise ReplayError("canonical initial memory images are missing")
+    memory_operations = any(
+        operation.opcode in {
+            canonical.Opcode.LOAD_U32, canonical.Opcode.LOAD_U64,
+            canonical.Opcode.LOAD_F32, canonical.Opcode.LOAD_F64,
+            canonical.Opcode.STORE_U32, canonical.Opcode.STORE_U64,
+            canonical.Opcode.STORE_F32, canonical.Opcode.STORE_F64,
+        }
+        for operation in bundle.operations
+    )
+    if memory_operations and not records:
+        raise ReplayError("canonical initial memory images are missing")
+    lines = [_INITIAL_MEMORY_MAGIC, str(len(records))]
+    for name in sorted(records):
+        record = records[name]
+        image_path = (Path(root) / record["path"]).resolve()
+        lines.append(" ".join((
+            str(record["logical_base"]), str(record["word_bits"]),
+            str(record["count"]), image_path.as_posix(),
+        )))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+    return path
+
+
+def _write_lazy_initial_memory_map(bundle, path):
+    path = Path(path).resolve()
+    scalar_root = path.with_suffix(".scalars")
+    scalar_root.mkdir(parents=True, exist_ok=False)
+    widths = {"u32": 32, "u64": 64, "f32": 32, "f64": 64}
+    rows = [
+        (array.logical_base, widths[array.element_type], array.count,
+         (bundle.root / array.path).resolve())
+        for array in bundle.arrays
+    ]
+    for name in sorted(bundle.meta["initial_scalars"]):
+        image = scalar_root / f"{name}.u64"
+        image.write_bytes(struct.pack("<Q", bundle.meta["initial_scalars"][name]))
+        rows.append((bundle.meta["scalar_addresses"][name], 64, 1, image))
+    lines = [_INITIAL_MEMORY_MAGIC, str(len(rows))]
+    lines.extend(" ".join(map(str, row)) for row in rows)
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+    return path
+
+
+def _write_lazy_boundary_map(bundle, path):
+    rows = []
+    sequence = 0
+    with lazy.MappedState(bundle) as state:
+        for invocation in bundle.invocations:
+            commit = None
+            for operation in npb.EXPANDERS[invocation.kernel](state, invocation, 1024):
+                lazy._validate_expanded_operation(bundle, invocation, operation)
+                if operation.opcode == canonical.Opcode.COMMIT:
+                    commit = sequence
+                sequence += 1
+            if commit is None:
+                raise ReplayError("lazy invocation has no COMMIT")
+            for name, bits, count, base in npb.invocation_boundary_specs(bundle, invocation):
+                step = bits // 8
+                rows.append((name, bits, tuple(
+                    (base + index * step, commit) for index in range(count)
+                )))
+    commitments = bundle.meta.get("boundary_commitments")
+    if not isinstance(commitments, dict) or set(commitments) != {row[0] for row in rows}:
+        raise ReplayError("lazy trace raw output boundary mapping is missing")
+    lines = [_BOUNDARY_MAGIC, str(len(rows))]
+    for name, bits, probes in rows:
+        lines.append(" ".join((name.encode().hex(), str(bits), str(len(probes)),
+            *(str(value) for probe in probes for value in probe))))
+    Path(path).write_text("\n".join(lines) + "\n", encoding="ascii")
+    return Path(path)
 
 
 def validate_output_boundaries(bundle, observed):
@@ -666,6 +873,9 @@ def run_native_replay(binary, *, system, trace, outdir):
     outdir.mkdir(parents=True)
     result = outdir / "result.json"
     boundary_map = _write_boundary_map(bundle, outdir / "boundary-map.txt")
+    initial_map = _write_initial_memory_map(
+        bundle, trace, outdir / "initial-memory-map.txt"
+    )
     command = [
         str(binary),
         "--system",
@@ -676,6 +886,8 @@ def run_native_replay(binary, *, system, trace, outdir):
         str(result),
         "--boundary-map",
         str(boundary_map),
+        "--initial-memory-map",
+        str(initial_map),
     ]
     try:
         subprocess.run(
@@ -700,6 +912,65 @@ def run_native_replay(binary, *, system, trace, outdir):
     if value.get("verification") != "pass":
         raise ReplayError("native replay bit-exact verification failed")
     validate_output_boundaries(bundle, value.get("output_boundaries"))
+    return value
+
+
+def run_native_lazy_replay(binary, *, system, trace, outdir):
+    trace = Path(trace).resolve()
+    outdir = Path(outdir).resolve()
+    bundle = lazy.read_bundle(trace)
+    _validate_lazy_functional_boundaries(bundle)
+    outdir.mkdir(parents=True)
+    boundary_map = _write_lazy_boundary_map(bundle, outdir / "boundary-map.txt")
+    initial_map = _write_lazy_initial_memory_map(
+        bundle, outdir / "initial-memory-map.txt"
+    )
+    result_path = outdir / "result.json"
+    pipe_read, pipe_write = os.pipe()
+    stream_path = Path(f"/proc/{os.getpid()}/fd/{pipe_read}")
+    command = [
+        str(Path(binary).resolve()), "--system", system,
+        "--trace", str(stream_path), "--result", str(result_path),
+        "--mode", "functional", "--stream", "1",
+        "--boundary-map", str(boundary_map),
+        "--initial-memory-map", str(initial_map),
+    ]
+    evidence = {}
+    errors = []
+    def produce():
+        try:
+            with os.fdopen(pipe_write, "wb", buffering=0) as stream:
+                evidence.update(_emit_lazy_replay_stream(trace, stream))
+        except BaseException as error:
+            errors.append(error)
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    try:
+        subprocess.run(command, cwd=REPO, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True,
+                       env={"OMP_NUM_THREADS": "4"})
+    except subprocess.CalledProcessError as error:
+        raise ReplayError(
+            f"{system} native lazy replay failed: {error.stderr.strip()}"
+        ) from error
+    finally:
+        os.close(pipe_read)
+        producer.join(timeout=60)
+    if producer.is_alive() or errors:
+        raise ReplayError(f"native lazy producer failed: {errors[:1]}")
+    expected = evidence
+    value = _load_json(result_path, "native lazy replay result")
+    if value.get("trace_records") != expected["trace_records"]:
+        raise ReplayError("native lazy replay record count differs")
+    observed = value.get("output_boundaries", {})
+    if set(observed) != set(expected["boundary_commitments"]):
+        raise ReplayError("native lazy replay boundary set differs")
+    for name, digest in expected["boundary_commitments"].items():
+        row = observed[name]
+        code = "I" if row["word_bits"] == 32 else "Q"
+        payload = struct.pack(f"<{len(row['raw_words'])}{code}", *row["raw_words"])
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise ReplayError(f"native lazy replay boundary {name} differs")
     return value
 
 
@@ -902,6 +1173,11 @@ def command_for(options):
     boundary_map = getattr(options, "boundary_map", None)
     if boundary_map is not None:
         binary_args.extend(("--boundary-map", str(Path(boundary_map).resolve())))
+    initial_memory_map = getattr(options, "initial_memory_map", None)
+    if initial_memory_map is not None:
+        binary_args.extend((
+            "--initial-memory-map", str(Path(initial_memory_map).resolve())
+        ))
     if options.mode == "functional":
         if any(
             value is not None
@@ -1031,8 +1307,21 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         raise ReplayError("replay program verification did not pass")
     if bundle is not None:
         validate_output_boundaries(bundle, result.get("output_boundaries"))
-    elif result.get("output_boundaries") != {}:
-        raise ReplayError("stream replay emitted unmapped output boundaries")
+    else:
+        observed = result.get("output_boundaries")
+        commitments = expected.get("boundary_commitments", {})
+        if not isinstance(observed, dict) or set(observed) != set(commitments):
+            raise ReplayError("stream replay output boundary set differs")
+        for name, digest in commitments.items():
+            record = observed[name]
+            bits = record.get("word_bits")
+            words = record.get("raw_words")
+            if bits not in (32, 64) or not isinstance(words, list):
+                raise ReplayError(f"stream replay boundary {name} is invalid")
+            code = "I" if bits == 32 else "Q"
+            payload = struct.pack(f"<{len(words)}{code}", *words)
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise ReplayError(f"stream replay boundary {name} differs")
 
     topology = validate_config_ini(config)
     allocation = (
@@ -1207,6 +1496,7 @@ def run(options):
     producer_errors = []
     pipe_read = None
     boundary_map = None
+    initial_memory_map = None
     replay_trace = trace
     if options.mode == "window":
         materialized = materialize_window_trace(
@@ -1217,9 +1507,22 @@ def run(options):
             outdir=outdir.with_name(outdir.name + ".input"),
         )
         replay_trace = materialized.root
+        materialized_bundle = canonical.read_bundle(replay_trace)
+        initial_memory_map = _write_initial_memory_map(
+            materialized_bundle, replay_trace,
+            outdir.with_name(outdir.name + ".initial-memory-map.txt"),
+        )
     elif (trace / "trace.v2.json").is_file():
         lazy_bundle = lazy.read_bundle(trace)
         _validate_lazy_functional_boundaries(lazy_bundle)
+        boundary_map = _write_lazy_boundary_map(
+            lazy_bundle,
+            outdir.with_name(outdir.name + ".boundary-map.txt"),
+        )
+        initial_memory_map = _write_lazy_initial_memory_map(
+            lazy_bundle,
+            outdir.with_name(outdir.name + ".initial-memory-map.txt"),
+        )
     else:
         try:
             eager_bundle = canonical.read_bundle(trace)
@@ -1230,6 +1533,10 @@ def run(options):
         boundary_map = _write_boundary_map(
             eager_bundle,
             outdir.with_name(outdir.name + ".boundary-map.txt"),
+        )
+        initial_memory_map = _write_initial_memory_map(
+            eager_bundle, trace,
+            outdir.with_name(outdir.name + ".initial-memory-map.txt"),
         )
     if options.mode == "window":
         manifest = Path(options.window_manifest).resolve()
@@ -1260,6 +1567,8 @@ def run(options):
         run_options.replay_trace = replay_trace / "trace.bin"
     if boundary_map is not None:
         run_options.boundary_map = boundary_map
+    if initial_memory_map is not None:
+        run_options.initial_memory_map = initial_memory_map
     if materialized is not None:
         run_options.measure_start_item = materialized.measure_start_item
     command = command_for(run_options)
@@ -1321,6 +1630,12 @@ def run(options):
         fixed_options.replay_trace = materialized.fixed_root / "trace.bin"
         fixed_options.measure_start_item = 0
         fixed_bundle = canonical.read_bundle(materialized.fixed_root)
+        fixed_options.initial_memory_map = _write_initial_memory_map(
+            fixed_bundle, materialized.fixed_root,
+            fixed_outdir.with_name(
+                fixed_outdir.name + ".initial-memory-map.txt"
+            ),
+        )
         fixed_options.boundary_map = _write_boundary_map(
             fixed_bundle,
             fixed_outdir.with_name(fixed_outdir.name + ".boundary-map.txt"),

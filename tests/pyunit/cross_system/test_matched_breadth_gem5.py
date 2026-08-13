@@ -4,9 +4,11 @@
 import hashlib
 import json
 import shlex
+import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +48,40 @@ def _op(opcode, sequence, *, work_item=0, address=0, left=0, right=0,
         operand1=right,
         result=result,
     )
+
+
+def _initial_memory(operations):
+    widths = {
+        canonical.Opcode.LOAD_U32: 32,
+        canonical.Opcode.LOAD_U64: 64,
+        canonical.Opcode.LOAD_F32: 32,
+        canonical.Opcode.LOAD_F64: 64,
+        canonical.Opcode.STORE_U32: 32,
+        canonical.Opcode.STORE_U64: 64,
+        canonical.Opcode.STORE_F32: 32,
+        canonical.Opcode.STORE_F64: 64,
+    }
+    images = {}
+    covered = set()
+    for operation in operations:
+        word_bits = widths.get(operation.opcode)
+        if word_bits is None or operation.address in covered:
+            continue
+        covered.add(operation.address)
+        initial = operation.operand0 if operation.opcode.name.startswith("LOAD") else 0
+        images[f"word-{operation.address:x}"] = {
+            "logical_base": operation.address,
+            "word_bits": word_bits,
+            "words": (initial,),
+        }
+    return images
+
+
+def _probes(addresses, after_sequence):
+    return [
+        {"address": address, "after_sequence": after_sequence}
+        for address in addresses
+    ]
 
 
 def _fixtures():
@@ -110,7 +146,8 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             with self.subTest(region=name):
                 bundle = self.root / name
                 canonical.write_bundle(bundle, _meta(name, len(operations)),
-                                       operations, {})
+                                       operations, {},
+                                       initial_memory=_initial_memory(operations))
                 observed = {
                     system: replay.run_native_replay(
                         binary, system=system, trace=bundle,
@@ -133,24 +170,24 @@ class MatchedBreadthGem5Test(unittest.TestCase):
     def test_functional_replay_dumps_every_declared_raw_boundary(self):
         operations = (
             _op(canonical.Opcode.STORE_U32, 0, address=0x1000,
-                result=0x01234567),
+                left=0x01234567, result=0x01234567),
             _op(canonical.Opcode.STORE_U32, 1, address=0x1004,
-                result=0x89ABCDEF),
+                left=0x89ABCDEF, result=0x89ABCDEF),
             _op(canonical.Opcode.STORE_U64, 2, address=0x2000,
-                result=0x0123456789ABCDEF),
-            _op(canonical.Opcode.COMMIT, 3,
-                result=0xFEDCBA9876543210),
+                left=0x0123456789ABCDEF, result=0x0123456789ABCDEF),
+            _op(canonical.Opcode.STORE_U64, 3, address=0x2008,
+                left=0xFEDCBA9876543210, result=0xFEDCBA9876543210),
         )
         boundaries = {
             "state.u32": {
                 "word_bits": 32,
                 "count": 2,
-                "operation_sequences": [0, 1],
+                "probes": _probes((0x1000, 0x1004), 3),
             },
             "state.u64": {
                 "word_bits": 64,
                 "count": 2,
-                "operation_sequences": [2, 3],
+                "probes": _probes((0x2000, 0x2008), 3),
             },
         }
         outputs = {
@@ -162,7 +199,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         bundle = self.root / "all-boundaries"
         canonical.write_bundle(
             bundle, _meta("all_boundaries", 1, boundaries),
-            operations, outputs,
+            operations, outputs, initial_memory=_initial_memory(operations),
         )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         result = replay.run_native_replay(
@@ -184,21 +221,53 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             },
         })
 
+    def test_boundary_observation_uses_runtime_store_value_not_expected_result(self):
+        runtime_word = 0x01234567
+        poisoned_expected_result = runtime_word ^ 1
+        operations = (
+            _op(canonical.Opcode.STORE_U32, 0, address=0x1000,
+                left=runtime_word, result=poisoned_expected_result),
+        )
+        boundaries = {
+            "state": {
+                "word_bits": 32,
+                "count": 1,
+                "probes": _probes((0x1000,), 0),
+            },
+        }
+        bundle = self.root / "runtime-boundary"
+        canonical.write_bundle(
+            bundle, _meta("runtime_boundary", 1, boundaries), operations,
+            {"state": (runtime_word,)},
+            initial_memory=_initial_memory(operations),
+        )
+        binary = replay.build_replay_binary(self.root / "build", native=True)
+        result = replay.run_native_replay(
+            binary, system="vanilla", trace=bundle,
+            outdir=self.root / "runtime-boundary-run",
+        )
+        self.assertEqual(
+            result["output_boundaries"]["state"]["raw_words"],
+            [runtime_word],
+        )
+
     def test_boundary_gate_rejects_bit_drift_missing_and_extra_data(self):
         operations = (
-            _op(canonical.Opcode.COMMIT, 0, result=0xDEADBEEF),
+            _op(canonical.Opcode.STORE_U32, 0, address=0x1000,
+                left=0xDEADBEEF, result=0xDEADBEEF),
         )
         boundaries = {
             "answer": {
                 "word_bits": 32,
                 "count": 1,
-                "operation_sequences": [0],
+                "probes": _probes((0x1000,), 0),
             },
         }
         bundle = self.root / "boundary-gate"
         canonical.write_bundle(
             bundle, _meta("boundary_gate", 1, boundaries), operations,
             {"answer": (0xDEADBEEF,)},
+            initial_memory=_initial_memory(operations),
         )
         loaded = canonical.read_bundle(bundle)
         clean = {
@@ -233,10 +302,11 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 "answer": {"word_bits": 32, "count": 1},
             }),
             operations, {"answer": (0xDEADBEEF,)},
+            initial_memory=_initial_memory(operations),
         )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         with self.assertRaisesRegex(
-            replay.ReplayError, "operation mapping is missing"
+            replay.ReplayError, "address mapping is missing"
         ):
             replay.run_native_replay(
                 binary, system="vanilla", trace=bundle,
@@ -314,7 +384,8 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             ))
         bundle = self.root / "four-workers"
         canonical.write_bundle(
-            bundle, _meta("four_workers", 4), tuple(operations), {}
+            bundle, _meta("four_workers", 4), tuple(operations), {},
+            initial_memory=_initial_memory(operations),
         )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         amu = replay.run_native_replay(
@@ -345,7 +416,8 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         )
         bundle = self.root / "interleaved-window"
         canonical.write_bundle(
-            bundle, _meta("interleaved_window", 1), operations, {}
+            bundle, _meta("interleaved_window", 1), operations, {},
+            initial_memory=_initial_memory(operations),
         )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         result = replay.run_native_replay(
@@ -366,7 +438,8 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         )
         bundle = self.root / "same-cache-line"
         canonical.write_bundle(
-            bundle, _meta("same_cache_line", 1), operations, {}
+            bundle, _meta("same_cache_line", 1), operations, {},
+            initial_memory=_initial_memory(operations),
         )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         result = replay.run_native_replay(
@@ -385,10 +458,17 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 left=17, result=17),
         )
         bundle = self.root / "selection"
-        canonical.write_bundle(bundle, _meta("selection", 1), operations, {})
+        canonical.write_bundle(
+            bundle, _meta("selection", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         manifest = self.root / "windows.json"
         manifest.write_text('{"schema":1}\n', encoding="utf-8")
+        initial_map = replay._write_initial_memory_map(
+            canonical.read_bundle(bundle), bundle,
+            self.root / "selection-initial-map.txt",
+        )
         for label, extra in (
             ("functional", ["--mode", "functional"]),
             ("window", [
@@ -401,6 +481,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             command = [
                 str(binary), "--system", "vanilla", "--trace",
                 str(bundle / "trace.bin"), "--result", str(result), *extra,
+                "--initial-memory-map", str(initial_map),
             ]
             with self.subTest(mode=label):
                 subprocess.run(command, check=True, stdout=subprocess.PIPE,
@@ -421,24 +502,80 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         )
         bundle = self.root / "warmup-measure"
         canonical.write_bundle(
-            bundle, _meta("warmup_measure", 2), operations, {}
+            bundle, _meta("warmup_measure", 2), operations, {},
+            initial_memory=_initial_memory(operations),
         )
         binary = replay.build_replay_binary(self.root / "build", native=True)
         manifest = self.root / "warmup-measure-windows.json"
         manifest.write_text('{"schema":1}\n', encoding="utf-8")
         result = self.root / "warmup-measure-result.json"
+        initial_map = replay._write_initial_memory_map(
+            canonical.read_bundle(bundle), bundle,
+            self.root / "warmup-initial-map.txt",
+        )
         subprocess.run([
             str(binary), "--system", "amu", "--trace",
             str(bundle / "trace.bin"), "--result", str(result),
             "--mode", "window", "--window-manifest", str(manifest),
             "--phase", "0", "--window-index", "0",
             "--measure-start-item", "1",
+            "--initial-memory-map", str(initial_map),
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
            text=True)
         value = json.loads(result.read_text(encoding="utf-8"))
         self.assertEqual(value["issued_loads"], 1)
         self.assertEqual(value["completed_loads"], 1)
         self.assertEqual(value["raw_outputs"], [41, 43])
+
+    def test_eager_window_inherits_prior_duplicate_store_state(self):
+        operations = (
+            _op(canonical.Opcode.STORE_U64, 0, work_item=0,
+                address=0x3000, left=7, result=7),
+            _op(canonical.Opcode.LOAD_U64, 1, work_item=1,
+                address=0x3000, left=7, result=7),
+            _op(canonical.Opcode.STORE_U64, 2, work_item=1,
+                address=0x3000, left=9, result=9),
+            _op(canonical.Opcode.COMMIT, 3, work_item=1,
+                address=0x3000, left=9, result=9),
+        )
+        trace = self.root / "duplicate-window"
+        canonical.write_bundle(
+            trace, _meta("duplicate_window", 2), operations, {},
+            initial_memory={"destination": {
+                "logical_base": 0x3000, "word_bits": 64, "words": (0,),
+            }},
+        )
+        manifest = self.root / "duplicate-plan.json"
+        manifest.write_text('{"schema":1}\n')
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 1, 1, 2),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace, manifest=manifest, phase=0, window_index=0,
+                outdir=self.root / "duplicate-materialized",
+            )
+        bundle = canonical.read_bundle(materialized.root)
+        image = next(iter(bundle.meta["initial_memory"].values()))
+        self.assertEqual(
+            (materialized.root / image["path"]).read_bytes(),
+            struct.pack("<Q", 7),
+        )
+        binary = replay.build_replay_binary(
+            self.root / "duplicate-build", native=True
+        )
+        initial = replay._write_initial_memory_map(
+            bundle, materialized.root, self.root / "duplicate-initial.txt"
+        )
+        result = self.root / "duplicate-result.json"
+        subprocess.run([
+            str(binary), "--system", "vanilla", "--trace",
+            str(materialized.root / "trace.bin"), "--result", str(result),
+            "--mode", "window", "--window-manifest", str(manifest),
+            "--phase", "0", "--window-index", "0",
+            "--measure-start-item", "0", "--initial-memory-map", str(initial),
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(json.loads(result.read_text())["verification"], "pass")
 
     def test_schema2_window_materializes_repeated_invocations_globally(self):
         trace = self.root / "lazy"
@@ -462,7 +599,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
              "initial_scalars": {"numerator": raw_four,
                                  "denominator": raw_two,
                                  "result": 0}},
-            (), invocations, {"primitive_records": 6},
+            (), invocations, {"primitive_records": 8},
         )
         trace_sha = replay.trace_identity_sha256(trace)
         plan = timing.make_plan(trace_sha, "cg_dot", 2)
@@ -484,18 +621,30 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             [operation.sequence for operation in bundle.operations], [0, 1]
         )
         self.assertEqual(materialized.measure_start_item, 0)
-        self.assertEqual(materialized.fixed_event_records, 4)
+        self.assertEqual(materialized.fixed_event_records, 6)
         fixed = canonical.read_bundle(materialized.fixed_root)
+        self.assertLessEqual(sum(
+            row["byte_count"]
+            for row in bundle.meta["initial_memory"].values()
+        ), 8)
+        self.assertLessEqual(sum(
+            row["byte_count"]
+            for row in fixed.meta["initial_memory"].values()
+        ), 8)
+        self.assertNotEqual(
+            bundle.meta["initial_memory"], fixed.meta["initial_memory"]
+        )
         self.assertEqual(
             [operation.opcode for operation in fixed.operations],
             [
-                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
-                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
+                canonical.Opcode.BARRIER, canonical.Opcode.STORE_F64,
+                canonical.Opcode.COMMIT, canonical.Opcode.BARRIER,
+                canonical.Opcode.STORE_F64, canonical.Opcode.COMMIT,
             ],
         )
         self.assertEqual(
             [operation.work_item for operation in fixed.operations],
-            [0, 0, 1, 1],
+            [0, 1, 0, 1, 2, 1],
         )
         self.assertNotEqual(
             bundle.meta["trace_sha256"], fixed.meta["trace_sha256"]
@@ -503,8 +652,8 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(bundle.meta["source_schema"], 2)
         stream = self.root / "lazy-stream.bin"
         stream_evidence = replay.write_lazy_replay_stream(trace, stream)
-        self.assertEqual(stream_evidence["trace_records"], 6)
-        self.assertEqual(stream_evidence["commit_order"], [2, 5])
+        self.assertEqual(stream_evidence["trace_records"], 8)
+        self.assertEqual(stream_evidence["commit_order"], [3, 7])
         self.assertEqual(stream_evidence["raw_outputs"], [0, 0])
         self.assertRegex(stream_evidence["operations_sha256"], r"^[0-9a-f]{64}$")
         self.assertFalse((trace / "trace.bin").exists())
@@ -512,16 +661,159 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             self.root / "lazy-stream-build", native=True
         )
         result_path = self.root / "lazy-stream-result.json"
+        initial_map = replay._write_lazy_initial_memory_map(
+            lazy.read_bundle(trace), self.root / "lazy-stream-initial.txt"
+        )
         subprocess.run([
             str(binary), "--system", "vanilla", "--trace", str(stream),
             "--result", str(result_path), "--mode", "functional",
             "--stream", "1",
+            "--initial-memory-map", str(initial_map),
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
            text=True)
         replayed = json.loads(result_path.read_text(encoding="utf-8"))
-        self.assertEqual(replayed["trace_records"], 6)
-        self.assertEqual(replayed["commit_order"], [2, 5])
+        self.assertEqual(replayed["trace_records"], 8)
+        self.assertEqual(replayed["commit_order"], [3, 7])
         self.assertEqual(replayed["raw_outputs"], [0, 0])
+
+    def test_native_lazy_schema2_boundaries_pass_all_backends(self):
+        raw_two = 0x4000000000000000
+        raw_four = 0x4010000000000000
+        commitment = hashlib.sha256(struct.pack("<Q", raw_two)).hexdigest()
+        binary = replay.build_replay_binary(
+            self.root / "native-lazy-build", native=True
+        )
+        for workload in ("npb_cg",):
+            trace = self.root / workload
+            trace.mkdir()
+            invocation = lazy.Invocation(
+                0, 103, "npb_cg_divide", 7, 1,
+                {"numerator": "numerator", "denominator": "denominator",
+                 "result": "result"},
+            )
+            lazy.write_bundle(
+                trace,
+                {"schema": 2, "workload": workload,
+                 "source_sha256": _digest(workload + "-source"),
+                 "binary_sha256": _digest(workload + "-binary"),
+                 "config_sha256": _digest(workload + "-config"),
+                 "initial_scalars": {"numerator": raw_four,
+                                     "denominator": raw_two, "result": 0},
+                 "boundary_commitments": {
+                     "scalar.result.divide.iter7": commitment,
+                 }},
+                (), (invocation,), {"primitive_records": 4},
+            )
+            for system in ("vanilla", "amu", "cira"):
+                result = replay.run_native_lazy_replay(
+                    binary, system=system, trace=trace,
+                    outdir=self.root / f"{workload}-{system}",
+                )
+                self.assertEqual(result["verification"], "pass")
+                self.assertEqual(
+                    result["output_boundaries"]
+                    ["scalar.result.divide.iter7"]["raw_words"],
+                    [raw_two],
+                )
+        mg_trace = self.root / "npb_mg"
+        mg_trace.mkdir()
+        image = mg_trace / "images/u.f64"
+        image.parent.mkdir(parents=True)
+        payload = struct.pack("<d", 3.0)
+        image.write_bytes(payload)
+        array = lazy.ArrayImage(
+            "u", "state", "f64", 1, 0x1000, "images/u.f64",
+            hashlib.sha256(payload).hexdigest(),
+        )
+        invocation = lazy.Invocation(
+            0, 201, "npb_mg_zero3", 2, 1,
+            {"u": "u", "n1": 1, "n2": 1, "n3": 1,
+             "boundaries": ["u"]},
+        )
+        zero_digest = hashlib.sha256(struct.pack("<Q", 0)).hexdigest()
+        lazy.write_bundle(
+            mg_trace,
+            {"schema": 2, "workload": "npb_mg",
+             "source_sha256": _digest("mg-source"),
+             "binary_sha256": _digest("mg-binary"),
+             "config_sha256": _digest("mg-config"),
+             "boundary_commitments": {"u.zero3.iter2": zero_digest}},
+            (array,), (invocation,), {"primitive_records": 3},
+        )
+        for system in ("vanilla", "amu", "cira"):
+            result = replay.run_native_lazy_replay(
+                binary, system=system, trace=mg_trace,
+                outdir=self.root / f"npb_mg-{system}",
+            )
+            self.assertEqual(
+                result["output_boundaries"]["u.zero3.iter2"]["raw_words"],
+                [0],
+            )
+
+    def test_native_lazy_one_bit_runtime_store_drift_fails_commitment(self):
+        raw_two = 0x4000000000000000
+        raw_four = 0x4010000000000000
+        trace = self.root / "lazy-drift"
+        trace.mkdir()
+        invocation = lazy.Invocation(
+            0, 103, "npb_cg_divide", 1, 1,
+            {"numerator": "numerator", "denominator": "denominator",
+             "result": "result"},
+        )
+        lazy.write_bundle(
+            trace,
+            {"schema": 2, "workload": "npb_cg",
+             "source_sha256": _digest("drift-source"),
+             "binary_sha256": _digest("drift-binary"),
+             "config_sha256": _digest("drift-config"),
+             "initial_scalars": {"numerator": raw_four,
+                                 "denominator": raw_two, "result": 0},
+             "boundary_commitments": {
+                 "scalar.result.divide.iter1":
+                     hashlib.sha256(struct.pack("<Q", raw_two)).hexdigest(),
+             }},
+            (), (invocation,), {"primitive_records": 4},
+        )
+        binary = replay.build_replay_binary(self.root / "drift-build", native=True)
+        stream = self.root / "drift.stream"
+        replay.write_lazy_replay_stream(trace, stream)
+        payload = bytearray(stream.read_bytes())
+        cursor = 0
+        changed = False
+        while cursor < len(payload):
+            _magic, records, flags = replay._STREAM_HEADER.unpack_from(payload, cursor)
+            cursor += replay._STREAM_HEADER.size
+            for _ in range(records):
+                opcode = struct.unpack_from("<H", payload, cursor + 2)[0]
+                if opcode == int(canonical.Opcode.STORE_F64):
+                    payload[cursor + 32] ^= 1
+                    changed = True
+                    break
+                cursor += canonical.TRACE_STRUCT.size
+            if changed:
+                break
+            cursor += records * canonical.TRACE_STRUCT.size
+        self.assertTrue(changed)
+        stream.write_bytes(payload)
+        bundle = lazy.read_bundle(trace)
+        boundary = replay._write_lazy_boundary_map(
+            bundle, self.root / "drift-boundary.txt"
+        )
+        initial = replay._write_lazy_initial_memory_map(
+            bundle, self.root / "drift-initial.txt"
+        )
+        result = self.root / "drift-result.json"
+        subprocess.run([
+            str(binary), "--system", "vanilla", "--trace", str(stream),
+            "--result", str(result), "--mode", "functional", "--stream", "1",
+            "--boundary-map", str(boundary), "--initial-memory-map", str(initial),
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        observed = json.loads(result.read_text())
+        with self.assertRaisesRegex(replay.ReplayError, "differs"):
+            row = observed["output_boundaries"]["scalar.result.divide.iter1"]
+            got = hashlib.sha256(struct.pack("<Q", *row["raw_words"])).hexdigest()
+            if got != bundle.meta["boundary_commitments"]["scalar.result.divide.iter1"]:
+                raise replay.ReplayError("stream replay boundary differs")
 
     def test_window_evidence_keeps_positive_fixed_roi_ticks_separate(self):
         dynamic = {"sim_ticks": 12345, "verification": "pass"}
@@ -552,7 +844,8 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         )
         trace = self.root / "eager-window"
         canonical.write_bundle(
-            trace, _meta("eager_window", 1), operations, {}
+            trace, _meta("eager_window", 1), operations, {},
+            initial_memory=_initial_memory(operations),
         )
         plan = timing.make_plan("f" * 64, "eager_window", 1)
         manifest = self.root / "bad-window.json"
@@ -790,7 +1083,10 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 left=17, result=17),
         )
         bundle = self.root / "evidence-trace"
-        canonical.write_bundle(bundle, _meta("evidence", 1), operations, {})
+        canonical.write_bundle(
+            bundle, _meta("evidence", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
         run_dir = self.root / "run"
         run_dir.mkdir()
         (run_dir / "result.json").write_text(json.dumps({
@@ -835,7 +1131,10 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 left=21, result=21),
         )
         bundle = self.root / "bad-commit-trace"
-        canonical.write_bundle(bundle, _meta("bad_commit", 1), operations, {})
+        canonical.write_bundle(
+            bundle, _meta("bad_commit", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
         run_dir = self.root / "bad-run"
         run_dir.mkdir()
         (run_dir / "result.json").write_text(json.dumps({

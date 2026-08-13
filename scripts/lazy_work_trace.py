@@ -41,6 +41,33 @@ _MEMORY_OPCODE_TYPES = {
     canonical.Opcode.STORE_F32: "f32",
     canonical.Opcode.STORE_F64: "f64",
 }
+_SCALAR_BASE = 0x7000000000000000
+
+
+def _default_scalar_addresses(scalars):
+    return {
+        name: _SCALAR_BASE + 8 * index
+        for index, name in enumerate(sorted(scalars))
+    }
+
+
+def _scalar_names(meta, invocations):
+    names = set(meta.get("initial_scalars", {}))
+    for invocation in invocations:
+        parameters = invocation.parameters
+        for key in (
+            "result", "result_xz", "result_zz", "norm3", "zeta",
+            "snapshot", "rnm2", "rnmu",
+        ):
+            value = parameters.get(key)
+            if isinstance(value, str):
+                names.add(value)
+        for key in ("zero", "results"):
+            names.update(
+                value for value in parameters.get(key, [])
+                if isinstance(value, str)
+            )
+    return names
 
 
 def _uint(value, bits, label):
@@ -183,6 +210,21 @@ def _validate_meta(meta):
     _name(meta.get("workload"), "workload")
     for field in ("source_sha256", "binary_sha256", "config_sha256"):
         _digest(meta.get(field), field.removesuffix("_sha256"))
+    scalars = meta.get("initial_scalars", {})
+    addresses = meta.get("scalar_addresses", {})
+    if not isinstance(scalars, dict) or not isinstance(addresses, dict):
+        raise LazyTraceError("lazy scalar memory contract is invalid")
+    if set(scalars) != set(addresses):
+        raise LazyTraceError("lazy scalar address set differs from initial state")
+    used = set()
+    for name, value in scalars.items():
+        _name(name, "scalar name")
+        _uint(value, 64, f"initial scalar {name}")
+        address = addresses[name]
+        _uint(address, 64, f"scalar address {name}")
+        if address % 8 or address in used:
+            raise LazyTraceError("lazy scalar addresses overlap or are unaligned")
+        used.add(address)
 
 
 def _validate_dynamic_work(value):
@@ -234,6 +276,25 @@ def _validate_arrays(root, arrays):
             )
 
 
+def _validate_scalar_ranges(meta, arrays):
+    ranges = [
+        (array.logical_base,
+         array.logical_base + array.count * _ELEMENTS[array.element_type][0],
+         array.name)
+        for array in arrays
+    ]
+    for name, start in meta.get("scalar_addresses", {}).items():
+        if start > (1 << 64) - 8:
+            raise LazyTraceError(f"scalar {name} address range wraps")
+        ranges.append((start, start + 8, f"scalar.{name}"))
+    ranges.sort()
+    for left, right in zip(ranges, ranges[1:]):
+        if left[1] > right[0]:
+            raise LazyTraceError(
+                f"logical ranges overlap: {left[2]} and {right[2]}"
+            )
+
+
 def _validate_invocations(invocations):
     for expected, invocation in enumerate(invocations):
         if invocation.ordinal != expected:
@@ -246,11 +307,21 @@ def write_bundle(root, meta, arrays, invocations, dynamic_work):
     path = root / "trace.v2.json"
     if path.exists():
         raise LazyTraceError("lazy trace bundle already exists")
-    arrays = tuple(arrays)
+    meta = dict(meta)
     invocations = tuple(invocations)
+    initial_scalars = dict(meta.get("initial_scalars", {}))
+    for name in _scalar_names(meta, invocations):
+        initial_scalars.setdefault(name, 0)
+    meta["initial_scalars"] = initial_scalars
+    meta.setdefault(
+        "scalar_addresses",
+        _default_scalar_addresses(meta.get("initial_scalars", {})),
+    )
+    arrays = tuple(arrays)
     _validate_meta(meta)
     _validate_dynamic_work(dynamic_work)
     _validate_arrays(root, arrays)
+    _validate_scalar_ranges(meta, arrays)
     _validate_invocations(invocations)
     _atomic_json(path, _canonical_payload(
         dict(meta), arrays, invocations, dict(dynamic_work)
@@ -274,6 +345,7 @@ def read_bundle(root):
     _validate_meta(meta)
     _validate_dynamic_work(dynamic_work)
     _validate_arrays(root, arrays)
+    _validate_scalar_ranges(meta, arrays)
     _validate_invocations(invocations)
     return LazyBundle(root, meta, arrays, invocations, dynamic_work)
 
@@ -289,6 +361,11 @@ class MappedState:
             raise LazyTraceError("initial scalar map is invalid")
         _validate_parameter(initial_scalars, "initial scalars")
         self._scalars = dict(initial_scalars)
+        for name in _scalar_names(bundle.meta, bundle.invocations):
+            self._scalars.setdefault(name, 0)
+        self._scalar_addresses = self._bundle.meta.get(
+            "scalar_addresses", _default_scalar_addresses(self._scalars)
+        )
 
     def __enter__(self):
         try:
@@ -383,6 +460,13 @@ class MappedState:
         _uint(raw, 64, "scalar raw value")
         self._scalars[name] = raw
 
+    def scalar_address(self, name):
+        _name(name, "scalar name")
+        try:
+            return self._scalar_addresses[name]
+        except KeyError as error:
+            raise LazyTraceError(f"unknown scalar {name}") from error
+
     def scalar_sha256(self, name):
         return hashlib.sha256(struct.pack("<Q", self.load_scalar(name))).hexdigest()
 
@@ -403,6 +487,13 @@ def _validate_memory_address(bundle, operation):
                 )
             if (operation.address - start) % width:
                 raise LazyTraceError("memory operation address is misaligned")
+            return
+    addresses = bundle.meta.get(
+        "scalar_addresses",
+        _default_scalar_addresses(bundle.meta.get("initial_scalars", {})),
+    )
+    for name, address in addresses.items():
+        if operation.address == address and element_type == "f64":
             return
     raise LazyTraceError("memory operation address is outside declared image")
 

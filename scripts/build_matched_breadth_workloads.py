@@ -52,6 +52,20 @@ MCF_OUTPUTS = (
     "objective", "flow", "cost", "potential", "predecessor", "depth",
     "orientation", "tree",
 )
+MCF_BASES = {
+    "arc": 0x100000000,
+    "potential": 0x200000000,
+    "tree": 0x300000000,
+    "predecessor": 0x310000000,
+    "depth": 0x320000000,
+    "orientation": 0x330000000,
+    "objective": 0x400000000,
+}
+SPATTER_BASES = {
+    "index": 0x100000000,
+    "values": 0x200000000,
+    "destination": 0x300000000,
+}
 
 
 class BuildError(RuntimeError):
@@ -1613,13 +1627,13 @@ def _cg_invocation_descriptors(capture):
         add(103, "npb_cg_dot", outer * 100, columns, {
             "left": "r", "right": "r", "result": "rho",
             "lanes": lanes,
-        }, 4 * columns + 5)
+        }, 4 * columns + 6)
         for cgit in range(1, cgitmax + 1):
             iteration = outer * 100 + cgit
             add(104, "npb_cg_prepare_iteration", iteration, 1, {
                 "source": "rho", "snapshot": "rho0",
                 "zero": ["d", "rho"], "results": ["rho0", "d", "rho"],
-            }, 5)
+            }, 8)
             add(101, "npb_cg_spmv", iteration, rows, {
                 "rowstr": "rowstr", "colidx": "colidx", "values": "a",
                 "source": "p", "destination": "q", "row_count": rows,
@@ -1629,22 +1643,22 @@ def _cg_invocation_descriptors(capture):
             add(103, "npb_cg_dot", iteration, columns, {
                 "left": "p", "right": "q", "result": "d",
                 "lanes": lanes,
-            }, 4 * columns + 5)
+            }, 4 * columns + 6)
             add(103, "npb_cg_divide", iteration * 10 + 1, 1, {
                 "numerator": "rho0", "denominator": "d",
                 "result": "alpha",
-            }, 3)
+            }, 4)
             add(102, "npb_cg_update_zr", iteration, columns, {
                 "z": "z", "p": "p", "r": "r", "q": "q",
                 "alpha": "alpha", "result": "rho",
                 "boundaries": ["z", "r"],
                 "boundary_counts": {"z": columns, "r": columns},
                 "lanes": lanes,
-            }, 12 * columns + 5)
+            }, 12 * columns + 6)
             add(102, "npb_cg_divide", iteration * 10 + 2, 1, {
                 "numerator": "rho", "denominator": "rho0",
                 "result": "beta",
-            }, 3)
+            }, 4)
             add(102, "npb_cg_update_p", iteration, columns, {
                 "r": "r", "p": "p", "beta": "beta",
                 "boundaries": ["p", "q"],
@@ -1659,19 +1673,19 @@ def _cg_invocation_descriptors(capture):
         }, spmv_count)
         add(103, "npb_cg_residual_norm", tail, columns, {
             "x": "x", "r": "r", "result": "rnorm", "lanes": lanes,
-        }, 5 * columns + 6)
+        }, 5 * columns + 7)
         add(103, "npb_cg_outer_dots", tail + 1, columns, {
             "x": "x", "z": "z", "result_xz": "norm1",
             "result_zz": "norm2", "results": ["norm1", "norm2"],
             "lanes": lanes,
-        }, 8 * columns + 8)
+        }, 8 * columns + 10)
         add(102, "npb_cg_normalize", outer, columns, {
             "z": "z", "x": "x", "norm1": "norm1", "norm2": "norm2",
             "norm3": "norm3", "shift": "shift", "zeta": "zeta",
             "write_zeta": 1, "boundaries": ["x"],
             "boundary_counts": {"x": columns},
             "results": ["norm3", "zeta", "rnorm"],
-        }, 3 * columns + 6)
+        }, 3 * columns + 8)
     return tuple(invocations), primitive_records, {
         "shift": shift_signed & ((1 << 64) - 1),
     }
@@ -1892,7 +1906,7 @@ def _mg_invocation_descriptors(capture):
                 "rnm2": "rnm2", "rnmu": "rnmu",
                 "results": ["rnm2", "rnmu"],
                 "lanes": _canonical_lanes(interior),
-            }, 6 * interior + 10)
+            }, 6 * interior + 12)
     return tuple(invocations), primitive_records, levels
 
 
@@ -1958,12 +1972,17 @@ def _write_npb_lazy_bundle(capture, workload, root, *, source_sha256,
         ))
     else:
         raise BuildError(f"unknown NPB lazy workload: {workload}")
+    boundary_crosswalk, boundary_expectations = _npb_boundary_expectations(
+        capture, workload
+    )
     meta = {
         "schema": 2, "workload": f"npb_{workload}",
         "source_sha256": source_sha256,
         "binary_sha256": binary_sha256,
         "config_sha256": config_sha256,
         "initial_scalars": initial_scalars,
+        "boundary_commitments": boundary_expectations,
+        "native_boundary_crosswalk": boundary_crosswalk,
     }
     lazy.write_bundle(
         root, meta, arrays, invocations,
@@ -3002,9 +3021,108 @@ def _combined_input_sha256(inputs, names):
     return digest.hexdigest()
 
 
+def _mcf_initial_memory(path):
+    payload = Path(path).read_bytes()
+    header = struct.Struct("<8sQQQQQ")
+    if len(payload) < header.size:
+        raise BuildError("MCF input is shorter than its header")
+    magic, nodes, arcs, _, _, _ = header.unpack_from(payload)
+    if magic != b"MCFREG1\0":
+        raise BuildError("MCF input magic differs")
+    offset = header.size
+
+    def image(name, base, count):
+        nonlocal offset
+        byte_count = count * 8
+        end = offset + byte_count
+        if end > len(payload):
+            raise BuildError(f"MCF input {name} image is truncated")
+        words = struct.unpack_from(f"<{count}Q", payload, offset)
+        offset = end
+        return {
+            "logical_base": base, "word_bits": 64, "words": words,
+        }
+
+    result = {"arcs": image("arcs", MCF_BASES["arc"], arcs * 4)}
+    for name in ("potential", "predecessor", "depth", "orientation", "tree"):
+        result[name] = image(name, MCF_BASES[name], nodes)
+    result["objective"] = {
+        "logical_base": MCF_BASES["objective"],
+        "word_bits": 64,
+        "words": (0,),
+    }
+    return result
+
+
+def _spatter_initial_memory(*, values_path, index_path, output_count):
+    values = _read_words(values_path, 32)
+    index = _read_words(index_path, 64)
+    return {
+        "values": {
+            "logical_base": SPATTER_BASES["values"],
+            "word_bits": 32,
+            "words": values,
+        },
+        "index": {
+            "logical_base": SPATTER_BASES["index"],
+            "word_bits": 64,
+            "words": index,
+        },
+        "destination": {
+            "logical_base": SPATTER_BASES["destination"],
+            "word_bits": 32,
+            "words": (0,) * output_count,
+        },
+    }
+
+
+def _boundary_probes(workload, operations, outputs, state_shape):
+    if workload != "mcf":
+        after = operations[-1].sequence if operations else 0
+        return {
+            "destination": [
+                {"address": SPATTER_BASES["destination"] + 4 * index,
+                 "after_sequence": after}
+                for index in range(len(outputs["destination"]))
+            ]
+        }
+    if not isinstance(state_shape, dict):
+        raise BuildError("MCF state shape is missing")
+    commits = [
+        operation.sequence for operation in operations
+        if operation.phase == 2 and operation.opcode == canonical.Opcode.COMMIT
+    ]
+    if len(commits) != len(outputs["objective"]):
+        raise BuildError("MCF objective/COMMIT boundary count differs")
+    arcs = state_shape["arcs"]
+    nodes = state_shape["nodes"]
+    result = {name: [] for name in MCF_OUTPUTS}
+    for after in commits:
+        result["objective"].append({
+            "address": MCF_BASES["objective"], "after_sequence": after,
+        })
+        for index in range(arcs):
+            result["flow"].append({
+                "address": MCF_BASES["arc"] + index * 32 + 24,
+                "after_sequence": after,
+            })
+            result["cost"].append({
+                "address": MCF_BASES["arc"] + index * 32 + 16,
+                "after_sequence": after,
+            })
+        for name in ("potential", "predecessor", "depth", "orientation", "tree"):
+            result[name].extend(
+                {"address": MCF_BASES[name] + index * 8,
+                 "after_sequence": after}
+                for index in range(nodes)
+            )
+    return result
+
+
 def _write_reference_bundle(
     *, bundle_root, workload, phases, input_sha256, binary_row,
     manifest_sha256, trace_path, output_paths, stdout,
+    initial_memory=None,
 ):
     operations = canonical.decode_operations(Path(trace_path).read_bytes())
     work, invocations, duplicate_policy, state_shape = _markers(stdout)
@@ -3012,6 +3130,7 @@ def _write_reference_bundle(
         name: _read_words(path, bits)
         for name, (path, bits) in output_paths.items()
     }
+    probes = _boundary_probes(workload, operations, outputs, state_shape)
     meta = {
         "schema": 1,
         "workload": workload,
@@ -3023,7 +3142,11 @@ def _write_reference_bundle(
         "phase_work": work,
         "phase_invocations": invocations,
         "output_boundaries": {
-            name: {"word_bits": bits, "count": len(outputs[name])}
+            name: {
+                "word_bits": bits,
+                "count": len(outputs[name]),
+                "probes": probes[name],
+            }
             for name, (_, bits) in output_paths.items()
         },
     }
@@ -3031,7 +3154,10 @@ def _write_reference_bundle(
         meta["duplicate_policy"] = duplicate_policy
     if state_shape is not None:
         meta["state_shape"] = state_shape
-    canonical.write_bundle(bundle_root, meta, operations, outputs)
+    canonical.write_bundle(
+        bundle_root, meta, operations, outputs,
+        initial_memory=initial_memory,
+    )
     return Path(bundle_root).resolve()
 
 
@@ -3053,6 +3179,9 @@ def _run_mcf_reference(manifest, root):
         manifest_sha256=_sha256_file(Path(manifest["root"]) / "manifest.json"),
         trace_path=trace_path,
         output_paths={name: (raw / f"{name}.u64", 64) for name in MCF_OUTPUTS},
+        initial_memory=_mcf_initial_memory(
+            manifest["inputs"]["mcf"]["path"]
+        ),
         stdout=stdout,
     )
 
@@ -3084,6 +3213,11 @@ def _run_spatter_reference(manifest, root, *, kind, faulty=False):
         manifest_sha256=_sha256_file(Path(manifest["root"]) / "manifest.json"),
         trace_path=raw / "trace.bin",
         output_paths={"destination": (raw / "destination.u32", 32)},
+        initial_memory=_spatter_initial_memory(
+            values_path=manifest["inputs"][f"{prefix}_values"]["path"],
+            index_path=manifest["inputs"][f"{prefix}_index"]["path"],
+            output_count=len(_read_words(raw / "destination.u32", 32)),
+        ),
         stdout=stdout,
     )
 

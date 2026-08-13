@@ -95,6 +95,9 @@ class TraceBundle:
     meta: dict
     operations: tuple[Operation, ...]
     outputs: dict[str, tuple[int, ...]]
+    initial_memory: dict[str, tuple[int, ...]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 def encode_operations(operations):
@@ -296,7 +299,7 @@ def _decode_words(payload, word_bits, label):
     return tuple(struct.unpack(f"<{count}{code}", payload))
 
 
-def write_bundle(root, meta, operations, outputs):
+def write_bundle(root, meta, operations, outputs, initial_memory=None):
     root = Path(root)
     if (root / "trace.meta.json").exists():
         raise TraceError("trace bundle already exists")
@@ -328,6 +331,42 @@ def write_bundle(root, meta, operations, outputs):
             "word_bits": word_bits,
             "count": count,
         }
+    initial_records = {}
+    initial_memory = {} if initial_memory is None else initial_memory
+    occupied = []
+    for name, image in sorted(initial_memory.items()):
+        if not isinstance(image, dict):
+            raise TraceError(f"initial memory image {name} is invalid")
+        word_bits = image.get("word_bits")
+        logical_base = image.get("logical_base")
+        values = tuple(image.get("words", ()))
+        if word_bits not in (32, 64):
+            raise TraceError(f"initial memory image {name} width is invalid")
+        if (
+            isinstance(logical_base, bool)
+            or not isinstance(logical_base, int)
+            or logical_base < 0
+            or logical_base >= 1 << 64
+        ):
+            raise TraceError(f"initial memory image {name} base is invalid")
+        payload = _encode_words(values, word_bits, f"initial memory {name}")
+        limit = logical_base + len(payload)
+        if limit > 1 << 64:
+            raise TraceError(f"initial memory image {name} range wraps")
+        if any(logical_base < end and start < limit for start, end in occupied):
+            raise TraceError(f"initial memory image {name} overlaps another image")
+        occupied.append((logical_base, limit))
+        suffix = "u32" if word_bits == 32 else "u64"
+        relative = Path("initial") / f"{_safe_name(name)}.{suffix}"
+        _atomic_write(root / relative, payload)
+        initial_records[name] = {
+            "path": relative.as_posix(),
+            "sha256": _sha256_bytes(payload),
+            "logical_base": logical_base,
+            "word_bits": word_bits,
+            "count": len(values),
+            "byte_count": len(payload),
+        }
     final_meta = {
         **meta,
         "trace_path": "trace.bin",
@@ -335,6 +374,7 @@ def write_bundle(root, meta, operations, outputs):
         "trace_record_bytes": TRACE_STRUCT.size,
         "trace_records": len(trace_payload) // TRACE_STRUCT.size,
         "outputs": output_records,
+        "initial_memory": initial_records,
     }
     contract.atomic_write_json(root / "trace.meta.json", final_meta)
     return root / "trace.meta.json"
@@ -372,4 +412,27 @@ def read_bundle(root):
         if len(values) != record.get("count"):
             raise TraceError(f"output {name} element count differs")
         outputs[name] = values
-    return TraceBundle(meta, operations, outputs)
+    initial_memory = {}
+    initial_records = meta.get("initial_memory")
+    if not isinstance(initial_records, dict):
+        raise TraceError("initial memory records are missing")
+    occupied = []
+    for name, record in initial_records.items():
+        try:
+            payload = (root / record["path"]).read_bytes()
+        except (KeyError, OSError) as error:
+            raise TraceError(f"cannot read initial memory {name}: {error}") from error
+        if _sha256_bytes(payload) != record.get("sha256"):
+            raise TraceError(f"initial memory {name} SHA-256 differs")
+        values = _decode_words(payload, record.get("word_bits"), name)
+        if len(values) != record.get("count") or len(payload) != record.get("byte_count"):
+            raise TraceError(f"initial memory {name} shape differs")
+        base = record.get("logical_base")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            raise TraceError(f"initial memory {name} base is invalid")
+        limit = base + len(payload)
+        if limit > 1 << 64 or any(base < end and start < limit for start, end in occupied):
+            raise TraceError(f"initial memory {name} range is invalid")
+        occupied.append((base, limit))
+        initial_memory[name] = values
+    return TraceBundle(meta, operations, outputs, initial_memory)

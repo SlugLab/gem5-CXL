@@ -59,10 +59,19 @@ struct Commit
 
 struct OutputBoundary
 {
+    struct Probe {
+        uint64_t address = 0;
+        uint64_t afterSequence = 0;
+    };
     std::string name;
     uint32_t wordBits = 0;
+    std::vector<Probe> probes;
     std::vector<uint64_t> words;
+    std::vector<bool> captured;
 };
+
+using BoundaryProbes = std::unordered_map<
+    uint64_t, std::vector<std::pair<OutputBoundary *, size_t>>>;
 
 struct ReplayStats
 {
@@ -137,7 +146,6 @@ class Memory
                     lineAddresses.push_back(line);
                     lines.push_back(std::make_unique<DataLine>());
                 }
-                const size_t lineIndex = lineIndices.at(line);
                 if (trackerIndices.count(record.address) == 0) {
                     trackerIndices.emplace(
                         record.address, trackerAddresses.size());
@@ -145,26 +153,33 @@ class Memory
                     trackers.push_back(
                         std::make_unique<std::atomic<uint64_t>>(NoStore));
                 }
-                const uint32_t bytes = width(opcode);
-                if (isLoad(opcode)) {
-                    std::array<unsigned char, sizeof(uint64_t)> raw{};
-                    std::memcpy(raw.data(), &record.result, bytes);
-                    auto *destination = static_cast<unsigned char *>(
-                        pointer(record.address));
-                    for (uint32_t offset = 0; offset < bytes; ++offset) {
-                        const uint64_t logical = record.address + offset;
-                        if (initializedBytes.insert(logical).second &&
-                            writtenBytes.count(logical) == 0) {
-                            destination[offset] = raw[offset];
-                            preparedLines.insert(lineIndex);
-                        }
-                    }
-                } else {
-                    for (uint32_t offset = 0; offset < bytes; ++offset)
-                        writtenBytes.insert(record.address + offset);
-                }
             }
         }
+    }
+
+    void initialize(uint64_t base, const std::string &path, uint64_t bytes)
+    {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream)
+            throw std::runtime_error("cannot open initial memory image");
+        for (uint64_t offset = 0; offset < bytes;) {
+            const uint64_t logical = base + offset;
+            const uint64_t line = lineAddress(logical);
+            if (lineIndices.count(line) == 0) {
+                lineIndices.emplace(line, lineAddresses.size());
+                lineAddresses.push_back(line);
+                lines.push_back(std::make_unique<DataLine>());
+            }
+            const size_t count = std::min<uint64_t>(
+                bytes - offset, 64 - lineOffset(logical));
+            stream.read(static_cast<char *>(pointer(logical)), count);
+            if (stream.gcount() != static_cast<std::streamsize>(count))
+                throw std::runtime_error("initial memory image is truncated");
+            offset += count;
+        }
+        char trailing;
+        if (stream.get(trailing))
+            throw std::runtime_error("initial memory image is oversized");
     }
 
     static bool isLoad(Opcode opcode)
@@ -290,8 +305,6 @@ class Memory
     std::vector<uint64_t> trackerAddresses;
     std::unordered_map<uint64_t, size_t> trackerIndices;
     std::vector<std::unique_ptr<std::atomic<uint64_t>>> trackers;
-    std::unordered_set<uint64_t> initializedBytes;
-    std::unordered_set<uint64_t> writtenBytes;
     std::unordered_set<size_t> preparedLines;
 };
 
@@ -643,8 +656,7 @@ decodeHexName(const std::string &encoded)
 }
 
 std::vector<OutputBoundary>
-readBoundaryMap(const std::string &path,
-                const std::vector<TraceRecord> &records)
+readBoundaryMap(const std::string &path)
 {
     if (path.empty())
         return {};
@@ -653,9 +665,9 @@ readBoundaryMap(const std::string &path,
         throw std::runtime_error("cannot open canonical boundary map");
     std::string magic;
     uint64_t boundaryCount = 0;
-    if (!(stream >> magic >> boundaryCount) || magic != "MTRBND1")
+    if (!(stream >> magic >> boundaryCount) || magic != "MTRBND2")
         throw std::runtime_error("canonical boundary map header differs");
-    if (boundaryCount > records.size() + 1)
+    if (boundaryCount > (uint64_t(1) << 32))
         throw std::runtime_error("canonical boundary map count is invalid");
     std::vector<OutputBoundary> boundaries;
     std::unordered_set<std::string> names;
@@ -666,31 +678,89 @@ readBoundaryMap(const std::string &path,
         uint64_t wordCount = 0;
         if (!(stream >> encodedName >> wordBits >> wordCount) ||
             (wordBits != 32 && wordBits != 64) ||
-            wordCount > records.size()) {
+            wordCount > (uint64_t(1) << 32)) {
             throw std::runtime_error("canonical boundary map shape differs");
         }
         const std::string name = decodeHexName(encodedName);
         if (!names.insert(name).second)
             throw std::runtime_error("canonical boundary name is duplicate");
-        OutputBoundary output{name, uint32_t(wordBits), {}};
-        output.words.reserve(size_t(wordCount));
+        OutputBoundary output{name, uint32_t(wordBits), {}, {}, {}};
+        output.probes.reserve(size_t(wordCount));
         for (uint64_t word = 0; word < wordCount; ++word) {
-            uint64_t sequence = 0;
-            if (!(stream >> sequence) || sequence >= records.size())
+            uint64_t address = 0;
+            uint64_t afterSequence = 0;
+            if (!(stream >> address >> afterSequence))
                 throw std::runtime_error(
-                    "canonical boundary operation mapping differs");
-            const uint64_t raw = records[size_t(sequence)].result;
-            if (wordBits == 32 && raw >= (uint64_t(1) << 32))
-                throw std::runtime_error(
-                    "canonical boundary uint32 word overflows");
-            output.words.push_back(raw);
+                    "canonical boundary probe mapping differs");
+            output.probes.push_back({address, afterSequence});
         }
+        output.words.resize(size_t(wordCount));
+        output.captured.resize(size_t(wordCount), false);
         boundaries.push_back(std::move(output));
     }
     std::string trailing;
     if (stream >> trailing)
         throw std::runtime_error("canonical boundary map has trailing data");
     return boundaries;
+}
+
+void
+observeBoundarySequence(std::vector<OutputBoundary> &boundaries,
+                        uint64_t sequence, Memory &memory)
+{
+    for (auto &boundary : boundaries) {
+        for (size_t index = 0; index < boundary.probes.size(); ++index) {
+            const auto &probe = boundary.probes[index];
+            if (probe.afterSequence != sequence)
+                continue;
+            if (boundary.captured[index])
+                throw std::runtime_error("canonical boundary probe is duplicate");
+            boundary.words[index] = memory.load(
+                probe.address, boundary.wordBits / 8);
+            boundary.captured[index] = true;
+        }
+    }
+}
+
+BoundaryProbes
+indexBoundaryProbes(std::vector<OutputBoundary> &boundaries, size_t records)
+{
+    BoundaryProbes result;
+    for (auto &boundary : boundaries) {
+        for (size_t index = 0; index < boundary.probes.size(); ++index) {
+            const auto &probe = boundary.probes[index];
+            if (probe.afterSequence >= records)
+                throw std::runtime_error(
+                    "canonical boundary after-sequence is out of range");
+            result[probe.afterSequence].push_back({&boundary, index});
+        }
+    }
+    return result;
+}
+
+void
+readInitialMemoryMap(const std::string &path, Memory &memory)
+{
+    if (path.empty())
+        throw std::runtime_error("canonical initial memory map is missing");
+    std::ifstream stream(path);
+    std::string magic;
+    uint64_t count = 0;
+    if (!(stream >> magic >> count) || magic != "MTRINI1")
+        throw std::runtime_error("canonical initial memory map header differs");
+    for (uint64_t index = 0; index < count; ++index) {
+        uint64_t base = 0, wordBits = 0, words = 0;
+        std::string imagePath;
+        if (!(stream >> base >> wordBits >> words >> imagePath) ||
+            (wordBits != 32 && wordBits != 64) ||
+            words > std::numeric_limits<uint64_t>::max() / (wordBits / 8)) {
+            throw std::runtime_error("canonical initial memory image differs");
+        }
+        memory.initialize(base, imagePath, words * (wordBits / 8));
+    }
+    std::string trailing;
+    if (stream >> trailing)
+        throw std::runtime_error("canonical initial memory map has trailing data");
 }
 
 bool
@@ -717,7 +787,8 @@ readExact(int descriptor, void *destination, size_t bytes, bool allowEof)
 }
 
 std::vector<TraceRecord>
-readStreamFrame(int descriptor, uint64_t &expectedSequence, bool &finished)
+readStreamFrame(int descriptor, uint64_t &expectedSequence, bool &finished,
+                bool &invocationEnd)
 {
     struct Header
     {
@@ -732,14 +803,18 @@ readStreamFrame(int descriptor, uint64_t &expectedSequence, bool &finished)
     alignas(64) Header header{};
     if (!readExact(descriptor, &header, sizeof(header), true))
         throw std::runtime_error("canonical stream has no final frame");
-    if (header.magic != magic || header.flags > 1 ||
+    if (header.magic != magic || header.flags > 2 ||
         header.records > 4096 ||
-        (header.flags == 1 && header.records != 0) ||
+        (header.flags != 0 && header.records != 0) ||
         (header.flags == 0 && header.records == 0)) {
         throw std::runtime_error("canonical stream frame header differs");
     }
     if (header.flags == 1) {
         finished = true;
+        return {};
+    }
+    if (header.flags == 2) {
+        invocationEnd = true;
         return {};
     }
     const size_t bytes = size_t(header.records) * sizeof(TraceRecord);
@@ -809,6 +884,18 @@ buildPhases(const std::vector<TraceRecord> &records)
     return phases;
 }
 
+std::vector<Phase>
+buildOrderedPhases(const std::vector<TraceRecord> &records)
+{
+    if (records.empty())
+        return {};
+    Phase phase{records.front().phase, {}};
+    for (size_t index = 0; index < records.size(); ++index)
+        phase.groups.push_back(WorkGroup{
+            records[index].phase, records[index].work_item, {index}});
+    return {std::move(phase)};
+}
+
 void
 captureAccessorStats(Accessor &accessor, ReplayStats &stats)
 {
@@ -848,7 +935,8 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
              Accessor &accessor, Memory &memory,
              const std::unordered_map<uint64_t, uint64_t> &previousStore,
              const std::unordered_map<uint64_t, size_t> &commitSlots,
-             std::vector<Commit> &commits)
+             std::vector<Commit> &commits,
+             const BoundaryProbes *boundaryProbes)
 {
     const auto waitForPreviousStore = [&](const TraceRecord &operation) {
         const auto found = previousStore.find(operation.sequence);
@@ -911,8 +999,9 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
         uint64_t observed = record->result;
         if (Memory::isStore(opcode)) {
             waitForPreviousStore(*record);
+            observed = record->operand0;
             accessor.store(record->address, Memory::width(opcode),
-                           record->result);
+                           observed);
             memory.publishStore(record->address, record->sequence);
         } else {
             observed = evaluate(*record);
@@ -924,10 +1013,20 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                     Commit{record->sequence, record->address, observed};
             }
         }
-        if (observed != record->result) {
+        if (!Memory::isStore(opcode) && observed != record->result) {
             throw std::runtime_error(
                 "bit-exact result differs at canonical sequence " +
                 std::to_string(record->sequence));
+        }
+        if (boundaryProbes) {
+            const auto probes = boundaryProbes->find(record->sequence);
+            if (probes != boundaryProbes->end()) {
+                for (const auto &[boundary, word] : probes->second) {
+                    const auto &probe = boundary->probes[word];
+                    boundary->words[word] = memory.load(
+                        probe.address, boundary->wordBits / 8);
+                }
+            }
         }
         ++index;
     }
@@ -938,7 +1037,8 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
              const std::vector<TraceRecord> &records, Memory &memory,
              const std::unordered_map<uint64_t, uint64_t> &previousStore,
              const std::unordered_map<uint64_t, size_t> &commitSlots,
-             std::vector<Commit> &commits)
+             std::vector<Commit> &commits,
+             const BoundaryProbes *boundaryProbes = nullptr)
 {
     ReplayStats total;
     omp_set_dynamic(0);
@@ -952,13 +1052,22 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
             const int core = omp_get_thread_num();
             threadStats[core].workerThreads[core] = true;
             auto accessor = makeAccessor(system, memory);
-#pragma omp for schedule(static)
+#pragma omp for ordered schedule(static)
             for (size_t group = 0; group < phase.groups.size(); ++group) {
                 if (failed.load(std::memory_order_relaxed))
                     continue;
                 try {
-                    executeGroup(phase.groups[group], records, *accessor, memory,
-                                 previousStore, commitSlots, commits);
+                    if (boundaryProbes) {
+#pragma omp ordered
+                        executeGroup(
+                            phase.groups[group], records, *accessor, memory,
+                            previousStore, commitSlots, commits,
+                            boundaryProbes);
+                    } else {
+                        executeGroup(
+                            phase.groups[group], records, *accessor, memory,
+                            previousStore, commitSlots, commits, nullptr);
+                    }
                 } catch (const std::exception &error) {
                     failed.store(true, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> guard(failureMutex);
@@ -1075,24 +1184,40 @@ writeResult(const std::string &path, const std::string &system,
 
 void
 executeStreamFile(const std::string &path, const std::string &system,
-                  const std::string &resultPath)
+                  const std::string &resultPath,
+                  const std::string &initialMemoryMap,
+                  const std::string &boundaryMap)
 {
     const int descriptor = ::open(path.c_str(), O_RDONLY);
     if (descriptor < 0)
         throw std::runtime_error("cannot open canonical stream");
     Memory memory;
+    readInitialMemoryMap(initialMemoryMap, memory);
+    auto boundaries = readBoundaryMap(boundaryMap);
+    const BoundaryProbes orderedExecution;
     ReplayStats total;
     std::vector<Commit> commits;
     std::unordered_map<uint64_t, uint64_t> lastStore;
     uint64_t expectedSequence = 0;
     size_t phaseExecutions = 0;
     bool finished = false;
+    uint64_t invocationCommit = 0;
+    size_t commitsSinceMarker = 0;
     try {
         while (!finished) {
+            bool invocationEnd = false;
             auto records = readStreamFrame(
-                descriptor, expectedSequence, finished);
+                descriptor, expectedSequence, finished, invocationEnd);
             if (finished)
                 break;
+            if (invocationEnd) {
+                if (commitsSinceMarker != 1)
+                    throw std::runtime_error(
+                        "canonical invocation COMMIT count differs");
+                observeBoundarySequence(boundaries, invocationCommit, memory);
+                commitsSinceMarker = 0;
+                continue;
+            }
             memory.prepare(records);
             memory.flushPrepared();
             std::unordered_map<uint64_t, uint64_t> previousStore;
@@ -1107,15 +1232,17 @@ executeStreamFile(const std::string &path, const std::string &system,
                         lastStore[record.address] = record.sequence;
                 }
                 if (opcode == Opcode::COMMIT) {
+                    invocationCommit = record.sequence;
+                    ++commitsSinceMarker;
                     commitSlots.emplace(record.sequence, commits.size());
                     commits.push_back({});
                 }
             }
-            const auto phases = buildPhases(records);
+            const auto phases = buildOrderedPhases(records);
             phaseExecutions += phases.size();
             const auto observed = executeTrace(
                 system, phases, records, memory, previousStore,
-                commitSlots, commits);
+                commitSlots, commits, &orderedExecution);
             accumulateStats(total, observed);
         }
     } catch (...) {
@@ -1124,13 +1251,26 @@ executeStreamFile(const std::string &path, const std::string &system,
     }
     if (::close(descriptor) != 0)
         throw std::runtime_error("canonical stream close failed");
+    if (commitsSinceMarker != 0)
+        throw std::runtime_error("canonical stream invocation marker is missing");
+    for (const auto &boundary : boundaries) {
+        if (std::find(boundary.captured.begin(), boundary.captured.end(), false)
+            != boundary.captured.end()) {
+            throw std::runtime_error("canonical boundary probe was not captured");
+        }
+        for (const auto &probe : boundary.probes) {
+            if (probe.afterSequence >= expectedSequence)
+                throw std::runtime_error(
+                    "canonical boundary after-sequence is out of range");
+        }
+    }
     std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
               << memory.allocatedBytes() << " allocated_bytes="
               << memory.allocatedBytes()
               << " all_memory_cxl=true" << std::endl;
     writeResult(resultPath, system, size_t(expectedSequence), commits,
                 memory.allocatedBytes(), phaseExecutions, total,
-                "functional");
+                "functional", boundaries);
 }
 
 } // anonymous namespace
@@ -1145,6 +1285,7 @@ main(int argc, char **argv)
         std::string mode = "functional";
         std::string windowManifest;
         std::string boundaryMap;
+        std::string initialMemoryMap;
         uint64_t selectedPhase = 0;
         uint64_t windowIndex = 0;
         uint64_t measureStartItem = 0;
@@ -1164,6 +1305,8 @@ main(int argc, char **argv)
                 resultPath = argv[++index];
             else if (option == "--boundary-map")
                 boundaryMap = argv[++index];
+            else if (option == "--initial-memory-map")
+                initialMemoryMap = argv[++index];
             else if (option == "--mode")
                 mode = argv[++index];
             else if (option == "--window-manifest")
@@ -1190,9 +1333,9 @@ main(int argc, char **argv)
             throw std::runtime_error("replay options are incomplete");
         if (mode != "functional" && mode != "window")
             throw std::runtime_error("replay mode is invalid");
-        if (streamMode && (mode != "functional" || !boundaryMap.empty()))
+        if (streamMode && mode != "functional")
             throw std::runtime_error(
-                "stream replay must be functional without an eager boundary map");
+                "stream replay must be functional");
         if (mode == "functional" &&
             (!windowManifest.empty() || hasPhase || hasWindowIndex ||
              hasMeasureStartItem)) {
@@ -1213,7 +1356,8 @@ main(int argc, char **argv)
 #endif
 
         if (streamMode) {
-            executeStreamFile(tracePath, system, resultPath);
+            executeStreamFile(
+                tracePath, system, resultPath, initialMemoryMap, boundaryMap);
 #ifndef TRACE_REPLAY_NATIVE
             m5_exit(0);
 #endif
@@ -1221,8 +1365,13 @@ main(int argc, char **argv)
         }
 
         const auto records = readTrace(tracePath);
-        const auto outputBoundaries = readBoundaryMap(boundaryMap, records);
+        auto outputBoundaries = readBoundaryMap(boundaryMap);
+        if (mode == "window" && !outputBoundaries.empty())
+            throw std::runtime_error("timing replay may not capture boundaries");
         Memory memory(records);
+        readInitialMemoryMap(initialMemoryMap, memory);
+        auto boundaryProbes = indexBoundaryProbes(
+            outputBoundaries, records.size());
         std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
                   << memory.allocatedBytes() << " allocated_bytes="
                   << memory.allocatedBytes()
@@ -1268,7 +1417,8 @@ main(int argc, char **argv)
             measuredPhases = measured.size();
         } else {
             stats = executeTrace(system, phases, records, memory,
-                                 previousStore, commitSlots, commits);
+                                 previousStore, commitSlots, commits,
+                                 &boundaryProbes);
         }
         writeResult(resultPath, system, records.size(), commits,
                     memory.allocatedBytes(), measuredPhases, stats, mode,

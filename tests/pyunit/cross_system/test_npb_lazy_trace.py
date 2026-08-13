@@ -34,6 +34,19 @@ def with_sequences(rows):
     )
 
 
+def without_scalar_stores(rows):
+    return tuple(
+        dataclasses.replace(row, sequence=index)
+        for index, row in enumerate(
+            row for row in rows
+            if not (
+                row.opcode == canonical.Opcode.STORE_F64
+                and row.address >= 0x7000000000000000
+            )
+        )
+    )
+
+
 def control(phase, opcode, iteration, work_items=0):
     return canonical.Operation(
         phase, opcode, iteration, 0, 0, 0, work_items, 0,
@@ -187,7 +200,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "binary_sha256": "2" * 64,
                 "config_sha256": "3" * 64,
             },
-            arrays, (invocation,), {"primitive_records": 25},
+            arrays, (invocation,), {"primitive_records": 26},
         )
         return lazy.read_bundle(self.root)
 
@@ -211,7 +224,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                     "rho0": raw_f64(10.0), "d": raw_f64(4.0),
                 },
             },
-            (), (invocation,), {"primitive_records": 3},
+            (), (invocation,), {"primitive_records": 4},
         )
         return lazy.read_bundle(self.root)
 
@@ -243,7 +256,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "config_sha256": "3" * 64,
                 "initial_scalars": {"alpha": raw_f64(0.5)},
             },
-            arrays, (invocation,), {"primitive_records": 65},
+            arrays, (invocation,), {"primitive_records": 66},
         )
         return lazy.read_bundle(self.root)
 
@@ -294,7 +307,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "binary_sha256": "2" * 64,
                 "config_sha256": "3" * 64,
             },
-            arrays, (invocation,), {"primitive_records": 21},
+            arrays, (invocation,), {"primitive_records": 22},
         )
         return lazy.read_bundle(self.root)
 
@@ -348,7 +361,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "binary_sha256": "2" * 64,
                 "config_sha256": "3" * 64,
             },
-            arrays, (invocation,), {"primitive_records": 32},
+            arrays, (invocation,), {"primitive_records": 34},
         )
         return lazy.read_bundle(self.root)
 
@@ -380,7 +393,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                     "shift": raw_f64(10.0),
                 },
             },
-            arrays, (invocation,), {"primitive_records": 15},
+            arrays, (invocation,), {"primitive_records": 17},
         )
         return lazy.read_bundle(self.root)
 
@@ -475,7 +488,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "config_sha256": "3" * 64,
                 "initial_scalars": {"shift": raw_f64(10.0)},
             },
-            arrays, tuple(invocations), {"primitive_records": 385},
+            arrays, tuple(invocations), {"primitive_records": 405},
         )
         return lazy.read_bundle(self.root)
 
@@ -641,7 +654,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         bundle = self.dot_bundle()
         expected, result = self.expected_dot()
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)), expected,
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)), expected,
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
@@ -675,7 +688,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "config_sha256": "3" * 64,
                 "initial_scalars": {"rho": raw_f64(17.0)},
             },
-            (), (invocation,), {"primitive_records": 5},
+            (), (invocation,), {"primitive_records": 8},
         )
         bundle = lazy.read_bundle(self.root)
         rows = (
@@ -686,7 +699,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             control(103, canonical.Opcode.COMMIT, 12),
         )
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)),
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)),
             with_sequences(rows),
         )
         self.assertEqual(npb.replay_boundaries(bundle), {
@@ -704,7 +717,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             control(103, canonical.Opcode.COMMIT, 5),
         ))
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)), expected,
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)), expected,
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
@@ -715,7 +728,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         bundle = self.update_zr_bundle()
         expected, z, r, rho = self.expected_update_zr()
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)), expected,
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)), expected,
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
@@ -748,7 +761,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             ))
         rows.append(control(102, canonical.Opcode.COMMIT, 7))
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)),
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)),
             with_sequences(rows),
         )
         self.assertEqual(
@@ -803,7 +816,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             control(103, canonical.Opcode.COMMIT, 8),
         ))
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)),
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)),
             with_sequences(rows),
         )
         self.assertEqual(
@@ -828,7 +841,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             ))
         rows.append(control(102, canonical.Opcode.COMMIT, 0))
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)),
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)),
             with_sequences(rows),
         )
         expected = b"".join(F64.pack(value) for value in values)
@@ -897,7 +910,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             results.append(result)
         rows.append(control(103, canonical.Opcode.COMMIT, 10))
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)),
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)),
             with_sequences(rows),
         )
         self.assertEqual(npb.replay_boundaries(bundle), {
@@ -934,7 +947,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             ))
         rows.append(control(102, canonical.Opcode.COMMIT, 11))
         self.assertEqual(
-            tuple(lazy.iter_operations(bundle, npb.EXPANDERS)),
+            without_scalar_stores(lazy.iter_operations(bundle, npb.EXPANDERS)),
             with_sequences(rows),
         )
         self.assertEqual(npb.replay_boundaries(bundle), {
@@ -967,7 +980,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         self.assertEqual(len(fingerprints), 1)
         digest_value, count = fingerprints.pop()
         self.assertRegex(digest_value, r"^[0-9a-f]{64}$")
-        self.assertEqual(count, 385)
+        self.assertEqual(count, 405)
         evidence_hash, evidence_count, boundaries = npb.expanded_evidence(bundle)
         self.assertEqual((evidence_hash, evidence_count), (digest_value, count))
         self.assertEqual({key: boundaries[key] for key in (
@@ -1213,14 +1226,14 @@ class NpbMgLazyTraceTest(unittest.TestCase):
                 "binary_sha256": "2" * 64,
                 "config_sha256": "3" * 64,
             },
-            arrays, (invocation,), {"primitive_records": 58},
+            arrays, (invocation,), {"primitive_records": 60},
         )
         return lazy.read_bundle(self.root), values
 
     def test_mg_norm_uses_sum_max_trees_division_and_sqrt(self):
         bundle, values = self.norm_bundle()
         operations = tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
-        self.assertEqual(len(operations), 58)
+        self.assertEqual(len(operations), 60)
         self.assertEqual(
             sum(row.opcode == canonical.Opcode.F64_MAX for row in operations),
             11,
@@ -1686,7 +1699,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
                 "source_sha256": "1" * 64,
                 "binary_sha256": "2" * 64,
                 "config_sha256": "3" * 64,
-            }, arrays, invocations, {"primitive_records": 5180},
+            }, arrays, invocations, {"primitive_records": 5182},
         )
         return lazy.read_bundle(self.root)
 
@@ -1701,7 +1714,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         self.assertEqual(len(fingerprints), 1)
         stream_sha256, count = fingerprints.pop()
         self.assertRegex(stream_sha256, r"^[0-9a-f]{64}$")
-        self.assertEqual(count, 5180)
+        self.assertEqual(count, 5182)
         boundaries = npb.replay_boundaries(bundle)
         self.assertEqual({key: boundaries[key] for key in (
             "vc_coarse_r.rprj3.iter10", "vc_coarse_u.psinv.iter11",
