@@ -8,6 +8,7 @@ import csv
 import hashlib
 import itertools
 import math
+import re
 from pathlib import Path
 
 
@@ -16,6 +17,9 @@ AMU_PDF_SHA256 = (
 )
 CIRA_CSV_SHA256 = (
     "4e0297da423cee0a742bc2e10656d022bb27776807f2d2ce4cca43e65c634184"
+)
+CIRA_SPATTER_CSV_SHA256 = (
+    "5e813083909be5d5c1a766ed0646268b426378d365989932bc57b3d8dd52429d"
 )
 
 AMU_TABLE4 = {
@@ -285,6 +289,171 @@ def load_cira_source(path):
             "Rows failing Verification are excluded from fitting and plots.",
             "Original fallback and confidence-interval fields are preserved.",
         ],
+    }
+
+
+def load_cira_spatter_source(path):
+    """Load the approved real-hardware Spatter policy-selection rows."""
+    path = Path(path).resolve()
+    digest = require_hash(
+        path, CIRA_SPATTER_CSV_SHA256, "CIRA Spatter CSV"
+    )
+    required_workloads = ("amg", "lulesh", "nekbone", "pennant")
+    rows = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            for line_number, source in enumerate(csv.DictReader(stream), start=2):
+                workload = source.get("Workload", "")
+                mode = source.get("Mode", "")
+                context = f"{path}:{line_number} {workload}/{mode}"
+                if source.get("Suite") != "spatter":
+                    raise CalibrationError(f"{context}: suite is not Spatter")
+                if workload not in required_workloads:
+                    raise CalibrationError(f"{context}: unexpected workload")
+                if mode not in _CIRA_REQUIRED_MODES:
+                    raise CalibrationError(f"{context}: unexpected mode")
+                modes = rows.setdefault(workload, {})
+                if mode in modes:
+                    raise CalibrationError(f"{context}: duplicate mode")
+                trials = _integer(source, "Trials", context)
+                if trials != 10:
+                    raise CalibrationError(
+                        f"{context}: expected 10 trials, got {trials}"
+                    )
+                try:
+                    raw = [
+                        float(value)
+                        for value in source.get("RawTrialMs", "").split(";")
+                        if value
+                    ]
+                except ValueError as error:
+                    raise CalibrationError(
+                        f"{context}: invalid RawTrialMs"
+                    ) from error
+                if len(raw) != trials or any(
+                    not math.isfinite(value) or value <= 0 for value in raw
+                ):
+                    raise CalibrationError(
+                        f"{context}: RawTrialMs must contain 10 positive values"
+                    )
+                numeric = {}
+                for field in (
+                    "MeanRuntimeMs", "RuntimeStdMs",
+                    "RuntimeCI95HalfWidthMs", "RuntimeCI95LowMs",
+                    "RuntimeCI95HighMs", "SpeedupVsBaseline",
+                    "SpeedupCI95Low", "SpeedupCI95High",
+                ):
+                    numeric[field] = _number(source, field, context)
+                    if not math.isfinite(numeric[field]):
+                        raise CalibrationError(f"{context}: invalid {field}")
+                if numeric["MeanRuntimeMs"] <= 0 or numeric["SpeedupVsBaseline"] <= 0:
+                    raise CalibrationError(f"{context}: timing value is nonpositive")
+                modes[mode] = {
+                    "mode": mode,
+                    "label": source.get("Label", ""),
+                    "binary": source.get("Binary", ""),
+                    "selected_from": source.get("SelectedFrom", ""),
+                    "trials": trials,
+                    "timing_method": source.get("TimingMethod", ""),
+                    "raw_trial_ms": raw,
+                    **{
+                        re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower(): value
+                        for key, value in numeric.items()
+                    },
+                }
+    except OSError as error:
+        raise CalibrationError(f"cannot read CIRA Spatter CSV {path}") from error
+    if tuple(sorted(rows)) != tuple(sorted(required_workloads)):
+        raise CalibrationError("CIRA Spatter CSV workload set differs")
+    for workload in required_workloads:
+        missing = sorted(set(_CIRA_REQUIRED_MODES) - set(rows[workload]))
+        if missing:
+            raise CalibrationError(
+                f"{workload}: missing Spatter modes {', '.join(missing)}"
+            )
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "rows": rows,
+        "classification": "direct_cira_policy",
+        "fit_source_speedup": False,
+        "limitations": [
+            "Hardware speedups select policy evidence only and are never fit targets.",
+            "Only AMG gather and LULESH scatter structurally match breadth regions.",
+        ],
+    }
+
+
+def _breadth_identity(value, label):
+    fields = ("input_sha256", "source_sha256", "roi_sha256")
+    if not isinstance(value, dict):
+        raise CalibrationError(f"{label} identity is missing")
+    result = {}
+    for field in fields:
+        digest = value.get(field)
+        if not isinstance(digest, str) or len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise CalibrationError(f"{label} {field} is invalid")
+        result[field] = digest
+    return result
+
+
+def classify_breadth_cira_evidence(
+    workload, *, trace_identity, hardware_identity=None, spatter=None,
+    synthetic=False,
+):
+    """Classify policy evidence without ever fitting a source speedup."""
+    trace = _breadth_identity(trace_identity, "trace")
+    if workload == "mcf" and synthetic:
+        raise CalibrationError(
+            "synthetic MCF cannot be a 345 MB speedup target"
+        )
+    spatter_names = {
+        "amg_gather": "amg",
+        "lulesh_scatter": "lulesh",
+    }
+    if workload in spatter_names:
+        if (
+            not isinstance(spatter, dict)
+            or spatter.get("sha256") != CIRA_SPATTER_CSV_SHA256
+        ):
+            raise CalibrationError("approved CIRA Spatter evidence is missing")
+        source_name = spatter_names[workload]
+        try:
+            modes = spatter["rows"][source_name]
+        except (KeyError, TypeError) as error:
+            raise CalibrationError(
+                f"CIRA Spatter {source_name} rows are missing"
+            ) from error
+        return {
+            "workload": workload,
+            "classification": "direct_cira_policy",
+            "source": "hardware_spatter",
+            "source_sha256": spatter["sha256"],
+            "source_workload": source_name,
+            "modes": modes,
+            "trace_identity": trace,
+            "fit_source_speedup": False,
+        }
+    if workload not in {"mcf", "npb_cg", "npb_mg"}:
+        raise CalibrationError(f"unsupported breadth workload {workload}")
+    if hardware_identity is None:
+        mismatch = list(trace)
+        hardware = None
+    else:
+        hardware = _breadth_identity(hardware_identity, "hardware")
+        mismatch = [field for field in trace if trace[field] != hardware[field]]
+    return {
+        "workload": workload,
+        "classification": (
+            "component_costs_only" if mismatch else "direct_cira_policy"
+        ),
+        "source": "identity_matched_hardware" if not mismatch else "components",
+        "trace_identity": trace,
+        "hardware_identity": hardware,
+        "mismatched_identity": mismatch,
+        "fit_source_speedup": False,
     }
 
 

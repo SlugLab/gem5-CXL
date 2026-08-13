@@ -26,6 +26,13 @@ CSV = Path(
         "benchmark_gapbs_workloads_ci_long.csv",
     )
 )
+SPATTER_CSV = Path(
+    os.environ.get(
+        "CIRA_SPATTER_CSV",
+        "/root/ia780i_type2_delay_buffer_new/"
+        "benchmark_spatter_workloads_ci_long.csv",
+    )
+)
 REPO = Path(__file__).resolve().parents[3]
 PROXY = REPO / "util/amu/amu_paper_profile.cc"
 
@@ -101,6 +108,79 @@ class CalibrationSourceTest(unittest.TestCase):
                 calibration.CalibrationError, "SHA-256"
             ):
                 calibration.load_cira_source(wrong)
+
+    def test_spatter_rows_are_direct_policy_evidence_not_speedup_targets(self):
+        facts = calibration.load_cira_spatter_source(SPATTER_CSV)
+        self.assertEqual(
+            facts["sha256"], calibration.CIRA_SPATTER_CSV_SHA256
+        )
+        for workload in ("amg_gather", "lulesh_scatter"):
+            row = calibration.classify_breadth_cira_evidence(
+                workload,
+                trace_identity={
+                    "input_sha256": "a" * 64,
+                    "source_sha256": "b" * 64,
+                    "roi_sha256": "c" * 64,
+                },
+                spatter=facts,
+            )
+            self.assertEqual(row["classification"], "direct_cira_policy")
+            self.assertFalse(row["fit_source_speedup"])
+            self.assertEqual(set(row["modes"]), {
+                "baseline", "A", "B", "C", "ABC",
+            })
+
+    def test_unmatched_mcf_cg_mg_rows_are_component_costs_only(self):
+        trace_identity = {
+            "input_sha256": "1" * 64,
+            "source_sha256": "2" * 64,
+            "roi_sha256": "3" * 64,
+        }
+        hardware_identity = {
+            "input_sha256": "1" * 64,
+            "source_sha256": "9" * 64,
+            "roi_sha256": "3" * 64,
+        }
+        for workload in ("mcf", "npb_cg", "npb_mg"):
+            with self.subTest(workload=workload):
+                row = calibration.classify_breadth_cira_evidence(
+                    workload,
+                    trace_identity=trace_identity,
+                    hardware_identity=hardware_identity,
+                )
+                self.assertEqual(
+                    row["classification"], "component_costs_only"
+                )
+                self.assertEqual(row["mismatched_identity"], [
+                    "source_sha256"
+                ])
+                self.assertFalse(row["fit_source_speedup"])
+
+        exact = calibration.classify_breadth_cira_evidence(
+            "npb_cg",
+            trace_identity=trace_identity,
+            hardware_identity=trace_identity,
+        )
+        self.assertEqual(exact["classification"], "direct_cira_policy")
+
+    def test_synthetic_mcf_can_never_be_a_345_mb_speedup_target(self):
+        with self.assertRaisesRegex(
+            calibration.CalibrationError, "synthetic MCF.*speedup target"
+        ):
+            calibration.classify_breadth_cira_evidence(
+                "mcf",
+                trace_identity={
+                    "input_sha256": "1" * 64,
+                    "source_sha256": "2" * 64,
+                    "roi_sha256": "3" * 64,
+                },
+                hardware_identity={
+                    "input_sha256": "1" * 64,
+                    "source_sha256": "2" * 64,
+                    "roi_sha256": "3" * 64,
+                },
+                synthetic=True,
+            )
 
 
 class CalibrationFitTest(unittest.TestCase):
