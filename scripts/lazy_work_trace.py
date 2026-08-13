@@ -352,13 +352,21 @@ class MappedState:
         raw_code = "I" if width == 4 else "Q"
         struct.pack_into(f"<{raw_code}", self._maps[name], offset, value)
 
-    def boundary_sha256(self, name):
+    def boundary_sha256(self, name, count=None):
         if name not in self._arrays:
             raise LazyTraceError(f"unknown array {name}")
+        array = self._arrays[name]
+        if count is None:
+            count = array.count
+        _uint(count, 64, "boundary count")
+        if count == 0 or count > array.count:
+            raise LazyTraceError(f"array {name} boundary count is invalid")
+        width = _ELEMENTS[array.element_type][0]
+        byte_count = count * width
         digest = hashlib.sha256()
         mapping = self._maps[name]
-        for offset in range(0, len(mapping), 1024 * 1024):
-            digest.update(mapping[offset:offset + 1024 * 1024])
+        for offset in range(0, byte_count, 1024 * 1024):
+            digest.update(mapping[offset:min(offset + 1024 * 1024, byte_count)])
         return digest.hexdigest()
 
     def load_scalar(self, name):

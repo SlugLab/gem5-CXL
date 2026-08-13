@@ -104,6 +104,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             parameters={
                 "rowstr": "rowstr", "colidx": "colidx", "values": "a",
                 "source": "p", "destination": "q", "row_count": 3,
+                "edge_base": 0, "column_base": 0,
+                "destination_count": 3,
             },
         )
         lazy.write_bundle(
@@ -228,7 +230,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             parameters={
                 "z": "z", "p": "p", "r": "r", "q": "q",
                 "alpha": "alpha", "result": "rho",
-                "boundaries": ["z", "r"], "lanes": lanes(5),
+                "boundaries": ["z", "r"], "boundary_counts": {},
+                "lanes": lanes(5),
             },
         )
         lazy.write_bundle(
@@ -254,7 +257,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             work_items=3,
             parameters={
                 "r": "r", "p": "p", "beta": "beta",
-                "boundaries": ["p"],
+                "boundaries": ["p"], "boundary_counts": {},
             },
         )
         lazy.write_bundle(
@@ -361,7 +364,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 "z": "z", "x": "x", "norm1": "norm1",
                 "norm2": "norm2", "norm3": "norm3", "shift": "shift",
                 "zeta": "zeta", "write_zeta": 1,
-                "boundaries": ["x"], "results": ["norm3", "zeta"],
+                "boundaries": ["x"], "boundary_counts": {},
+                "results": ["norm3", "zeta"],
             },
         )
         lazy.write_bundle(
@@ -415,6 +419,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             add(101, "npb_cg_spmv", cgit, 3, {
                 "rowstr": "rowstr", "colidx": "colidx", "values": "a",
                 "source": "p", "destination": "q", "row_count": 3,
+                "edge_base": 0, "column_base": 0,
+                "destination_count": 3,
             })
             add(103, "npb_cg_dot", cgit, 3, {
                 "left": "p", "right": "q", "result": "d",
@@ -427,7 +433,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             add(102, "npb_cg_update_zr", cgit, 3, {
                 "z": "z", "p": "p", "r": "r", "q": "q",
                 "alpha": "alpha", "result": "rho",
-                "boundaries": ["z", "r"], "lanes": lanes(3),
+                "boundaries": ["z", "r"], "boundary_counts": {},
+                "lanes": lanes(3),
             })
             add(102, "npb_cg_divide", cgit * 10 + 2, 1, {
                 "numerator": "rho", "denominator": "rho0",
@@ -435,11 +442,13 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             })
             add(102, "npb_cg_update_p", cgit, 3, {
                 "r": "r", "p": "p", "beta": "beta",
-                "boundaries": ["p"],
+                "boundaries": ["p"], "boundary_counts": {},
             })
         add(101, "npb_cg_spmv", 90, 3, {
             "rowstr": "rowstr", "colidx": "colidx", "values": "a",
             "source": "z", "destination": "r", "row_count": 3,
+            "edge_base": 0, "column_base": 0,
+            "destination_count": 3,
         })
         add(103, "npb_cg_residual_norm", 90, 3, {
             "x": "x", "r": "r", "result": "rnorm",
@@ -454,6 +463,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             "z": "z", "x": "x", "norm1": "norm1", "norm2": "norm2",
             "norm3": "norm3", "shift": "shift", "zeta": "zeta",
             "write_zeta": 1, "boundaries": ["x"],
+            "boundary_counts": {},
             "results": ["norm3", "zeta"],
         })
         lazy.write_bundle(
@@ -599,7 +609,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         self.assertEqual(observed, self.expected_spmv())
         self.assertEqual(
             npb.replay_boundaries(bundle),
-            {"q.iter9": digest(F64.pack(5.0) + F64.pack(6.0) + F64.pack(11.0))},
+            {"q.spmv.iter9": digest(F64.pack(5.0) + F64.pack(6.0) + F64.pack(11.0))},
         )
 
     def test_tiny_cg_dot_uses_explicit_four_lane_tree(self):
@@ -610,7 +620,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
-            {"scalar.d.iter4": digest(U64.pack(raw_f64(result)))},
+            {"scalar.d.dot.iter4": digest(U64.pack(raw_f64(result)))},
         )
 
     def test_canonical_abi_exposes_f64_division(self):
@@ -655,9 +665,9 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             with_sequences(rows),
         )
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "scalar.rho0.iter12": digest(U64.pack(raw_f64(17.0))),
-            "scalar.d.iter12": digest(U64.pack(raw_f64(0.0))),
-            "scalar.rho.iter12": digest(U64.pack(raw_f64(0.0))),
+            "scalar.rho0.prepare_iteration.iter12": digest(U64.pack(raw_f64(17.0))),
+            "scalar.d.prepare_iteration.iter12": digest(U64.pack(raw_f64(0.0))),
+            "scalar.rho.prepare_iteration.iter12": digest(U64.pack(raw_f64(0.0))),
         })
 
     def test_cg_scalar_division_is_explicit_and_bit_exact(self):
@@ -673,7 +683,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
-            {"scalar.alpha.iter5": digest(U64.pack(raw_f64(2.5)))},
+            {"scalar.alpha.divide.iter5": digest(U64.pack(raw_f64(2.5)))},
         )
 
     def test_cg_update_zr_and_rho_preserves_expression_and_lane_order(self):
@@ -685,9 +695,9 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         self.assertEqual(
             npb.replay_boundaries(bundle),
             {
-                "z.iter6": digest(b"".join(F64.pack(value) for value in z)),
-                "r.iter6": digest(b"".join(F64.pack(value) for value in r)),
-                "scalar.rho.iter6": digest(U64.pack(raw_f64(rho))),
+                "z.update_zr.iter6": digest(b"".join(F64.pack(value) for value in z)),
+                "r.update_zr.iter6": digest(b"".join(F64.pack(value) for value in r)),
+                "scalar.rho.update_zr.iter6": digest(U64.pack(raw_f64(rho))),
             },
         )
 
@@ -718,7 +728,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
-            {"p.iter7": digest(b"".join(
+            {"p.update_p.iter7": digest(b"".join(
                 F64.pack(value) for value in expected_values
             ))},
         )
@@ -773,7 +783,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         )
         self.assertEqual(
             npb.replay_boundaries(bundle),
-            {"scalar.rnorm.iter8": digest(U64.pack(raw_f64(result)))},
+            {"scalar.rnorm.residual_norm.iter8": digest(U64.pack(raw_f64(result)))},
         )
 
     def test_cg_initialization_records_source_loads_and_every_store(self):
@@ -799,8 +809,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         expected = b"".join(F64.pack(value) for value in values)
         zeros = F64.pack(0.0) * 3
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "q.iter0": digest(zeros), "z.iter0": digest(zeros),
-            "r.iter0": digest(expected), "p.iter0": digest(expected),
+            "q.init.iter0": digest(zeros), "z.init.iter0": digest(zeros),
+            "r.init.iter0": digest(expected), "p.init.iter0": digest(expected),
         })
 
     def test_cg_outer_dots_preserve_interleaved_source_order_and_two_trees(self):
@@ -866,8 +876,8 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             with_sequences(rows),
         )
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "scalar.norm1.iter10": digest(U64.pack(raw_f64(results[0]))),
-            "scalar.norm2.iter10": digest(U64.pack(raw_f64(results[1]))),
+            "scalar.norm1.outer_dots.iter10": digest(U64.pack(raw_f64(results[0]))),
+            "scalar.norm2.outer_dots.iter10": digest(U64.pack(raw_f64(results[1]))),
         })
 
     def test_cg_normalization_emits_sqrt_div_zeta_and_vector_stores(self):
@@ -903,9 +913,9 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             with_sequences(rows),
         )
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "x.iter11": digest(b"".join(F64.pack(value) for value in values)),
-            "scalar.norm3.iter11": digest(U64.pack(raw_f64(norm3))),
-            "scalar.zeta.iter11": digest(U64.pack(raw_f64(zeta))),
+            "x.normalize.iter11": digest(b"".join(F64.pack(value) for value in values)),
+            "scalar.norm3.normalize.iter11": digest(U64.pack(raw_f64(norm3))),
+            "scalar.zeta.normalize.iter11": digest(U64.pack(raw_f64(zeta))),
         })
 
     def test_cg_reduction_rejects_one_changed_lane_endpoint(self):
@@ -933,18 +943,20 @@ class NpbCgLazyTraceTest(unittest.TestCase):
         digest_value, count = fingerprints.pop()
         self.assertRegex(digest_value, r"^[0-9a-f]{64}$")
         self.assertEqual(count, 385)
-        boundaries = npb.replay_boundaries(bundle)
+        evidence_hash, evidence_count, boundaries = npb.expanded_evidence(bundle)
+        self.assertEqual((evidence_hash, evidence_count), (digest_value, count))
         self.assertEqual({key: boundaries[key] for key in (
-            "p.iter2", "q.iter2", "z.iter2", "r.iter90",
-            "scalar.rnorm.iter90", "scalar.zeta.iter92", "x.iter92",
+            "p.update_p.iter2", "q.spmv.iter2", "z.update_zr.iter2",
+            "r.spmv.iter90", "scalar.rnorm.residual_norm.iter90",
+            "scalar.zeta.normalize.iter92", "x.normalize.iter92",
         )}, {
-            "p.iter2": "a3b53e2c123ab65b6b3be7bc6cd2310bda1ef47acfdd81cfe4bcee2a96d40056",
-            "q.iter2": "914cf00c1437bb483104959d7029ca9a11ec5ca03e35167aa40c76f49adb7f0f",
-            "z.iter2": "c8f7c5eda6963c0c2499525363c38ef15bd512e667e62dd943a3ce92d555e8fd",
-            "r.iter90": "d2509a6be14ce92a9a1a3cc0ed43aba5bcd51e8a05d746367e61ff4e846d729a",
-            "scalar.rnorm.iter90": "5746cfde1201660e43b77c6200cc5f75f4f48fbafda5b469671f42b6aaf9a183",
-            "scalar.zeta.iter92": "1fb50b16377943c1a719035202ac5aeb31fd194380c2ff2df935e02786fd3a2c",
-            "x.iter92": "f1c1d4650afbddea40a1f16f628db30047f9b9b023935f0c4bd7bc46db385066",
+            "p.update_p.iter2": "a3b53e2c123ab65b6b3be7bc6cd2310bda1ef47acfdd81cfe4bcee2a96d40056",
+            "q.spmv.iter2": "914cf00c1437bb483104959d7029ca9a11ec5ca03e35167aa40c76f49adb7f0f",
+            "z.update_zr.iter2": "c8f7c5eda6963c0c2499525363c38ef15bd512e667e62dd943a3ce92d555e8fd",
+            "r.spmv.iter90": "d2509a6be14ce92a9a1a3cc0ed43aba5bcd51e8a05d746367e61ff4e846d729a",
+            "scalar.rnorm.residual_norm.iter90": "5746cfde1201660e43b77c6200cc5f75f4f48fbafda5b469671f42b6aaf9a183",
+            "scalar.zeta.normalize.iter92": "1fb50b16377943c1a719035202ac5aeb31fd194380c2ff2df935e02786fd3a2c",
+            "x.normalize.iter92": "f1c1d4650afbddea40a1f16f628db30047f9b9b023935f0c4bd7bc46db385066",
         })
 
     def test_cg_out_of_range_column_fails_before_commitment(self):
@@ -1018,6 +1030,99 @@ class NpbMgLazyTraceTest(unittest.TestCase):
                 result[index(i1, i2, n3 - 1, n1, n2, n3)] = result[index(i1, i2, 1, n1, n2, n3)]
         return tuple(result)
 
+    def test_mg_zero3_stores_every_padded_grid_element(self):
+        values = tuple((index + 1) / 8.0 for index in range(64))
+        arrays = (self.image("zero_u", values, 0xF000, "state"),)
+        invocation = lazy.Invocation(
+            0, 200, "npb_mg_zero3", 0, 64,
+            {
+                "u": "zero_u", "n1": 4, "n2": 4, "n3": 4,
+                "boundaries": ["zero_u"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, (invocation,), {"primitive_records": 66},
+        )
+        bundle = lazy.read_bundle(self.root)
+        operations = tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
+        self.assertEqual(len(operations), 66)
+        self.assertEqual(
+            sum(row.opcode == canonical.Opcode.STORE_F64 for row in operations),
+            64,
+        )
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "zero_u.zero3.iter0": digest(F64.pack(0.0) * 64)
+        })
+
+    def test_mg_boundary_identity_includes_kernel_program_point(self):
+        values = tuple((index + 1) / 8.0 for index in range(64))
+        arrays = (
+            self.image("shared_u", values, 0xF000, "state"),
+            self.image("shared_r", values, 0x10000),
+        )
+        invocations = (
+            lazy.Invocation(0, 200, "npb_mg_zero3", 7, 64, {
+                "u": "shared_u", "n1": 4, "n2": 4, "n3": 4,
+                "boundaries": ["shared_u"],
+            }),
+            lazy.Invocation(1, 201, "npb_mg_psinv", 7, 8, {
+                "r": "shared_r", "u": "shared_u",
+                "n1": 4, "n2": 4, "n3": 4,
+                "c_raw": [raw_f64(value)
+                          for value in (0.75, -0.25, 0.125, 0.0)],
+                "boundaries": ["shared_u"],
+            }),
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, invocations, {"primitive_records": 524},
+        )
+        boundaries = npb.replay_boundaries(lazy.read_bundle(self.root))
+        self.assertEqual(set(boundaries), {
+            "shared_u.zero3.iter7", "shared_u.psinv.iter7",
+        })
+        self.assertNotEqual(
+            boundaries["shared_u.zero3.iter7"],
+            boundaries["shared_u.psinv.iter7"],
+        )
+
+    def test_mg_duplicate_boundary_identity_is_rejected(self):
+        arrays = (self.image(
+            "duplicate_u", (1.0,) * 64, 0xF000, "state",
+        ),)
+        parameters = {
+            "u": "duplicate_u", "n1": 4, "n2": 4, "n3": 4,
+            "boundaries": ["duplicate_u"],
+        }
+        invocations = tuple(
+            lazy.Invocation(ordinal, 200, "npb_mg_zero3", 7, 64, parameters)
+            for ordinal in range(2)
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, invocations, {"primitive_records": 132},
+        )
+        with self.assertRaisesRegex(
+            lazy.LazyTraceError, "duplicate lazy boundary",
+        ):
+            npb.replay_boundaries(lazy.read_bundle(self.root))
+
     def resid_bundle(self):
         n1 = n2 = n3 = 4
         count = n1 * n2 * n3
@@ -1060,7 +1165,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         self.assertEqual(operations[-1].opcode, canonical.Opcode.COMMIT)
         expected = self.resid_reference(u, v, 4, 4, 4, coefficients)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "mg_r.iter1": digest(b"".join(F64.pack(value) for value in expected))
+            "mg_r.resid.iter1": digest(b"".join(F64.pack(value) for value in expected))
         })
 
     def norm_bundle(self):
@@ -1119,8 +1224,8 @@ class NpbMgLazyTraceTest(unittest.TestCase):
                       max(lane_maxes[2], lane_maxes[3]))
         rnm2 = math.sqrt(total / 8.0)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "scalar.rnm2.iter2": digest(U64.pack(raw_f64(rnm2))),
-            "scalar.rnmu.iter2": digest(U64.pack(raw_f64(maximum))),
+            "scalar.rnm2.norm2u3.iter2": digest(U64.pack(raw_f64(rnm2))),
+            "scalar.rnmu.norm2u3.iter2": digest(U64.pack(raw_f64(maximum))),
         })
 
     def test_canonical_abi_exposes_f64_absolute_value(self):
@@ -1150,9 +1255,11 @@ class NpbMgLazyTraceTest(unittest.TestCase):
                 for i1 in range(1, n1 - 1):
                     at = index(i1, i2, i3, n1, n2, n3)
                     value = result[at] + c0 * r[at]
-                    value = value + c1 * ((r[index(i1 - 1, i2, i3, n1, n2, n3)] +
-                                           r[index(i1 + 1, i2, i3, n1, n2, n3)]) + r1[i1])
-                    value = value + c2 * ((r2[i1] + r1[i1 - 1]) + r1[i1 + 1])
+                    pair = (r[index(i1 + 1, i2, i3, n1, n2, n3)] +
+                            r[index(i1 - 1, i2, i3, n1, n2, n3)])
+                    value = value + c1 * (r1[i1] + pair)
+                    pair = r1[i1 - 1] + r2[i1]
+                    value = value + c2 * (r1[i1 + 1] + pair)
                     result[at] = value
         # The routine calls comm3(u).
         for i3 in range(1, n3 - 1):
@@ -1202,7 +1309,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         )
         expected = self.psinv_reference(r, u, n1, n2, n3, coefficients)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "ps_u.iter3": digest(b"".join(F64.pack(value) for value in expected))
+            "ps_u.psinv.iter3": digest(b"".join(F64.pack(value) for value in expected))
         })
 
     def rprj_reference(self, fine, fine_dims, coarse_dims):
@@ -1291,7 +1398,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         )
         expected = self.rprj_reference(fine, fine_dims, coarse_dims)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "rp_s.iter4": digest(b"".join(F64.pack(value) for value in expected))
+            "rp_s.rprj3.iter4": digest(b"".join(F64.pack(value) for value in expected))
         })
 
     def test_mg_rprj3_three_point_level_uses_degenerate_offsets(self):
@@ -1325,7 +1432,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         )
         expected = self.rprj_reference(fine, fine_dims, coarse_dims)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "rd_s.iter41": digest(
+            "rd_s.rprj3.iter41": digest(
                 b"".join(F64.pack(value) for value in expected)
             )
         })
@@ -1407,7 +1514,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         )
         expected = self.interp_reference(coarse, fine, coarse_dims, fine_dims)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "ip_u.iter5": digest(b"".join(F64.pack(value) for value in expected))
+            "ip_u.interp.iter5": digest(b"".join(F64.pack(value) for value in expected))
         })
 
     def interp_degenerate_reference(self, coarse, fine):
@@ -1498,7 +1605,7 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         )
         expected = self.interp_degenerate_reference(coarse, fine)
         self.assertEqual(npb.replay_boundaries(bundle), {
-            "id_u.iter6": digest(b"".join(F64.pack(value) for value in expected))
+            "id_u.interp.iter6": digest(b"".join(F64.pack(value) for value in expected))
         })
 
     def full_vcycle_bundle(self):
@@ -1570,16 +1677,16 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         self.assertEqual(count, 5180)
         boundaries = npb.replay_boundaries(bundle)
         self.assertEqual({key: boundaries[key] for key in (
-            "vc_coarse_r.iter10", "vc_coarse_u.iter11",
-            "vc_fine_u.iter12", "vc_resid.iter13",
-            "scalar.rnm2.iter14", "scalar.rnmu.iter14",
+            "vc_coarse_r.rprj3.iter10", "vc_coarse_u.psinv.iter11",
+            "vc_fine_u.interp.iter12", "vc_resid.resid.iter13",
+            "scalar.rnm2.norm2u3.iter14", "scalar.rnmu.norm2u3.iter14",
         )}, {
-            "vc_coarse_r.iter10": "2b797866313918128011f1ad4e8377e9d7e9fd9e9db0069e43cd7e96ddbad522",
-            "vc_coarse_u.iter11": "2c3a800c768cd3bda4050fdaf304748beef12ba3841ede03d50be02b765d9aa2",
-            "vc_fine_u.iter12": "2e2bb8418e0cee991b5fa7db960d4234c5df9ba35542392deca9a382ad7072b9",
-            "vc_resid.iter13": "8831b8b04d1c9f0160a69ca3919eb211fe29a19eed3a5e9f639c291e4ace821d",
-            "scalar.rnm2.iter14": "2d81149e7f1152e790cdb27de6e10cc3a58930c7d81efa6a71ea49d9534d237b",
-            "scalar.rnmu.iter14": "6cbf669f8ded3fca4f4358cc94e2408405b03ba3db916b3d3ef633c3995dc119",
+            "vc_coarse_r.rprj3.iter10": "2b797866313918128011f1ad4e8377e9d7e9fd9e9db0069e43cd7e96ddbad522",
+            "vc_coarse_u.psinv.iter11": "2c3a800c768cd3bda4050fdaf304748beef12ba3841ede03d50be02b765d9aa2",
+            "vc_fine_u.interp.iter12": "2e2bb8418e0cee991b5fa7db960d4234c5df9ba35542392deca9a382ad7072b9",
+            "vc_resid.resid.iter13": "8831b8b04d1c9f0160a69ca3919eb211fe29a19eed3a5e9f639c291e4ace821d",
+            "scalar.rnm2.norm2u3.iter14": "2d81149e7f1152e790cdb27de6e10cc3a58930c7d81efa6a71ea49d9534d237b",
+            "scalar.rnmu.norm2u3.iter14": "6cbf669f8ded3fca4f4358cc94e2408405b03ba3db916b3d3ef633c3995dc119",
         })
 
     def test_mg_changed_coarse_level_dimension_fails_before_boundary(self):

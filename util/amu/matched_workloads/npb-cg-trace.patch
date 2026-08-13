@@ -1,0 +1,525 @@
+--- a/CG/cg.f
++++ b/CG/cg.f
+@@ -64,6 +64,19 @@
+       external           randlc
+       double precision   rnorm
+       double precision   norm_temp1,norm_temp2,norm_temp3
++c MATCHED_TRACE_BEGIN declarations
++      double precision matched_lane1(0:3),matched_lane2(0:3)
++      double precision matched_part1,matched_part2
++      double precision matched_reduce_sum4
++      integer matched_tid,omp_get_thread_num,omp_get_num_threads
++      integer*8 matched_id,matched_iter,matched_count,matched_threads
++      integer*8 matched_allocated_bytes,matched_workload
++      integer*8 matched_bits,matched_base,matched_nnz
++      integer*8 matched_ordinal,matched_kernel,matched_phase
++      integer*8 matched_params(11),matched_param_count
++      external matched_reduce_sum4
++      external omp_get_thread_num,omp_get_num_threads
++c MATCHED_TRACE_END declarations
+ 
+       double precision   t, mflops, tmax
+       character          class
+@@ -155,11 +168,28 @@
+  1001 format(' Size: ', i11 )
+  1002 format(' Iterations:                  ', i5 )
+  1003 format(' Number of available threads: ', i5)
++c MATCHED_TRACE_BEGIN runtime thread gate
++      matched_threads=omp_get_max_threads()
++      call matched_require_four_threads(matched_threads)
++c MATCHED_TRACE_END runtime thread gate
+ 
+       naa = na
+       nzz = nz
+ 
+       call alloc_space
++c MATCHED_TRACE_BEGIN allocation probe
++      matched_allocated_bytes=0
++      matched_allocated_bytes=matched_allocated_bytes
++     >     +4_8*(size(colidx,kind=8)+size(rowstr,kind=8)
++     >     +size(iv,kind=8)+size(arow,kind=8)+size(acol,kind=8))
++      matched_allocated_bytes=matched_allocated_bytes
++     >     +8_8*(size(v,kind=8)+size(aelt,kind=8)+size(a,kind=8)
++     >     +size(x,kind=8)+size(z,kind=8)+size(p,kind=8)
++     >     +size(q,kind=8)+size(r,kind=8))
++      matched_workload=1
++      call matched_allocation_probe(matched_workload,
++     >     matched_allocated_bytes)
++c MATCHED_TRACE_END allocation probe
+ 
+ c---------------------------------------------------------------------
+ c  Inialize random number generator
+@@ -234,16 +264,41 @@
+ c---------------------------------------------------------------------
+          norm_temp1 = 0.0d0
+          norm_temp2 = 0.0d0
+-!$omp parallel default(shared) private(j,norm_temp3)
+-!$omp do reduction(+:norm_temp1,norm_temp2)
++c MATCHED_TRACE_BEGIN fixed four-lane sum
++      matched_id=103
++      matched_iter=it
++      matched_count=lastcol-firstcol+1
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp parallel default(shared)
++!$omp& private(j,matched_tid,matched_part1,matched_part2)
++      matched_tid = omp_get_thread_num()
++!$omp master
++      matched_threads = omp_get_num_threads()
++      call matched_require_four_threads(matched_threads)
++!$omp end master
++!$omp barrier
++      matched_part1 = 0.0d0
++      matched_part2 = 0.0d0
++!$omp do schedule(static)
+          do j=1, lastcol-firstcol+1
+-            norm_temp1 = norm_temp1 + x(j)*z(j)
+-            norm_temp2 = norm_temp2 + z(j)*z(j)
++            matched_part1 = matched_part1 + x(j)*z(j)
++            matched_part2 = matched_part2 + z(j)*z(j)
+          enddo
+ !$omp end do
++      matched_lane1(matched_tid) = matched_part1
++      matched_lane2(matched_tid) = matched_part2
++!$omp barrier
++!$omp master
++         norm_temp1 = matched_reduce_sum4(matched_lane1)
++         norm_temp2 = matched_reduce_sum4(matched_lane2)
++!$omp end master
++!$omp barrier
++!$omp end parallel
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END fixed four-lane sum
+ 
+          norm_temp3 = 1.0d0 / sqrt( norm_temp2 )
+-
++!$omp parallel default(shared) private(j)
+ 
+ c---------------------------------------------------------------------
+ c  Normalize z to obtain x
+@@ -273,6 +328,67 @@
+ 
+       zeta  = 0.0d0
+ 
++c MATCHED_TRACE_BEGIN bounded CG descriptor root
++      matched_bits=32
++      matched_count=lastrow-firstrow+2
++      matched_base=1000000000000_8
++      matched_id=1
++      call matched_array_image_u32(matched_id,matched_bits,matched_base,
++     >     rowstr(1),matched_count)
++      matched_nnz=rowstr(lastrow-firstrow+2)-1
++      matched_count=matched_nnz
++      matched_base=2000000000000_8
++      matched_id=2
++      call matched_array_image_u32(matched_id,matched_bits,matched_base,
++     >     colidx(1),matched_count)
++      matched_bits=64
++      matched_base=3000000000000_8
++      matched_id=3
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     a(1),matched_count)
++      matched_count=naa+1
++      matched_base=4000000000000_8
++      matched_id=4
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     p(1),matched_count)
++      matched_base=5000000000000_8
++      matched_id=5
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     q(1),matched_count)
++      matched_base=6000000000000_8
++      matched_id=6
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     z(1),matched_count)
++      matched_base=7000000000000_8
++      matched_id=7
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     r(1),matched_count)
++      matched_base=8000000000000_8
++      matched_id=8
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     x(1),matched_count)
++      matched_params(1)=lastrow-firstrow+1
++      matched_params(2)=lastcol-firstcol+1
++      matched_params(3)=matched_nnz
++      matched_params(4)=niter
++      matched_params(5)=25
++      matched_params(6)=firstrow
++      matched_params(7)=lastrow
++      matched_params(8)=firstcol
++      matched_params(9)=lastcol
++      matched_params(10)=transfer(shift,matched_params(10))
++      matched_params(11)=naa+1
++      matched_ordinal=0
++      matched_phase=100
++      matched_kernel=1000
++      matched_iter=0
++      matched_count=niter
++      matched_param_count=11
++      call matched_invocation(matched_ordinal,matched_phase,
++     >     matched_kernel,matched_iter,matched_count,matched_params,
++     >     matched_param_count)
++c MATCHED_TRACE_END bounded CG descriptor root
++
+       call timer_stop( T_init )
+ 
+       write (*, 2000) timer_read(T_init)
+@@ -303,17 +419,42 @@
+ c---------------------------------------------------------------------
+          norm_temp1 = 0.0d0
+          norm_temp2 = 0.0d0
+-!$omp parallel default(shared) private(j,norm_temp3)
+-!$omp do reduction(+:norm_temp1,norm_temp2)
++c MATCHED_TRACE_BEGIN fixed four-lane sum
++      matched_id=103
++      matched_iter=it
++      matched_count=lastcol-firstcol+1
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp parallel default(shared)
++!$omp& private(j,matched_tid,matched_part1,matched_part2)
++      matched_tid = omp_get_thread_num()
++!$omp master
++      matched_threads = omp_get_num_threads()
++      call matched_require_four_threads(matched_threads)
++!$omp end master
++!$omp barrier
++      matched_part1 = 0.0d0
++      matched_part2 = 0.0d0
++!$omp do schedule(static)
+          do j=1, lastcol-firstcol+1
+-            norm_temp1 = norm_temp1 + x(j)*z(j)
+-            norm_temp2 = norm_temp2 + z(j)*z(j)
++            matched_part1 = matched_part1 + x(j)*z(j)
++            matched_part2 = matched_part2 + z(j)*z(j)
+          enddo
+ !$omp end do
++      matched_lane1(matched_tid) = matched_part1
++      matched_lane2(matched_tid) = matched_part2
++!$omp barrier
++!$omp master
++         norm_temp1 = matched_reduce_sum4(matched_lane1)
++         norm_temp2 = matched_reduce_sum4(matched_lane2)
++!$omp end master
++!$omp barrier
++!$omp end parallel
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END fixed four-lane sum
+ 
+ 
+          norm_temp3 = 1.0d0 / sqrt( norm_temp2 )
+-
++!$omp parallel default(shared) private(j)
+ 
+ !$omp master
+          zeta = shift + 1.0d0 / norm_temp1
+@@ -334,6 +475,20 @@
+ !$omp end do nowait
+ !$omp end parallel
+ 
++c MATCHED_TRACE_BEGIN measured outer boundaries
++         matched_iter=it
++         matched_count=lastcol-firstcol+1
++         matched_id=110
++         call matched_boundary_sha256(matched_id,matched_iter,
++     >        x(1),64_8,matched_count)
++         matched_count=1
++         matched_id=115
++         call matched_boundary_sha256(matched_id,matched_iter,
++     >        rnorm,64_8,matched_count)
++         matched_id=116
++         call matched_boundary_sha256(matched_id,matched_iter,
++     >        zeta,64_8,matched_count)
++c MATCHED_TRACE_END measured outer boundaries
+ 
+       enddo                              ! end of main iter inv pow meth
+ 
+@@ -452,6 +607,25 @@
+       integer   cgit, cgitmax
+ 
+       double precision   d, sum, rho, rho0, alpha, beta, rnorm, suml
++c MATCHED_TRACE_BEGIN declarations
++      double precision matched_lane1(0:3),matched_part1
++      double precision matched_reduce_sum4
++      integer matched_tid,omp_get_thread_num,omp_get_num_threads
++      integer*8 matched_id,matched_iter,matched_count,matched_threads
++      integer*8 matched_call,matched_boundary_iter
++      integer*8 matched_work,matched_ord,matched_addr,matched_opc
++      double precision matched_l,matched_r,matched_res
++      save matched_call
++      data matched_call /0/
++      external matched_reduce_sum4
++      external omp_get_thread_num,omp_get_num_threads
++c MATCHED_PHASE cg_spmv
++c MATCHED_PHASE cg_vector_update
++c MATCHED_PHASE cg_dot
++c MATCHED_PHASE cg_conj_grad
++c MATCHED_THREADS 4
++c MATCHED_FIXED_REDUCTION_TREE
++c MATCHED_TRACE_END declarations
+ 
+       data      cgitmax / 25 /
+ 
+@@ -459,8 +633,25 @@
+       rho = 0.0d0
+       sum = 0.0d0
+ 
+-!$omp parallel default(shared) private(j,k,cgit,suml,alpha,beta)
+-!$omp&  shared(d,rho0,rho,sum)
++c MATCHED_TRACE_BEGIN conj_grad begin
++      matched_id=104
++      matched_iter=matched_call
++      matched_call=matched_call+1
++      matched_count=lastcol-firstcol+1
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++c MATCHED_TRACE_END conj_grad begin
++!$omp parallel default(shared)
++!$omp& private(j,k,cgit,suml,alpha,beta,matched_tid,matched_part1)
++!$omp& private(matched_work,matched_ord,matched_addr,matched_opc)
++!$omp& private(matched_l,matched_r,matched_res)
++!$omp& shared(d,rho0,rho,sum,matched_lane1,matched_threads)
++!$omp& shared(matched_boundary_iter)
++      matched_tid=omp_get_thread_num()
++!$omp master
++      matched_threads=omp_get_num_threads()
++      call matched_require_four_threads(matched_threads)
++!$omp end master
++!$omp barrier
+ 
+ c---------------------------------------------------------------------
+ c  Initialize the CG algorithm:
+@@ -479,11 +670,29 @@
+ c  rho = r.r
+ c  Now, obtain the norm of r: First, sum squares of r elements locally...
+ c---------------------------------------------------------------------
+-!$omp do reduction(+:rho)
++c MATCHED_TRACE_BEGIN CG initial rho
++!$omp master
++      matched_id=103
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
++      matched_part1=0.0d0
++!$omp do schedule(static)
+       do j=1, lastcol-firstcol+1
+-         rho = rho + r(j)*r(j)
++         matched_part1 = matched_part1 + r(j)*r(j)
+       enddo
+ !$omp end do
++      matched_lane1(matched_tid)=matched_part1
++!$omp barrier
++!$omp master
++         rho=matched_reduce_sum4(matched_lane1)
++!$omp end master
++!$omp barrier
++!$omp master
++      call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
++c MATCHED_TRACE_END CG initial rho
+ 
+ c---------------------------------------------------------------------
+ c---->
+@@ -514,6 +723,11 @@
+ C        The unrolled-by-8 version below is significantly faster
+ C        on the Cray t3d - overall speed of code is 1.5 times faster.
+ C
++!$omp master
++         matched_id=101
++         call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
+ !$omp do
+          do j=1,lastrow-firstrow+1
+             suml = 0.d0
+@@ -523,6 +737,10 @@
+             q(j) = suml
+          enddo
+ !$omp end do
++!$omp master
++         call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
+ 
+ CC          do j=1,lastrow-firstrow+1
+ CC             i = rowstr(j) 
+@@ -563,11 +781,29 @@
+ c---------------------------------------------------------------------
+ c  Obtain p.q
+ c---------------------------------------------------------------------
+-!$omp do reduction(+:d)
++c MATCHED_TRACE_BEGIN CG p dot q
++!$omp master
++         matched_id=103
++         call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
++      matched_part1=0.0d0
++!$omp do schedule(static)
+          do j=1, lastcol-firstcol+1
+-            d = d + p(j)*q(j)
++            matched_part1 = matched_part1 + p(j)*q(j)
+          enddo
+ !$omp end do
++      matched_lane1(matched_tid)=matched_part1
++!$omp barrier
++!$omp master
++         d=matched_reduce_sum4(matched_lane1)
++!$omp end master
++!$omp barrier
++!$omp master
++         call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
++c MATCHED_TRACE_END CG p dot q
+ 
+ 
+ c---------------------------------------------------------------------
+@@ -579,7 +815,14 @@
+ c  Obtain z = z + alpha*p
+ c  and    r = r - alpha*q
+ c---------------------------------------------------------------------
+-!$omp do reduction(+:rho)
++c MATCHED_TRACE_BEGIN CG updated rho
++!$omp master
++         matched_id=102
++         call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
++      matched_part1=0.0d0
++!$omp do schedule(static)
+          do j=1, lastcol-firstcol+1
+             z(j) = z(j) + alpha*p(j)
+             r(j) = r(j) - alpha*q(j)
+@@ -590,9 +833,20 @@
+ c  Now, obtain the norm of r: First, sum squares of r elements locally...
+ c---------------------------------------------------------------------
+ c         do j=1, lastcol-firstcol+1
+-            rho = rho + r(j)*r(j)
++            matched_part1 = matched_part1 + r(j)*r(j)
+          enddo
+ !$omp end do
++      matched_lane1(matched_tid)=matched_part1
++!$omp barrier
++!$omp master
++         rho=matched_reduce_sum4(matched_lane1)
++!$omp end master
++!$omp barrier
++!$omp master
++         call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
++c MATCHED_TRACE_END CG updated rho
+ 
+ c---------------------------------------------------------------------
+ c  Obtain beta:
+@@ -602,11 +856,34 @@
+ c---------------------------------------------------------------------
+ c  p = r + beta*p
+ c---------------------------------------------------------------------
++!$omp master
++         matched_id=102
++         call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
+ !$omp do
+          do j=1, lastcol-firstcol+1
+             p(j) = r(j) + beta*p(j)
+          enddo
+ !$omp end do
++!$omp master
++         matched_boundary_iter=matched_iter*100+cgit
++         matched_id=111
++         call matched_boundary_sha256(matched_id,matched_boundary_iter,
++     >        z(1),64_8,matched_count)
++         matched_id=112
++         call matched_boundary_sha256(matched_id,matched_boundary_iter,
++     >        p(1),64_8,matched_count)
++         matched_id=113
++         call matched_boundary_sha256(matched_id,matched_boundary_iter,
++     >        q(1),64_8,matched_count)
++         matched_id=114
++         call matched_boundary_sha256(matched_id,matched_boundary_iter,
++     >        r(1),64_8,matched_count)
++         matched_id=102
++         call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
+ 
+ 
+       enddo                             ! end of do cgit=1,cgitmax
+@@ -617,6 +894,11 @@
+ c  First, form A.z
+ c  The partition submatrix-vector multiply
+ c---------------------------------------------------------------------
++!$omp master
++      matched_id=101
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
+ !$omp do
+       do j=1,lastrow-firstrow+1
+          suml = 0.d0
+@@ -626,18 +908,58 @@
+          r(j) = suml
+       enddo
+ !$omp end do
++!$omp master
++      call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
+ 
+ 
+ c---------------------------------------------------------------------
+ c  At this point, r contains A.z
+ c---------------------------------------------------------------------
+-!$omp do reduction(+:sum)
++c MATCHED_TRACE_BEGIN CG residual norm
++!$omp master
++      matched_id=103
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp end master
++!$omp barrier
++      matched_part1=0.0d0
++!$omp do schedule(static)
+       do j=1, lastcol-firstcol+1
+-         suml = x(j) - r(j)         
+-         sum  = sum + suml*suml
+-      enddo
+-!$omp end do nowait
++         suml = x(j) - r(j)
++         matched_part1  = matched_part1 + suml*suml
++      enddo
++!$omp end do
++      matched_lane1(matched_tid)=matched_part1
++!$omp barrier
++!$omp master
++         sum=matched_reduce_sum4(matched_lane1)
++!$omp end master
++!$omp barrier
++!$omp master
++      call matched_phase_end(matched_id,matched_iter)
++!$omp end master
++!$omp barrier
++c MATCHED_TRACE_END CG residual norm
+ !$omp end parallel
++
++c MATCHED_TRACE_BEGIN conj_grad dumps
++      matched_id=113
++      matched_count=lastcol-firstcol+1
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     q(1),64_8,matched_count)
++      matched_id=111
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     z(1),64_8,matched_count)
++      matched_id=112
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     p(1),64_8,matched_count)
++      matched_id=114
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     r(1),64_8,matched_count)
++      matched_id=104
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END conj_grad dumps
+ 
+       rnorm = sqrt( sum )
+ 

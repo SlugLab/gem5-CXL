@@ -160,6 +160,11 @@ class LazyTraceTest(unittest.TestCase):
                 state.boundary_sha256("x"),
                 digest(F64.pack(1.0) + F64.pack(3.0)),
             )
+            self.assertEqual(
+                state.boundary_sha256("x", 1), digest(F64.pack(1.0))
+            )
+            with self.assertRaisesRegex(lazy.LazyTraceError, "count"):
+                state.boundary_sha256("x", 3)
 
     def test_memory_operation_outside_declared_images_is_rejected(self):
         bundle = self.make_bundle()

@@ -4,6 +4,8 @@
 
 """Bit-exact lazy operation expansion for canonical NPB CG and MG phases."""
 
+import dataclasses
+import hashlib
 import math
 import struct
 
@@ -81,12 +83,18 @@ def _require_parameters(invocation, names):
 def expand_cg_spmv(state, invocation, batch_work_items):
     _require_parameters(invocation, (
         "rowstr", "colidx", "values", "source", "destination",
-        "row_count",
+        "row_count", "edge_base", "column_base", "destination_count",
     ))
     parameters = invocation.parameters
     row_count = parameters["row_count"]
+    edge_base = parameters["edge_base"]
+    column_base = parameters["column_base"]
+    if edge_base not in (0, 1) or column_base not in (0, 1):
+        raise lazy.LazyTraceError("CG index base is not zero or one")
     if row_count != invocation.work_items:
         raise lazy.LazyTraceError("CG SpMV row count differs from work items")
+    if parameters["destination_count"] != row_count:
+        raise lazy.LazyTraceError("CG SpMV destination count differs")
     yield _control(
         invocation, canonical.Opcode.BARRIER, invocation.work_items
     )
@@ -106,15 +114,21 @@ def expand_cg_spmv(state, invocation, batch_work_items):
                 row, end_address, end,
             )
             total = 0.0
-            for edge in range(start, end):
+            if start < edge_base or end < edge_base:
+                raise lazy.LazyTraceError("CG row offset precedes edge base")
+            for edge in range(start - edge_base, end - edge_base):
                 column_address, column = state.load_raw(
                     parameters["colidx"], edge
                 )
                 value_address, value = state.load_float(
                     parameters["values"], edge
                 )
+                if column < column_base:
+                    raise lazy.LazyTraceError(
+                        "CG column precedes column base"
+                    )
                 source_address, source = state.load_float(
-                    parameters["source"], column
+                    parameters["source"], column - column_base
                 )
                 yield _load(
                     invocation, canonical.Opcode.LOAD_U32,
@@ -256,7 +270,8 @@ def _merge_sum4(invocation, lanes, work_item):
 
 def expand_cg_update_zr(state, invocation, _batch_work_items):
     _require_parameters(invocation, (
-        "z", "p", "r", "q", "alpha", "result", "boundaries", "lanes",
+        "z", "p", "r", "q", "alpha", "result", "boundaries",
+        "boundary_counts", "lanes",
     ))
     ranges = _validate_lanes(invocation)
     parameters = invocation.parameters
@@ -337,7 +352,9 @@ def expand_cg_update_zr(state, invocation, _batch_work_items):
 
 
 def expand_cg_update_p(state, invocation, batch_work_items):
-    _require_parameters(invocation, ("r", "p", "beta", "boundaries"))
+    _require_parameters(invocation, (
+        "r", "p", "beta", "boundaries", "boundary_counts",
+    ))
     parameters = invocation.parameters
     beta = f64_from_raw(state.load_scalar(parameters["beta"]))
     yield _control(
@@ -556,7 +573,7 @@ def expand_cg_outer_dots(state, invocation, _batch_work_items):
 def expand_cg_normalize(state, invocation, batch_work_items):
     _require_parameters(invocation, (
         "z", "x", "norm1", "norm2", "norm3", "shift", "zeta",
-        "write_zeta", "boundaries", "results",
+        "write_zeta", "boundaries", "boundary_counts", "results",
     ))
     parameters = invocation.parameters
     if parameters["write_zeta"] not in (0, 1):
@@ -643,6 +660,24 @@ def f_index(i1, i2, i3, n1, n2, n3):
     ):
         raise lazy.LazyTraceError("MG grid index is outside image")
     return i1 + n1 * (i2 + n2 * i3)
+
+
+def expand_mg_zero3(state, invocation, batch_work_items):
+    _require_parameters(invocation, (
+        "u", "n1", "n2", "n3", "boundaries",
+    ))
+    parameters = invocation.parameters
+    dimensions = (parameters["n1"], parameters["n2"], parameters["n3"])
+    count = dimensions[0] * dimensions[1] * dimensions[2]
+    if min(dimensions) < 1 or invocation.work_items != count:
+        raise lazy.LazyTraceError("MG zero3 dimensions or work items differ")
+    yield _control(invocation, canonical.Opcode.BARRIER, count)
+    for first in range(0, count, batch_work_items):
+        for index in range(first, min(first + batch_work_items, count)):
+            address, _old = state.load_float(parameters["u"], index)
+            state.store_float(parameters["u"], index, 0.0)
+            yield _store(invocation, index, address, 0.0)
+    yield _control(invocation, canonical.Opcode.COMMIT)
 
 
 def _grid_load(state, invocation, name, i1, i2, i3, dimensions, work_item):
@@ -1054,15 +1089,16 @@ def expand_mg_psinv(state, invocation, _batch_work_items):
                     dimensions, work_item,
                 )
                 yield operation
-                fold = _run_fold(_fold_add(
-                    invocation, work_item, [r_left, r_right, r1[i1]],
-                ))
-                while True:
-                    try:
-                        yield next(fold)
-                    except StopIteration as stop:
-                        neighbors = stop.value
-                        break
+                pair = f64(r_right + r_left)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, r_right, r_left, pair,
+                )
+                neighbors = f64(r1[i1] + pair)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, r1[i1], pair, neighbors,
+                )
                 product = f64(coefficients[1] * neighbors)
                 yield _binary(
                     invocation, canonical.Opcode.F64_MUL,
@@ -1073,16 +1109,16 @@ def expand_mg_psinv(state, invocation, _batch_work_items):
                     invocation, canonical.Opcode.F64_ADD,
                     work_item, result, product, updated,
                 )
-                fold = _run_fold(_fold_add(
-                    invocation, work_item,
-                    [r2[i1], r1[i1 - 1], r1[i1 + 1]],
-                ))
-                while True:
-                    try:
-                        yield next(fold)
-                    except StopIteration as stop:
-                        diagonals = stop.value
-                        break
+                pair = f64(r1[i1 - 1] + r2[i1])
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, r1[i1 - 1], r2[i1], pair,
+                )
+                diagonals = f64(r1[i1 + 1] + pair)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, r1[i1 + 1], pair, diagonals,
+                )
                 product = f64(coefficients[2] * diagonals)
                 yield _binary(
                     invocation, canonical.Opcode.F64_MUL,
@@ -1564,12 +1600,38 @@ EXPANDERS = {
     "npb_mg_psinv": expand_mg_psinv,
     "npb_mg_rprj3": expand_mg_rprj3,
     "npb_mg_interp": expand_mg_interp,
+    "npb_mg_zero3": expand_mg_zero3,
 }
 
 
-def replay_boundaries(bundle, *, batch_work_items=1):
+def expanded_evidence(bundle, *, batch_work_items=1,
+                      boundary_expectations=None):
     boundaries = {}
     count = 0
+    digest = hashlib.sha256()
+    if boundary_expectations is None:
+        boundary_expectations = {}
+    if not isinstance(boundary_expectations, dict):
+        raise lazy.LazyTraceError("boundary expectations are invalid")
+    observed_expectations = set()
+
+    def program_point(kernel):
+        for prefix in ("npb_cg_", "npb_mg_"):
+            if kernel.startswith(prefix):
+                return kernel.removeprefix(prefix)
+        return kernel.removeprefix("npb_")
+
+    def remember(key, value):
+        if key in boundaries:
+            raise lazy.LazyTraceError(f"duplicate lazy boundary {key}")
+        boundaries[key] = value
+        if key in boundary_expectations:
+            if value != boundary_expectations[key]:
+                raise lazy.LazyTraceError(
+                    f"boundary {key} differs from native commitment"
+                )
+            observed_expectations.add(key)
+
     with lazy.MappedState(bundle) as state:
         for invocation in bundle.invocations:
             try:
@@ -1580,28 +1642,63 @@ def replay_boundaries(bundle, *, batch_work_items=1):
                 ) from error
             for operation in expander(state, invocation, batch_work_items):
                 lazy._validate_memory_address(bundle, operation)
+                sequenced = dataclasses.replace(operation, sequence=count)
+                digest.update(canonical.TRACE_STRUCT.pack(
+                    sequenced.phase, int(sequenced.opcode), 0,
+                    sequenced.work_item, sequenced.sequence,
+                    sequenced.address, sequenced.operand0,
+                    sequenced.operand1, sequenced.result,
+                ))
                 count += 1
             boundary_arrays = []
             destination = invocation.parameters.get("destination")
             if destination is not None:
                 boundary_arrays.append(destination)
             boundary_arrays.extend(invocation.parameters.get("boundaries", []))
+            boundary_counts = invocation.parameters.get("boundary_counts", {})
             for boundary in boundary_arrays:
-                boundaries[
-                    f"{boundary}.iter{invocation.iteration}"
-                ] = state.boundary_sha256(boundary)
+                count_value = boundary_counts.get(boundary)
+                if boundary == destination:
+                    count_value = invocation.parameters.get(
+                        "destination_count", count_value
+                    )
+                point = program_point(invocation.kernel)
+                boundary_key = (
+                    f"{boundary}.{point}.iter{invocation.iteration}"
+                )
+                remember(
+                    boundary_key,
+                    state.boundary_sha256(boundary, count_value),
+                )
             result = invocation.parameters.get("result")
             if result is not None:
-                boundaries[
-                    f"scalar.{result}.iter{invocation.iteration}"
-                ] = state.scalar_sha256(result)
+                point = program_point(invocation.kernel)
+                remember(
+                    f"scalar.{result}.{point}"
+                    f".iter{invocation.iteration}",
+                    state.scalar_sha256(result),
+                )
             for result in invocation.parameters.get("results", []):
-                boundaries[
-                    f"scalar.{result}.iter{invocation.iteration}"
-                ] = state.scalar_sha256(result)
+                point = program_point(invocation.kernel)
+                remember(
+                    f"scalar.{result}.{point}"
+                    f".iter{invocation.iteration}",
+                    state.scalar_sha256(result),
+                )
     if count != bundle.dynamic_work["primitive_records"]:
         raise lazy.LazyTraceError(
             f"dynamic primitive count {count} != "
             f"{bundle.dynamic_work['primitive_records']}"
         )
-    return boundaries
+    missing = set(boundary_expectations) - observed_expectations
+    if missing:
+        raise lazy.LazyTraceError(
+            f"native boundary expectations were not replayed: {sorted(missing)}"
+        )
+    return digest.hexdigest(), count, boundaries
+
+
+def replay_boundaries(bundle, *, batch_work_items=1):
+    return expanded_evidence(
+        bundle, batch_work_items=batch_work_items
+    )[2]

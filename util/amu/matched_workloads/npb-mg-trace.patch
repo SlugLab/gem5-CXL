@@ -1,0 +1,323 @@
+--- a/MG/mg.f
++++ b/MG/mg.f
+@@ -76,6 +76,11 @@
+       integer i, fstatus
+       character t_names(t_last)*8
+       double precision tmax
++      integer*8 matched_threads,matched_allocated_bytes,matched_workload
++      integer*8 matched_bits,matched_base,matched_count,matched_id
++      integer*8 matched_ordinal,matched_kernel,matched_phase
++      integer*8 matched_iter
++      integer*8 matched_params(16+4*maxlevel),matched_param_count
+ !$    integer  omp_get_max_threads
+ !$    external omp_get_max_threads
+ 
+@@ -188,6 +193,13 @@
+       k  = lt
+ 
+       call alloc_space
++c MATCHED_TRACE_BEGIN allocation probe
++      matched_allocated_bytes=8_8*(size(u,kind=8)+size(v,kind=8)
++     >     +size(r,kind=8))
++      matched_workload=2
++      call matched_allocation_probe(matched_workload,
++     >     matched_allocated_bytes)
++c MATCHED_TRACE_END allocation probe
+ 
+       call setup(n1,n2,n3,k)
+       call zero3(u,n1,n2,n3)
+@@ -209,6 +221,10 @@
+  1001 format(' Size: ', i4, 'x', i4, 'x', i4, '  (class ', A, ')' )
+  1002 format(' Iterations:                  ', i5)
+  1003 format(' Number of available threads: ', i5)
++c MATCHED_TRACE_BEGIN runtime thread gate
++      matched_threads=omp_get_max_threads()
++      call matched_require_four_threads(matched_threads)
++c MATCHED_TRACE_END runtime thread gate
+ 
+ 
+       call resid(u,v,r,n1,n2,n3,a,k)
+@@ -224,6 +240,52 @@
+       call setup(n1,n2,n3,k)
+       call zero3(u,n1,n2,n3)
+       call zran3(v,n1,n2,n3,nx(lt),ny(lt),k)
++
++c MATCHED_TRACE_BEGIN bounded MG descriptor root
++      matched_bits=64
++      matched_base=10000000000000_8
++      matched_count=size(u,kind=8)
++      matched_id=21
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     u(1),matched_count)
++      matched_base=20000000000000_8
++      matched_count=size(v,kind=8)
++      matched_id=22
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     v(1),matched_count)
++      matched_base=30000000000000_8
++      matched_count=size(r,kind=8)
++      matched_id=23
++      call matched_array_image_f64(matched_id,matched_bits,matched_base,
++     >     r(1),matched_count)
++      matched_params(1)=lt
++      matched_params(2)=nit
++      matched_params(3)=n1
++      matched_params(4)=n2
++      matched_params(5)=n3
++      matched_params(6)=size(u,kind=8)
++      matched_params(7)=size(v,kind=8)
++      matched_params(8)=size(r,kind=8)
++      do i=0,3
++         matched_params(9+i)=transfer(a(i),matched_params(9+i))
++         matched_params(13+i)=transfer(c(i),matched_params(13+i))
++      enddo
++      do i=1,lt
++         matched_params(16+4*(i-1)+1)=m1(i)
++         matched_params(16+4*(i-1)+2)=m2(i)
++         matched_params(16+4*(i-1)+3)=m3(i)
++         matched_params(16+4*(i-1)+4)=ir(i)
++      enddo
++      matched_ordinal=0
++      matched_phase=200
++      matched_kernel=2000
++      matched_iter=0
++      matched_count=nit
++      matched_param_count=16+4*lt
++      call matched_invocation(matched_ordinal,matched_phase,
++     >     matched_kernel,matched_iter,matched_count,matched_params,
++     >     matched_param_count)
++c MATCHED_TRACE_END bounded MG descriptor root
+ 
+       call timer_stop(T_init)
+       tinit = timer_read(T_init)
+@@ -528,10 +590,23 @@
+       integer n1,n2,n3,k
+       double precision u(n1,n2,n3),r(n1,n2,n3),c(0:3)
+       integer i3, i2, i1
++c MATCHED_TRACE_BEGIN psinv declarations
++      integer*8 matched_id,matched_iter,matched_count,matched_call
++      save matched_call
++      data matched_call /0/
++c MATCHED_PHASE mg_psinv
++c MATCHED_TRACE_END psinv declarations
+ 
+       double precision r1(m), r2(m)
+ 
+       if (timeron) call timer_start(T_psinv)
++c MATCHED_TRACE_BEGIN psinv begin
++      matched_id=201
++      matched_iter=matched_call*100+k
++      matched_call=matched_call+1
++      matched_count=n1*n2*n3
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++c MATCHED_TRACE_END psinv begin
+ !$omp parallel do default(shared) private(i1,i2,i3,r1,r2) collapse(2)
+       do i3=2,n3-1
+          do i2=2,n2-1
+@@ -570,6 +645,11 @@
+          call showall(u,n1,n2,n3)
+       endif
+ 
++c MATCHED_TRACE_BEGIN psinv boundary
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     u(1,1,1),64_8,matched_count)
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END psinv boundary
+       return
+       end
+ 
+@@ -600,9 +680,22 @@
+       integer n1,n2,n3,k
+       double precision u(n1,n2,n3),v(n1,n2,n3),r(n1,n2,n3),a(0:3)
+       integer i3, i2, i1
++c MATCHED_TRACE_BEGIN resid declarations
++      integer*8 matched_id,matched_iter,matched_count,matched_call
++      save matched_call
++      data matched_call /0/
++c MATCHED_PHASE mg_resid
++c MATCHED_TRACE_END resid declarations
+       double precision u1(m), u2(m)
+ 
+       if (timeron) call timer_start(T_resid)
++c MATCHED_TRACE_BEGIN resid begin
++      matched_id=202
++      matched_iter=matched_call*100+k
++      matched_call=matched_call+1
++      matched_count=n1*n2*n3
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++c MATCHED_TRACE_END resid begin
+ !$omp parallel do default(shared) private(i1,i2,i3,u1,u2) collapse(2)
+       do i3=2,n3-1
+          do i2=2,n2-1
+@@ -641,6 +734,11 @@
+          call showall(r,n1,n2,n3)
+       endif
+ 
++c MATCHED_TRACE_BEGIN resid boundary
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     r(1,1,1),64_8,matched_count)
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END resid boundary
+       return
+       end
+ 
+@@ -668,10 +766,23 @@
+       integer m1k, m2k, m3k, m1j, m2j, m3j,k
+       double precision r(m1k,m2k,m3k), s(m1j,m2j,m3j)
+       integer j3, j2, j1, i3, i2, i1, d1, d2, d3, j
++c MATCHED_TRACE_BEGIN rprj3 declarations
++      integer*8 matched_id,matched_iter,matched_count,matched_call
++      save matched_call
++      data matched_call /0/
++c MATCHED_PHASE mg_rprj3
++c MATCHED_TRACE_END rprj3 declarations
+ 
+       double precision x1(m), y1(m), x2,y2
+ 
+       if (timeron) call timer_start(T_rprj3)
++c MATCHED_TRACE_BEGIN rprj3 begin
++      matched_id=203
++      matched_iter=matched_call*100+k
++      matched_call=matched_call+1
++      matched_count=m1j*m2j*m3j
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++c MATCHED_TRACE_END rprj3 begin
+       if(m1k.eq.3)then
+         d1 = 2
+       else
+@@ -734,6 +845,11 @@
+          call showall(s,m1j,m2j,m3j)
+       endif
+ 
++c MATCHED_TRACE_BEGIN rprj3 boundary
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     s(1,1,1),64_8,matched_count)
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END rprj3 boundary
+       return
+       end
+ 
+@@ -762,6 +878,12 @@
+       integer mm1, mm2, mm3, n1, n2, n3,k
+       double precision z(mm1,mm2,mm3),u(n1,n2,n3)
+       integer i3, i2, i1, d1, d2, d3, t1, t2, t3
++c MATCHED_TRACE_BEGIN interp declarations
++      integer*8 matched_id,matched_iter,matched_count,matched_call
++      save matched_call
++      data matched_call /0/
++c MATCHED_PHASE mg_interp
++c MATCHED_TRACE_END interp declarations
+ 
+ c note that m = 1037 in globals.h but for this only need to be
+ c 535 to handle up to 1024^3
+@@ -770,6 +892,13 @@
+       double precision z1(m),z2(m),z3(m)
+ 
+       if (timeron) call timer_start(T_interp)
++c MATCHED_TRACE_BEGIN interp begin
++      matched_id=204
++      matched_iter=matched_call*100+k
++      matched_call=matched_call+1
++      matched_count=n1*n2*n3
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++c MATCHED_TRACE_END interp begin
+       if( n1 .ne. 3 .and. n2 .ne. 3 .and. n3 .ne. 3 ) then
+ 
+ !$omp parallel do default(shared) private(i1,i2,i3,z1,z2,z3) collapse(2)
+@@ -911,7 +1040,12 @@
+          call showall(u,n1,n2,n3)
+       endif
+ 
+-      return 
++c MATCHED_TRACE_BEGIN interp boundary
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     u(1,1,1),64_8,matched_count)
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END interp boundary
++      return
+       end
+ 
+ c---------------------------------------------------------------------
+@@ -937,6 +1071,21 @@
+       double precision rnm2, rnmu, r(n1,n2,n3)
+       double precision s, a
+       integer i3, i2, i1
++c MATCHED_TRACE_BEGIN norm2u3 declarations
++      double precision matched_sum(0:3),matched_max(0:3)
++      double precision matched_s,matched_a,matched_reduce_sum4
++      double precision matched_reduce_max4
++      integer matched_tid,omp_get_thread_num,omp_get_num_threads
++      integer*8 matched_id,matched_iter,matched_count,matched_threads
++      integer*8 matched_call
++      save matched_call
++      data matched_call /0/
++      external matched_reduce_sum4,matched_reduce_max4
++      external omp_get_thread_num,omp_get_num_threads
++c MATCHED_PHASE mg_norm2u3
++c MATCHED_THREADS 4
++c MATCHED_FIXED_REDUCTION_TREE
++c MATCHED_TRACE_END norm2u3 declarations
+ 
+       double precision dn
+ 
+@@ -946,21 +1095,54 @@
+       if (timeron) call timer_start(T_norm2)
+       dn = 1.0d0*nx*ny*nz
+ 
+-      s=0.0D0
+-      rnmu = 0.0D0
+-!$omp parallel do default(shared) private(i1,i2,i3,a) collapse(2)
+-!$omp& reduction(+:s) reduction(max:rnmu)
++c MATCHED_TRACE_BEGIN norm2u3 fixed four-lane reduction
++      matched_id=205
++      matched_iter=matched_call
++      matched_call=matched_call+1
++      matched_count=n1*n2*n3
++      call matched_phase_begin(matched_id,matched_iter,matched_count)
++!$omp parallel default(shared)
++!$omp& private(i1,i2,i3,a,matched_a,matched_s,matched_tid)
++      matched_tid=omp_get_thread_num()
++!$omp master
++      matched_threads=omp_get_num_threads()
++      call matched_require_four_threads(matched_threads)
++!$omp end master
++!$omp barrier
++      matched_s=0.0d0
++      matched_a=0.0d0
++!$omp do schedule(static) collapse(2)
+       do  i3=2,n3-1
+          do  i2=2,n2-1
+             do  i1=2,n1-1
+-               s=s+r(i1,i2,i3)**2
++               matched_s=matched_s+r(i1,i2,i3)**2
+                a=abs(r(i1,i2,i3))
+-               rnmu=dmax1(rnmu,a)
++               matched_a=dmax1(matched_a,a)
+             enddo
+          enddo
+       enddo
++!$omp end do
++      matched_sum(matched_tid)=matched_s
++      matched_max(matched_tid)=matched_a
++!$omp barrier
++!$omp master
++      s=matched_reduce_sum4(matched_sum)
++      rnmu=matched_reduce_max4(matched_max)
++!$omp end master
++!$omp end parallel
++c MATCHED_TRACE_END norm2u3 fixed four-lane reduction
+ 
+       rnm2=sqrt( s / dn )
++c MATCHED_TRACE_BEGIN norm2u3 boundary
++      matched_count=1
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     rnm2,64_8,matched_count)
++      matched_id=206
++      call matched_boundary_sha256(matched_id,matched_iter,
++     >     rnmu,64_8,matched_count)
++      matched_id=205
++      call matched_phase_end(matched_id,matched_iter)
++c MATCHED_TRACE_END norm2u3 boundary
+       if (timeron) call timer_stop(T_norm2)
+ 
+       return
