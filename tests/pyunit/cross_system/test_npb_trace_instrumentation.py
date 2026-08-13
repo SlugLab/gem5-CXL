@@ -1,6 +1,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -125,6 +126,45 @@ class NpbTraceInstrumentationTest(unittest.TestCase):
             self.assertGreater(row["expanded_records"], 0)
             descriptor = Path(row["descriptor_file"])
             bundle = lazy.read_bundle(descriptor.parent)
+            bundle_identity = builder._npb_bundle_identity(bundle)
+            self.assertEqual(
+                row["ordered_image_sha256"],
+                bundle_identity["ordered_image_sha256"],
+            )
+            self.assertEqual(
+                row["invocation_table_sha256"],
+                bundle_identity["invocation_table_sha256"],
+            )
+            self.assertEqual(
+                row["dynamic_work_sha256"],
+                bundle_identity["dynamic_work_sha256"],
+            )
+            self.assertEqual(row["config_sha256"], row["parameter_sha256"])
+            self.assertRegex(
+                row["repeated_capture_sha256"], r"^[0-9a-f]{64}$",
+            )
+            self.assertRegex(
+                row["repeated_descriptor_sha256"], r"^[0-9a-f]{64}$",
+            )
+            expected_environment = {
+                "OMP_NUM_THREADS": "4",
+                "OMP_DYNAMIC": "FALSE",
+                "OMP_PROC_BIND": "TRUE",
+            }
+            for run_name in ("reference_run", "repeat_run"):
+                run = row[run_name]
+                self.assertEqual(run["argv"], [row["binary_file"]])
+                self.assertEqual(
+                    Path(run["cwd"]),
+                    Path(row["binary_file"]).parent.parent / workload.upper(),
+                )
+                self.assertEqual(run["environment"], expected_environment)
+            self.assertEqual(row["lazy_boundary_map_sha256"], "pending")
+            self.assertEqual(row["boundary_crosswalk_sha256"], "pending")
+            self.assertEqual(row["repeated_expanded_sha256"], "pending")
+            self.assertEqual(
+                row["repeated_expanded_records"], row["expanded_records"],
+            )
             capture = builder._parse_npb_capture(Path(row["capture_file"]))
             crosswalk, expectations = builder._npb_boundary_expectations(
                 capture, workload,
@@ -155,6 +195,8 @@ class NpbTraceInstrumentationTest(unittest.TestCase):
                 image_bytes + 2 * 1024 * 1024,
             )
             self.assertFalse(list(descriptor.parent.glob("*.trace.bin")))
+        self.assertFalse((self.root / "fixture/manifest.json").exists())
+        self.assertTrue((self.root / "fixture/diagnostic.json").is_file())
         self.assertGreaterEqual(
             result["workloads"]["cg"]["boundary_count"], 25 * 5
         )
@@ -172,6 +214,145 @@ class NpbTraceInstrumentationTest(unittest.TestCase):
                 result["workloads"]["mg"]["boundary_ids"]
             )
         )
+
+    def test_fixture_rejects_different_reference_and_repeat_expansions(self):
+        expected_count = 165_607_500
+        with mock.patch.object(
+            builder.npb, "expanded_evidence",
+            side_effect=(
+                ("1" * 64, expected_count, {"x.normalize.iter1": "2" * 64}),
+                ("3" * 64, expected_count, {"x.normalize.iter1": "2" * 64}),
+            ),
+        ) as expansion:
+            with self.assertRaisesRegex(
+                builder.BuildError, "expanded evidence differs",
+            ):
+                builder.build_and_run_npb_fixture(
+                    NPB_ROOT, self.root / "two-run",
+                    workloads=("cg",), expand=True,
+                )
+        self.assertEqual(expansion.call_count, 2)
+        self.assertFalse((self.root / "two-run/manifest.json").exists())
+
+    def test_verified_fixture_manifest_binds_both_expansions(self):
+        expected_count = 165_607_500
+        evidence = (
+            "1" * 64, expected_count,
+            {"x.normalize.iter1": "2" * 64},
+        )
+        with mock.patch.object(
+            builder.npb, "expanded_evidence", return_value=evidence,
+        ) as expansion:
+            result = builder.build_and_run_npb_fixture(
+                NPB_ROOT, self.root / "verified",
+                workloads=("cg",), expand=True,
+            )
+        self.assertEqual(expansion.call_count, 2)
+        self.assertFalse(result["publishable"])
+        self.assertFalse(result["paper_evidence"])
+        self.assertEqual(result["evidence_scope"], "class_s_validation")
+        self.assertEqual(result["status"], "verified")
+        row = result["workloads"]["cg"]
+        self.assertEqual(row["expanded_sha256"], "1" * 64)
+        self.assertEqual(row["expanded_records"], expected_count)
+        self.assertEqual(row["repeated_expanded_sha256"], "1" * 64)
+        self.assertEqual(row["repeated_expanded_records"], expected_count)
+        self.assertRegex(
+            row["lazy_boundary_map_sha256"], r"^[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            row["boundary_crosswalk_sha256"], r"^[0-9a-f]{64}$",
+        )
+        self.assertTrue((self.root / "verified/manifest.json").is_file())
+        self.assertFalse((self.root / "verified/diagnostic.json").exists())
+
+    def test_semantic_identity_rejects_every_bound_component(self):
+        identity = builder._npb_semantic_identity()
+        expected_names = {
+            "builder_source_sha256", "canonical_trace_source_sha256",
+            "expander_sha256",
+            "hook_header_sha256", "hook_implementation_sha256",
+            "lazy_runtime_sha256", "trace_abi_sha256",
+            "cg_patch_sha256", "mg_patch_sha256",
+        }
+        self.assertEqual(set(identity), expected_names)
+        self.assertTrue(builder._validate_npb_semantic_identity(identity))
+        for name in sorted(expected_names):
+            changed = dict(identity)
+            changed[name] = ("0" if identity[name][0] != "0" else "1") + identity[name][1:]
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    builder.BuildError, f"semantic identity {name} differs",
+                ):
+                    builder._validate_npb_semantic_identity(changed)
+
+    def test_frozen_inputs_require_current_semantic_identity(self):
+        frozen = self.root / "frozen.json"
+        payload = {
+            "schema": 1,
+            "status": "accepted",
+            "semantic_identity": builder._npb_semantic_identity(),
+            "workloads": {
+                name: {
+                    "source_root": str(NPB_ROOT),
+                    "source_commit": "a" * 40,
+                    "parameter_file": str(
+                        NPB_ROOT / short.upper() / "npbparams.h"
+                    ),
+                    "parameter_sha256": "b" * 64,
+                    "allocated_bytes": 12_800_000_000,
+                    "class": "S",
+                }
+                for short, name in (("cg", "npb_cg"), ("mg", "npb_mg"))
+            },
+        }
+        frozen.write_text(json.dumps(payload), encoding="utf-8")
+        rows, _digest = builder.load_frozen_npb_inputs(frozen)
+        self.assertEqual(set(rows), {"cg", "mg"})
+        payload["semantic_identity"]["expander_sha256"] = "0" * 64
+        frozen.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            builder.BuildError, "semantic identity expander_sha256 differs",
+        ):
+            builder.load_frozen_npb_inputs(frozen)
+
+    def test_fixture_rejects_semantic_identity_drift_during_run(self):
+        initial = builder._npb_semantic_identity()
+        changed = dict(initial)
+        changed["builder_source_sha256"] = "0" * 64
+        with mock.patch.object(
+            builder, "_npb_semantic_identity",
+            side_effect=(initial, changed),
+        ):
+            with self.assertRaisesRegex(
+                builder.BuildError,
+                "semantic identity builder_source_sha256 differs",
+            ):
+                builder.build_and_run_npb_fixture(
+                    NPB_ROOT, self.root / "identity-drift",
+                    workloads=("cg",), expand=False,
+                )
+        self.assertFalse(
+            (self.root / "identity-drift/diagnostic.json").exists()
+        )
+
+    def test_native_boundary_sequence_rejects_one_missing_record(self):
+        result = builder.build_and_run_npb_fixture(
+            NPB_ROOT, self.root / "missing-boundary",
+            workloads=("cg", "mg"), expand=False,
+        )
+        for workload in ("cg", "mg"):
+            capture = builder._parse_npb_capture(Path(
+                result["workloads"][workload]["capture_file"]
+            ))
+            missing = dict(capture)
+            missing["boundaries"] = capture["boundaries"][:-1]
+            with self.subTest(workload=workload):
+                with self.assertRaisesRegex(
+                    builder.BuildError,
+                    f"NPB {workload} native boundary sequence differs",
+                ):
+                    builder._npb_boundary_expectations(missing, workload)
 
     def test_one_flipped_residual_bit_fails_raw_verification(self):
         result = builder.build_and_run_npb_fixture(

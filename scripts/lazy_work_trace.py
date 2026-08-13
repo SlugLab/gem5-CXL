@@ -407,10 +407,24 @@ def _validate_memory_address(bundle, operation):
     raise LazyTraceError("memory operation address is outside declared image")
 
 
-def iter_operations(bundle, expanders, *, batch_work_items=1):
+def _validate_expanded_operation(bundle, invocation, operation):
+    if not isinstance(operation, canonical.Operation):
+        raise LazyTraceError("expander emitted a non-operation")
+    if operation.sequence != 0:
+        raise LazyTraceError("expander assigned a sequence")
+    if operation.phase != invocation.phase:
+        raise LazyTraceError("expander changed invocation phase")
+    _validate_memory_address(bundle, operation)
+
+
+def _validate_batch_work_items(batch_work_items):
     _uint(batch_work_items, 64, "batch work items")
     if batch_work_items == 0:
         raise LazyTraceError("batch work items is zero")
+
+
+def iter_operations(bundle, expanders, *, batch_work_items=1):
+    _validate_batch_work_items(batch_work_items)
     sequence = 0
     with MappedState(bundle) as state:
         for invocation in bundle.invocations:
@@ -418,13 +432,7 @@ def iter_operations(bundle, expanders, *, batch_work_items=1):
             if expander is None:
                 raise LazyTraceError(f"unknown kernel {invocation.kernel}")
             for operation in expander(state, invocation, batch_work_items):
-                if not isinstance(operation, canonical.Operation):
-                    raise LazyTraceError("expander emitted a non-operation")
-                if operation.sequence != 0:
-                    raise LazyTraceError("expander assigned a sequence")
-                if operation.phase != invocation.phase:
-                    raise LazyTraceError("expander changed invocation phase")
-                _validate_memory_address(bundle, operation)
+                _validate_expanded_operation(bundle, invocation, operation)
                 yield dataclasses.replace(operation, sequence=sequence)
                 sequence += 1
     if sequence != bundle.dynamic_work["primitive_records"]:

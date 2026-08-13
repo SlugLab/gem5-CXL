@@ -28,6 +28,7 @@ except ImportError:
 
 
 REPO = Path(__file__).resolve().parents[1]
+BUILDER_SOURCE = Path(__file__).resolve()
 SOURCE_ROOT = REPO / "util/amu/matched_workloads"
 SOURCES = {
     "mcf": SOURCE_ROOT / "mcf_regions.cc",
@@ -40,6 +41,9 @@ NPB_PATCHES = {
     "cg": SOURCE_ROOT / "npb-cg-trace.patch",
     "mg": SOURCE_ROOT / "npb-mg-trace.patch",
 }
+CANONICAL_TRACE_SOURCE = REPO / "scripts/canonical_work_trace.py"
+LAZY_TRACE_SOURCE = REPO / "scripts/lazy_work_trace.py"
+NPB_EXPANDER_SOURCE = REPO / "scripts/npb_lazy_trace.py"
 BACKENDS = ("reference", "vanilla", "amu", "cira")
 STRICT_FLAGS = ("-O3", "-fopenmp", "-ffp-contract=off", "-fno-fast-math")
 COMMAND_FLAGS = ("-std=c++17", *STRICT_FLAGS, "-Wall", "-Wextra", "-Werror")
@@ -1396,58 +1400,6 @@ def compare_npb_raw_boundaries(reference, actual):
     return True
 
 
-def validate_npb_replayable_trace(path, workload):
-    """Reject phase-only NPB traces that Task 8/9 cannot replay/lower."""
-    requirements = {
-        "cg": {
-            101: {
-                canonical.Opcode.LOAD_U32, canonical.Opcode.LOAD_F64,
-                canonical.Opcode.F64_MUL, canonical.Opcode.F64_ADD,
-                canonical.Opcode.STORE_F64,
-            },
-            102: {
-                canonical.Opcode.LOAD_F64, canonical.Opcode.F64_MUL,
-                canonical.Opcode.F64_ADD, canonical.Opcode.F64_SUB,
-                canonical.Opcode.STORE_F64,
-            },
-            103: {
-                canonical.Opcode.LOAD_F64, canonical.Opcode.F64_MUL,
-                canonical.Opcode.F64_ADD,
-            },
-        },
-        "mg": {
-            phase: {
-                canonical.Opcode.LOAD_F64, canonical.Opcode.F64_MUL,
-                canonical.Opcode.F64_ADD, canonical.Opcode.STORE_F64,
-            }
-            for phase in (201, 202, 203, 204, 205)
-        },
-    }
-    if workload not in requirements:
-        raise canonical.TraceError(f"unknown NPB trace workload {workload}")
-    operations = canonical.decode_operations(Path(path).read_bytes())
-    by_phase = {}
-    for operation in operations:
-        by_phase.setdefault(operation.phase, set()).add(operation.opcode)
-        if operation.opcode in {
-            canonical.Opcode.LOAD_U32, canonical.Opcode.LOAD_U64,
-            canonical.Opcode.LOAD_F32, canonical.Opcode.LOAD_F64,
-            canonical.Opcode.STORE_U32, canonical.Opcode.STORE_U64,
-            canonical.Opcode.STORE_F32, canonical.Opcode.STORE_F64,
-        } and operation.address == 0:
-            raise canonical.TraceError(
-                f"NPB {workload} phase {operation.phase} memory address is zero"
-            )
-    for phase, needed in requirements[workload].items():
-        missing = needed - by_phase.get(phase, set())
-        if missing:
-            names = ",".join(sorted(opcode.name for opcode in missing))
-            raise canonical.TraceError(
-                f"NPB {workload} phase {phase} is not replayable: missing {names}"
-            )
-    return True
-
-
 def _npb_boundary_count(path):
     return len(_npb_boundary_records(path))
 
@@ -2096,7 +2048,18 @@ def _run_npb_binary(binary, workload, root, run_name):
         )
     if not capture.is_file() or not allocation.is_file():
         raise BuildError(f"NPB {workload} trace hooks produced no evidence")
-    return capture, output, _npb_allocation_probe(allocation, workload)
+    run_identity = {
+        "argv": [str(binary)],
+        "cwd": str((binary.parent.parent / workload.upper()).resolve()),
+        "environment": {
+            name: environment[name]
+            for name in ("OMP_NUM_THREADS", "OMP_DYNAMIC", "OMP_PROC_BIND")
+        },
+    }
+    return (
+        capture, output, _npb_allocation_probe(allocation, workload),
+        run_identity,
+    )
 
 
 def _capture_boundary_map(capture):
@@ -2116,8 +2079,60 @@ def _capture_boundary_map(capture):
     return result, hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_npb_native_boundary_sequence(capture, workload):
+    expected = []
+    if workload == "cg":
+        _invocations, _records, _scalars = _cg_invocation_descriptors(capture)
+        config = capture["invocations"][0]["parameters"]
+        columns, niter, cgitmax = config[1], config[3], config[4]
+        for outer in range(1, niter + 1):
+            for cgit in range(1, cgitmax + 1):
+                iteration = outer * 100 + cgit
+                expected.extend(
+                    (boundary, iteration, columns, 64)
+                    for boundary in (111, 112, 113, 114)
+                )
+            expected.extend(
+                (boundary, outer, columns, 64)
+                for boundary in (113, 111, 112, 114, 110)
+            )
+            expected.extend(((115, outer, 1, 64), (116, outer, 1, 64)))
+    elif workload == "mg":
+        _invocations, _records, _levels = _mg_invocation_descriptors(capture)
+        boundary_ids = {201: (201,), 202: (202,), 203: (203,), 204: (204,)}
+        for record in capture["invocations"][1:]:
+            phase = record["phase"]
+            if phase == 205:
+                expected.extend((boundary, record["iteration"], 1, 64)
+                                for boundary in (205, 206))
+            else:
+                try:
+                    ids = boundary_ids[phase]
+                except KeyError as error:
+                    raise BuildError(
+                        f"NPB MG invocation phase {phase} has no boundary"
+                    ) from error
+                expected.extend(
+                    (boundary, record["iteration"], record["work_items"], 64)
+                    for boundary in ids
+                )
+    else:
+        raise BuildError(f"unknown NPB boundary workload {workload}")
+    observed = [
+        (
+            record["boundary"], record["iteration"], record["count"],
+            record["element_bits"],
+        )
+        for record in capture["boundaries"]
+    ]
+    if observed != expected:
+        raise BuildError(f"NPB {workload} native boundary sequence differs")
+    return True
+
+
 def _npb_boundary_expectations(capture, workload):
     """Crosswalk native boundary ids to exact lazy state commitments."""
+    _validate_npb_native_boundary_sequence(capture, workload)
     crosswalk = {}
     if workload == "cg":
         config = capture["invocations"][0]["parameters"]
@@ -2222,6 +2237,64 @@ def _validate_npb_boundary_commitments(capture, workload, lazy_boundaries):
     return crosswalk
 
 
+def _npb_semantic_identity():
+    return {
+        "builder_source_sha256": _sha256_file(BUILDER_SOURCE),
+        "canonical_trace_source_sha256": _sha256_file(
+            CANONICAL_TRACE_SOURCE
+        ),
+        "expander_sha256": _sha256_file(NPB_EXPANDER_SOURCE),
+        "hook_header_sha256": _sha256_file(NPB_TRACE_HOOKS),
+        "hook_implementation_sha256": _sha256_file(
+            NPB_TRACE_IMPLEMENTATION
+        ),
+        "lazy_runtime_sha256": _sha256_file(LAZY_TRACE_SOURCE),
+        "trace_abi_sha256": _sha256_file(TRACE_ABI),
+        "cg_patch_sha256": _sha256_file(NPB_PATCHES["cg"]),
+        "mg_patch_sha256": _sha256_file(NPB_PATCHES["mg"]),
+    }
+
+
+def _json_sha256(value):
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _npb_bundle_identity(bundle):
+    images = [
+        {"name": array.name, "sha256": array.sha256}
+        for array in bundle.arrays
+    ]
+    invocations = [
+        {
+            "ordinal": invocation.ordinal,
+            "phase": invocation.phase,
+            "kernel": invocation.kernel,
+            "iteration": invocation.iteration,
+            "work_items": invocation.work_items,
+            "parameters": invocation.parameters,
+        }
+        for invocation in bundle.invocations
+    ]
+    return {
+        "ordered_image_sha256": images,
+        "invocation_table_sha256": _json_sha256(invocations),
+        "dynamic_work_sha256": _json_sha256(bundle.dynamic_work),
+    }
+
+
+def _validate_npb_semantic_identity(expected):
+    current = _npb_semantic_identity()
+    if not isinstance(expected, dict) or set(expected) != set(current):
+        raise BuildError("formal NPB semantic identity fields differ")
+    for name, observed in current.items():
+        if expected.get(name) != observed:
+            raise BuildError(f"formal NPB semantic identity {name} differs")
+    return True
+
+
 def build_and_run_npb_fixture(source_root, outdir, *, workloads=("cg", "mg"),
                               expand=True):
     """Build patched Class S CG/MG and prove deterministic raw boundaries."""
@@ -2251,6 +2324,11 @@ def build_and_run_npb_fixture(source_root, outdir, *, workloads=("cg", "mg"),
     hook_command = _compile_npb_hook(hook_object)
     result = {
         "schema": 1,
+        "status": "verified" if expand else "diagnostic",
+        "publishable": False,
+        "paper_evidence": False,
+        "evidence_scope": "class_s_validation",
+        "validation_complete": bool(expand),
         "class": "S",
         "threads": 4,
         "source_root": str(source_root),
@@ -2261,14 +2339,15 @@ def build_and_run_npb_fixture(source_root, outdir, *, workloads=("cg", "mg"),
             "fixture Class S is not the frozen 12.8 GB paper input"
         ),
         "hook_command": [str(item) for item in hook_command],
+        "semantic_identity": _npb_semantic_identity(),
         "workloads": {},
     }
     for workload in selected:
         binary, command = _build_npb(source, workload, hook_object, "S")
-        reference_path, _, allocated_bytes = _run_npb_binary(
+        reference_path, _, allocated_bytes, reference_run = _run_npb_binary(
             binary, workload, outdir, "reference"
         )
-        repeated_path, _, repeated_bytes = _run_npb_binary(
+        repeated_path, _, repeated_bytes, repeated_run = _run_npb_binary(
             binary, workload, outdir, "repeat"
         )
         if allocated_bytes != repeated_bytes:
@@ -2319,13 +2398,38 @@ def build_and_run_npb_fixture(source_root, outdir, *, workloads=("cg", "mg"),
                     boundary_expectations=boundary_expectations,
                 )
             )
-            del replay_boundaries
+            repeated_crosswalk, repeated_expectations = (
+                _npb_boundary_expectations(repeated, workload)
+            )
+            repeated_evidence = npb.expanded_evidence(
+                repeated_bundle,
+                boundary_expectations=repeated_expectations,
+            )
+            if (
+                repeated_crosswalk != boundary_crosswalk
+                or repeated_evidence != (
+                    expanded_sha256, expanded_records, replay_boundaries
+                )
+            ):
+                raise BuildError(
+                    f"NPB {workload} reference/repeat expanded evidence differs"
+                )
+            repeated_expanded_sha256 = repeated_evidence[0]
+            repeated_expanded_records = repeated_evidence[1]
+            lazy_boundary_map_sha256 = _json_sha256(replay_boundaries)
+            boundary_crosswalk_sha256 = _json_sha256(boundary_crosswalk)
         else:
             expanded_sha256 = "pending"
             expanded_records = reference_bundle.dynamic_work[
                 "primitive_records"
             ]
             boundary_crosswalk = {}
+            replay_boundaries = {}
+            repeated_expanded_sha256 = "pending"
+            repeated_expanded_records = expanded_records
+            lazy_boundary_map_sha256 = "pending"
+            boundary_crosswalk_sha256 = "pending"
+        bundle_identity = _npb_bundle_identity(reference_bundle)
         result["workloads"][workload] = {
             "class": "S",
             "official_verification": "pass",
@@ -2340,20 +2444,36 @@ def build_and_run_npb_fixture(source_root, outdir, *, workloads=("cg", "mg"),
             "boundary_map_sha256": boundary_map_sha256,
             "capture_file": str(reference_path),
             "capture_sha256": reference["capture_sha256"],
+            "repeated_capture_sha256": repeated["capture_sha256"],
             "descriptor_file": str(descriptor),
             "descriptor_sha256": _sha256_file(descriptor),
+            "repeated_descriptor_sha256": _sha256_file(
+                repeated_descriptor
+            ),
+            **bundle_identity,
             "expanded_sha256": expanded_sha256,
             "expanded_records": expanded_records,
+            "repeated_expanded_sha256": repeated_expanded_sha256,
+            "repeated_expanded_records": repeated_expanded_records,
             "boundary_crosswalk": boundary_crosswalk,
+            "boundary_crosswalk_sha256": boundary_crosswalk_sha256,
+            "lazy_boundary_map": replay_boundaries,
+            "lazy_boundary_map_sha256": lazy_boundary_map_sha256,
             "binary_sha256": binary_sha256,
+            "binary_file": str(binary),
             "parameter_sha256": parameter_sha256,
+            "config_sha256": parameter_sha256,
             "source_sha256": source_sha256,
             "patch_sha256": _sha256_file(NPB_PATCHES[workload]),
             "hook_sha256": _sha256_file(NPB_TRACE_IMPLEMENTATION),
             "trace_abi_sha256": _sha256_file(TRACE_ABI),
             "build_command": [str(item) for item in command],
+            "reference_run": reference_run,
+            "repeat_run": repeated_run,
         }
-    contract.atomic_write_json(outdir / "manifest.json", result)
+    output_name = "manifest.json" if expand else "diagnostic.json"
+    _validate_npb_semantic_identity(result["semantic_identity"])
+    contract.atomic_write_json(outdir / output_name, result)
     return result
 
 
@@ -2365,6 +2485,7 @@ def load_frozen_npb_inputs(path):
         raise BuildError(f"invalid frozen NPB inputs: {error}") from error
     if value.get("schema") != 1 or value.get("status") != "accepted":
         raise BuildError("frozen NPB inputs are not accepted schema 1")
+    _validate_npb_semantic_identity(value.get("semantic_identity"))
     workloads = value.get("workloads", {})
     result = {}
     for short, name in (("cg", "npb_cg"), ("mg", "npb_mg")):
@@ -2414,11 +2535,16 @@ def build_and_run_npb_formal(inputs_path, outdir):
     result = {
         "schema": 1,
         "mode": "formal",
+        "status": "verified",
+        "publishable": True,
+        "paper_evidence": True,
+        "evidence_scope": "formal_paper_input",
         "threads": 4,
         "source_root": str(source_root),
         "source_commit": next(iter({row["source_commit"] for row in rows.values()})),
         "inputs_sha256": inputs_sha256,
         "hook_command": [str(item) for item in hook_command],
+        "semantic_identity": _npb_semantic_identity(),
         "workloads": {},
     }
     measured = {}
@@ -2426,7 +2552,7 @@ def build_and_run_npb_formal(inputs_path, outdir):
         binary, command = _build_npb(
             source, workload, hook_object, row["class"]
         )
-        capture_path, _, allocated = _run_npb_binary(
+        capture_path, _, allocated, run_identity = _run_npb_binary(
             binary, workload, outdir, "formal"
         )
         if allocated != row["allocated_bytes"]:
@@ -2454,26 +2580,50 @@ def build_and_run_npb_formal(inputs_path, outdir):
                 bundle, boundary_expectations=boundary_expectations
             )
         )
-        del replay_boundaries
+        bundle_identity = _npb_bundle_identity(bundle)
         measured[workload] = allocated
         descriptor = bundle.root / "trace.v2.json"
         result["workloads"][workload] = {
             "class": row["class"],
             "official_verification": "pass",
+            "raw_verification": "pass",
+            "runtime_threads": 4,
             "capture_file": str(capture_path),
             "capture_sha256": capture["capture_sha256"],
             "boundary_map": boundary_map,
             "boundary_map_sha256": boundary_map_sha256,
             "descriptor_file": str(descriptor),
             "descriptor_sha256": _sha256_file(descriptor),
+            **bundle_identity,
             "expanded_sha256": expanded_sha256,
             "expanded_records": expanded_records,
             "boundary_crosswalk": boundary_crosswalk,
+            "boundary_crosswalk_sha256": _json_sha256(
+                boundary_crosswalk
+            ),
+            "lazy_boundary_map": replay_boundaries,
+            "lazy_boundary_map_sha256": _json_sha256(
+                replay_boundaries
+            ),
             "measured_allocated_bytes": allocated,
             "parameter_sha256": row["parameter_sha256"],
+            "config_sha256": row["parameter_sha256"],
             "binary_sha256": binary_sha256,
+            "binary_file": str(binary),
             "source_sha256": source_sha256,
+            "patch_sha256": _sha256_file(NPB_PATCHES[workload]),
+            "hook_header_sha256": _sha256_file(NPB_TRACE_HOOKS),
+            "hook_implementation_sha256": _sha256_file(
+                NPB_TRACE_IMPLEMENTATION
+            ),
+            "expander_sha256": _sha256_file(NPB_EXPANDER_SOURCE),
+            "lazy_runtime_sha256": _sha256_file(LAZY_TRACE_SOURCE),
+            "canonical_trace_source_sha256": _sha256_file(
+                CANONICAL_TRACE_SOURCE
+            ),
+            "trace_abi_sha256": _sha256_file(TRACE_ABI),
             "build_command": [str(item) for item in command],
+            "formal_run": run_identity,
         }
     validate_npb_formal_source(
         source_root,
@@ -2489,6 +2639,7 @@ def build_and_run_npb_formal(inputs_path, outdir):
         },
         measured_allocated_bytes=measured,
     )
+    _validate_npb_semantic_identity(result["semantic_identity"])
     contract.atomic_write_json(outdir / "manifest.json", result)
     return result
 

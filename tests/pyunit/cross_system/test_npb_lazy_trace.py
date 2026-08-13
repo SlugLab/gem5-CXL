@@ -612,6 +612,31 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             {"q.spmv.iter9": digest(F64.pack(5.0) + F64.pack(6.0) + F64.pack(11.0))},
         )
 
+    def test_combined_evidence_rejects_an_expander_phase_change(self):
+        bundle = self.spmv_bundle()
+        original = npb.EXPANDERS["npb_cg_spmv"]
+
+        def changed_phase(_state, invocation, _batch_work_items):
+            yield canonical.Operation(
+                invocation.phase + 1, canonical.Opcode.BARRIER,
+                invocation.iteration, 0, 0, 0, invocation.work_items, 0,
+            )
+
+        npb.EXPANDERS["npb_cg_spmv"] = changed_phase
+        try:
+            with self.assertRaisesRegex(
+                lazy.LazyTraceError, "changed invocation phase",
+            ):
+                npb.expanded_evidence(bundle)
+        finally:
+            npb.EXPANDERS["npb_cg_spmv"] = original
+
+    def test_combined_evidence_rejects_zero_batch_size(self):
+        with self.assertRaisesRegex(
+            lazy.LazyTraceError, "batch work items is zero",
+        ):
+            npb.expanded_evidence(self.spmv_bundle(), batch_work_items=0)
+
     def test_tiny_cg_dot_uses_explicit_four_lane_tree(self):
         bundle = self.dot_bundle()
         expected, result = self.expected_dot()
@@ -1276,6 +1301,8 @@ class NpbMgLazyTraceTest(unittest.TestCase):
         return tuple(result)
 
     def test_mg_psinv_preserves_expression_grouping_and_comm3(self):
+        # Expected operands follow the exact-flag gfortran optimized tree,
+        # which is also checked against every native Class S boundary.
         n1 = n2 = n3 = 4
         count = 64
         r = tuple((index - 17) / 16.0 for index in range(count))

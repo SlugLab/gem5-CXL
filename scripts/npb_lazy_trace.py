@@ -1089,6 +1089,8 @@ def expand_mg_psinv(state, invocation, _batch_work_items):
                     dimensions, work_item,
                 )
                 yield operation
+                # Exact production gfortran -O3 strict-FP optimized tree,
+                # confirmed by native boundary commitments: r1+(right+left).
                 pair = f64(r_right + r_left)
                 yield _binary(
                     invocation, canonical.Opcode.F64_ADD,
@@ -1109,6 +1111,7 @@ def expand_mg_psinv(state, invocation, _batch_work_items):
                     invocation, canonical.Opcode.F64_ADD,
                     work_item, result, product, updated,
                 )
+                # The compiled second tree is right+(left+r2).
                 pair = f64(r1[i1 - 1] + r2[i1])
                 yield _binary(
                     invocation, canonical.Opcode.F64_ADD,
@@ -1606,6 +1609,7 @@ EXPANDERS = {
 
 def expanded_evidence(bundle, *, batch_work_items=1,
                       boundary_expectations=None):
+    lazy._validate_batch_work_items(batch_work_items)
     boundaries = {}
     count = 0
     digest = hashlib.sha256()
@@ -1641,7 +1645,9 @@ def expanded_evidence(bundle, *, batch_work_items=1,
                     f"unknown NPB kernel {invocation.kernel}"
                 ) from error
             for operation in expander(state, invocation, batch_work_items):
-                lazy._validate_memory_address(bundle, operation)
+                lazy._validate_expanded_operation(
+                    bundle, invocation, operation
+                )
                 sequenced = dataclasses.replace(operation, sequence=count)
                 digest.update(canonical.TRACE_STRUCT.pack(
                     sequenced.phase, int(sequenced.opcode), 0,

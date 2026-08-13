@@ -573,65 +573,68 @@ git commit -m "feat: add exact MCF and Spatter region adapters"
 
 **Files:**
 - Create: `util/amu/matched_workloads/npb_trace_hooks.h`
+- Create: `util/amu/matched_workloads/npb_trace_hooks.cc`
 - Create: `util/amu/matched_workloads/npb-cg-trace.patch`
 - Create: `util/amu/matched_workloads/npb-mg-trace.patch`
+- Create: `scripts/lazy_work_trace.py`
+- Create: `scripts/npb_lazy_trace.py`
 - Modify: `scripts/build_matched_breadth_workloads.py`
+- Create: `tests/pyunit/cross_system/test_lazy_work_trace.py`
+- Create: `tests/pyunit/cross_system/test_npb_lazy_trace.py`
 - Create: `tests/pyunit/cross_system/test_npb_trace_instrumentation.py`
 
-- [ ] **Step 1: Write failing patch-integrity and boundary tests**
+- [ ] **Step 1: Prove patch integrity and exact transformed execution**
 
-Use miniature CG/MG sources with the same function anchors. Require patches to
-apply with zero fuzz, original arithmetic lines to remain byte-identical after
-hook lines are removed, official fixture verifiers to pass, and one flipped
-residual bit to fail.
+Use the pinned CG/MG sources and exact function anchors. Require patches to
+apply with zero fuzz, every non-reduction arithmetic line to remain
+byte-identical after hook lines are removed, the explicit four-lane reduction
+transform to match the checked-in patch byte for byte, official fixture
+verifiers to pass, and one flipped residual bit to fail.
 
-- [ ] **Step 2: Run and verify RED**
+- [ ] **Step 2: Capture bounded descriptors instead of primitive traces**
 
-Run: `PYTHONPATH=. python3 -m unittest tests.pyunit.cross_system.test_npb_trace_instrumentation -v`
+Capture hash-bound initial array images, ordered kernel invocations, exact raw
+parameters, four-lane reductions, dynamic counts, allocation bytes, and
+streaming SHA-256 boundary commitments. Emit no per-load/store/arithmetic
+records from the native hooks and produce no eager `trace.bin`.
 
-Expected: missing hooks and patches.
+- [ ] **Step 3: Expand exact CG and MG semantics lazily**
 
-- [ ] **Step 3: Implement observation-only hooks**
+Use a schema-2, copy-on-write memory-mapped iterator that emits the canonical
+56-byte operation ABI one record at a time. Preserve CSR order, every MG
+stencil expression tree as compiled under the fixed strict-FP flags, all
+`zero3` calls, Fortran level offsets, and the fixed four-lane merge tree. Peak
+host memory must not scale with expanded operation count.
 
-```c
-void matched_phase_begin(uint16_t phase, uint64_t iteration, uint64_t work_items);
-void matched_phase_end(uint16_t phase, uint64_t iteration);
-void matched_dump_f64(const char *name, uint64_t iteration,
-                      const double *values, uint64_t count);
-void matched_reduction_edge(uint16_t phase, uint64_t parent,
-                            uint64_t left, uint64_t right);
-```
+- [ ] **Step 4: Require full native-to-lazy bit-exact commitments**
 
-Hooks write raw bits and existing reduction-tree edges through the canonical
-ABI; they never recompute or replace a value.
+For both reference and repeat Class S executions, exhaust the full lazy stream,
+require identical operation SHA-256/count, and compare every native array or
+scalar boundary at its kernel-qualified program point. A missing, duplicate,
+or mismatched commitment fails immediately. Diagnostic runs with skipped
+expansion may not write `manifest.json`.
 
-- [ ] **Step 4: Patch exact CG boundaries**
+- [ ] **Step 5: Bind all formal semantic identities**
 
-Add hooks around sparse matvec, vector updates, dot products, and every
-`conj_grad` iteration. Dump `x`, `z`, `p`, `q`, `r`, residual, and final zeta.
-Wrap the existing reduction tree without changing operand grouping.
+Bind clean source commit, parameter/config hash, measured allocation, patched
+source, binary, checked-in patch, hook header and implementation, lazy runtime,
+NPB expander, canonical Python source, C++ trace ABI, ordered image hashes,
+invocation-table hash, dynamic-work hash, expanded stream, boundary crosswalk,
+and replayed boundary map. Reject any drift before formal publication.
 
-- [ ] **Step 5: Patch exact MG boundaries**
+- [ ] **Step 6: Keep formal inputs fail closed**
 
-Add hooks around `resid`, `rprj3`, `interp`, `psinv`, and `norm2u3`. Dump every
-allocated grid level and residual after each V-cycle and record existing norm
-tree edges without changing boundary handling or level order.
+Require the accepted frozen source/parameter/allocation authority and the exact
+semantic identity above. Missing clean 12.8 GB inputs remains `failed_input`;
+Class S fixture success is validation evidence, not paper evidence, and no
+smaller NPB class may substitute.
 
-- [ ] **Step 6: Bind source commit, parameters, and allocation size**
+- [ ] **Step 7: Run the complete proof, review, commit, and push**
 
-Copy the frozen source to the build root, verify commit and parameter hash,
-apply with `patch --fuzz=0`, build with four OpenMP threads and strict FP flags,
-run an untimed allocation probe, and require its bytes to match `inputs.json`.
-Missing 12.8 GB-class identity becomes `failed_input`; never fall back.
-
-- [ ] **Step 7: Run tests and commit**
-
-```bash
-PYTHONPATH=. python3 -m unittest tests.pyunit.cross_system.test_npb_trace_instrumentation -v
-git add scripts/build_matched_breadth_workloads.py util/amu/matched_workloads/npb* \
-  tests/pyunit/cross_system/test_npb_trace_instrumentation.py
-git commit -m "feat: instrument exact NPB CG and MG semantics"
-```
+Run the lazy, NPB-kernel, instrumentation, and complete cross-system Python
+suites freshly. Review operation/address generation, FP grouping, lane trees,
+MG boundaries, hash coverage, count checks, and formal fail-closed behavior.
+Resolve every Critical/Important finding before commit and push.
 
 ### Task 8: Common Vanilla, AMU, and coherent CIRA replay in gem5
 
