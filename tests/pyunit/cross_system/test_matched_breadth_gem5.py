@@ -21,7 +21,7 @@ def _digest(label):
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def _meta(name, records):
+def _meta(name, records, output_boundaries=None):
     return {
         "schema": 1,
         "workload": name,
@@ -30,7 +30,7 @@ def _meta(name, records):
         "binary_sha256": _digest(f"{name}-binary"),
         "config_sha256": _digest(f"{name}-config"),
         "phases": [{"id": 0, "name": name, "work_items": records}],
-        "output_boundaries": {},
+        "output_boundaries": output_boundaries or {},
     }
 
 
@@ -129,6 +129,157 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                         reference["commit_order"],
                     )
                 self.assertEqual(reference["verification"], "pass")
+
+    def test_functional_replay_dumps_every_declared_raw_boundary(self):
+        operations = (
+            _op(canonical.Opcode.STORE_U32, 0, address=0x1000,
+                result=0x01234567),
+            _op(canonical.Opcode.STORE_U32, 1, address=0x1004,
+                result=0x89ABCDEF),
+            _op(canonical.Opcode.STORE_U64, 2, address=0x2000,
+                result=0x0123456789ABCDEF),
+            _op(canonical.Opcode.COMMIT, 3,
+                result=0xFEDCBA9876543210),
+        )
+        boundaries = {
+            "state.u32": {
+                "word_bits": 32,
+                "count": 2,
+                "operation_sequences": [0, 1],
+            },
+            "state.u64": {
+                "word_bits": 64,
+                "count": 2,
+                "operation_sequences": [2, 3],
+            },
+        }
+        outputs = {
+            "state.u32": (0x01234567, 0x89ABCDEF),
+            "state.u64": (
+                0x0123456789ABCDEF, 0xFEDCBA9876543210,
+            ),
+        }
+        bundle = self.root / "all-boundaries"
+        canonical.write_bundle(
+            bundle, _meta("all_boundaries", 1, boundaries),
+            operations, outputs,
+        )
+        binary = replay.build_replay_binary(self.root / "build", native=True)
+        result = replay.run_native_replay(
+            binary, system="vanilla", trace=bundle,
+            outdir=self.root / "all-boundaries-run",
+        )
+        self.assertEqual(result["output_boundaries"], {
+            "state.u32": {
+                "word_bits": 32,
+                "count": 2,
+                "raw_words": [0x01234567, 0x89ABCDEF],
+            },
+            "state.u64": {
+                "word_bits": 64,
+                "count": 2,
+                "raw_words": [
+                    0x0123456789ABCDEF, 0xFEDCBA9876543210,
+                ],
+            },
+        })
+
+    def test_boundary_gate_rejects_bit_drift_missing_and_extra_data(self):
+        operations = (
+            _op(canonical.Opcode.COMMIT, 0, result=0xDEADBEEF),
+        )
+        boundaries = {
+            "answer": {
+                "word_bits": 32,
+                "count": 1,
+                "operation_sequences": [0],
+            },
+        }
+        bundle = self.root / "boundary-gate"
+        canonical.write_bundle(
+            bundle, _meta("boundary_gate", 1, boundaries), operations,
+            {"answer": (0xDEADBEEF,)},
+        )
+        loaded = canonical.read_bundle(bundle)
+        clean = {
+            "answer": {
+                "word_bits": 32,
+                "count": 1,
+                "raw_words": [0xDEADBEEF],
+            },
+        }
+        replay.validate_output_boundaries(loaded, clean)
+        failures = (
+            ({"answer": {**clean["answer"],
+                         "raw_words": [0xDEADBEEE]}}, "answer\\[0\\]"),
+            ({}, "boundary set"),
+            ({**clean, "extra": clean["answer"]}, "boundary set"),
+        )
+        for observed, message in failures:
+            with self.subTest(observed=observed), self.assertRaisesRegex(
+                replay.ReplayError, message
+            ):
+                replay.validate_output_boundaries(loaded, observed)
+
+    def test_functional_replay_rejects_unmapped_legacy_boundaries(self):
+        operations = (
+            _op(canonical.Opcode.STORE_U32, 0, address=0x1000,
+                result=0xDEADBEEF),
+        )
+        bundle = self.root / "legacy-boundary"
+        canonical.write_bundle(
+            bundle,
+            _meta("legacy_boundary", 1, {
+                "answer": {"word_bits": 32, "count": 1},
+            }),
+            operations, {"answer": (0xDEADBEEF,)},
+        )
+        binary = replay.build_replay_binary(self.root / "build", native=True)
+        with self.assertRaisesRegex(
+            replay.ReplayError, "operation mapping is missing"
+        ):
+            replay.run_native_replay(
+                binary, system="vanilla", trace=bundle,
+                outdir=self.root / "legacy-boundary-run",
+            )
+
+    def test_lazy_functional_replay_rejects_missing_raw_boundary_mapping(self):
+        trace = self.root / "lazy-boundary"
+        trace.mkdir()
+        lazy.write_bundle(
+            trace,
+            {"schema": 2, "workload": "npb_cg",
+             "source_sha256": _digest("lazy-source"),
+             "binary_sha256": _digest("lazy-binary"),
+             "config_sha256": _digest("lazy-config"),
+             "initial_scalars": {"numerator": 0x4010000000000000,
+                                 "denominator": 0x4000000000000000,
+                                 "result": 0},
+             "boundary_commitments": {"scalar.result": _digest("result")}},
+            (),
+            (lazy.Invocation(
+                0, 103, "npb_cg_divide", 0, 1,
+                {"numerator": "numerator", "denominator": "denominator",
+                 "result": "result"},
+            ),),
+            {"primitive_records": 3},
+        )
+        binary = self.root / "trace_replay"
+        gem5 = self.root / "gem5.opt"
+        config = self.root / "config.py"
+        calibration = self.root / "calibration.json"
+        for path in (binary, gem5, config, calibration):
+            path.write_bytes(path.name.encode("utf-8"))
+        options = SimpleNamespace(
+            mode="functional", system="vanilla", trace=trace,
+            window_manifest=None, phase=None, window_index=None,
+            binary=binary, gem5=gem5, config=config,
+            calibration=calibration, outdir=self.root / "lazy-run", timeout=0,
+        )
+        with self.assertRaisesRegex(
+            replay.ReplayError, "raw output boundary mapping"
+        ):
+            replay.run(options)
 
     def test_native_engine_uses_four_workers_and_real_load_windows(self):
         operations = []
@@ -334,6 +485,21 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         )
         self.assertEqual(materialized.measure_start_item, 0)
         self.assertEqual(materialized.fixed_event_records, 4)
+        fixed = canonical.read_bundle(materialized.fixed_root)
+        self.assertEqual(
+            [operation.opcode for operation in fixed.operations],
+            [
+                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
+                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
+            ],
+        )
+        self.assertEqual(
+            [operation.work_item for operation in fixed.operations],
+            [0, 0, 1, 1],
+        )
+        self.assertNotEqual(
+            bundle.meta["trace_sha256"], fixed.meta["trace_sha256"]
+        )
         self.assertEqual(bundle.meta["source_schema"], 2)
         stream = self.root / "lazy-stream.bin"
         stream_evidence = replay.write_lazy_replay_stream(trace, stream)
@@ -356,6 +522,26 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(replayed["trace_records"], 6)
         self.assertEqual(replayed["commit_order"], [2, 5])
         self.assertEqual(replayed["raw_outputs"], [0, 0])
+
+    def test_window_evidence_keeps_positive_fixed_roi_ticks_separate(self):
+        dynamic = {"sim_ticks": 12345, "verification": "pass"}
+        fixed = {"sim_ticks": 321, "verification": "pass"}
+        fixed_root = self.root / "fixed-input"
+        fixed_root.mkdir()
+        fixed_trace = fixed_root / "trace.bin"
+        fixed_trace.write_bytes(b"fixed-control-trace")
+        combined = replay.combine_window_evidence(
+            dynamic, fixed, fixed_trace=fixed_trace,
+        )
+        self.assertEqual(combined["sim_ticks"], 12345)
+        self.assertEqual(combined["fixed_sim_ticks"], 321)
+        self.assertGreater(combined["fixed_sim_ticks"], 0)
+        self.assertEqual(
+            combined["fixed_trace_sha256"], replay._sha256_file(fixed_trace)
+        )
+        self.assertNotEqual(
+            combined["sim_ticks"], combined["fixed_sim_ticks"]
+        )
 
     def test_window_materialization_rejects_trace_or_phase_drift(self):
         operations = (
@@ -610,6 +796,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         (run_dir / "result.json").write_text(json.dumps({
             "verification": "pass", "threads": 4, "phases": 1,
             "commit_order": [1], "raw_outputs": [17],
+            "output_boundaries": {},
             "issued_loads": 999, "completed_loads": 999,
             "drains": 4,
         }) + "\n", encoding="utf-8")

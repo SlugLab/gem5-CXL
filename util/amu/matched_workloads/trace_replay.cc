@@ -57,6 +57,13 @@ struct Commit
     uint64_t bits = 0;
 };
 
+struct OutputBoundary
+{
+    std::string name;
+    uint32_t wordBits = 0;
+    std::vector<uint64_t> words;
+};
+
 struct ReplayStats
 {
     uint64_t issuedLoads = 0;
@@ -608,6 +615,84 @@ readTrace(const std::string &path)
     return records;
 }
 
+uint8_t
+hexNibble(char value)
+{
+    if (value >= '0' && value <= '9')
+        return uint8_t(value - '0');
+    if (value >= 'a' && value <= 'f')
+        return uint8_t(value - 'a' + 10);
+    throw std::runtime_error("boundary name encoding is invalid");
+}
+
+std::string
+decodeHexName(const std::string &encoded)
+{
+    if (encoded.empty() || encoded.size() % 2 != 0)
+        throw std::runtime_error("boundary name encoding is invalid");
+    std::string name;
+    name.reserve(encoded.size() / 2);
+    for (size_t index = 0; index < encoded.size(); index += 2) {
+        const char value = char(
+            (hexNibble(encoded[index]) << 4) | hexNibble(encoded[index + 1]));
+        if (value == '\0')
+            throw std::runtime_error("boundary name contains NUL");
+        name.push_back(value);
+    }
+    return name;
+}
+
+std::vector<OutputBoundary>
+readBoundaryMap(const std::string &path,
+                const std::vector<TraceRecord> &records)
+{
+    if (path.empty())
+        return {};
+    std::ifstream stream(path);
+    if (!stream)
+        throw std::runtime_error("cannot open canonical boundary map");
+    std::string magic;
+    uint64_t boundaryCount = 0;
+    if (!(stream >> magic >> boundaryCount) || magic != "MTRBND1")
+        throw std::runtime_error("canonical boundary map header differs");
+    if (boundaryCount > records.size() + 1)
+        throw std::runtime_error("canonical boundary map count is invalid");
+    std::vector<OutputBoundary> boundaries;
+    std::unordered_set<std::string> names;
+    boundaries.reserve(size_t(boundaryCount));
+    for (uint64_t boundary = 0; boundary < boundaryCount; ++boundary) {
+        std::string encodedName;
+        uint64_t wordBits = 0;
+        uint64_t wordCount = 0;
+        if (!(stream >> encodedName >> wordBits >> wordCount) ||
+            (wordBits != 32 && wordBits != 64) ||
+            wordCount > records.size()) {
+            throw std::runtime_error("canonical boundary map shape differs");
+        }
+        const std::string name = decodeHexName(encodedName);
+        if (!names.insert(name).second)
+            throw std::runtime_error("canonical boundary name is duplicate");
+        OutputBoundary output{name, uint32_t(wordBits), {}};
+        output.words.reserve(size_t(wordCount));
+        for (uint64_t word = 0; word < wordCount; ++word) {
+            uint64_t sequence = 0;
+            if (!(stream >> sequence) || sequence >= records.size())
+                throw std::runtime_error(
+                    "canonical boundary operation mapping differs");
+            const uint64_t raw = records[size_t(sequence)].result;
+            if (wordBits == 32 && raw >= (uint64_t(1) << 32))
+                throw std::runtime_error(
+                    "canonical boundary uint32 word overflows");
+            output.words.push_back(raw);
+        }
+        boundaries.push_back(std::move(output));
+    }
+    std::string trailing;
+    if (stream >> trailing)
+        throw std::runtime_error("canonical boundary map has trailing data");
+    return boundaries;
+}
+
 bool
 readExact(int descriptor, void *destination, size_t bytes, bool allowEof)
 {
@@ -920,7 +1005,8 @@ void
 writeResult(const std::string &path, const std::string &system,
             size_t traceRecords,
             const std::vector<Commit> &commits, size_t allocatedBytes,
-            size_t phases, const ReplayStats &stats, const std::string &mode)
+            size_t phases, const ReplayStats &stats, const std::string &mode,
+            const std::vector<OutputBoundary> &boundaries = {})
 {
     std::ofstream stream(path);
     if (!stream)
@@ -966,7 +1052,22 @@ writeResult(const std::string &path, const std::string &system,
         stream << core;
         first = false;
     }
-    stream << "],\"trace_records\":" << traceRecords
+    stream << "],\"output_boundaries\":{";
+    for (size_t boundary = 0; boundary < boundaries.size(); ++boundary) {
+        if (boundary)
+            stream << ',';
+        stream << std::quoted(boundaries[boundary].name)
+               << ":{\"word_bits\":" << boundaries[boundary].wordBits
+               << ",\"count\":" << boundaries[boundary].words.size()
+               << ",\"raw_words\":[";
+        for (size_t word = 0; word < boundaries[boundary].words.size(); ++word) {
+            if (word)
+                stream << ',';
+            stream << boundaries[boundary].words[word];
+        }
+        stream << "]}";
+    }
+    stream << "},\"trace_records\":" << traceRecords
            << ",\"verification\":\"pass\"}\n";
     if (!stream)
         throw std::runtime_error("replay result write failed");
@@ -1043,6 +1144,7 @@ main(int argc, char **argv)
         std::string resultPath;
         std::string mode = "functional";
         std::string windowManifest;
+        std::string boundaryMap;
         uint64_t selectedPhase = 0;
         uint64_t windowIndex = 0;
         uint64_t measureStartItem = 0;
@@ -1060,6 +1162,8 @@ main(int argc, char **argv)
                 tracePath = argv[++index];
             else if (option == "--result")
                 resultPath = argv[++index];
+            else if (option == "--boundary-map")
+                boundaryMap = argv[++index];
             else if (option == "--mode")
                 mode = argv[++index];
             else if (option == "--window-manifest")
@@ -1086,8 +1190,9 @@ main(int argc, char **argv)
             throw std::runtime_error("replay options are incomplete");
         if (mode != "functional" && mode != "window")
             throw std::runtime_error("replay mode is invalid");
-        if (streamMode && mode != "functional")
-            throw std::runtime_error("stream replay must be functional");
+        if (streamMode && (mode != "functional" || !boundaryMap.empty()))
+            throw std::runtime_error(
+                "stream replay must be functional without an eager boundary map");
         if (mode == "functional" &&
             (!windowManifest.empty() || hasPhase || hasWindowIndex ||
              hasMeasureStartItem)) {
@@ -1116,6 +1221,7 @@ main(int argc, char **argv)
         }
 
         const auto records = readTrace(tracePath);
+        const auto outputBoundaries = readBoundaryMap(boundaryMap, records);
         Memory memory(records);
         std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
                   << memory.allocatedBytes() << " allocated_bytes="
@@ -1165,7 +1271,8 @@ main(int argc, char **argv)
                                  previousStore, commitSlots, commits);
         }
         writeResult(resultPath, system, records.size(), commits,
-                    memory.allocatedBytes(), measuredPhases, stats, mode);
+                    memory.allocatedBytes(), measuredPhases, stats, mode,
+                    outputBoundaries);
 #ifndef TRACE_REPLAY_NATIVE
         m5_exit(0);
 #endif

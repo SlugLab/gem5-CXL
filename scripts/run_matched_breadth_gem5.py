@@ -58,6 +58,7 @@ _NPB_PHASE_NAMES = {
 _STREAM_MAGIC = b"MTRCV2\0\0"
 _STREAM_HEADER = struct.Struct("<8sQQ")
 _STREAM_CHUNK_RECORDS = 4096
+_BOUNDARY_MAGIC = "MTRBND1"
 
 
 class ReplayError(RuntimeError):
@@ -67,6 +68,7 @@ class ReplayError(RuntimeError):
 @dataclasses.dataclass(frozen=True)
 class MaterializedTrace:
     root: Path
+    fixed_root: Path
     source_schema: int
     source_trace_sha256: str
     phase: int
@@ -160,7 +162,7 @@ def _window_coordinates(manifest, *, trace_sha256, phase_name, work_items,
     return plan.windows[window_index]
 
 
-def _write_segment_payload(root, operations):
+def _write_segment_payload(root, operations, *, label="selected timing window"):
     root = Path(root).resolve()
     if root.exists():
         raise ReplayError(f"fresh materialized trace root required: {root}")
@@ -192,8 +194,69 @@ def _write_segment_payload(root, operations):
         Path(temporary_name).unlink(missing_ok=True)
         raise
     if count == 0:
-        raise ReplayError("selected timing window has no canonical operations")
+        raise ReplayError(f"{label} has no canonical operations")
     return digest.hexdigest(), count
+
+
+def _write_partitioned_payload(dynamic_root, fixed_root, operations):
+    """Write dynamic and fixed records in one bounded pass over a source."""
+    dynamic_root = Path(dynamic_root).resolve()
+    fixed_root = Path(fixed_root).resolve()
+    if dynamic_root.exists() or fixed_root.exists():
+        raise ReplayError("fresh materialized dynamic and fixed roots required")
+    dynamic_root.mkdir(parents=True)
+    fixed_root.mkdir(parents=True)
+    roots = (dynamic_root, fixed_root)
+    descriptors = []
+    temporary_paths = []
+    streams = []
+    digests = [hashlib.sha256(), hashlib.sha256()]
+    counts = [0, 0]
+    try:
+        for root in roots:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".trace.bin.", dir=root
+            )
+            descriptors.append(descriptor)
+            temporary_paths.append(Path(temporary_name))
+            streams.append(os.fdopen(descriptor, "wb"))
+        descriptors.clear()
+        for fixed, operation in operations:
+            index = 1 if fixed else 0
+            sequenced = dataclasses.replace(
+                operation, sequence=counts[index]
+            )
+            payload = canonical.TRACE_STRUCT.pack(
+                sequenced.phase, int(sequenced.opcode), 0,
+                sequenced.work_item, sequenced.sequence, sequenced.address,
+                sequenced.operand0, sequenced.operand1, sequenced.result,
+            )
+            streams[index].write(payload)
+            digests[index].update(payload)
+            counts[index] += 1
+        for stream in streams:
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+        streams.clear()
+        for temporary, root in zip(temporary_paths, roots):
+            os.replace(temporary, root / "trace.bin")
+    except BaseException:
+        for stream in streams:
+            stream.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+        for temporary in temporary_paths:
+            temporary.unlink(missing_ok=True)
+        raise
+    if counts[0] == 0:
+        raise ReplayError("selected timing window has no canonical operations")
+    if counts[1] == 0:
+        raise ReplayError("selected timing window has no fixed events")
+    return tuple(
+        (digest.hexdigest(), count)
+        for digest, count in zip(digests, counts)
+    )
 
 
 def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
@@ -211,7 +274,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
             work_items=phase_items, window_index=window_index,
         )
 
-        def selected_operations():
+        def partitioned_operations():
             for operation in source.operations:
                 if operation.phase != phase:
                     continue
@@ -219,15 +282,16 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                     canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
                 }:
                     state["fixed"] += 1
+                    yield True, operation
                     continue
                 if window.warmup_start <= operation.work_item < window.measure_stop:
-                    yield dataclasses.replace(
+                    yield False, dataclasses.replace(
                         operation,
                         work_item=operation.work_item - window.warmup_start,
                     )
 
         source_meta = source.meta
-        operations = selected_operations()
+        operations = partitioned_operations()
     else:
         source_schema = 2
         source = lazy.read_bundle(trace)
@@ -237,7 +301,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
             work_items=phase_items, window_index=window_index,
         )
 
-        def selected_operations():
+        def partitioned_operations():
             phase_base = 0
             expanded = 0
             with lazy.MappedState(source) as mapped:
@@ -260,13 +324,18 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                             canonical.Opcode.COMMIT,
                         }:
                             state["fixed"] += 1
+                            yield True, operation
                             continue
                         if operation.work_item >= invocation.work_items:
                             state["fixed"] += 1
+                            yield True, dataclasses.replace(
+                                operation,
+                                work_item=phase_base + operation.work_item,
+                            )
                             continue
                         global_item = phase_base + operation.work_item
                         if window.warmup_start <= global_item < window.measure_stop:
-                            yield dataclasses.replace(
+                            yield False, dataclasses.replace(
                                 operation,
                                 work_item=global_item - window.warmup_start,
                             )
@@ -280,9 +349,14 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                 raise ReplayError("lazy phase work count changed during expansion")
 
         source_meta = source.meta
-        operations = selected_operations()
+        operations = partitioned_operations()
 
-    trace_sha256, trace_records = _write_segment_payload(outdir, operations)
+    fixed_outdir = Path(outdir).with_name(Path(outdir).name + ".fixed")
+    dynamic_record, fixed_record = _write_partitioned_payload(
+        outdir, fixed_outdir, operations
+    )
+    trace_sha256, trace_records = dynamic_record
+    fixed_trace_sha256, fixed_trace_records = fixed_record
     warmup_items = window.measure_start - window.warmup_start
     measured_items = window.measure_stop - window.measure_start
     meta = {
@@ -311,9 +385,21 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         "outputs": {},
     }
     contract.atomic_write_json(Path(outdir) / "trace.meta.json", meta)
+    fixed_meta = {
+        **meta,
+        "phases": [{"id": phase, "name": f"{phase_name}.fixed",
+                    "work_items": phase_items}],
+        "measure_start_item": 0,
+        "trace_sha256": fixed_trace_sha256,
+        "trace_records": fixed_trace_records,
+        "fixed_component": True,
+    }
+    contract.atomic_write_json(fixed_outdir / "trace.meta.json", fixed_meta)
     canonical.read_bundle(outdir)
+    canonical.read_bundle(fixed_outdir)
     return MaterializedTrace(
-        Path(outdir).resolve(), source_schema, source_sha256, phase,
+        Path(outdir).resolve(), fixed_outdir.resolve(), source_schema,
+        source_sha256, phase,
         phase_name, warmup_items, measured_items, warmup_items, state["fixed"],
     )
 
@@ -459,6 +545,115 @@ def build_replay_binary(outdir, *, native=False, cxx="g++"):
     return binary
 
 
+def _boundary_contract(bundle):
+    specifications = bundle.meta.get("output_boundaries")
+    if not isinstance(specifications, dict):
+        raise ReplayError("canonical output boundary metadata is invalid")
+    if set(specifications) != set(bundle.outputs):
+        raise ReplayError("canonical output boundary set differs")
+    rows = []
+    for name in sorted(specifications):
+        specification = specifications[name]
+        if not isinstance(specification, dict):
+            raise ReplayError(f"output boundary {name} metadata is invalid")
+        word_bits = specification.get("word_bits")
+        count = specification.get("count")
+        sequences = specification.get("operation_sequences")
+        if word_bits not in (32, 64):
+            raise ReplayError(f"output boundary {name} word width is invalid")
+        if (
+            isinstance(count, bool) or not isinstance(count, int)
+            or count < 0 or len(bundle.outputs[name]) != count
+        ):
+            raise ReplayError(f"output boundary {name} count is invalid")
+        if not isinstance(sequences, list) or len(sequences) != count:
+            raise ReplayError(
+                f"output boundary {name} operation mapping is missing"
+            )
+        checked = []
+        for index, sequence in enumerate(sequences):
+            if (
+                isinstance(sequence, bool) or not isinstance(sequence, int)
+                or sequence < 0 or sequence >= len(bundle.operations)
+            ):
+                raise ReplayError(
+                    f"output boundary {name} operation mapping {index} "
+                    "is invalid"
+                )
+            raw = bundle.operations[sequence].result
+            if raw >= 1 << word_bits:
+                raise ReplayError(
+                    f"output boundary {name} operation mapping {index} "
+                    f"exceeds uint{word_bits}"
+                )
+            checked.append(sequence)
+        rows.append((name, word_bits, tuple(checked)))
+    return tuple(rows)
+
+
+def _validate_lazy_functional_boundaries(bundle):
+    commitments = bundle.meta.get("boundary_commitments")
+    if not isinstance(commitments, dict) or not commitments:
+        raise ReplayError("lazy trace raw output boundary mapping is missing")
+    mappings = bundle.meta.get("output_boundary_mappings")
+    outputs = bundle.meta.get("output_boundaries")
+    if (
+        not isinstance(mappings, dict) or not isinstance(outputs, dict)
+        or set(mappings) != set(commitments) or set(outputs) != set(commitments)
+    ):
+        raise ReplayError("lazy trace raw output boundary mapping is missing")
+    raise ReplayError(
+        "lazy trace raw output boundary replay is not implemented"
+    )
+
+
+def _write_boundary_map(bundle, path):
+    """Bind each named raw word to one canonical observed operation."""
+    path = Path(path).resolve()
+    if path.exists():
+        raise ReplayError(f"fresh boundary map required: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _boundary_contract(bundle)
+    lines = [_BOUNDARY_MAGIC, str(len(rows))]
+    for name, word_bits, sequences in rows:
+        encoded_name = name.encode("utf-8").hex()
+        lines.append(" ".join((
+            encoded_name, str(word_bits), str(len(sequences)),
+            *(str(sequence) for sequence in sequences),
+        )))
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+    return path
+
+
+def validate_output_boundaries(bundle, observed):
+    """Require an exact named/shape/order/raw-word replay boundary image."""
+    _boundary_contract(bundle)
+    if not isinstance(observed, dict):
+        raise ReplayError("replay output boundaries are missing")
+    if set(observed) != set(bundle.outputs):
+        raise ReplayError("replay output boundary set differs from canonical")
+    for name in sorted(bundle.outputs):
+        record = observed[name]
+        specification = bundle.meta["output_boundaries"][name]
+        if not isinstance(record, dict):
+            raise ReplayError(f"replay output boundary {name} is invalid")
+        if record.get("word_bits") != specification["word_bits"]:
+            raise ReplayError(f"replay output boundary {name} width differs")
+        if record.get("count") != specification["count"]:
+            raise ReplayError(f"replay output boundary {name} count differs")
+        words = record.get("raw_words")
+        if not isinstance(words, list):
+            raise ReplayError(f"replay output boundary {name} words are missing")
+        try:
+            canonical.compare_words(
+                bundle.outputs[name], words, name,
+                word_bits=specification["word_bits"],
+            )
+        except canonical.TraceError as error:
+            raise ReplayError(str(error)) from error
+    return observed
+
+
 def run_native_replay(binary, *, system, trace, outdir):
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
@@ -470,6 +665,7 @@ def run_native_replay(binary, *, system, trace, outdir):
     bundle = canonical.read_bundle(trace)
     outdir.mkdir(parents=True)
     result = outdir / "result.json"
+    boundary_map = _write_boundary_map(bundle, outdir / "boundary-map.txt")
     command = [
         str(binary),
         "--system",
@@ -478,6 +674,8 @@ def run_native_replay(binary, *, system, trace, outdir):
         str(trace / "trace.bin"),
         "--result",
         str(result),
+        "--boundary-map",
+        str(boundary_map),
     ]
     try:
         subprocess.run(
@@ -501,6 +699,7 @@ def run_native_replay(binary, *, system, trace, outdir):
         raise ReplayError("native replay record count differs from trace")
     if value.get("verification") != "pass":
         raise ReplayError("native replay bit-exact verification failed")
+    validate_output_boundaries(bundle, value.get("output_boundaries"))
     return value
 
 
@@ -517,7 +716,7 @@ def _integer(row, field):
     return result
 
 
-def validate_mechanism(system, row):
+def validate_mechanism(system, row, *, require_activity=True):
     """Fail closed on topology, correctness, or mechanism-counter drift."""
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
@@ -539,7 +738,7 @@ def validate_mechanism(system, row):
     if system == "amu":
         issued = _integer(row, "issued_loads")
         completed = _integer(row, "completed_loads")
-        if issued == 0 or issued != completed:
+        if issued != completed or (require_activity and issued == 0):
             raise ReplayError("AMU issued/completed loads differ")
         drains = _integer(row, "drains")
         phases = _integer(row, "phases")
@@ -548,15 +747,17 @@ def validate_mechanism(system, row):
     elif system == "cira":
         issued = _integer(row, "issued_prefetches")
         completed = _integer(row, "completed_prefetches")
-        if issued == 0 or issued != completed:
+        if issued != completed or (require_activity and issued == 0):
             raise ReplayError("CIRA issued/completed prefetches differ")
         issued_per_core = row.get("issued_per_core")
         completed_per_core = row.get("completed_per_core")
         if (
             not isinstance(issued_per_core, list)
             or len(issued_per_core) != 4
-            or any(_integer({"value": value}, "value") == 0
-                   for value in issued_per_core)
+            or (require_activity and any(
+                _integer({"value": value}, "value") == 0
+                for value in issued_per_core
+            ))
         ):
             raise ReplayError("CIRA requires four active cores")
         if issued_per_core != completed_per_core:
@@ -698,6 +899,9 @@ def command_for(options):
     ]
     if getattr(options, "stream_mode", False):
         binary_args.extend(("--stream", "1"))
+    boundary_map = getattr(options, "boundary_map", None)
+    if boundary_map is not None:
+        binary_args.extend(("--boundary-map", str(Path(boundary_map).resolve())))
     if options.mode == "functional":
         if any(
             value is not None
@@ -798,7 +1002,8 @@ def _required_shadow_bytes(bundle):
 
 
 def collect_run_evidence(run_dir, *, system, trace, config,
-                         expected=None, required_bytes=None):
+                         expected=None, required_bytes=None,
+                         require_activity=True):
     """Join bit-exact program output with gem5-owned causal statistics."""
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
@@ -824,6 +1029,10 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         raise ReplayError("stream replay record count differs")
     if result.get("verification") != "pass":
         raise ReplayError("replay program verification did not pass")
+    if bundle is not None:
+        validate_output_boundaries(bundle, result.get("output_boundaries"))
+    elif result.get("output_boundaries") != {}:
+        raise ReplayError("stream replay emitted unmapped output boundaries")
 
     topology = validate_config_ini(config)
     allocation = (
@@ -898,8 +1107,55 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         row["descriptor_errors"] = _stat_integer(
             stats, "board.cira.droppedCsrDescriptors"
         )
-    validate_mechanism(system, row)
+    validate_mechanism(system, row, require_activity=require_activity)
     return row
+
+
+def combine_window_evidence(dynamic, fixed, *, fixed_trace):
+    """Keep measured-window and one-time fixed ROI timing disjoint."""
+    dynamic_ticks = _integer(dynamic, "sim_ticks")
+    fixed_ticks = _integer(fixed, "sim_ticks")
+    if dynamic.get("verification") != "pass":
+        raise ReplayError("dynamic window verification did not pass")
+    if fixed.get("verification") != "pass":
+        raise ReplayError("fixed replay verification did not pass")
+    if fixed_ticks == 0:
+        raise ReplayError("fixed replay simTicks must be positive")
+    fixed_trace = Path(fixed_trace).resolve()
+    if not fixed_trace.is_file():
+        raise ReplayError("fixed replay trace artifact is missing")
+    return {
+        **dynamic,
+        "sim_ticks": dynamic_ticks,
+        "fixed_sim_ticks": fixed_ticks,
+        "fixed_trace_sha256": _sha256_file(fixed_trace),
+    }
+
+
+def _launch_gem5(command, *, outdir, timeout, label):
+    outdir = Path(outdir).resolve()
+    outdir.parent.mkdir(parents=True, exist_ok=True)
+    driver_log = outdir.with_suffix(f".{label}.driver.log")
+    try:
+        with driver_log.open("x", encoding="utf-8") as stream:
+            completed = subprocess.run(
+                command,
+                cwd=REPO,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=None if timeout == 0 else timeout,
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReplayError(
+            f"gem5 {label} replay launch failed: {error}"
+        ) from error
+    if completed.returncode != 0:
+        raise ReplayError(
+            f"gem5 {label} replay exited {completed.returncode}; "
+            f"see {driver_log}"
+        )
+    return driver_log
 
 
 def parse_args(argv=None):
@@ -950,6 +1206,7 @@ def run(options):
     producer_evidence = {}
     producer_errors = []
     pipe_read = None
+    boundary_map = None
     replay_trace = trace
     if options.mode == "window":
         materialized = materialize_window_trace(
@@ -962,13 +1219,18 @@ def run(options):
         replay_trace = materialized.root
     elif (trace / "trace.v2.json").is_file():
         lazy_bundle = lazy.read_bundle(trace)
+        _validate_lazy_functional_boundaries(lazy_bundle)
     else:
         try:
-            canonical.read_bundle(trace)
+            eager_bundle = canonical.read_bundle(trace)
         except canonical.TraceError as error:
             raise ReplayError(
                 f"invalid canonical replay trace: {error}"
             ) from error
+        boundary_map = _write_boundary_map(
+            eager_bundle,
+            outdir.with_name(outdir.name + ".boundary-map.txt"),
+        )
     if options.mode == "window":
         manifest = Path(options.window_manifest).resolve()
         if not manifest.is_file():
@@ -996,11 +1258,13 @@ def run(options):
         producer_thread.start()
     else:
         run_options.replay_trace = replay_trace / "trace.bin"
+    if boundary_map is not None:
+        run_options.boundary_map = boundary_map
     if materialized is not None:
         run_options.measure_start_item = materialized.measure_start_item
     command = command_for(run_options)
     outdir.parent.mkdir(parents=True, exist_ok=True)
-    driver_log = outdir.with_suffix(".driver.log")
+    driver_log = outdir.with_suffix(".dynamic.driver.log")
     completed = None
     launch_error = None
     try:
@@ -1046,6 +1310,35 @@ def run(options):
             config=outdir / "config.ini", expected=producer_evidence,
             required_bytes=required_bytes,
         )
+    fixed_command = None
+    fixed_row = None
+    fixed_outdir = None
+    if materialized is not None:
+        fixed_outdir = outdir.with_name(outdir.name + ".fixed")
+        fixed_options = argparse.Namespace(**vars(options))
+        fixed_options.outdir = fixed_outdir
+        fixed_options.trace = materialized.fixed_root
+        fixed_options.replay_trace = materialized.fixed_root / "trace.bin"
+        fixed_options.measure_start_item = 0
+        fixed_bundle = canonical.read_bundle(materialized.fixed_root)
+        fixed_options.boundary_map = _write_boundary_map(
+            fixed_bundle,
+            fixed_outdir.with_name(fixed_outdir.name + ".boundary-map.txt"),
+        )
+        fixed_command = command_for(fixed_options)
+        _launch_gem5(
+            fixed_command, outdir=fixed_outdir, timeout=options.timeout,
+            label="fixed",
+        )
+        fixed_row = collect_run_evidence(
+            fixed_outdir, system=options.system,
+            trace=materialized.fixed_root,
+            config=fixed_outdir / "config.ini", require_activity=False,
+        )
+        row = combine_window_evidence(
+            row, fixed_row,
+            fixed_trace=materialized.fixed_root / "trace.bin",
+        )
     source_descriptor = (
         trace / "trace.v2.json"
         if (trace / "trace.v2.json").is_file()
@@ -1070,6 +1363,18 @@ def run(options):
             **dataclasses.asdict(materialized),
             "root": str(materialized.root),
             "trace_sha256": _sha256_file(replay_trace / "trace.bin"),
+        }
+        evidence["fixed_replay"] = {
+            "root": str(fixed_outdir),
+            "command": fixed_command,
+            "row": fixed_row,
+            "trace_root": str(materialized.fixed_root),
+            "trace_sha256": _sha256_file(
+                materialized.fixed_root / "trace.bin"
+            ),
+            "config_sha256": _sha256_file(fixed_outdir / "config.ini"),
+            "stats_sha256": _sha256_file(fixed_outdir / "stats.txt"),
+            "result_sha256": _sha256_file(fixed_outdir / "result.json"),
         }
     if lazy_bundle is not None:
         evidence["functional_stream"] = producer_evidence
