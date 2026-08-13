@@ -957,5 +957,646 @@ class NpbCgLazyTraceTest(unittest.TestCase):
             tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
 
 
+class NpbMgLazyTraceTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def image(self, name, values, base, role="input"):
+        payload = b"".join(F64.pack(value) for value in values)
+        path = self.root / f"images/{name}.f64"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return lazy.ArrayImage(
+            name, role, "f64", len(values), base,
+            path.relative_to(self.root).as_posix(), digest(payload),
+        )
+
+    @staticmethod
+    def index(i1, i2, i3, n1, n2, n3):
+        del n3
+        return i1 + n1 * (i2 + n2 * i3)
+
+    def resid_reference(self, u, v, n1, n2, n3, coefficients):
+        result = [0.0] * len(u)
+        index = self.index
+        a0, _a1, a2, a3 = coefficients
+        for i3 in range(1, n3 - 1):
+            for i2 in range(1, n2 - 1):
+                u1 = []
+                u2 = []
+                for i1 in range(n1):
+                    u1.append(
+                        ((u[index(i1, i2 - 1, i3, n1, n2, n3)] +
+                          u[index(i1, i2 + 1, i3, n1, n2, n3)]) +
+                         u[index(i1, i2, i3 - 1, n1, n2, n3)]) +
+                        u[index(i1, i2, i3 + 1, n1, n2, n3)]
+                    )
+                    u2.append(
+                        ((u[index(i1, i2 - 1, i3 - 1, n1, n2, n3)] +
+                          u[index(i1, i2 + 1, i3 - 1, n1, n2, n3)]) +
+                         u[index(i1, i2 - 1, i3 + 1, n1, n2, n3)]) +
+                        u[index(i1, i2 + 1, i3 + 1, n1, n2, n3)]
+                    )
+                for i1 in range(1, n1 - 1):
+                    at = index(i1, i2, i3, n1, n2, n3)
+                    value = v[at] - a0 * u[at]
+                    value = value - a2 * ((u2[i1] + u1[i1 - 1]) + u1[i1 + 1])
+                    value = value - a3 * (u2[i1 - 1] + u2[i1 + 1])
+                    result[at] = value
+        for i3 in range(1, n3 - 1):
+            for i2 in range(1, n2 - 1):
+                result[index(0, i2, i3, n1, n2, n3)] = result[index(n1 - 2, i2, i3, n1, n2, n3)]
+                result[index(n1 - 1, i2, i3, n1, n2, n3)] = result[index(1, i2, i3, n1, n2, n3)]
+            for i1 in range(n1):
+                result[index(i1, 0, i3, n1, n2, n3)] = result[index(i1, n2 - 2, i3, n1, n2, n3)]
+                result[index(i1, n2 - 1, i3, n1, n2, n3)] = result[index(i1, 1, i3, n1, n2, n3)]
+        for i2 in range(n2):
+            for i1 in range(n1):
+                result[index(i1, i2, 0, n1, n2, n3)] = result[index(i1, i2, n3 - 2, n1, n2, n3)]
+                result[index(i1, i2, n3 - 1, n1, n2, n3)] = result[index(i1, i2, 1, n1, n2, n3)]
+        return tuple(result)
+
+    def resid_bundle(self):
+        n1 = n2 = n3 = 4
+        count = n1 * n2 * n3
+        u = tuple((index + 1) / 16.0 for index in range(count))
+        v = tuple(((-1.0) ** index) * (index + 3) / 32.0
+                  for index in range(count))
+        r = (0.0,) * count
+        coefficients = (1.25, 0.0, -0.5, 0.25)
+        arrays = (
+            self.image("mg_u", u, 0x10000),
+            self.image("mg_v", v, 0x20000),
+            self.image("mg_r", r, 0x30000, "state"),
+        )
+        invocation = lazy.Invocation(
+            0, 201, "npb_mg_resid", 1, 8,
+            {
+                "u": "mg_u", "v": "mg_v", "r": "mg_r",
+                "n1": n1, "n2": n2, "n3": n3,
+                "a_raw": [raw_f64(value) for value in coefficients],
+                "boundaries": ["mg_r"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            },
+            arrays, (invocation,), {"primitive_records": 434},
+        )
+        return lazy.read_bundle(self.root), u, v, coefficients
+
+    def test_mg_resid_preserves_stencil_grouping_and_comm3_boundaries(self):
+        bundle, u, v, coefficients = self.resid_bundle()
+        operations = tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
+        self.assertEqual(len(operations), 434)
+        self.assertEqual(operations[0].opcode, canonical.Opcode.BARRIER)
+        self.assertEqual(operations[-1].opcode, canonical.Opcode.COMMIT)
+        expected = self.resid_reference(u, v, 4, 4, 4, coefficients)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "mg_r.iter1": digest(b"".join(F64.pack(value) for value in expected))
+        })
+
+    def norm_bundle(self):
+        n1 = n2 = n3 = 4
+        values = tuple((index - 31) / 8.0 for index in range(64))
+        arrays = (self.image("mg_norm_r", values, 0x40000),)
+        invocation = lazy.Invocation(
+            0, 205, "npb_mg_norm2u3", 2, 8,
+            {
+                "r": "mg_norm_r", "n1": n1, "n2": n2, "n3": n3,
+                "dn_raw": raw_f64(8.0), "rnm2": "rnm2", "rnmu": "rnmu",
+                "results": ["rnm2", "rnmu"], "lanes": lanes(8),
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            },
+            arrays, (invocation,), {"primitive_records": 58},
+        )
+        return lazy.read_bundle(self.root), values
+
+    def test_mg_norm_uses_sum_max_trees_division_and_sqrt(self):
+        bundle, values = self.norm_bundle()
+        operations = tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
+        self.assertEqual(len(operations), 58)
+        self.assertEqual(
+            sum(row.opcode == canonical.Opcode.F64_MAX for row in operations),
+            11,
+        )
+        self.assertEqual(
+            sum(row.opcode == canonical.Opcode.F64_ABS for row in operations),
+            8,
+        )
+        interior = [values[self.index(i1, i2, i3, 4, 4, 4)]
+                    for i3 in range(1, 3)
+                    for i2 in range(1, 3)
+                    for i1 in range(1, 3)]
+        lane_sums = []
+        lane_maxes = []
+        for lane in range(4):
+            first, last = lanes(8)[lane]
+            total = 0.0
+            maximum = 0.0
+            for value in interior[first:last]:
+                total = total + value * value
+                maximum = max(maximum, abs(value))
+            lane_sums.append(total)
+            lane_maxes.append(maximum)
+        total = (lane_sums[0] + lane_sums[1]) + (lane_sums[2] + lane_sums[3])
+        maximum = max(max(lane_maxes[0], lane_maxes[1]),
+                      max(lane_maxes[2], lane_maxes[3]))
+        rnm2 = math.sqrt(total / 8.0)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "scalar.rnm2.iter2": digest(U64.pack(raw_f64(rnm2))),
+            "scalar.rnmu.iter2": digest(U64.pack(raw_f64(maximum))),
+        })
+
+    def test_canonical_abi_exposes_f64_absolute_value(self):
+        self.assertEqual(canonical.Opcode.F64_ABS.value, 23)
+
+    def psinv_reference(self, r, u, n1, n2, n3, coefficients):
+        result = list(u)
+        index = self.index
+        c0, c1, c2, _c3 = coefficients
+        for i3 in range(1, n3 - 1):
+            for i2 in range(1, n2 - 1):
+                r1 = []
+                r2 = []
+                for i1 in range(n1):
+                    r1.append(
+                        ((r[index(i1, i2 - 1, i3, n1, n2, n3)] +
+                          r[index(i1, i2 + 1, i3, n1, n2, n3)]) +
+                         r[index(i1, i2, i3 - 1, n1, n2, n3)]) +
+                        r[index(i1, i2, i3 + 1, n1, n2, n3)]
+                    )
+                    r2.append(
+                        ((r[index(i1, i2 - 1, i3 - 1, n1, n2, n3)] +
+                          r[index(i1, i2 + 1, i3 - 1, n1, n2, n3)]) +
+                         r[index(i1, i2 - 1, i3 + 1, n1, n2, n3)]) +
+                        r[index(i1, i2 + 1, i3 + 1, n1, n2, n3)]
+                    )
+                for i1 in range(1, n1 - 1):
+                    at = index(i1, i2, i3, n1, n2, n3)
+                    value = result[at] + c0 * r[at]
+                    value = value + c1 * ((r[index(i1 - 1, i2, i3, n1, n2, n3)] +
+                                           r[index(i1 + 1, i2, i3, n1, n2, n3)]) + r1[i1])
+                    value = value + c2 * ((r2[i1] + r1[i1 - 1]) + r1[i1 + 1])
+                    result[at] = value
+        # The routine calls comm3(u).
+        for i3 in range(1, n3 - 1):
+            for i2 in range(1, n2 - 1):
+                result[index(0, i2, i3, n1, n2, n3)] = result[index(n1 - 2, i2, i3, n1, n2, n3)]
+                result[index(n1 - 1, i2, i3, n1, n2, n3)] = result[index(1, i2, i3, n1, n2, n3)]
+            for i1 in range(n1):
+                result[index(i1, 0, i3, n1, n2, n3)] = result[index(i1, n2 - 2, i3, n1, n2, n3)]
+                result[index(i1, n2 - 1, i3, n1, n2, n3)] = result[index(i1, 1, i3, n1, n2, n3)]
+        for i2 in range(n2):
+            for i1 in range(n1):
+                result[index(i1, i2, 0, n1, n2, n3)] = result[index(i1, i2, n3 - 2, n1, n2, n3)]
+                result[index(i1, i2, n3 - 1, n1, n2, n3)] = result[index(i1, i2, 1, n1, n2, n3)]
+        return tuple(result)
+
+    def test_mg_psinv_preserves_expression_grouping_and_comm3(self):
+        n1 = n2 = n3 = 4
+        count = 64
+        r = tuple((index - 17) / 16.0 for index in range(count))
+        u = tuple((index + 5) / 32.0 for index in range(count))
+        coefficients = (0.75, -0.25, 0.125, 0.0)
+        arrays = (
+            self.image("ps_r", r, 0x50000),
+            self.image("ps_u", u, 0x60000, "state"),
+        )
+        invocation = lazy.Invocation(
+            0, 204, "npb_mg_psinv", 3, 8,
+            {
+                "r": "ps_r", "u": "ps_u",
+                "n1": n1, "n2": n2, "n3": n3,
+                "c_raw": [raw_f64(value) for value in coefficients],
+                "boundaries": ["ps_u"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, (invocation,), {"primitive_records": 458},
+        )
+        bundle = lazy.read_bundle(self.root)
+        self.assertEqual(
+            len(tuple(lazy.iter_operations(bundle, npb.EXPANDERS))), 458
+        )
+        expected = self.psinv_reference(r, u, n1, n2, n3, coefficients)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "ps_u.iter3": digest(b"".join(F64.pack(value) for value in expected))
+        })
+
+    def rprj_reference(self, fine, fine_dims, coarse_dims):
+        m1k, m2k, m3k = fine_dims
+        m1j, m2j, m3j = coarse_dims
+        coarse = [0.0] * (m1j * m2j * m3j)
+        d1 = 2 if m1k == 3 else 1
+        d2 = 2 if m2k == 3 else 1
+        d3 = 2 if m3k == 3 else 1
+
+        def r(i1, i2, i3):
+            return fine[self.index(i1 - 1, i2 - 1, i3 - 1,
+                                   m1k, m2k, m3k)]
+
+        for j3 in range(2, m3j):
+            for j2 in range(2, m2j):
+                i3 = 2 * j3 - d3
+                i2 = 2 * j2 - d2
+                x1 = {}
+                y1 = {}
+                for j1 in range(2, m1j + 1):
+                    i1 = 2 * j1 - d1
+                    x1[i1 - 1] = ((r(i1 - 1, i2 - 1, i3) +
+                                  r(i1 - 1, i2 + 1, i3)) +
+                                 r(i1 - 1, i2, i3 - 1)) + r(i1 - 1, i2, i3 + 1)
+                    y1[i1 - 1] = ((r(i1 - 1, i2 - 1, i3 - 1) +
+                                  r(i1 - 1, i2 - 1, i3 + 1)) +
+                                 r(i1 - 1, i2 + 1, i3 - 1)) + r(i1 - 1, i2 + 1, i3 + 1)
+                for j1 in range(2, m1j):
+                    i1 = 2 * j1 - d1
+                    y2 = ((r(i1, i2 - 1, i3 - 1) + r(i1, i2 - 1, i3 + 1)) +
+                          r(i1, i2 + 1, i3 - 1)) + r(i1, i2 + 1, i3 + 1)
+                    x2 = ((r(i1, i2 - 1, i3) + r(i1, i2 + 1, i3)) +
+                          r(i1, i2, i3 - 1)) + r(i1, i2, i3 + 1)
+                    value = 0.5 * r(i1, i2, i3)
+                    value = value + 0.25 * ((r(i1 - 1, i2, i3) +
+                                             r(i1 + 1, i2, i3)) + x2)
+                    value = value + 0.125 * ((x1[i1 - 1] + x1[i1 + 1]) + y2)
+                    value = value + 0.0625 * (y1[i1 - 1] + y1[i1 + 1])
+                    coarse[self.index(j1 - 1, j2 - 1, j3 - 1,
+                                      m1j, m2j, m3j)] = value
+        # comm3 on the coarse result.
+        for i3 in range(1, m3j - 1):
+            for i2 in range(1, m2j - 1):
+                coarse[self.index(0, i2, i3, m1j, m2j, m3j)] = coarse[self.index(m1j - 2, i2, i3, m1j, m2j, m3j)]
+                coarse[self.index(m1j - 1, i2, i3, m1j, m2j, m3j)] = coarse[self.index(1, i2, i3, m1j, m2j, m3j)]
+            for i1 in range(m1j):
+                coarse[self.index(i1, 0, i3, m1j, m2j, m3j)] = coarse[self.index(i1, m2j - 2, i3, m1j, m2j, m3j)]
+                coarse[self.index(i1, m2j - 1, i3, m1j, m2j, m3j)] = coarse[self.index(i1, 1, i3, m1j, m2j, m3j)]
+        for i2 in range(m2j):
+            for i1 in range(m1j):
+                coarse[self.index(i1, i2, 0, m1j, m2j, m3j)] = coarse[self.index(i1, i2, m3j - 2, m1j, m2j, m3j)]
+                coarse[self.index(i1, i2, m3j - 1, m1j, m2j, m3j)] = coarse[self.index(i1, i2, 1, m1j, m2j, m3j)]
+        return tuple(coarse)
+
+    def test_mg_rprj3_preserves_projection_grouping_and_coarse_comm3(self):
+        fine_dims = (6, 6, 6)
+        coarse_dims = (4, 4, 4)
+        fine = tuple((index - 71) / 64.0 for index in range(216))
+        coarse = (0.0,) * 64
+        arrays = (
+            self.image("rp_r", fine, 0x70000),
+            self.image("rp_s", coarse, 0x80000, "state"),
+        )
+        invocation = lazy.Invocation(
+            0, 202, "npb_mg_rprj3", 4, 8,
+            {
+                "r": "rp_r", "s": "rp_s",
+                "m1k": 6, "m2k": 6, "m3k": 6,
+                "m1j": 4, "m2j": 4, "m3j": 4,
+                "boundaries": ["rp_s"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, (invocation,), {"primitive_records": 522},
+        )
+        bundle = lazy.read_bundle(self.root)
+        self.assertEqual(
+            len(tuple(lazy.iter_operations(bundle, npb.EXPANDERS))), 522
+        )
+        expected = self.rprj_reference(fine, fine_dims, coarse_dims)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "rp_s.iter4": digest(b"".join(F64.pack(value) for value in expected))
+        })
+
+    def test_mg_rprj3_three_point_level_uses_degenerate_offsets(self):
+        fine_dims = coarse_dims = (3, 3, 3)
+        fine = tuple((index - 11) / 32.0 for index in range(27))
+        arrays = (
+            self.image("rd_r", fine, 0x88000),
+            self.image("rd_s", (0.0,) * 27, 0x8C000, "state"),
+        )
+        invocation = lazy.Invocation(
+            0, 202, "npb_mg_rprj3", 41, 1,
+            {
+                "r": "rd_r", "s": "rd_s",
+                "m1k": 3, "m2k": 3, "m3k": 3,
+                "m1j": 3, "m2j": 3, "m3j": 3,
+                "boundaries": ["rd_s"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, (invocation,), {"primitive_records": 112},
+        )
+        bundle = lazy.read_bundle(self.root)
+        self.assertEqual(
+            len(tuple(lazy.iter_operations(bundle, npb.EXPANDERS))), 112
+        )
+        expected = self.rprj_reference(fine, fine_dims, coarse_dims)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "rd_s.iter41": digest(
+                b"".join(F64.pack(value) for value in expected)
+            )
+        })
+
+    def interp_reference(self, coarse, fine, coarse_dims, fine_dims):
+        mm1, mm2, mm3 = coarse_dims
+        n1, n2, n3 = fine_dims
+        result = list(fine)
+
+        def z(i1, i2, i3):
+            return coarse[self.index(i1 - 1, i2 - 1, i3 - 1,
+                                     mm1, mm2, mm3)]
+
+        def add(i1, i2, i3, value):
+            at = self.index(i1 - 1, i2 - 1, i3 - 1, n1, n2, n3)
+            result[at] = result[at] + value
+
+        for i3 in range(1, mm3):
+            for i2 in range(1, mm2):
+                z1 = {}
+                z2 = {}
+                z3 = {}
+                for i1 in range(1, mm1 + 1):
+                    z1[i1] = z(i1, i2 + 1, i3) + z(i1, i2, i3)
+                    z2[i1] = z(i1, i2, i3 + 1) + z(i1, i2, i3)
+                    z3[i1] = (z(i1, i2 + 1, i3 + 1) + z(i1, i2, i3 + 1)) + z1[i1]
+                for i1 in range(1, mm1):
+                    add(2 * i1 - 1, 2 * i2 - 1, 2 * i3 - 1,
+                        z(i1, i2, i3))
+                    add(2 * i1, 2 * i2 - 1, 2 * i3 - 1,
+                        0.5 * (z(i1 + 1, i2, i3) + z(i1, i2, i3)))
+                for i1 in range(1, mm1):
+                    add(2 * i1 - 1, 2 * i2, 2 * i3 - 1, 0.5 * z1[i1])
+                    add(2 * i1, 2 * i2, 2 * i3 - 1,
+                        0.25 * (z1[i1] + z1[i1 + 1]))
+                for i1 in range(1, mm1):
+                    add(2 * i1 - 1, 2 * i2 - 1, 2 * i3, 0.5 * z2[i1])
+                    add(2 * i1, 2 * i2 - 1, 2 * i3,
+                        0.25 * (z2[i1] + z2[i1 + 1]))
+                for i1 in range(1, mm1):
+                    add(2 * i1 - 1, 2 * i2, 2 * i3, 0.25 * z3[i1])
+                    add(2 * i1, 2 * i2, 2 * i3,
+                        0.125 * (z3[i1] + z3[i1 + 1]))
+        return tuple(result)
+
+    def test_mg_interp_normal_path_preserves_all_eight_weighted_updates(self):
+        coarse_dims = (4, 4, 4)
+        fine_dims = (6, 6, 6)
+        coarse = tuple((index - 13) / 32.0 for index in range(64))
+        fine = tuple((index + 7) / 128.0 for index in range(216))
+        arrays = (
+            self.image("ip_z", coarse, 0x90000),
+            self.image("ip_u", fine, 0xA0000, "state"),
+        )
+        invocation = lazy.Invocation(
+            0, 203, "npb_mg_interp", 5, 216,
+            {
+                "z": "ip_z", "u": "ip_u",
+                "mm1": 4, "mm2": 4, "mm3": 4,
+                "n1": 6, "n2": 6, "n3": 6,
+                "boundaries": ["ip_u"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, (invocation,), {"primitive_records": 1388},
+        )
+        bundle = lazy.read_bundle(self.root)
+        operations = tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
+        self.assertEqual(len(operations), 1388)
+        self.assertEqual(
+            sum(row.opcode == canonical.Opcode.STORE_F64 for row in operations),
+            216,
+        )
+        expected = self.interp_reference(coarse, fine, coarse_dims, fine_dims)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "ip_u.iter5": digest(b"".join(F64.pack(value) for value in expected))
+        })
+
+    def interp_degenerate_reference(self, coarse, fine):
+        result = list(fine)
+
+        def z(i1, i2, i3):
+            return coarse[self.index(i1 - 1, i2 - 1, i3 - 1, 3, 3, 3)]
+
+        def add(i1, i2, i3, value):
+            at = self.index(i1 - 1, i2 - 1, i3 - 1, 3, 3, 3)
+            result[at] = result[at] + value
+
+        d1 = d2 = d3 = 2
+        t1 = t2 = t3 = 1
+        for i3 in range(d3, 3):
+            for i2 in range(d2, 3):
+                for i1 in range(d1, 3):
+                    add(2*i1-d1, 2*i2-d2, 2*i3-d3, z(i1, i2, i3))
+                for i1 in range(1, 3):
+                    add(2*i1-t1, 2*i2-d2, 2*i3-d3,
+                        0.5 * (z(i1+1, i2, i3) + z(i1, i2, i3)))
+        for i3 in range(d3, 3):
+            for i2 in range(1, 3):
+                for i1 in range(d1, 3):
+                    add(2*i1-d1, 2*i2-t2, 2*i3-d3,
+                        0.5 * (z(i1, i2+1, i3) + z(i1, i2, i3)))
+                for i1 in range(1, 3):
+                    add(2*i1-t1, 2*i2-t2, 2*i3-d3,
+                        0.25 * (((z(i1+1, i2+1, i3) + z(i1+1, i2, i3)) +
+                                 z(i1, i2+1, i3)) + z(i1, i2, i3)))
+        for i3 in range(1, 3):
+            for i2 in range(d2, 3):
+                for i1 in range(d1, 3):
+                    add(2*i1-d1, 2*i2-d2, 2*i3-t3,
+                        0.5 * (z(i1, i2, i3+1) + z(i1, i2, i3)))
+                for i1 in range(1, 3):
+                    add(2*i1-t1, 2*i2-d2, 2*i3-t3,
+                        0.25 * (((z(i1+1, i2, i3+1) + z(i1, i2, i3+1)) +
+                                 z(i1+1, i2, i3)) + z(i1, i2, i3)))
+        for i3 in range(1, 3):
+            for i2 in range(1, 3):
+                for i1 in range(d1, 3):
+                    add(2*i1-d1, 2*i2-t2, 2*i3-t3,
+                        0.25 * (((z(i1, i2+1, i3+1) + z(i1, i2, i3+1)) +
+                                 z(i1, i2+1, i3)) + z(i1, i2, i3)))
+                for i1 in range(1, 3):
+                    add(2*i1-t1, 2*i2-t2, 2*i3-t3,
+                        0.125 * (((((((z(i1+1, i2+1, i3+1) +
+                                      z(i1+1, i2, i3+1)) +
+                                     z(i1, i2+1, i3+1)) +
+                                    z(i1, i2, i3+1)) +
+                                   z(i1+1, i2+1, i3)) +
+                                  z(i1+1, i2, i3)) +
+                                 z(i1, i2+1, i3)) + z(i1, i2, i3)))
+        return tuple(result)
+
+    def test_mg_interp_degenerate_three_point_path_covers_every_cell(self):
+        coarse = tuple((index - 9) / 16.0 for index in range(27))
+        fine = tuple((index + 1) / 64.0 for index in range(27))
+        arrays = (
+            self.image("id_z", coarse, 0xB0000),
+            self.image("id_u", fine, 0xC0000, "state"),
+        )
+        invocation = lazy.Invocation(
+            0, 203, "npb_mg_interp", 6, 27,
+            {
+                "z": "id_z", "u": "id_u",
+                "mm1": 3, "mm2": 3, "mm3": 3,
+                "n1": 3, "n2": 3, "n3": 3,
+                "boundaries": ["id_u"],
+            },
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, (invocation,), {"primitive_records": 332},
+        )
+        bundle = lazy.read_bundle(self.root)
+        operations = tuple(lazy.iter_operations(bundle, npb.EXPANDERS))
+        self.assertEqual(len(operations), 332)
+        self.assertEqual(
+            sum(row.opcode == canonical.Opcode.STORE_F64 for row in operations),
+            27,
+        )
+        expected = self.interp_degenerate_reference(coarse, fine)
+        self.assertEqual(npb.replay_boundaries(bundle), {
+            "id_u.iter6": digest(b"".join(F64.pack(value) for value in expected))
+        })
+
+    def full_vcycle_bundle(self):
+        fine_r = tuple((index - 71) / 64.0 for index in range(216))
+        fine_v = tuple((index + 11) / 128.0 for index in range(216))
+        arrays = (
+            self.image("vc_fine_r", fine_r, 0xD0000),
+            self.image("vc_coarse_r", (0.0,) * 64, 0xE0000, "state"),
+            self.image("vc_coarse_u", (0.0,) * 64, 0xF0000, "state"),
+            self.image("vc_fine_u", (0.0,) * 216, 0x100000, "state"),
+            self.image("vc_fine_v", fine_v, 0x110000),
+            self.image("vc_resid", (0.0,) * 216, 0x120000, "state"),
+        )
+        invocations = (
+            lazy.Invocation(0, 202, "npb_mg_rprj3", 10, 8, {
+                "r": "vc_fine_r", "s": "vc_coarse_r",
+                "m1k": 6, "m2k": 6, "m3k": 6,
+                "m1j": 4, "m2j": 4, "m3j": 4,
+                "boundaries": ["vc_coarse_r"],
+            }),
+            lazy.Invocation(1, 204, "npb_mg_psinv", 11, 8, {
+                "r": "vc_coarse_r", "u": "vc_coarse_u",
+                "n1": 4, "n2": 4, "n3": 4,
+                "c_raw": [raw_f64(value)
+                          for value in (0.75, -0.25, 0.125, 0.0)],
+                "boundaries": ["vc_coarse_u"],
+            }),
+            lazy.Invocation(2, 203, "npb_mg_interp", 12, 216, {
+                "z": "vc_coarse_u", "u": "vc_fine_u",
+                "mm1": 4, "mm2": 4, "mm3": 4,
+                "n1": 6, "n2": 6, "n3": 6,
+                "boundaries": ["vc_fine_u"],
+            }),
+            lazy.Invocation(3, 201, "npb_mg_resid", 13, 64, {
+                "u": "vc_fine_u", "v": "vc_fine_v", "r": "vc_resid",
+                "n1": 6, "n2": 6, "n3": 6,
+                "a_raw": [raw_f64(value)
+                          for value in (1.25, 0.0, -0.5, 0.25)],
+                "boundaries": ["vc_resid"],
+            }),
+            lazy.Invocation(4, 205, "npb_mg_norm2u3", 14, 64, {
+                "r": "vc_resid", "n1": 6, "n2": 6, "n3": 6,
+                "dn_raw": raw_f64(64.0), "rnm2": "rnm2", "rnmu": "rnmu",
+                "results": ["rnm2", "rnmu"], "lanes": lanes(64),
+            }),
+        )
+        lazy.write_bundle(
+            self.root,
+            {
+                "schema": 2, "workload": "npb_mg",
+                "source_sha256": "1" * 64,
+                "binary_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            }, arrays, invocations, {"primitive_records": 5180},
+        )
+        return lazy.read_bundle(self.root)
+
+    def test_mg_mini_vcycle_is_batch_invariant_and_matches_fixed_boundaries(self):
+        bundle = self.full_vcycle_bundle()
+        fingerprints = {
+            lazy.expanded_fingerprint(
+                bundle, npb.EXPANDERS, batch_work_items=batch,
+            )
+            for batch in (1, 2, 17)
+        }
+        self.assertEqual(len(fingerprints), 1)
+        stream_sha256, count = fingerprints.pop()
+        self.assertRegex(stream_sha256, r"^[0-9a-f]{64}$")
+        self.assertEqual(count, 5180)
+        boundaries = npb.replay_boundaries(bundle)
+        self.assertEqual({key: boundaries[key] for key in (
+            "vc_coarse_r.iter10", "vc_coarse_u.iter11",
+            "vc_fine_u.iter12", "vc_resid.iter13",
+            "scalar.rnm2.iter14", "scalar.rnmu.iter14",
+        )}, {
+            "vc_coarse_r.iter10": "2b797866313918128011f1ad4e8377e9d7e9fd9e9db0069e43cd7e96ddbad522",
+            "vc_coarse_u.iter11": "2c3a800c768cd3bda4050fdaf304748beef12ba3841ede03d50be02b765d9aa2",
+            "vc_fine_u.iter12": "2e2bb8418e0cee991b5fa7db960d4234c5df9ba35542392deca9a382ad7072b9",
+            "vc_resid.iter13": "8831b8b04d1c9f0160a69ca3919eb211fe29a19eed3a5e9f639c291e4ace821d",
+            "scalar.rnm2.iter14": "2d81149e7f1152e790cdb27de6e10cc3a58930c7d81efa6a71ea49d9534d237b",
+            "scalar.rnmu.iter14": "6cbf669f8ded3fca4f4358cc94e2408405b03ba3db916b3d3ef633c3995dc119",
+        })
+
+    def test_mg_changed_coarse_level_dimension_fails_before_boundary(self):
+        bundle = self.full_vcycle_bundle()
+        first = bundle.invocations[0]
+        parameters = dict(first.parameters)
+        parameters["m1j"] = 5
+        corrupted = dataclasses.replace(
+            bundle,
+            invocations=(dataclasses.replace(
+                first, work_items=12, parameters=parameters,
+            ),) + bundle.invocations[1:],
+            dynamic_work={"primitive_records": 1},
+        )
+        with self.assertRaisesRegex(lazy.LazyTraceError, "outside image"):
+            tuple(lazy.iter_operations(corrupted, npb.EXPANDERS))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -244,18 +244,18 @@ git commit -m "feat: expand exact NPB CG lazy traces"
 - Modify: `scripts/npb_lazy_trace.py`
 - Modify: `tests/pyunit/cross_system/test_npb_lazy_trace.py`
 
-- [ ] **Step 1: Add hand-checked tiny-grid tests for every MG phase**
+- [x] **Step 1: Add hand-checked tiny-grid tests for every MG phase**
 
 Use padded `4x4x4` and `6x6x6` grids with non-symmetric binary64 values so
 reassociation is visible. Add separate eager operation lists and post-state
 raw words for `resid`, `rprj3`, `interp`, `psinv`, and `norm2u3`. Require
 boundary handling, level offsets, and every raw arithmetic result to match.
 
-- [ ] **Step 2: Run the MG tests and verify RED**
+- [x] **Step 2: Run the MG tests and verify RED**
 
 Run the NPB lazy test file. Expected: FAIL naming the first unknown MG kernel.
 
-- [ ] **Step 3: Implement MG indexing and expression primitives**
+- [x] **Step 3: Implement MG indexing and expression primitives**
 
 Define checked Fortran-column-major indexing and helpers that emit one
 operation for each source expression node. Encode each NPB fixed-form
@@ -269,14 +269,14 @@ def f_index(i1, i2, i3, n1, n2, n3):
     return i1 + n1 * (i2 + n2 * i3)
 ```
 
-- [ ] **Step 4: Implement the five MG expanders and fixed norm tree**
+- [x] **Step 4: Implement the five MG expanders and fixed norm tree**
 
 Implement `npb_mg_resid`, `npb_mg_rprj3`, `npb_mg_interp`, `npb_mg_psinv`,
 and `npb_mg_norm2u3` in source loop order. Stores update `MappedState`
 immediately. Norm uses four explicit ranges and emits both `F64_ADD` and
 `F64_MAX` edges with raw operands/results.
 
-- [ ] **Step 5: Add batch invariance and full V-cycle fixture tests**
+- [x] **Step 5: Add batch invariance and full V-cycle fixture tests**
 
 Run the same tiny V-cycle with batch sizes 1, 2, and 17; require equal encoded
 streams, dynamic counts, final grids, residuals, and norm commitments. Flip a

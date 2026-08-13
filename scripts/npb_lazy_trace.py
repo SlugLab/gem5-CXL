@@ -637,6 +637,917 @@ def expand_cg_prepare_iteration(state, invocation, _batch_work_items):
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
+def f_index(i1, i2, i3, n1, n2, n3):
+    if not (
+        0 <= i1 < n1 and 0 <= i2 < n2 and 0 <= i3 < n3
+    ):
+        raise lazy.LazyTraceError("MG grid index is outside image")
+    return i1 + n1 * (i2 + n2 * i3)
+
+
+def _grid_load(state, invocation, name, i1, i2, i3, dimensions, work_item):
+    index = f_index(i1, i2, i3, *dimensions)
+    address, value = state.load_float(name, index)
+    return value, _load(
+        invocation, canonical.Opcode.LOAD_F64,
+        work_item, address, raw_f64(value),
+    )
+
+
+def _grid_store(state, invocation, name, i1, i2, i3, dimensions,
+                work_item, value):
+    index = f_index(i1, i2, i3, *dimensions)
+    address, _old = state.load_float(name, index)
+    state.store_float(name, index, value)
+    return _store(invocation, work_item, address, value)
+
+
+def _fold_add(invocation, work_item, values):
+    if not values:
+        raise lazy.LazyTraceError("MG addition has no operands")
+    result = values[0]
+    for value in values[1:]:
+        updated = f64(result + value)
+        yield _binary(
+            invocation, canonical.Opcode.F64_ADD,
+            work_item, result, value, updated,
+        )
+        result = updated
+    return result
+
+
+def _run_fold(generator):
+    while True:
+        try:
+            yield next(generator)
+        except StopIteration as stop:
+            return stop.value
+
+
+def _comm3(state, invocation, name, dimensions):
+    n1, n2, n3 = dimensions
+    work_item = invocation.work_items
+
+    def copy(destination, source):
+        nonlocal work_item
+        value, load_operation = _grid_load(
+            state, invocation, name, *source, dimensions, work_item
+        )
+        yield load_operation
+        yield _grid_store(
+            state, invocation, name, *destination,
+            dimensions, work_item, value,
+        )
+        work_item += 1
+
+    for i3 in range(1, n3 - 1):
+        for i2 in range(1, n2 - 1):
+            yield from copy((0, i2, i3), (n1 - 2, i2, i3))
+            yield from copy((n1 - 1, i2, i3), (1, i2, i3))
+        for i1 in range(n1):
+            yield from copy((i1, 0, i3), (i1, n2 - 2, i3))
+            yield from copy((i1, n2 - 1, i3), (i1, 1, i3))
+    for i2 in range(n2):
+        for i1 in range(n1):
+            yield from copy((i1, i2, 0), (i1, i2, n3 - 2))
+            yield from copy((i1, i2, n3 - 1), (i1, i2, 1))
+
+
+def expand_mg_resid(state, invocation, _batch_work_items):
+    _require_parameters(invocation, (
+        "u", "v", "r", "n1", "n2", "n3", "a_raw", "boundaries",
+    ))
+    parameters = invocation.parameters
+    dimensions = (
+        parameters["n1"], parameters["n2"], parameters["n3"]
+    )
+    n1, n2, n3 = dimensions
+    expected_work = (n1 - 2) * (n2 - 2) * (n3 - 2)
+    if min(dimensions) < 3 or invocation.work_items != expected_work:
+        raise lazy.LazyTraceError("MG resid dimensions or work items differ")
+    if len(parameters["a_raw"]) != 4:
+        raise lazy.LazyTraceError("MG resid coefficient count differs")
+    coefficients = [f64_from_raw(value) for value in parameters["a_raw"]]
+    yield _control(
+        invocation, canonical.Opcode.BARRIER, invocation.work_items
+    )
+    for i3 in range(1, n3 - 1):
+        for i2 in range(1, n2 - 1):
+            row_work = (i3 - 1) * (n2 - 2) + (i2 - 1)
+            u1 = []
+            u2 = []
+            for i1 in range(n1):
+                values1 = []
+                for coordinate in (
+                    (i1, i2 - 1, i3), (i1, i2 + 1, i3),
+                    (i1, i2, i3 - 1), (i1, i2, i3 + 1),
+                ):
+                    value, operation = _grid_load(
+                        state, invocation, parameters["u"], *coordinate,
+                        dimensions, row_work,
+                    )
+                    yield operation
+                    values1.append(value)
+                fold = _run_fold(_fold_add(invocation, row_work, values1))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        u1.append(stop.value)
+                        break
+                values2 = []
+                for coordinate in (
+                    (i1, i2 - 1, i3 - 1), (i1, i2 + 1, i3 - 1),
+                    (i1, i2 - 1, i3 + 1), (i1, i2 + 1, i3 + 1),
+                ):
+                    value, operation = _grid_load(
+                        state, invocation, parameters["u"], *coordinate,
+                        dimensions, row_work,
+                    )
+                    yield operation
+                    values2.append(value)
+                fold = _run_fold(_fold_add(invocation, row_work, values2))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        u2.append(stop.value)
+                        break
+            for i1 in range(1, n1 - 1):
+                work_item = f_index(i1, i2, i3, *dimensions)
+                v, operation = _grid_load(
+                    state, invocation, parameters["v"], i1, i2, i3,
+                    dimensions, work_item,
+                )
+                yield operation
+                u, operation = _grid_load(
+                    state, invocation, parameters["u"], i1, i2, i3,
+                    dimensions, work_item,
+                )
+                yield operation
+                product = f64(coefficients[0] * u)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, coefficients[0], u, product,
+                )
+                result = f64(v - product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_SUB,
+                    work_item, v, product, result,
+                )
+                fold = _run_fold(_fold_add(
+                    invocation, work_item,
+                    [u2[i1], u1[i1 - 1], u1[i1 + 1]],
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        neighbors = stop.value
+                        break
+                product = f64(coefficients[2] * neighbors)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, coefficients[2], neighbors, product,
+                )
+                updated = f64(result - product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_SUB,
+                    work_item, result, product, updated,
+                )
+                fold = _run_fold(_fold_add(
+                    invocation, work_item, [u2[i1 - 1], u2[i1 + 1]],
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        corners = stop.value
+                        break
+                product = f64(coefficients[3] * corners)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, coefficients[3], corners, product,
+                )
+                result = f64(updated - product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_SUB,
+                    work_item, updated, product, result,
+                )
+                yield _grid_store(
+                    state, invocation, parameters["r"], i1, i2, i3,
+                    dimensions, work_item, result,
+                )
+    yield from _comm3(state, invocation, parameters["r"], dimensions)
+    yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def _merge_max4(invocation, lanes, work_item):
+    left = max(lanes[0], lanes[1])
+    right = max(lanes[2], lanes[3])
+    result = max(left, right)
+    yield _binary(
+        invocation, canonical.Opcode.F64_MAX,
+        work_item, lanes[0], lanes[1], left,
+    )
+    yield _binary(
+        invocation, canonical.Opcode.F64_MAX,
+        work_item + 1, lanes[2], lanes[3], right,
+    )
+    yield _binary(
+        invocation, canonical.Opcode.F64_MAX,
+        work_item + 2, left, right, result,
+    )
+    return result
+
+
+def expand_mg_norm2u3(state, invocation, _batch_work_items):
+    _require_parameters(invocation, (
+        "r", "n1", "n2", "n3", "dn_raw", "rnm2", "rnmu",
+        "results", "lanes",
+    ))
+    parameters = invocation.parameters
+    dimensions = (
+        parameters["n1"], parameters["n2"], parameters["n3"]
+    )
+    n1, n2, n3 = dimensions
+    expected_work = (n1 - 2) * (n2 - 2) * (n3 - 2)
+    if min(dimensions) < 3 or invocation.work_items != expected_work:
+        raise lazy.LazyTraceError("MG norm dimensions or work items differ")
+    ranges = _validate_lanes(invocation)
+    coordinates = [
+        (i1, i2, i3)
+        for i3 in range(1, n3 - 1)
+        for i2 in range(1, n2 - 1)
+        for i1 in range(1, n1 - 1)
+    ]
+    yield _control(
+        invocation, canonical.Opcode.BARRIER, invocation.work_items
+    )
+    sum_lanes = []
+    max_lanes = []
+    for lane in range(4):
+        first, last = ranges[lane]
+        total = 0.0
+        maximum = 0.0
+        for work_item in range(first, last):
+            coordinate = coordinates[work_item]
+            value, operation = _grid_load(
+                state, invocation, parameters["r"], *coordinate,
+                dimensions, work_item,
+            )
+            yield operation
+            square = f64(value * value)
+            yield _binary(
+                invocation, canonical.Opcode.F64_MUL,
+                work_item, value, value, square,
+            )
+            updated = f64(total + square)
+            yield _binary(
+                invocation, canonical.Opcode.F64_ADD,
+                work_item, total, square, updated,
+            )
+            total = updated
+            value_again, operation = _grid_load(
+                state, invocation, parameters["r"], *coordinate,
+                dimensions, work_item,
+            )
+            yield operation
+            absolute = f64(abs(value_again))
+            yield _unary(
+                invocation, canonical.Opcode.F64_ABS,
+                work_item, value_again, absolute,
+            )
+            updated_max = max(maximum, absolute)
+            yield _binary(
+                invocation, canonical.Opcode.F64_MAX,
+                work_item, maximum, absolute, updated_max,
+            )
+            maximum = updated_max
+        sum_lanes.append(total)
+        max_lanes.append(maximum)
+    merge_sum = _finish_merge(_merge_sum4(
+        invocation, sum_lanes, invocation.work_items
+    ))
+    while True:
+        try:
+            yield next(merge_sum)
+        except StopIteration as stop:
+            total = stop.value
+            break
+    merge_max = _finish_merge(_merge_max4(
+        invocation, max_lanes, invocation.work_items + 3
+    ))
+    while True:
+        try:
+            yield next(merge_max)
+        except StopIteration as stop:
+            maximum = stop.value
+            break
+    dn = f64_from_raw(parameters["dn_raw"])
+    if dn <= 0.0:
+        raise lazy.LazyTraceError("MG norm denominator is not positive")
+    quotient = f64(total / dn)
+    yield _binary(
+        invocation, canonical.Opcode.F64_DIV,
+        invocation.work_items + 6, total, dn, quotient,
+    )
+    rnm2 = f64(math.sqrt(quotient))
+    yield _unary(
+        invocation, canonical.Opcode.F64_SQRT,
+        invocation.work_items + 7, quotient, rnm2,
+    )
+    state.store_scalar(parameters["rnm2"], raw_f64(rnm2))
+    state.store_scalar(parameters["rnmu"], raw_f64(maximum))
+    yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_mg_psinv(state, invocation, _batch_work_items):
+    _require_parameters(invocation, (
+        "r", "u", "n1", "n2", "n3", "c_raw", "boundaries",
+    ))
+    parameters = invocation.parameters
+    dimensions = (
+        parameters["n1"], parameters["n2"], parameters["n3"]
+    )
+    n1, n2, n3 = dimensions
+    expected_work = (n1 - 2) * (n2 - 2) * (n3 - 2)
+    if min(dimensions) < 3 or invocation.work_items != expected_work:
+        raise lazy.LazyTraceError("MG psinv dimensions or work items differ")
+    if len(parameters["c_raw"]) != 4:
+        raise lazy.LazyTraceError("MG psinv coefficient count differs")
+    coefficients = [f64_from_raw(value) for value in parameters["c_raw"]]
+    yield _control(
+        invocation, canonical.Opcode.BARRIER, invocation.work_items
+    )
+    for i3 in range(1, n3 - 1):
+        for i2 in range(1, n2 - 1):
+            row_work = (i3 - 1) * (n2 - 2) + (i2 - 1)
+            r1 = []
+            r2 = []
+            for i1 in range(n1):
+                values1 = []
+                for coordinate in (
+                    (i1, i2 - 1, i3), (i1, i2 + 1, i3),
+                    (i1, i2, i3 - 1), (i1, i2, i3 + 1),
+                ):
+                    value, operation = _grid_load(
+                        state, invocation, parameters["r"], *coordinate,
+                        dimensions, row_work,
+                    )
+                    yield operation
+                    values1.append(value)
+                fold = _run_fold(_fold_add(invocation, row_work, values1))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        r1.append(stop.value)
+                        break
+                values2 = []
+                for coordinate in (
+                    (i1, i2 - 1, i3 - 1), (i1, i2 + 1, i3 - 1),
+                    (i1, i2 - 1, i3 + 1), (i1, i2 + 1, i3 + 1),
+                ):
+                    value, operation = _grid_load(
+                        state, invocation, parameters["r"], *coordinate,
+                        dimensions, row_work,
+                    )
+                    yield operation
+                    values2.append(value)
+                fold = _run_fold(_fold_add(invocation, row_work, values2))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        r2.append(stop.value)
+                        break
+            for i1 in range(1, n1 - 1):
+                work_item = f_index(i1, i2, i3, *dimensions)
+                u, operation = _grid_load(
+                    state, invocation, parameters["u"], i1, i2, i3,
+                    dimensions, work_item,
+                )
+                yield operation
+                r, operation = _grid_load(
+                    state, invocation, parameters["r"], i1, i2, i3,
+                    dimensions, work_item,
+                )
+                yield operation
+                product = f64(coefficients[0] * r)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, coefficients[0], r, product,
+                )
+                result = f64(u + product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, u, product, result,
+                )
+                r_left, operation = _grid_load(
+                    state, invocation, parameters["r"], i1 - 1, i2, i3,
+                    dimensions, work_item,
+                )
+                yield operation
+                r_right, operation = _grid_load(
+                    state, invocation, parameters["r"], i1 + 1, i2, i3,
+                    dimensions, work_item,
+                )
+                yield operation
+                fold = _run_fold(_fold_add(
+                    invocation, work_item, [r_left, r_right, r1[i1]],
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        neighbors = stop.value
+                        break
+                product = f64(coefficients[1] * neighbors)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, coefficients[1], neighbors, product,
+                )
+                updated = f64(result + product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, result, product, updated,
+                )
+                fold = _run_fold(_fold_add(
+                    invocation, work_item,
+                    [r2[i1], r1[i1 - 1], r1[i1 + 1]],
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        diagonals = stop.value
+                        break
+                product = f64(coefficients[2] * diagonals)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, coefficients[2], diagonals, product,
+                )
+                result = f64(updated + product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, updated, product, result,
+                )
+                yield _grid_store(
+                    state, invocation, parameters["u"], i1, i2, i3,
+                    dimensions, work_item, result,
+                )
+    yield from _comm3(state, invocation, parameters["u"], dimensions)
+    yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_mg_rprj3(state, invocation, _batch_work_items):
+    _require_parameters(invocation, (
+        "r", "s", "m1k", "m2k", "m3k", "m1j", "m2j", "m3j",
+        "boundaries",
+    ))
+    parameters = invocation.parameters
+    fine_dims = (parameters["m1k"], parameters["m2k"], parameters["m3k"])
+    coarse_dims = (parameters["m1j"], parameters["m2j"], parameters["m3j"])
+    m1k, m2k, m3k = fine_dims
+    m1j, m2j, m3j = coarse_dims
+    if min(fine_dims + coarse_dims) < 3:
+        raise lazy.LazyTraceError("MG rprj3 dimensions are too small")
+    expected_work = (m1j - 2) * (m2j - 2) * (m3j - 2)
+    if invocation.work_items != expected_work:
+        raise lazy.LazyTraceError("MG rprj3 work items differ")
+    d1 = 2 if m1k == 3 else 1
+    d2 = 2 if m2k == 3 else 1
+    d3 = 2 if m3k == 3 else 1
+
+    def load_r(i1, i2, i3, work_item):
+        return _grid_load(
+            state, invocation, parameters["r"], i1 - 1, i2 - 1, i3 - 1,
+            fine_dims, work_item,
+        )
+
+    yield _control(
+        invocation, canonical.Opcode.BARRIER, invocation.work_items
+    )
+    for j3 in range(2, m3j):
+        for j2 in range(2, m2j):
+            i3 = 2 * j3 - d3
+            i2 = 2 * j2 - d2
+            row_work = (j3 - 2) * (m2j - 2) + (j2 - 2)
+            x1 = {}
+            y1 = {}
+            for j1 in range(2, m1j + 1):
+                i1 = 2 * j1 - d1
+                values = []
+                for coordinate in (
+                    (i1 - 1, i2 - 1, i3), (i1 - 1, i2 + 1, i3),
+                    (i1 - 1, i2, i3 - 1), (i1 - 1, i2, i3 + 1),
+                ):
+                    value, operation = load_r(*coordinate, row_work)
+                    yield operation
+                    values.append(value)
+                fold = _run_fold(_fold_add(invocation, row_work, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        x1[i1 - 1] = stop.value
+                        break
+                values = []
+                for coordinate in (
+                    (i1 - 1, i2 - 1, i3 - 1),
+                    (i1 - 1, i2 - 1, i3 + 1),
+                    (i1 - 1, i2 + 1, i3 - 1),
+                    (i1 - 1, i2 + 1, i3 + 1),
+                ):
+                    value, operation = load_r(*coordinate, row_work)
+                    yield operation
+                    values.append(value)
+                fold = _run_fold(_fold_add(invocation, row_work, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        y1[i1 - 1] = stop.value
+                        break
+            for j1 in range(2, m1j):
+                i1 = 2 * j1 - d1
+                work_item = f_index(
+                    j1 - 1, j2 - 1, j3 - 1, *coarse_dims
+                )
+                values = []
+                for coordinate in (
+                    (i1, i2 - 1, i3 - 1), (i1, i2 - 1, i3 + 1),
+                    (i1, i2 + 1, i3 - 1), (i1, i2 + 1, i3 + 1),
+                ):
+                    value, operation = load_r(*coordinate, work_item)
+                    yield operation
+                    values.append(value)
+                fold = _run_fold(_fold_add(invocation, work_item, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        y2 = stop.value
+                        break
+                values = []
+                for coordinate in (
+                    (i1, i2 - 1, i3), (i1, i2 + 1, i3),
+                    (i1, i2, i3 - 1), (i1, i2, i3 + 1),
+                ):
+                    value, operation = load_r(*coordinate, work_item)
+                    yield operation
+                    values.append(value)
+                fold = _run_fold(_fold_add(invocation, work_item, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        x2 = stop.value
+                        break
+                center, operation = load_r(i1, i2, i3, work_item)
+                yield operation
+                result = f64(0.5 * center)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, 0.5, center, result,
+                )
+                left, operation = load_r(i1 - 1, i2, i3, work_item)
+                yield operation
+                right, operation = load_r(i1 + 1, i2, i3, work_item)
+                yield operation
+                fold = _run_fold(_fold_add(
+                    invocation, work_item, [left, right, x2]
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        neighbors = stop.value
+                        break
+                product = f64(0.25 * neighbors)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, 0.25, neighbors, product,
+                )
+                updated = f64(result + product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, result, product, updated,
+                )
+                fold = _run_fold(_fold_add(
+                    invocation, work_item,
+                    [x1[i1 - 1], x1[i1 + 1], y2],
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        diagonals = stop.value
+                        break
+                product = f64(0.125 * diagonals)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, 0.125, diagonals, product,
+                )
+                result = f64(updated + product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, updated, product, result,
+                )
+                fold = _run_fold(_fold_add(
+                    invocation, work_item, [y1[i1 - 1], y1[i1 + 1]]
+                ))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        corners = stop.value
+                        break
+                product = f64(0.0625 * corners)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_MUL,
+                    work_item, 0.0625, corners, product,
+                )
+                before_corners = result
+                result = f64(before_corners + product)
+                yield _binary(
+                    invocation, canonical.Opcode.F64_ADD,
+                    work_item, before_corners, product, result,
+                )
+                yield _grid_store(
+                    state, invocation, parameters["s"],
+                    j1 - 1, j2 - 1, j3 - 1, coarse_dims,
+                    work_item, result,
+                )
+    yield from _comm3(state, invocation, parameters["s"], coarse_dims)
+    yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def _mg_weighted_update(state, invocation, name, coordinate, dimensions,
+                        work_item, values, coefficient):
+    fold = _run_fold(_fold_add(invocation, work_item, values))
+    while True:
+        try:
+            yield next(fold)
+        except StopIteration as stop:
+            source = stop.value
+            break
+    if coefficient != 1.0:
+        weighted = f64(coefficient * source)
+        yield _binary(
+            invocation, canonical.Opcode.F64_MUL,
+            work_item, coefficient, source, weighted,
+        )
+    else:
+        weighted = source
+    old, operation = _grid_load(
+        state, invocation, name, *coordinate, dimensions, work_item
+    )
+    yield operation
+    result = f64(old + weighted)
+    yield _binary(
+        invocation, canonical.Opcode.F64_ADD,
+        work_item, old, weighted, result,
+    )
+    yield _grid_store(
+        state, invocation, name, *coordinate,
+        dimensions, work_item, result,
+    )
+
+
+def _expand_mg_interp_degenerate(state, invocation, parameters,
+                                 coarse_dims, fine_dims):
+    mm1, mm2, mm3 = coarse_dims
+    n1, n2, n3 = fine_dims
+    d1, t1 = (2, 1) if n1 == 3 else (1, 0)
+    d2, t2 = (2, 1) if n2 == 3 else (1, 0)
+    d3, t3 = (2, 1) if n3 == 3 else (1, 0)
+
+    def emit(destination, sources, coefficient):
+        coordinate = tuple(value - 1 for value in destination)
+        work_item = f_index(*coordinate, *fine_dims)
+        values = []
+        for source in sources:
+            source_coordinate = tuple(value - 1 for value in source)
+            value, operation = _grid_load(
+                state, invocation, parameters["z"], *source_coordinate,
+                coarse_dims, work_item,
+            )
+            yield operation
+            values.append(value)
+        yield from _mg_weighted_update(
+            state, invocation, parameters["u"], coordinate, fine_dims,
+            work_item, values, coefficient,
+        )
+
+    yield _control(
+        invocation, canonical.Opcode.BARRIER, invocation.work_items
+    )
+    for i3 in range(d3, mm3):
+        for i2 in range(d2, mm2):
+            for i1 in range(d1, mm1):
+                yield from emit(
+                    (2*i1-d1, 2*i2-d2, 2*i3-d3),
+                    ((i1, i2, i3),), 1.0,
+                )
+            for i1 in range(1, mm1):
+                yield from emit(
+                    (2*i1-t1, 2*i2-d2, 2*i3-d3),
+                    ((i1+1, i2, i3), (i1, i2, i3)), 0.5,
+                )
+    for i3 in range(d3, mm3):
+        for i2 in range(1, mm2):
+            for i1 in range(d1, mm1):
+                yield from emit(
+                    (2*i1-d1, 2*i2-t2, 2*i3-d3),
+                    ((i1, i2+1, i3), (i1, i2, i3)), 0.5,
+                )
+            for i1 in range(1, mm1):
+                yield from emit(
+                    (2*i1-t1, 2*i2-t2, 2*i3-d3),
+                    ((i1+1, i2+1, i3), (i1+1, i2, i3),
+                     (i1, i2+1, i3), (i1, i2, i3)), 0.25,
+                )
+    for i3 in range(1, mm3):
+        for i2 in range(d2, mm2):
+            for i1 in range(d1, mm1):
+                yield from emit(
+                    (2*i1-d1, 2*i2-d2, 2*i3-t3),
+                    ((i1, i2, i3+1), (i1, i2, i3)), 0.5,
+                )
+            for i1 in range(1, mm1):
+                yield from emit(
+                    (2*i1-t1, 2*i2-d2, 2*i3-t3),
+                    ((i1+1, i2, i3+1), (i1, i2, i3+1),
+                     (i1+1, i2, i3), (i1, i2, i3)), 0.25,
+                )
+    for i3 in range(1, mm3):
+        for i2 in range(1, mm2):
+            for i1 in range(d1, mm1):
+                yield from emit(
+                    (2*i1-d1, 2*i2-t2, 2*i3-t3),
+                    ((i1, i2+1, i3+1), (i1, i2, i3+1),
+                     (i1, i2+1, i3), (i1, i2, i3)), 0.25,
+                )
+            for i1 in range(1, mm1):
+                yield from emit(
+                    (2*i1-t1, 2*i2-t2, 2*i3-t3),
+                    ((i1+1, i2+1, i3+1), (i1+1, i2, i3+1),
+                     (i1, i2+1, i3+1), (i1, i2, i3+1),
+                     (i1+1, i2+1, i3), (i1+1, i2, i3),
+                     (i1, i2+1, i3), (i1, i2, i3)), 0.125,
+                )
+    yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_mg_interp(state, invocation, _batch_work_items):
+    _require_parameters(invocation, (
+        "z", "u", "mm1", "mm2", "mm3", "n1", "n2", "n3",
+        "boundaries",
+    ))
+    parameters = invocation.parameters
+    coarse_dims = (
+        parameters["mm1"], parameters["mm2"], parameters["mm3"]
+    )
+    fine_dims = (parameters["n1"], parameters["n2"], parameters["n3"])
+    mm1, mm2, mm3 = coarse_dims
+    n1, n2, n3 = fine_dims
+    if min(coarse_dims + fine_dims) < 3:
+        raise lazy.LazyTraceError("MG interp dimensions are too small")
+    if invocation.work_items != n1 * n2 * n3:
+        raise lazy.LazyTraceError("MG interp work items differ")
+    if n1 == 3 or n2 == 3 or n3 == 3:
+        yield from _expand_mg_interp_degenerate(
+            state, invocation, parameters, coarse_dims, fine_dims
+        )
+        return
+    if fine_dims != (2 * mm1 - 2, 2 * mm2 - 2, 2 * mm3 - 2):
+        raise lazy.LazyTraceError("MG interp fine/coarse dimensions differ")
+
+    def load_z(i1, i2, i3, work_item):
+        return _grid_load(
+            state, invocation, parameters["z"],
+            i1 - 1, i2 - 1, i3 - 1, coarse_dims, work_item,
+        )
+
+    def loaded_values(coordinates, work_item):
+        values = []
+        operations = []
+        for coordinate in coordinates:
+            value, operation = load_z(*coordinate, work_item)
+            values.append(value)
+            operations.append(operation)
+        return values, operations
+
+    yield _control(
+        invocation, canonical.Opcode.BARRIER, invocation.work_items
+    )
+    for i3 in range(1, mm3):
+        for i2 in range(1, mm2):
+            row_work = (i3 - 1) * (mm2 - 1) + (i2 - 1)
+            z1 = {}
+            z2 = {}
+            z3 = {}
+            for i1 in range(1, mm1 + 1):
+                values, operations = loaded_values(
+                    ((i1, i2 + 1, i3), (i1, i2, i3)), row_work
+                )
+                yield from operations
+                fold = _run_fold(_fold_add(invocation, row_work, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        z1[i1] = stop.value
+                        break
+                values, operations = loaded_values(
+                    ((i1, i2, i3 + 1), (i1, i2, i3)), row_work
+                )
+                yield from operations
+                fold = _run_fold(_fold_add(invocation, row_work, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        z2[i1] = stop.value
+                        break
+                values, operations = loaded_values(
+                    ((i1, i2 + 1, i3 + 1), (i1, i2, i3 + 1)), row_work
+                )
+                yield from operations
+                values.append(z1[i1])
+                fold = _run_fold(_fold_add(invocation, row_work, values))
+                while True:
+                    try:
+                        yield next(fold)
+                    except StopIteration as stop:
+                        z3[i1] = stop.value
+                        break
+
+            for i1 in range(1, mm1):
+                odd = (2 * i1 - 2, 2 * i2 - 2, 2 * i3 - 2)
+                even = (2 * i1 - 1, 2 * i2 - 2, 2 * i3 - 2)
+                work_item = f_index(*odd, *fine_dims)
+                values, operations = loaded_values(
+                    ((i1, i2, i3),), work_item
+                )
+                yield from operations
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], odd, fine_dims,
+                    work_item, values, 1.0,
+                )
+                work_item = f_index(*even, *fine_dims)
+                values, operations = loaded_values(
+                    ((i1 + 1, i2, i3), (i1, i2, i3)), work_item
+                )
+                yield from operations
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], even, fine_dims,
+                    work_item, values, 0.5,
+                )
+            for i1 in range(1, mm1):
+                odd = (2 * i1 - 2, 2 * i2 - 1, 2 * i3 - 2)
+                even = (2 * i1 - 1, 2 * i2 - 1, 2 * i3 - 2)
+                work_item = f_index(*odd, *fine_dims)
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], odd, fine_dims,
+                    work_item, [z1[i1]], 0.5,
+                )
+                work_item = f_index(*even, *fine_dims)
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], even, fine_dims,
+                    work_item, [z1[i1], z1[i1 + 1]], 0.25,
+                )
+            for i1 in range(1, mm1):
+                odd = (2 * i1 - 2, 2 * i2 - 2, 2 * i3 - 1)
+                even = (2 * i1 - 1, 2 * i2 - 2, 2 * i3 - 1)
+                work_item = f_index(*odd, *fine_dims)
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], odd, fine_dims,
+                    work_item, [z2[i1]], 0.5,
+                )
+                work_item = f_index(*even, *fine_dims)
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], even, fine_dims,
+                    work_item, [z2[i1], z2[i1 + 1]], 0.25,
+                )
+            for i1 in range(1, mm1):
+                odd = (2 * i1 - 2, 2 * i2 - 1, 2 * i3 - 1)
+                even = (2 * i1 - 1, 2 * i2 - 1, 2 * i3 - 1)
+                work_item = f_index(*odd, *fine_dims)
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], odd, fine_dims,
+                    work_item, [z3[i1]], 0.25,
+                )
+                work_item = f_index(*even, *fine_dims)
+                yield from _mg_weighted_update(
+                    state, invocation, parameters["u"], even, fine_dims,
+                    work_item, [z3[i1], z3[i1 + 1]], 0.125,
+                )
+    yield _control(invocation, canonical.Opcode.COMMIT)
+
+
 EXPANDERS = {
     "npb_cg_spmv": expand_cg_spmv,
     "npb_cg_dot": expand_cg_dot,
@@ -648,6 +1559,11 @@ EXPANDERS = {
     "npb_cg_outer_dots": expand_cg_outer_dots,
     "npb_cg_normalize": expand_cg_normalize,
     "npb_cg_prepare_iteration": expand_cg_prepare_iteration,
+    "npb_mg_resid": expand_mg_resid,
+    "npb_mg_norm2u3": expand_mg_norm2u3,
+    "npb_mg_psinv": expand_mg_psinv,
+    "npb_mg_rprj3": expand_mg_rprj3,
+    "npb_mg_interp": expand_mg_interp,
 }
 
 

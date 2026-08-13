@@ -38,6 +38,7 @@ enum class Opcode : uint16_t
     F64_DIV = 20,
     F64_SQRT = 21,
     F64_MOV = 22,
+    F64_ABS = 23,
 };
 
 #pragma pack(push, 1)
