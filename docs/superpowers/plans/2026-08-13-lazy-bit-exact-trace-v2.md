@@ -41,7 +41,7 @@
 - Create: `tests/pyunit/cross_system/test_lazy_work_trace.py`
 - Modify: `scripts/canonical_work_trace.py`
 
-- [ ] **Step 1: Write failing schema, corruption, and streaming tests**
+- [x] **Step 1: Write failing schema, corruption, and streaming tests**
 
 Add fixtures that use a two-element `f64` image and a registered `fixture_add`
 expander. Require schema-2 round trip, one-bit image corruption rejection,
@@ -70,14 +70,14 @@ def test_one_bit_image_change_fails_before_iteration(self):
         lazy.read_bundle(self.root)
 ```
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 Run:
 `PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system -p 'test_lazy_work_trace.py'`
 
 Expected: FAIL because `scripts.lazy_work_trace` does not exist.
 
-- [ ] **Step 3: Implement immutable schema-2 types and fail-closed loading**
+- [x] **Step 3: Implement immutable schema-2 types and fail-closed loading**
 
 Define these public types and reject booleans, negative/overflowing integers,
 unknown roles/types, duplicate names, path escape, byte-count mismatch, hash
@@ -116,7 +116,7 @@ Write `write_bundle(root, meta, arrays, invocations, dynamic_work)` and
 `read_bundle(root)`. Use canonical JSON, sibling temporary files, `fsync`, and
 `os.replace`; schema 1 remains owned by `canonical_work_trace.py`.
 
-- [ ] **Step 4: Implement copy-on-write mapped state and streaming expansion**
+- [x] **Step 4: Implement copy-on-write mapped state and streaming expansion**
 
 `MappedState` opens each image read-only and maps mutable arrays with
 `mmap.ACCESS_COPY`. It exposes checked `load_raw`, `load_float`, `store_raw`,
@@ -144,7 +144,7 @@ Add `operations_sha256(iterable)` to `canonical_work_trace.py` and
 `expanded_fingerprint(bundle, expanders)` to stream encoded records through
 SHA-256 without constructing a tuple.
 
-- [ ] **Step 5: Prove bounded memory and run canonical regressions**
+- [x] **Step 5: Prove bounded memory and run canonical regressions**
 
 Use a synthetic descriptor with ten million repeated work items but consume
 only its first 100,000 operations under `tracemalloc`; peak Python allocation
@@ -159,7 +159,7 @@ PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system -p 'te
 
 Expected: all tests PASS.
 
-- [ ] **Step 6: Commit the generic lazy-trace layer**
+- [x] **Step 6: Commit the generic lazy-trace layer**
 
 ```bash
 git add scripts/canonical_work_trace.py scripts/lazy_work_trace.py \

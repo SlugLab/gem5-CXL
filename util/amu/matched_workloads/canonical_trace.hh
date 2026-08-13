@@ -32,6 +32,9 @@ enum class Opcode : uint16_t
     I64_MIN = 14,
     BARRIER = 15,
     COMMIT = 16,
+    F64_MAX = 17,
+    F64_MUL = 18,
+    F64_SUB = 19,
 };
 
 #pragma pack(push, 1)

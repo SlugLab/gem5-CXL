@@ -44,6 +44,9 @@ class Opcode(enum.IntEnum):
     I64_MIN = 14
     BARRIER = 15
     COMMIT = 16
+    F64_MAX = 17
+    F64_MUL = 18
+    F64_SUB = 19
 
 
 def _unsigned(value, bits, label):
@@ -113,6 +116,31 @@ def encode_operations(operations):
             )
         )
     return bytes(payload)
+
+
+def operations_sha256(operations):
+    """Hash an ordered operation stream without materializing its encoding."""
+    digest = hashlib.sha256()
+    for expected_sequence, operation in enumerate(operations):
+        if not isinstance(operation, Operation):
+            raise TraceError("trace contains a non-operation value")
+        if operation.sequence != expected_sequence:
+            raise TraceError(
+                f"operation sequence {operation.sequence} != "
+                f"{expected_sequence}"
+            )
+        digest.update(TRACE_STRUCT.pack(
+            operation.phase,
+            int(operation.opcode),
+            0,
+            operation.work_item,
+            operation.sequence,
+            operation.address,
+            operation.operand0,
+            operation.operand1,
+            operation.result,
+        ))
+    return digest.hexdigest()
 
 
 def decode_operations(payload):
