@@ -40,10 +40,15 @@ def _control(invocation, opcode, work_items=0):
     )
 
 
-def _load(invocation, opcode, work_item, address, raw):
+def _load(invocation, opcode, work_item, address, raw, *, dependency_distance=0):
+    dependency = 0
+    if dependency_distance:
+        dependency = (
+            canonical.LOAD_DEPENDENCY_RELATIVE_FLAG | dependency_distance
+        )
     return canonical.Operation(
         invocation.phase, opcode, work_item, 0,
-        address, raw, 0, raw,
+        address, raw, dependency, raw,
     )
 
 
@@ -124,7 +129,9 @@ def expand_cg_spmv(state, invocation, batch_work_items):
             total = 0.0
             if start < edge_base or end < edge_base:
                 raise lazy.LazyTraceError("CG row offset precedes edge base")
-            for edge in range(start - edge_base, end - edge_base):
+            for edge_number, edge in enumerate(
+                range(start - edge_base, end - edge_base)
+            ):
                 column_address, column = state.load_raw(
                     parameters["colidx"], edge
                 )
@@ -141,6 +148,7 @@ def expand_cg_spmv(state, invocation, batch_work_items):
                 yield _load(
                     invocation, canonical.Opcode.LOAD_U32,
                     row, column_address, column,
+                    dependency_distance=1 if edge_number == 0 else 0,
                 )
                 yield _load(
                     invocation, canonical.Opcode.LOAD_F64,
@@ -149,6 +157,7 @@ def expand_cg_spmv(state, invocation, batch_work_items):
                 yield _load(
                     invocation, canonical.Opcode.LOAD_F64,
                     row, source_address, raw_f64(source),
+                    dependency_distance=2,
                 )
                 product = f64(value * source)
                 yield _binary(

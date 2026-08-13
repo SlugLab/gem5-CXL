@@ -60,6 +60,9 @@ MCF_BASES = {
     "depth": 0x320000000,
     "orientation": 0x330000000,
     "objective": 0x400000000,
+    "pricing_offsets": 0x500000000,
+    "pricing_index": 0x600000000,
+    "price_out_index": 0x700000000,
 }
 SPATTER_BASES = {
     "index": 0x100000000,
@@ -3026,7 +3029,9 @@ def _mcf_initial_memory(path):
     header = struct.Struct("<8sQQQQQ")
     if len(payload) < header.size:
         raise BuildError("MCF input is shorter than its header")
-    magic, nodes, arcs, _, _, _ = header.unpack_from(payload)
+    magic, nodes, arcs, pricing_calls, pricing_items, price_out_calls = (
+        header.unpack_from(payload)
+    )
     if magic != b"MCFREG1\0":
         raise BuildError("MCF input magic differs")
     offset = header.size
@@ -3051,6 +3056,17 @@ def _mcf_initial_memory(path):
         "word_bits": 64,
         "words": (0,),
     }
+    result["pricing_offsets"] = image(
+        "pricing offsets", MCF_BASES["pricing_offsets"], pricing_calls + 1
+    )
+    result["pricing_index"] = image(
+        "pricing index", MCF_BASES["pricing_index"], pricing_items
+    )
+    result["price_out_index"] = image(
+        "price-out index", MCF_BASES["price_out_index"], price_out_calls
+    )
+    if offset != len(payload):
+        raise BuildError("MCF input has trailing state bytes")
     return result
 
 

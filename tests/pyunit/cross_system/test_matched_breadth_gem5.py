@@ -12,6 +12,7 @@ from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
+from scripts import build_matched_breadth_workloads as builder
 from scripts import canonical_work_trace as canonical
 from scripts import lazy_work_trace as lazy
 from scripts import npb_lazy_trace as npb
@@ -114,9 +115,9 @@ def _fixtures():
             _op(canonical.Opcode.LOAD_U64, 0, address=0x4000,
                 left=0x4080, result=0x4080),
             _op(canonical.Opcode.LOAD_U64, 1, address=0x4080,
-                left=0x4100, result=0x4100),
+                left=0x4100, right=1, result=0x4100),
             _op(canonical.Opcode.LOAD_U64, 2, address=0x4100,
-                left=23, result=23),
+                left=23, right=2, result=23),
             _op(canonical.Opcode.COMMIT, 3, address=0x5000,
                 left=23, result=23),
         ),
@@ -166,6 +167,52 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                         reference["commit_order"],
                     )
                 self.assertEqual(reference["verification"], "pass")
+
+    def test_actual_fixture_bundles_pass_all_three_backends(self):
+        manifest = builder.build_fixture_suite(self.root / "actual-build")
+        bundles = builder.run_fixture_references(
+            manifest, self.root / "actual-reference"
+        )
+        binary = replay.build_replay_binary(
+            self.root / "actual-replay-build", native=True
+        )
+        for workload in ("mcf", "amg_gather", "lulesh_scatter"):
+            for system in ("vanilla", "amu", "cira"):
+                with self.subTest(workload=workload, system=system):
+                    result = replay.run_native_replay(
+                        binary, system=system, trace=bundles[workload],
+                        outdir=self.root / f"actual-{workload}-{system}",
+                    )
+                    self.assertEqual(result["verification"], "pass")
+                    self.assertEqual(
+                        set(result["output_boundaries"]),
+                        set(canonical.read_bundle(bundles[workload]).outputs),
+                    )
+        manifest_path = self.root / "actual-mcf-window.json"
+        manifest_path.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 1, 1, 2),
+        ):
+            materialized = replay.materialize_window_trace(
+                bundles["mcf"], manifest=manifest_path, phase=1,
+                window_index=0, outdir=self.root / "actual-mcf-window",
+            )
+        dynamic = canonical.read_bundle(materialized.root)
+        fixed = canonical.read_bundle(materialized.fixed_root)
+        self.assertFalse(any(
+            operation.opcode == canonical.Opcode.COMMIT
+            for operation in dynamic.operations
+        ))
+        self.assertTrue(any(
+            operation.opcode == canonical.Opcode.COMMIT
+            for operation in fixed.operations
+        ))
+        self.assertTrue(any(
+            builder.MCF_BASES["pricing_offsets"] <= operation.address <
+            builder.MCF_BASES["pricing_offsets"] + 3 * 8
+            for operation in fixed.operations
+        ))
 
     def test_functional_replay_dumps_every_declared_raw_boundary(self):
         operations = (
@@ -427,6 +474,77 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertGreaterEqual(result["max_observed_outstanding"], 2)
         self.assertEqual(result["raw_outputs"], [8])
 
+    def test_amu_does_not_issue_dependent_pointer_loads_early(self):
+        operations = _fixtures()["pointer_chain"]
+        bundle = self.root / "dependent-pointer-chain"
+        canonical.write_bundle(
+            bundle, _meta("dependent_pointer_chain", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        binary = replay.build_replay_binary(
+            self.root / "dependent-pointer-build", native=True
+        )
+        result = replay.run_native_replay(
+            binary, system="amu", trace=bundle,
+            outdir=self.root / "dependent-pointer-run",
+        )
+        self.assertEqual(result["issued_loads"], 3)
+        self.assertEqual(result["completed_loads"], 3)
+        self.assertEqual(result["max_observed_outstanding"], 1)
+
+    def test_cross_work_item_dependency_waits_for_global_completion(self):
+        operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, work_item=0,
+                address=0xA000, left=0xA080, result=0xA080),
+            _op(canonical.Opcode.LOAD_U64, 1, work_item=1,
+                address=0xA080, left=29, right=1, result=29),
+            _op(canonical.Opcode.COMMIT, 2, work_item=1, left=29, result=29),
+        )
+        bundle = self.root / "cross-group-dependency"
+        canonical.write_bundle(
+            bundle, _meta("cross_group_dependency", 2), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        binary = replay.build_replay_binary(
+            self.root / "cross-group-build", native=True
+        )
+        result = replay.run_native_replay(
+            binary, system="amu", trace=bundle,
+            outdir=self.root / "cross-group-run",
+        )
+        self.assertEqual(result["verification"], "pass")
+        self.assertEqual(result["max_observed_outstanding"], 1)
+
+    def test_cross_work_item_failure_cancels_dependency_waiters(self):
+        operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, work_item=0,
+                address=0xA800, left=5, result=6),
+            _op(canonical.Opcode.LOAD_U64, 1, work_item=1,
+                address=0xA880, left=7, right=1, result=7),
+            _op(canonical.Opcode.COMMIT, 2, work_item=1, left=7, result=7),
+        )
+        bundle = self.root / "cancelled-dependency"
+        canonical.write_bundle(
+            bundle, _meta("cancelled_dependency", 2), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        binary = replay.build_replay_binary(
+            self.root / "cancelled-dependency-build", native=True
+        )
+        initial = replay._write_initial_memory_map(
+            canonical.read_bundle(bundle), bundle,
+            self.root / "cancelled-dependency-initial.txt",
+        )
+        completed = subprocess.run([
+            str(binary), "--system", "amu", "--trace",
+            str(bundle / "trace.bin"), "--result",
+            str(self.root / "cancelled-dependency-result.json"),
+            "--initial-memory-map", str(initial),
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+           timeout=5)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("bit-exact result differs", completed.stderr)
+
     def test_native_replay_preserves_logical_cache_line_layout(self):
         operations = (
             _op(canonical.Opcode.LOAD_U64, 0, address=0x7100,
@@ -576,6 +694,72 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             "--measure-start-item", "0", "--initial-memory-map", str(initial),
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(json.loads(result.read_text())["verification"], "pass")
+
+    def test_eager_window_remaps_load_dependencies_after_fixed_split(self):
+        operations = (
+            _op(canonical.Opcode.BARRIER, 0, work_item=0),
+            _op(canonical.Opcode.LOAD_U64, 1, work_item=0,
+                address=0x9000, left=0x9080, result=0x9080),
+            _op(canonical.Opcode.LOAD_U64, 2, work_item=0,
+                address=0x9080, left=17, right=2, result=17),
+            _op(canonical.Opcode.COMMIT, 3, work_item=0, left=17, result=17),
+        )
+        trace = self.root / "dependency-window"
+        canonical.write_bundle(
+            trace, _meta("dependency_window", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        manifest = self.root / "dependency-window-plan.json"
+        manifest.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 0, 0, 1),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace, manifest=manifest, phase=0, window_index=0,
+                outdir=self.root / "dependency-materialized",
+            )
+        dynamic = canonical.read_bundle(materialized.root)
+        self.assertEqual([operation.sequence for operation in dynamic.operations],
+                         [0, 1])
+        self.assertEqual(dynamic.operations[1].operand1, 1)
+        binary = replay.build_replay_binary(
+            self.root / "dependency-window-build", native=True
+        )
+        result = replay.run_native_replay(
+            binary, system="amu", trace=materialized.root,
+            outdir=self.root / "dependency-window-run",
+        )
+        self.assertEqual(result["max_observed_outstanding"], 1)
+
+    def test_eager_out_of_range_request_is_timed_as_fixed_component(self):
+        operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, work_item=3,
+                address=0xB000, left=1, result=1),
+            _op(canonical.Opcode.LOAD_U64, 1, work_item=1,
+                address=0xB080, left=31, right=1, result=31),
+            _op(canonical.Opcode.COMMIT, 2, work_item=1, left=31, result=31),
+        )
+        trace = self.root / "fixed-request-window"
+        canonical.write_bundle(
+            trace, _meta("fixed_request_window", 3), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        manifest = self.root / "fixed-request-plan.json"
+        manifest.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 1, 1, 2),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace, manifest=manifest, phase=0, window_index=0,
+                outdir=self.root / "fixed-request-materialized",
+            )
+        dynamic = canonical.read_bundle(materialized.root)
+        fixed = canonical.read_bundle(materialized.fixed_root)
+        self.assertEqual(dynamic.operations[0].address, 0xB080)
+        self.assertEqual(dynamic.operations[0].operand1, 0)
+        self.assertIn(0xB000, [operation.address for operation in fixed.operations])
 
     def test_schema2_window_materializes_repeated_invocations_globally(self):
         trace = self.root / "lazy"
@@ -749,6 +933,80 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 result["output_boundaries"]["u.zero3.iter2"]["raw_words"],
                 [0],
             )
+
+    def test_schema2_multiload_window_exercises_amu_and_four_cira_cores(self):
+        trace_root = self.root / "schema2-cg-window"
+        image_root = trace_root / "images"
+        image_root.mkdir(parents=True)
+
+        def array(name, element_type, base, values, code):
+            payload = struct.pack(f"<{len(values)}{code}", *values)
+            path = image_root / f"{name}.{element_type}"
+            path.write_bytes(payload)
+            return lazy.ArrayImage(
+                name, "state", element_type, len(values), base,
+                f"images/{path.name}", hashlib.sha256(payload).hexdigest(),
+            )
+
+        rows = 8
+        rowstr = tuple(2 * row for row in range(rows + 1))
+        colidx = tuple(index % rows for index in range(2 * rows))
+        one = 0x3FF0000000000000
+        zero = 0
+        arrays = (
+            array("rowstr", "u32", 0x1000, rowstr, "I"),
+            array("colidx", "u32", 0x2000, colidx, "I"),
+            array("a", "f64", 0x3000, (one,) * (2 * rows), "Q"),
+            array("p", "f64", 0x4000, (one,) * rows, "Q"),
+            array("q", "f64", 0x5000, (zero,) * rows, "Q"),
+        )
+        invocation = lazy.Invocation(
+            0, 101, "npb_cg_spmv", 1, rows,
+            {"rowstr": "rowstr", "colidx": "colidx", "values": "a",
+             "source": "p", "destination": "q", "row_count": rows,
+             "edge_base": 0, "column_base": 0,
+             "destination_count": rows},
+        )
+        result_words = (0x4000000000000000,) * rows
+        lazy.write_bundle(
+            trace_root,
+            {"schema": 2, "workload": "npb_cg",
+             "source_sha256": _digest("window-source"),
+             "binary_sha256": _digest("window-binary"),
+             "config_sha256": _digest("window-config"),
+             "boundary_commitments": {
+                 "q.spmv.iter1": hashlib.sha256(
+                     struct.pack(f"<{rows}Q", *result_words)
+                 ).hexdigest(),
+             }},
+            arrays, (invocation,), {"primitive_records": 106},
+        )
+        manifest = self.root / "schema2-window-plan.json"
+        manifest.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 0, 0, rows),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace_root, manifest=manifest, phase=101, window_index=0,
+                outdir=self.root / "schema2-cg-materialized",
+            )
+        binary = replay.build_replay_binary(
+            self.root / "schema2-window-build", native=True
+        )
+        amu = replay.run_native_replay(
+            binary, system="amu", trace=materialized.root,
+            outdir=self.root / "schema2-window-amu",
+        )
+        cira = replay.run_native_replay(
+            binary, system="cira", trace=materialized.root,
+            outdir=self.root / "schema2-window-cira",
+        )
+        self.assertGreater(amu["max_observed_outstanding"], 1)
+        self.assertEqual(amu["issued_loads"], amu["completed_loads"])
+        self.assertLess(amu["drains"], amu["issued_loads"])
+        self.assertTrue(all(count > 0 for count in cira["issued_per_core"]))
+        self.assertEqual(cira["issued_per_core"], cira["completed_per_core"])
 
     def test_native_lazy_one_bit_runtime_store_drift_fails_commitment(self):
         raw_two = 0x4000000000000000

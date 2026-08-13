@@ -14,6 +14,8 @@
 namespace matched_trace
 {
 
+constexpr uint64_t LoadDependencyRelativeFlag = UINT64_C(1) << 63;
+
 enum class Opcode : uint16_t
 {
     LOAD_U32 = 1,

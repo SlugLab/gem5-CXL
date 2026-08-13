@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -41,6 +43,90 @@ namespace
 
 using matched_trace::Opcode;
 using matched_trace::TraceRecord;
+using matched_trace::LoadDependencyRelativeFlag;
+
+class DependencyTracker
+{
+  public:
+    static constexpr size_t MaxOutOfOrder = 65536;
+
+    void wait(uint64_t sequence)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ready.wait(lock, [&] {
+            return cancelled || sequence < frontier ||
+                   outOfOrder.count(sequence) != 0;
+        });
+        if (cancelled)
+            throw std::runtime_error("canonical dependency cancelled: " +
+                                     cancellationReason);
+    }
+
+    void publish(uint64_t sequence)
+    {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ready.wait(lock, [&] {
+                return cancelled || sequence <= frontier ||
+                       outOfOrder.size() < MaxOutOfOrder;
+            });
+            if (cancelled)
+                throw std::runtime_error(
+                    "canonical dependency cancelled: " +
+                    cancellationReason);
+            if (sequence < frontier || outOfOrder.count(sequence) != 0)
+                throw std::runtime_error(
+                    "canonical dependency completion is duplicate");
+            if (sequence == frontier) {
+                ++frontier;
+                while (outOfOrder.erase(frontier) != 0)
+                    ++frontier;
+            } else if (!outOfOrder.insert(sequence).second) {
+                throw std::runtime_error(
+                    "canonical dependency completion is duplicate");
+            }
+        }
+        ready.notify_all();
+    }
+
+    void cancel(const std::string &reason)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!cancelled) {
+                cancelled = true;
+                cancellationReason = reason;
+            }
+        }
+        ready.notify_all();
+    }
+
+  private:
+    std::mutex mutex;
+    std::condition_variable ready;
+    uint64_t frontier = 0;
+    std::unordered_set<uint64_t> outOfOrder;
+    bool cancelled = false;
+    std::string cancellationReason;
+};
+
+uint64_t
+dependencySequence(const TraceRecord &record)
+{
+    if (record.operand1 == 0)
+        return std::numeric_limits<uint64_t>::max();
+    const bool relative =
+        (record.operand1 & LoadDependencyRelativeFlag) != 0;
+    const uint64_t encoded = relative ?
+        record.operand1 & ~LoadDependencyRelativeFlag : record.operand1;
+    if (encoded == 0 || (relative && encoded > record.sequence))
+        throw std::runtime_error("canonical load dependency is invalid");
+    const uint64_t dependency = relative ?
+        record.sequence - encoded : encoded - 1;
+    if (dependency >= record.sequence)
+        throw std::runtime_error("canonical load dependency is not prior");
+    return dependency;
+}
 
 struct Request
 {
@@ -624,6 +710,8 @@ readTrace(const std::string &path)
                 "canonical trace opcode differs at sequence " +
                 std::to_string(index));
         }
+        if (Memory::isLoad(static_cast<Opcode>(records[index].opcode)))
+            (void)dependencySequence(records[index]);
     }
     return records;
 }
@@ -837,6 +925,8 @@ readStreamFrame(int descriptor, uint64_t &expectedSequence, bool &finished,
             record.opcode > static_cast<uint16_t>(Opcode::F64_ABS)) {
             throw std::runtime_error("canonical stream opcode differs");
         }
+        if (Memory::isLoad(static_cast<Opcode>(record.opcode)))
+            (void)dependencySequence(record);
     }
     return records;
 }
@@ -933,6 +1023,7 @@ accumulateStats(ReplayStats &total, const ReplayStats &observed)
 void
 executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
              Accessor &accessor, Memory &memory,
+             DependencyTracker &dependencies,
              const std::unordered_map<uint64_t, uint64_t> &previousStore,
              const std::unordered_map<uint64_t, size_t> &commitSlots,
              std::vector<Commit> &commits,
@@ -953,6 +1044,7 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
             const size_t begin = index;
             size_t end = begin;
             std::vector<Request> requests;
+            std::unordered_set<uint64_t> pendingSequences;
             while (end < group.recordIndices.size()) {
                 const auto *candidate = &records[group.recordIndices[end]];
                 const auto candidateOpcode =
@@ -965,11 +1057,18 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                 if (Memory::isLoad(candidateOpcode)) {
                     if (requests.size() == 32)
                         break;
+                    const uint64_t dependency =
+                        dependencySequence(*candidate);
+                    if (pendingSequences.count(dependency) != 0)
+                        break;
+                    if (dependency != std::numeric_limits<uint64_t>::max())
+                        dependencies.wait(dependency);
                     waitForPreviousStore(*candidate);
                     requests.push_back(accessor.load(
                         candidate->address, Memory::width(candidateOpcode),
                         candidate->sequence));
                 }
+                pendingSequences.insert(candidate->sequence);
                 ++end;
             }
             if (!requests.empty()) {
@@ -990,6 +1089,7 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                             "bit-exact result differs at canonical sequence " +
                             std::to_string(operation->sequence));
                     }
+                    dependencies.publish(operation->sequence);
                 }
                 index = end;
                 continue;
@@ -1018,6 +1118,7 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                 "bit-exact result differs at canonical sequence " +
                 std::to_string(record->sequence));
         }
+        dependencies.publish(record->sequence);
         if (boundaryProbes) {
             const auto probes = boundaryProbes->find(record->sequence);
             if (probes != boundaryProbes->end()) {
@@ -1035,6 +1136,7 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
 ReplayStats
 executeTrace(const std::string &system, const std::vector<Phase> &phases,
              const std::vector<TraceRecord> &records, Memory &memory,
+             DependencyTracker &dependencies,
              const std::unordered_map<uint64_t, uint64_t> &previousStore,
              const std::unordered_map<uint64_t, size_t> &commitSlots,
              std::vector<Commit> &commits,
@@ -1061,14 +1163,17 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
 #pragma omp ordered
                         executeGroup(
                             phase.groups[group], records, *accessor, memory,
+                            dependencies,
                             previousStore, commitSlots, commits,
                             boundaryProbes);
                     } else {
                         executeGroup(
                             phase.groups[group], records, *accessor, memory,
+                            dependencies,
                             previousStore, commitSlots, commits, nullptr);
                     }
                 } catch (const std::exception &error) {
+                    dependencies.cancel(error.what());
                     failed.store(true, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> guard(failureMutex);
                     if (failure.empty())
@@ -1079,6 +1184,7 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
                 accessor->drain();
                 captureAccessorStats(*accessor, threadStats[core]);
             } catch (const std::exception &error) {
+                dependencies.cancel(error.what());
                 failed.store(true, std::memory_order_relaxed);
                 std::lock_guard<std::mutex> guard(failureMutex);
                 if (failure.empty())
@@ -1198,6 +1304,7 @@ executeStreamFile(const std::string &path, const std::string &system,
     ReplayStats total;
     std::vector<Commit> commits;
     std::unordered_map<uint64_t, uint64_t> lastStore;
+    DependencyTracker dependencies;
     uint64_t expectedSequence = 0;
     size_t phaseExecutions = 0;
     bool finished = false;
@@ -1241,7 +1348,7 @@ executeStreamFile(const std::string &path, const std::string &system,
             const auto phases = buildOrderedPhases(records);
             phaseExecutions += phases.size();
             const auto observed = executeTrace(
-                system, phases, records, memory, previousStore,
+                system, phases, records, memory, dependencies, previousStore,
                 commitSlots, commits, &orderedExecution);
             accumulateStats(total, observed);
         }
@@ -1394,6 +1501,7 @@ main(int argc, char **argv)
                 commitSlots.emplace(record.sequence, commitCount++);
         }
         std::vector<Commit> commits(commitCount);
+        DependencyTracker dependencies;
         memory.flushForRoi();
         ReplayStats stats;
         size_t measuredPhases = phases.size();
@@ -1403,22 +1511,26 @@ main(int argc, char **argv)
             if (measured.empty())
                 throw std::runtime_error("window measured range is empty");
             if (!warmup.empty()) {
-                executeTrace(system, warmup, records, memory, previousStore,
-                             commitSlots, commits);
+                executeTrace(system, warmup, records, memory, dependencies,
+                             previousStore, commitSlots, commits);
             }
 #ifndef TRACE_REPLAY_NATIVE
             m5_work_begin(selectedPhase, windowIndex);
 #endif
             stats = executeTrace(system, measured, records, memory,
+                                 dependencies,
                                  previousStore, commitSlots, commits);
 #ifndef TRACE_REPLAY_NATIVE
             m5_work_end(selectedPhase, windowIndex);
 #endif
             measuredPhases = measured.size();
         } else {
+            const BoundaryProbes *orderedProbes =
+                outputBoundaries.empty() ? nullptr : &boundaryProbes;
             stats = executeTrace(system, phases, records, memory,
+                                 dependencies,
                                  previousStore, commitSlots, commits,
-                                 &boundaryProbes);
+                                 orderedProbes);
         }
         writeResult(resultPath, system, records.size(), commits,
                     memory.allocatedBytes(), measuredPhases, stats, mode,

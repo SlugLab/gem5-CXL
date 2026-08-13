@@ -213,6 +213,7 @@ def _write_partitioned_payload(dynamic_root, fixed_root, operations):
     streams = []
     digests = [hashlib.sha256(), hashlib.sha256()]
     counts = [0, 0]
+    source_to_partition_sequence = ({}, {})
     try:
         for root in roots:
             descriptor, temporary_name = tempfile.mkstemp(
@@ -224,8 +225,33 @@ def _write_partitioned_payload(dynamic_root, fixed_root, operations):
         descriptors.clear()
         for fixed, operation in operations:
             index = 1 if fixed else 0
+            operand1 = operation.operand1
+            if operation.opcode in {
+                canonical.Opcode.LOAD_U32, canonical.Opcode.LOAD_U64,
+                canonical.Opcode.LOAD_F32, canonical.Opcode.LOAD_F64,
+            } and operand1:
+                if operand1 & canonical.LOAD_DEPENDENCY_RELATIVE_FLAG:
+                    distance = (
+                        operand1 &
+                        ~canonical.LOAD_DEPENDENCY_RELATIVE_FLAG
+                    )
+                    if distance == 0 or distance > operation.sequence:
+                        raise ReplayError(
+                            "canonical relative load dependency is invalid"
+                        )
+                    source_dependency = operation.sequence - distance
+                else:
+                    source_dependency = operand1 - 1
+                    if source_dependency >= operation.sequence:
+                        raise ReplayError(
+                            "canonical absolute load dependency is invalid"
+                        )
+                mapped = source_to_partition_sequence[index].get(
+                    source_dependency
+                )
+                operand1 = 0 if mapped is None else mapped + 1
             sequenced = dataclasses.replace(
-                operation, sequence=counts[index]
+                operation, sequence=counts[index], operand1=operand1,
             )
             payload = canonical.TRACE_STRUCT.pack(
                 sequenced.phase, int(sequenced.opcode), 0,
@@ -234,6 +260,9 @@ def _write_partitioned_payload(dynamic_root, fixed_root, operations):
             )
             streams[index].write(payload)
             digests[index].update(payload)
+            source_to_partition_sequence[index][operation.sequence] = (
+                counts[index]
+            )
             counts[index] += 1
         for stream in streams:
             stream.flush()
@@ -353,6 +382,11 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                     _remember_initial(fixed_initial, operation)
                     yield True, operation
                     continue
+                if operation.work_item >= phase_items:
+                    state["fixed"] += 1
+                    _remember_initial(fixed_initial, operation)
+                    yield True, operation
+                    continue
                 if window.warmup_start <= operation.work_item < window.measure_stop:
                     if operation.opcode.name.startswith(
                         ("LOAD_", "STORE_")
@@ -415,6 +449,9 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                             source, invocation, operation
                         )
                         expanded += 1
+                        operation = dataclasses.replace(
+                            operation, sequence=expanded - 1
+                        )
                         if invocation.phase != phase:
                             continue
                         if operation.opcode in {

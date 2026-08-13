@@ -58,9 +58,14 @@ def lanes(count):
             for lane in range(4)]
 
 
-def load(phase, opcode, work_item, address, raw):
+def load(phase, opcode, work_item, address, raw, *, dependency_distance=0):
+    dependency = 0
+    if dependency_distance:
+        dependency = (
+            canonical.LOAD_DEPENDENCY_RELATIVE_FLAG | dependency_distance
+        )
     return canonical.Operation(
-        phase, opcode, work_item, 0, address, raw, 0, raw,
+        phase, opcode, work_item, 0, address, raw, dependency, raw,
     )
 
 
@@ -150,11 +155,14 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 0x1000 + (row + 1) * 4, rowstr[row + 1],
             ))
             total = 0.0
-            for edge in range(rowstr[row], rowstr[row + 1]):
+            for edge_number, edge in enumerate(
+                range(rowstr[row], rowstr[row + 1])
+            ):
                 column = colidx[edge]
                 rows.append(load(
                     phase, canonical.Opcode.LOAD_U32, row,
                     0x2000 + edge * 4, column,
+                    dependency_distance=1 if edge_number == 0 else 0,
                 ))
                 rows.append(load(
                     phase, canonical.Opcode.LOAD_F64, row,
@@ -163,6 +171,7 @@ class NpbCgLazyTraceTest(unittest.TestCase):
                 rows.append(load(
                     phase, canonical.Opcode.LOAD_F64, row,
                     0x4000 + column * 8, raw_f64(source[column]),
+                    dependency_distance=2,
                 ))
                 product = values[edge] * source[column]
                 rows.append(binary(

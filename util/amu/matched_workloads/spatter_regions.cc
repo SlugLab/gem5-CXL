@@ -158,10 +158,12 @@ runGather(
         if (source >= values.size())
             throw std::runtime_error("gather index is out of bounds");
         const uint32_t bits = matched_trace::raw_bits(values[source]);
+        const uint64_t indexSequence = sequence;
         emit(trace, GatherPhase, Opcode::LOAD_U64, i, sequence,
              IndexBase + i * sizeof(uint64_t), source, 0, source);
         emit(trace, GatherPhase, Opcode::LOAD_F32, i, sequence,
-             ValueBase + source * sizeof(float), bits, 0, bits);
+             ValueBase + source * sizeof(float), bits, indexSequence + 1,
+             bits);
         destination[i] = values[source];
         emit(trace, GatherPhase, Opcode::STORE_F32, i, sequence,
              DestinationBase + i * sizeof(float), bits, 0, bits);

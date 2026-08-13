@@ -20,6 +20,7 @@ except ImportError:
 
 
 TRACE_STRUCT = struct.Struct("<H H I Q Q Q Q Q Q")
+LOAD_DEPENDENCY_RELATIVE_FLAG = 1 << 63
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 

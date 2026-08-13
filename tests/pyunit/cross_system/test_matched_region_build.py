@@ -67,9 +67,53 @@ class MatchedRegionBuildTest(unittest.TestCase):
         self.assertEqual(len(mcf.outputs["potential"]), 4 * 3)
         self.assertEqual(
             mcf.meta["trace_sha256"],
-            "1e0265f05bf7d0027adb8ae3454394fb16f85a5fce4d03f26a97a427f32b08b5",
+            "def6c2c55fd2615fbf603804c05ade0107d46d2083ec903e7b216c79d7602b01",
         )
-        self.assertEqual(mcf.meta["trace_records"], 26)
+        self.assertEqual(mcf.meta["trace_records"], 101)
+        self.assertEqual(set(mcf.meta["initial_memory"]), {
+            "arcs", "potential", "predecessor", "depth", "orientation",
+            "tree", "objective", "pricing_offsets", "pricing_index",
+            "price_out_index",
+        })
+        pricing = [
+            operation for operation in mcf.operations
+            if operation.phase == 1
+        ]
+        self.assertEqual(
+            [operation.address for operation in pricing[:8]],
+            [
+                builder.MCF_BASES["pricing_offsets"],
+                builder.MCF_BASES["pricing_offsets"] + 8,
+                builder.MCF_BASES["pricing_index"],
+                builder.MCF_BASES["arc"],
+                builder.MCF_BASES["arc"] + 8,
+                builder.MCF_BASES["arc"] + 16,
+                builder.MCF_BASES["potential"],
+                builder.MCF_BASES["potential"] + 8,
+            ],
+        )
+        self.assertEqual(
+            [operation.operand1 for operation in pricing[:8]],
+            [0, 0, 2, 3, 3, 3, 4, 5],
+        )
+        price_out_loads = {
+            operation.address for operation in mcf.operations
+            if operation.phase == 2 and operation.opcode == trace.Opcode.LOAD_U64
+        }
+        self.assertTrue(any(
+            builder.MCF_BASES["price_out_index"] <= address <
+            builder.MCF_BASES["price_out_index"] + 3 * 8
+            for address in price_out_loads
+        ))
+        self.assertTrue(any(
+            builder.MCF_BASES["arc"] + 24 == address
+            for address in price_out_loads
+        ))
+        self.assertTrue(any(
+            builder.MCF_BASES["depth"] <= address <
+            builder.MCF_BASES["depth"] + 4 * 8
+            for address in price_out_loads
+        ))
         self.assertEqual(mcf.outputs["flow"], (
             1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0,
         ))
@@ -92,8 +136,14 @@ class MatchedRegionBuildTest(unittest.TestCase):
         self.assertEqual(gather.outputs["destination"], expected_bits)
         self.assertEqual(
             gather.meta["trace_sha256"],
-            "44993de93f6a914e49747218f9080becf42a12d1b9f5559cb1781d6241f8cbf7",
+            "9ce8139d9b57dfb1629966a781391c51e766c4693a566da14df2ef43b4501223",
         )
+        for index in range(0, len(gather.operations), 3):
+            index_load, value_load, store = gather.operations[index:index + 3]
+            self.assertEqual(index_load.opcode, trace.Opcode.LOAD_U64)
+            self.assertEqual(value_load.opcode, trace.Opcode.LOAD_F32)
+            self.assertEqual(value_load.operand1, index_load.sequence + 1)
+            self.assertEqual(store.opcode, trace.Opcode.STORE_F32)
         self.assertEqual(
             scatter.meta["trace_sha256"],
             "6bcb6b74e9f15421a2abcf8ab1c0317250692ce3089f15dc0a47f9b9bbda1fd8",

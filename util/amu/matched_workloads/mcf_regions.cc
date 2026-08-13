@@ -31,6 +31,9 @@ constexpr uint64_t PredecessorBase = 0x310000000ULL;
 constexpr uint64_t DepthBase = 0x320000000ULL;
 constexpr uint64_t OrientationBase = 0x330000000ULL;
 constexpr uint64_t ObjectiveBase = 0x400000000ULL;
+constexpr uint64_t PricingOffsetsBase = 0x500000000ULL;
+constexpr uint64_t PricingIndexBase = 0x600000000ULL;
+constexpr uint64_t PriceOutIndexBase = 0x700000000ULL;
 constexpr char Magic[8] = {'M', 'C', 'F', 'R', 'E', 'G', '1', '\0'};
 
 #pragma pack(push, 1)
@@ -171,15 +174,17 @@ loadState(const std::string &path, Header &header)
     return state;
 }
 
-void
+uint64_t
 emit(
     std::FILE *trace, uint16_t phase, Opcode opcode, uint64_t workItem,
     uint64_t &sequence, uint64_t address, uint64_t operand0,
     uint64_t operand1, uint64_t result)
 {
+    const uint64_t emittedSequence = sequence++;
     matched_trace::emit(trace, TraceRecord{
-        phase, static_cast<uint16_t>(opcode), 0, workItem, sequence++,
+        phase, static_cast<uint16_t>(opcode), 0, workItem, emittedSequence,
         address, operand0, operand1, result});
+    return emittedSequence;
 }
 
 uint64_t
@@ -202,13 +207,43 @@ runPricing(const Header &header, const State &state, std::FILE *trace,
          ++invocation) {
         int64_t best = std::numeric_limits<int64_t>::max();
         uint64_t bestIndex = std::numeric_limits<uint64_t>::max();
-        for (uint64_t item = state.pricingOffsets[invocation];
-             item < state.pricingOffsets[invocation + 1]; ++item) {
+        const uint64_t begin = state.pricingOffsets[invocation];
+        const uint64_t end = state.pricingOffsets[invocation + 1];
+        const uint64_t fixedWorkItem = header.pricingItems + invocation;
+        emit(trace, PricingPhase, Opcode::LOAD_U64, fixedWorkItem, sequence,
+             PricingOffsetsBase + invocation * sizeof(uint64_t), begin, 0,
+             begin);
+        const uint64_t endSequence = emit(
+            trace, PricingPhase, Opcode::LOAD_U64, fixedWorkItem, sequence,
+            PricingOffsetsBase + (invocation + 1) * sizeof(uint64_t), end, 0,
+            end);
+        for (uint64_t item = begin; item < end; ++item) {
             const uint64_t arcIndex = state.pricingIndex[item];
             const Arc &arc = state.arcs[arcIndex];
             const int64_t reduced = reducedCost(state, arc);
+            const uint64_t indexSequence = emit(
+                trace, PricingPhase, Opcode::LOAD_U64, item, sequence,
+                PricingIndexBase + item * sizeof(uint64_t), arcIndex,
+                endSequence + 1, arcIndex);
+            const uint64_t tailSequence = emit(
+                trace, PricingPhase, Opcode::LOAD_U64, item, sequence,
+                ArcBase + arcIndex * sizeof(Arc), arc.tail,
+                indexSequence + 1, arc.tail);
+            const uint64_t headSequence = emit(
+                trace, PricingPhase, Opcode::LOAD_U64, item, sequence,
+                ArcBase + arcIndex * sizeof(Arc) + sizeof(uint64_t), arc.head,
+                indexSequence + 1, arc.head);
             emit(trace, PricingPhase, Opcode::LOAD_U64, item, sequence,
-                 ArcBase + arcIndex * sizeof(Arc), arc.tail, 0, arc.tail);
+                 ArcBase + arcIndex * sizeof(Arc) + 2 * sizeof(uint64_t),
+                 bits(arc.cost), indexSequence + 1, bits(arc.cost));
+            emit(trace, PricingPhase, Opcode::LOAD_U64, item, sequence,
+                 PotentialBase + arc.tail * sizeof(int64_t),
+                 bits(state.potential[arc.tail]), tailSequence + 1,
+                 bits(state.potential[arc.tail]));
+            emit(trace, PricingPhase, Opcode::LOAD_U64, item, sequence,
+                 PotentialBase + arc.head * sizeof(int64_t),
+                 bits(state.potential[arc.head]), headSequence + 1,
+                 bits(state.potential[arc.head]));
             const int64_t partial = arc.cost + state.potential[arc.tail];
             emit(trace, PricingPhase, Opcode::I64_ADD, item, sequence,
                  PotentialBase + arc.tail * sizeof(int64_t), bits(arc.cost),
@@ -266,14 +301,44 @@ runPriceOut(
     std::vector<uint64_t> depth;
     std::vector<uint64_t> orientation;
     std::vector<uint64_t> tree;
+    uint64_t previousInvocationTail = 0;
     for (uint64_t invocation = 0; invocation < header.priceOutCalls;
          ++invocation) {
         const uint64_t arcIndex = state.priceOutIndex[invocation];
         Arc &arc = state.arcs[arcIndex];
         const int64_t reduced = reducedCost(state, arc);
+        const uint64_t indexSequence = emit(
+            trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+            PriceOutIndexBase + invocation * sizeof(uint64_t), arcIndex,
+            invocation == 0 ? 0 : previousInvocationTail + 1,
+            arcIndex);
+        const uint64_t tailSequence = emit(
+            trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+            ArcBase + arcIndex * sizeof(Arc), arc.tail, indexSequence + 1,
+            arc.tail);
+        const uint64_t headSequence = emit(
+            trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+            ArcBase + arcIndex * sizeof(Arc) + sizeof(uint64_t), arc.head,
+            indexSequence + 1, arc.head);
         emit(trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
-             ArcBase + arcIndex * sizeof(Arc), arc.tail, 0, arc.tail);
+             ArcBase + arcIndex * sizeof(Arc) + 2 * sizeof(uint64_t),
+             bits(arc.cost), indexSequence + 1, bits(arc.cost));
+        emit(trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+             PotentialBase + arc.tail * sizeof(int64_t),
+             bits(state.potential[arc.tail]), tailSequence + 1,
+             bits(state.potential[arc.tail]));
+        emit(trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+             PotentialBase + arc.head * sizeof(int64_t),
+             bits(state.potential[arc.head]), headSequence + 1,
+             bits(state.potential[arc.head]));
         if (reduced < 0) {
+            emit(trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+                 ArcBase + arcIndex * sizeof(Arc) + 3 * sizeof(uint64_t),
+                 bits(arc.flow), indexSequence + 1, bits(arc.flow));
+            emit(trace, PriceOutPhase, Opcode::LOAD_U64, invocation, sequence,
+                 DepthBase + arc.tail * sizeof(int64_t),
+                 bits(state.depth[arc.tail]), tailSequence + 1,
+                 bits(state.depth[arc.tail]));
             ++arc.flow;
             arc.cost = reduced;
             state.potential[arc.head] += reduced;
@@ -309,6 +374,7 @@ runPriceOut(
             emit(trace, PriceOutPhase, Opcode::STORE_U64, invocation, sequence,
                  ObjectiveBase, bits(objective), 0, bits(objective));
         }
+        previousInvocationTail = sequence - 1;
         emit(trace, PriceOutPhase, Opcode::COMMIT, invocation, sequence,
              TreeBase + arc.head * sizeof(int64_t), bits(reduced),
              bits(arc.flow), bits(objective));
