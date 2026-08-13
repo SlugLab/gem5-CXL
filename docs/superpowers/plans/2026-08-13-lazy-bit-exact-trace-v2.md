@@ -282,7 +282,7 @@ Run the same tiny V-cycle with batch sizes 1, 2, and 17; require equal encoded
 streams, dynamic counts, final grids, residuals, and norm commitments. Flip a
 level offset and require bounds failure before a boundary can pass.
 
-- [ ] **Step 6: Run tests and commit MG expansion**
+- [x] **Step 6: Run tests and commit MG expansion**
 
 ```bash
 PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system \
@@ -302,7 +302,7 @@ git commit -m "feat: expand exact NPB MG lazy traces"
 - Modify: `util/amu/matched_workloads/npb-mg-trace.patch`
 - Modify: `tests/pyunit/cross_system/test_npb_trace_instrumentation.py`
 
-- [ ] **Step 1: Replace the eager replayability assertion with failing v2 evidence assertions**
+- [x] **Step 1: Replace the eager replayability assertion with failing v2 evidence assertions**
 
 Require each Class S run to produce `trace.v2.json`, hash-bound array images,
 ordered invocation records, exact dynamic counts, expanded-stream SHA-256,
@@ -311,12 +311,12 @@ reduction/control record budget. Keep official verification, two-run raw-bit
 comparison, zero-fuzz patch equality, arithmetic fingerprint, allocation
 probe, and the flipped-bit failure.
 
-- [ ] **Step 2: Run focused instrumentation tests and verify RED**
+- [x] **Step 2: Run focused instrumentation tests and verify RED**
 
 Run the NPB instrumentation test file. Expected: FAIL because no schema-2
 descriptor exists.
 
-- [ ] **Step 3: Remove primitive buffering and add fail-closed capture records**
+- [x] **Step 3: Remove primitive buffering and add fail-closed capture records**
 
 Delete `matched_trace_load_*`, `matched_trace_store_*`, and
 `matched_trace_binary_*` from the Fortran-facing API. Add hooks with fixed
@@ -342,7 +342,7 @@ the commitment record. Reject repeated array ids with different metadata,
 duplicate invocation ordinals, invalid widths, negative counts, and I/O
 errors.
 
-- [ ] **Step 4: Make the CG patch capture one initial state plus exact invocations**
+- [x] **Step 4: Make the CG patch capture one initial state plus exact invocations**
 
 Capture `rowstr`, `colidx`, `a`, `x`, `z`, `p`, `q`, and `r` at the declared
 canonical start. Emit ordered CG invocation parameters (`firstrow`, `lastrow`,
@@ -350,7 +350,7 @@ canonical start. Emit ordered CG invocation parameters (`firstrow`, `lastrow`,
 ranges). Retain transformed arithmetic and raw boundary commitments; remove
 all per-primitive hook calls.
 
-- [ ] **Step 5: Make the MG patch capture initial grids plus all phase invocations**
+- [x] **Step 5: Make the MG patch capture initial grids plus all phase invocations**
 
 Register each allocation once with array id, logical base, dimensions, and
 raw bytes. At every `resid`, `rprj3`, `interp`, `psinv`, and `norm2u3` entry,
@@ -358,14 +358,14 @@ record kernel id, array ids/offsets, dimensions, coefficients, level,
 invocation ordinal, and exact work-item count. Preserve the explicit four-lane
 norm transform and boundary commitments.
 
-- [ ] **Step 6: Parse capture files into a canonical schema-2 bundle**
+- [x] **Step 6: Parse capture files into a canonical schema-2 bundle**
 
 Add `_parse_npb_capture`, `_write_npb_lazy_bundle`, and
 `_validate_npb_capture_counts`. Copy/hash each image exactly once, translate
 numeric kernel/array ids through constant tables, derive no missing semantic
 parameter, and compare captured counts with the descriptor manifest.
 
-- [ ] **Step 7: Regenerate zero-fuzz patches and run focused tests**
+- [x] **Step 7: Regenerate zero-fuzz patches and run focused tests**
 
 Generate unified diffs from `_transform_cg` and `_transform_mg`, use
 `a/CG/cg.f` / `b/CG/cg.f` and `a/MG/mg.f` / `b/MG/mg.f`, then run:
@@ -377,7 +377,7 @@ PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system \
 
 Expected: all tests PASS and Class S produces bounded descriptor/capture files.
 
-- [ ] **Step 8: Commit descriptor capture**
+- [x] **Step 8: Commit descriptor capture**
 
 ```bash
 git add scripts/build_matched_breadth_workloads.py \
@@ -396,7 +396,7 @@ git commit -m "feat: capture bounded NPB lazy trace descriptors"
 - Modify: `tests/pyunit/cross_system/test_npb_trace_instrumentation.py`
 - Modify: `docs/superpowers/plans/2026-08-12-cira-amu-m2ndp-scaling-breadth.md`
 
-- [ ] **Step 1: Add failing two-run expansion and formal fail-closed tests**
+- [x] **Step 1: Add failing two-run expansion and formal fail-closed tests**
 
 For CG and MG Class S, require identical descriptor hash, image hashes,
 invocation table, dynamic counts, expanded-stream hash, and boundary
@@ -405,12 +405,12 @@ equal transformed Vanilla commitments. Mock the formal input identity only at
 the file boundary and prove allocation, parameter, source, patch, expander,
 and ABI drift each reject publication.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run the instrumentation tests. Expected: FAIL at the first missing expanded
 hash or identity field.
 
-- [ ] **Step 3: Integrate full functional lazy replay**
+- [x] **Step 3: Integrate full functional lazy replay**
 
 `build_and_run_npb_fixture()` and `build_and_run_npb_formal()` must call
 `lazy.read_bundle`, exhaust `npb.iter_operations` through
@@ -418,14 +418,14 @@ hash or identity field.
 commitment before constructing a result manifest. Delete the old
 `validate_npb_replayable_trace(path, workload)` eager-opcode heuristic.
 
-- [ ] **Step 4: Bind every semantic identity in manifests**
+- [x] **Step 4: Bind every semantic identity in manifests**
 
 Record schema, descriptor SHA-256, ordered image SHA-256 values, expanded
 stream SHA-256/count, boundary map SHA-256, expander source SHA-256, trace ABI
 SHA-256, source/patch/parameter/binary/config hashes, exact four-thread proof,
 allocation bytes, and build/run commands. Write no manifest on any mismatch.
 
-- [ ] **Step 5: Update the parent Task 7 checklist and run full regressions**
+- [x] **Step 5: Update the parent Task 7 checklist and run full regressions**
 
 Mark parent Task 7 steps complete only after these commands pass freshly:
 
@@ -443,13 +443,13 @@ PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system \
 Expected: all tests PASS; no formal result is claimed unless the clean frozen
 12.8 GB inputs themselves were executed.
 
-- [ ] **Step 6: Request code review and resolve every Critical/Important finding**
+- [x] **Step 6: Request code review and resolve every Critical/Important finding**
 
 The reviewer must specifically inspect eager/lazy equivalence, sequence and
 address generation, floating-point grouping, lane partition/tree, MG boundary
 handling, hash coverage, dynamic counts, and formal fail-closed behavior.
 
-- [ ] **Step 7: Commit and push the completed Task 7**
+- [x] **Step 7: Commit and push the completed Task 7**
 
 ```bash
 git add scripts/build_matched_breadth_workloads.py \

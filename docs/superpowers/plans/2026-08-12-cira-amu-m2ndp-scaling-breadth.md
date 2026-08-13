@@ -583,7 +583,7 @@ git commit -m "feat: add exact MCF and Spatter region adapters"
 - Create: `tests/pyunit/cross_system/test_npb_lazy_trace.py`
 - Create: `tests/pyunit/cross_system/test_npb_trace_instrumentation.py`
 
-- [ ] **Step 1: Prove patch integrity and exact transformed execution**
+- [x] **Step 1: Prove patch integrity and exact transformed execution**
 
 Use the pinned CG/MG sources and exact function anchors. Require patches to
 apply with zero fuzz, every non-reduction arithmetic line to remain
@@ -591,14 +591,14 @@ byte-identical after hook lines are removed, the explicit four-lane reduction
 transform to match the checked-in patch byte for byte, official fixture
 verifiers to pass, and one flipped residual bit to fail.
 
-- [ ] **Step 2: Capture bounded descriptors instead of primitive traces**
+- [x] **Step 2: Capture bounded descriptors instead of primitive traces**
 
 Capture hash-bound initial array images, ordered kernel invocations, exact raw
 parameters, four-lane reductions, dynamic counts, allocation bytes, and
 streaming SHA-256 boundary commitments. Emit no per-load/store/arithmetic
 records from the native hooks and produce no eager `trace.bin`.
 
-- [ ] **Step 3: Expand exact CG and MG semantics lazily**
+- [x] **Step 3: Expand exact CG and MG semantics lazily**
 
 Use a schema-2, copy-on-write memory-mapped iterator that emits the canonical
 56-byte operation ABI one record at a time. Preserve CSR order, every MG
@@ -606,7 +606,7 @@ stencil expression tree as compiled under the fixed strict-FP flags, all
 `zero3` calls, Fortran level offsets, and the fixed four-lane merge tree. Peak
 host memory must not scale with expanded operation count.
 
-- [ ] **Step 4: Require full native-to-lazy bit-exact commitments**
+- [x] **Step 4: Require full native-to-lazy bit-exact commitments**
 
 For both reference and repeat Class S executions, exhaust the full lazy stream,
 require identical operation SHA-256/count, and compare every native array or
@@ -614,7 +614,7 @@ scalar boundary at its kernel-qualified program point. A missing, duplicate,
 or mismatched commitment fails immediately. Diagnostic runs with skipped
 expansion may not write `manifest.json`.
 
-- [ ] **Step 5: Bind all formal semantic identities**
+- [x] **Step 5: Bind all formal semantic identities**
 
 Bind clean source commit, parameter/config hash, measured allocation, patched
 source, binary, checked-in patch, hook header and implementation, lazy runtime,
@@ -622,14 +622,14 @@ NPB expander, canonical Python source, C++ trace ABI, ordered image hashes,
 invocation-table hash, dynamic-work hash, expanded stream, boundary crosswalk,
 and replayed boundary map. Reject any drift before formal publication.
 
-- [ ] **Step 6: Keep formal inputs fail closed**
+- [x] **Step 6: Keep formal inputs fail closed**
 
 Require the accepted frozen source/parameter/allocation authority and the exact
 semantic identity above. Missing clean 12.8 GB inputs remains `failed_input`;
 Class S fixture success is validation evidence, not paper evidence, and no
 smaller NPB class may substitute.
 
-- [ ] **Step 7: Run the complete proof, review, commit, and push**
+- [x] **Step 7: Run the complete proof, review, commit, and push**
 
 Run the lazy, NPB-kernel, instrumentation, and complete cross-system Python
 suites freshly. Review operation/address generation, FP grouping, lane trees,
