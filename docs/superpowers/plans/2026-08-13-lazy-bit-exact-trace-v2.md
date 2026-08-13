@@ -173,7 +173,7 @@ git commit -m "feat: add bounded-memory canonical trace v2"
 - Create: `scripts/npb_lazy_trace.py`
 - Create: `tests/pyunit/cross_system/test_npb_lazy_trace.py`
 
-- [ ] **Step 1: Write a tiny CG eager-equivalence test**
+- [x] **Step 1: Write a tiny CG eager-equivalence test**
 
 Use a three-row CSR matrix, explicit `x/z/p/q/r` images, two conjugate-gradient
 steps, and four canonical lane ranges. Hand-build the expected eager operations
@@ -190,14 +190,14 @@ def test_tiny_cg_lazy_stream_equals_hand_eager_stream(self):
     self.assertEqual(npb.replay_boundaries(bundle), tiny_cg_boundaries())
 ```
 
-- [ ] **Step 2: Run the CG test and verify RED**
+- [x] **Step 2: Run the CG test and verify RED**
 
 Run:
 `PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system -p 'test_npb_lazy_trace.py'`
 
 Expected: FAIL because `scripts.npb_lazy_trace` does not exist.
 
-- [ ] **Step 3: Implement raw IEEE-754 helpers and canonical four-lane merge**
+- [x] **Step 3: Implement raw IEEE-754 helpers and canonical four-lane merge**
 
 Use `struct.pack/unpack`, never decimal serialization. Each multiply, add,
 subtract, and divide is a separate Python float operation immediately rounded
@@ -213,7 +213,7 @@ def lane_range(count, lane):
     return count * lane // 4, count * (lane + 1) // 4
 ```
 
-- [ ] **Step 4: Implement `npb_cg` expansion and boundary replay**
+- [x] **Step 4: Implement `npb_cg` expansion and boundary replay**
 
 Emit explicit load/store records with image logical addresses and explicit
 `F64_MUL`, `F64_ADD`, `F64_SUB` records with raw operands/results. Preserve
@@ -222,13 +222,13 @@ three fixed merge edges. Do not use `sum`, NumPy, FMA, vector operations, or a
 different reduction order. `replay_boundaries()` streams SHA-256 over raw
 little-endian words at each descriptor boundary.
 
-- [ ] **Step 5: Add CG corruption and deterministic replay tests**
+- [x] **Step 5: Add CG corruption and deterministic replay tests**
 
 Flip one CSR index bit and require an out-of-bounds failure. Change one lane
 boundary or `cgitmax` and require descriptor/dynamic-count rejection. Expand
 twice and require identical stream hashes and boundary maps.
 
-- [ ] **Step 6: Run tests and commit CG expansion**
+- [x] **Step 6: Run tests and commit CG expansion**
 
 ```bash
 PYTHONPATH=. python3 -m unittest discover -v -s tests/pyunit/cross_system \

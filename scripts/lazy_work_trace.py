@@ -284,6 +284,11 @@ class MappedState:
         self._files = {}
         self._maps = {}
         self._arrays = {array.name: array for array in bundle.arrays}
+        initial_scalars = bundle.meta.get("initial_scalars", {})
+        if not isinstance(initial_scalars, dict):
+            raise LazyTraceError("initial scalar map is invalid")
+        _validate_parameter(initial_scalars, "initial scalars")
+        self._scalars = dict(initial_scalars)
 
     def __enter__(self):
         try:
@@ -355,6 +360,23 @@ class MappedState:
         for offset in range(0, len(mapping), 1024 * 1024):
             digest.update(mapping[offset:offset + 1024 * 1024])
         return digest.hexdigest()
+
+    def load_scalar(self, name):
+        _name(name, "scalar name")
+        try:
+            raw = self._scalars[name]
+        except KeyError as error:
+            raise LazyTraceError(f"unknown scalar {name}") from error
+        _uint(raw, 64, "scalar raw value")
+        return raw
+
+    def store_scalar(self, name, raw):
+        _name(name, "scalar name")
+        _uint(raw, 64, "scalar raw value")
+        self._scalars[name] = raw
+
+    def scalar_sha256(self, name):
+        return hashlib.sha256(struct.pack("<Q", self.load_scalar(name))).hexdigest()
 
 
 def _validate_memory_address(bundle, operation):
