@@ -147,6 +147,69 @@ gem5 markers, AMU operations, CIRA descriptors, or M2NDP launches, but the
 translator records a source-trace hash and fails if it drops, duplicates,
 reorders, fuses, or changes a work item that affects canonical semantics.
 
+### Lazy bit-exact trace v2
+
+Paper-scale NPB cannot materialize one 56-byte record for every primitive
+operation: even the Class S fixture produces multi-gigabyte traces, while the
+12.8 GB-class runs would require impractical storage. Canonical trace schema 2
+therefore represents regular dynamic work as deterministic lazy descriptors.
+This is a lossless representation, not sampling or operation aggregation.
+
+A v2 bundle contains:
+
+- immutable initial-state images for input and read-write arrays or sparse
+  structures, each with a role, type, shape, logical address range, byte
+  count, and SHA-256;
+- an ordered phase table whose descriptors identify the canonical kernel,
+  invocation, loop bounds, array mappings, scalar inputs, guards, and exact
+  floating-point expression tree;
+- explicit reduction descriptors containing the four static lanes and the
+  fixed tree `(lane0 op lane1) op (lane2 op lane3)`; and
+- a dynamic-work manifest with full invocation, work-item, primitive,
+  barrier, commit, and output-boundary counts.
+
+The shared lazy iterator validates the bundle and emits the same logical
+`Operation` stream that an eager trace would contain. It owns global sequence
+assignment, logical-address generation, scalar floating-point evaluation,
+state mutation, barriers, commits, and reduction ordering. Arithmetic uses the
+declared width, separate multiply and add operations, no contraction, and the
+descriptor's exact expression tree. Backends consume this iterator; they may
+not independently rediscover loops, recompute guards, fuse operations, or
+change work-item order.
+
+Iteration is streaming and bounded-memory. Consumers may request one operation
+or one declared work-item batch at a time, but batching may only change API
+overhead: expanding a batch must produce the identical ordered primitive
+stream. The iterator computes a streaming expanded-operation SHA-256 and
+primitive count without storing the expansion. Each functional backend must
+finish the full iterator, match both values, and reproduce every required
+raw-bit boundary before any timing result is accepted.
+
+Schema 1 eager bundles remain supported for small fixtures. A fixture can be
+encoded both ways; complete v2 expansion must compare equal to the schema 1
+operations record by record, including sequence, address, raw operands, raw
+result, barrier, and commit records. Formal NPB uses only v2 and records the
+descriptor, frozen-input, expander implementation, expanded-stream, source,
+binary, patch, parameter, and configuration hashes.
+
+Timing windows are selected from canonical v2 work-item coordinates only
+after full functional replay succeeds. The selected window is expanded
+exactly; its measured cost may be weighted by the manifest's complete dynamic
+counts as specified below. No sample, exemplar operation, or phase-only marker
+may substitute for full functional replay.
+
+Bundle loading fails closed on an unknown schema or kernel, hash mismatch,
+overlapping logical mappings, arithmetic-count overflow, out-of-bounds access,
+unsupported expression, dynamic-count mismatch, premature iterator end,
+trailing work, expanded-stream hash mismatch, or raw-bit boundary mismatch.
+
+The v2 test gate includes eager-versus-lazy record equality on tiny CG and MG,
+one-bit input and descriptor corruptions, deterministic expansion across two
+executions, batch-size invariance, exact primitive counts, and full Class S
+official-verifier plus raw-boundary validation. A performance test also
+requires expansion memory to remain bounded independently of dynamic-work
+count.
+
 ## Matched kernels and exactness boundaries
 
 ### PR-SpMV
@@ -191,12 +254,26 @@ with a different tree are forbidden. The verifier compares every iterative
 vector, residual, and final zeta value bit for bit, then also requires the NPB
 official verifier to pass.
 
+The upstream OpenMP source does not define an observable reduction tree: its
+tree is selected by the OpenMP runtime and therefore cannot be required to
+match bit for bit across Vanilla, AMU, CIRA, and M2NDP. The canonical reference
+replaces only those OpenMP reduction clauses with four static lanes and the
+explicit tree `(lane0 + lane1) + (lane2 + lane3)`. Non-reduction arithmetic
+statements remain byte-identical. All systems use this transformed Vanilla
+execution as their raw-bit reference, while the unmodified NPB official
+verifier remains an independent semantic gate. This transformation must never
+be described as observation-only instrumentation.
+
 ### NPB MG
 
 MG preserves per-grid-point operation order, restriction/prolongation order,
 boundary handling, level transitions, and the fixed norm-reduction tree. The
 verifier compares every grid level, residual image, and norm boundary bit for
 bit, then requires the NPB official verifier to pass.
+
+MG uses the same explicit four-lane rule for both sum and maximum reductions;
+the canonical trace distinguishes `F64_ADD` from `F64_MAX` edges and stores raw
+floating operands and results for each edge.
 
 ## Backend boundaries
 
