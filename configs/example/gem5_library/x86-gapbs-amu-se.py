@@ -93,6 +93,7 @@ def load_amu_calibration(path):
             raise ValueError("AMU calibration validation did not pass")
         profile = calibration["amu"]["formal_profile"]
         fit_parameters = calibration["amu"]["fit"]["parameters"]
+        selection = calibration["amu"]["formal_profile_selection"]
     except (KeyError, TypeError) as error:
         raise ValueError("AMU calibration manifest is incomplete") from error
 
@@ -115,8 +116,40 @@ def load_amu_calibration(path):
             or value not in {0, 2, 4, 6, 8, 10}
         ):
             raise ValueError(f"AMU calibration {name} is outside the fit space")
-        if fit_parameters.get(name) != value:
-            raise ValueError(f"AMU calibration {name} differs from fitted value")
+    source = selection.get("source")
+    fit_applied = selection.get("fit_parameters_applied")
+    if source == "bounded_table4_fit":
+        if fit_applied is not True:
+            raise ValueError("bounded AMU fit must apply fit parameters")
+        for name in fitted_names:
+            if fit_parameters.get(name) != profile[name]:
+                raise ValueError(
+                    f"AMU calibration {name} differs from fitted value"
+                )
+    elif source == "asmc_architecture_defaults":
+        if fit_applied is not False:
+            raise ValueError("infeasible AMU proxy must not apply fit parameters")
+        if (
+            calibration["amu"]["validation"].get(
+                "proxy_feasibility_status"
+            )
+            != "INFEASIBLE_NONNEGATIVE_COSTS"
+        ):
+            raise ValueError(
+                "AMU architecture defaults require proven infeasible proxy"
+            )
+        architecture_defaults = {
+            "metadata_cycles": 10,
+            "id_refill_cycles": 0,
+            "completion_cycles": 0,
+        }
+        for name, expected in architecture_defaults.items():
+            if profile[name] != expected:
+                raise ValueError(
+                    f"AMU {name} differs from architecture default {expected}"
+                )
+    else:
+        raise ValueError("AMU formal profile selection source is invalid")
     return profile, sha256_file(path)
 
 
@@ -457,8 +490,8 @@ amu_l2_spm_partition = args.asmc_profile != "legacy"
 
 if args.fast_forward_cpu and not args.roi_work_events:
     parser.error("--fast-forward-cpu requires --roi-work-events")
-if args.fast_forward_cpu and args.cpu != "timing":
-    parser.error("--fast-forward-cpu requires --cpu timing")
+if args.fast_forward_cpu and args.cpu not in ("timing", "o3"):
+    parser.error("--fast-forward-cpu requires --cpu timing or o3")
 if args.fast_forward_cpu and args.measure_trial != 1:
     parser.error(
         "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
@@ -662,7 +695,10 @@ def handle_workbegin():
         )
         for action in actions:
             if action == "switch":
-                print("Switching from fast-forward CPU to timing CPU!")
+                print(
+                    "Switching from fast-forward CPU to "
+                    f"{args.cpu} CPU!"
+                )
                 processor.switch()
             elif action == "reset":
                 print("Resetting stats at the start of measured ROI!")

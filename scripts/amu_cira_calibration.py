@@ -58,6 +58,12 @@ AMU_SEARCH_SPACE = {
     "completion_cycles": (0, 2, 4, 6, 8, 10),
 }
 
+AMU_ARCHITECTURE_DEFAULTS = {
+    "metadata_cycles": 10,
+    "id_refill_cycles": 0,
+    "completion_cycles": 0,
+}
+
 
 class CalibrationError(RuntimeError):
     """The selected calibration evidence is missing or inconsistent."""
@@ -540,6 +546,116 @@ def predict_normalized_time(row, parameters):
     )
 
 
+def analyze_amu_proxy_feasibility(measurements):
+    """Prove whether nonnegative costs and the fixed MLP cap can hit targets."""
+    rows = _validated_measurements(measurements)
+    points = {}
+    infeasible = []
+    for index, row in enumerate(rows):
+        numeric = {}
+        for field in (
+            "normalizer_ticks",
+            "outstanding_integral",
+            "occupancy_ticks",
+            "average_mlp",
+        ):
+            try:
+                numeric[field] = float(row[field])
+            except (KeyError, TypeError, ValueError) as error:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                ) from error
+            if not math.isfinite(numeric[field]) or numeric[field] <= 0:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                )
+        limits = {}
+        for field in ("peak_mlp", "max_mlp"):
+            try:
+                raw = float(row[field])
+                limits[field] = int(raw)
+            except (KeyError, TypeError, ValueError) as error:
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                ) from error
+            if (
+                not math.isfinite(raw)
+                or limits[field] != raw
+                or limits[field] <= 0
+            ):
+                raise CalibrationError(
+                    f"measurement {index}: invalid {field}"
+                )
+        if limits["peak_mlp"] > limits["max_mlp"]:
+            raise CalibrationError(
+                f"measurement {index}: peak_mlp exceeds max_mlp"
+            )
+        derived_average = (
+            numeric["outstanding_integral"] / numeric["occupancy_ticks"]
+        )
+        if not math.isclose(
+            derived_average,
+            numeric["average_mlp"],
+            rel_tol=1e-9,
+            abs_tol=5.1e-7,
+        ):
+            raise CalibrationError(
+                f"measurement {index}: average_mlp differs from "
+                "outstanding_integral / occupancy_ticks"
+            )
+        if numeric["average_mlp"] > limits["peak_mlp"] + 1e-9:
+            raise CalibrationError(
+                f"measurement {index}: average_mlp exceeds peak_mlp"
+            )
+
+        target_ticks = row["target"] * numeric["normalizer_ticks"]
+        required_average_mlp = (
+            numeric["outstanding_integral"] / target_ticks
+        )
+        mlp_capacity_floor = (
+            numeric["outstanding_integral"]
+            / (limits["max_mlp"] * numeric["normalizer_ticks"])
+        )
+        reasons = []
+        if row["simulated_normalized_time"] > row["target"] + 1e-12:
+            reasons.append("ZERO_COST_PROXY")
+        if mlp_capacity_floor > row["target"] + 1e-12:
+            reasons.append("MLP_CAPACITY")
+        key = _measurement_key(row)
+        if reasons:
+            infeasible.append(key)
+        points[key] = {
+            "status": (
+                "INFEASIBLE_NONNEGATIVE_COSTS" if reasons else "FEASIBLE"
+            ),
+            "target": row["target"],
+            "zero_cost_proxy": row["simulated_normalized_time"],
+            "normalizer_ticks": numeric["normalizer_ticks"],
+            "outstanding_integral": numeric["outstanding_integral"],
+            "occupancy_ticks": numeric["occupancy_ticks"],
+            "observed_average_mlp": numeric["average_mlp"],
+            "derived_average_mlp": derived_average,
+            "peak_mlp": limits["peak_mlp"],
+            "max_mlp": limits["max_mlp"],
+            "required_average_mlp": required_average_mlp,
+            "mlp_capacity_floor": mlp_capacity_floor,
+            "reasons": reasons,
+        }
+    return {
+        "status": (
+            "INFEASIBLE_NONNEGATIVE_COSTS" if infeasible else "FEASIBLE"
+        ),
+        "proof": (
+            "outstanding_integral / (max_mlp * normalizer_ticks)"
+        ),
+        "proof_scope": (
+            "frozen zero-control request occupancy and fixed scheduler"
+        ),
+        "infeasible_points": sorted(infeasible),
+        "points": points,
+    }
+
+
 def _residual_record(row, prediction):
     residual = prediction - row["target"]
     return {
@@ -675,23 +791,32 @@ def paper_measurements_for_test():
         for latency_text, targets in observations.items():
             latency = float(latency_text)
             checksum = f"{workload}-{latency_text}-checksum"
+            simulated = targets["amu"] - overhead
+            average_mlp = (
+                131.0
+                if workload == "gups" and latency == 5.0
+                else 16.0
+            )
+            normalizer_ticks = 100000.0
+            occupancy_ticks = simulated * normalizer_ticks
             rows.append(
                 {
                     "workload": workload,
                     "latency_us": latency,
-                    "simulated_normalized_time": targets["amu"] - overhead,
+                    "simulated_normalized_time": simulated,
                     "normalizer_cycles": 100000,
+                    "normalizer_ticks": normalizer_ticks,
                     "metadata_accesses": metadata,
                     "id_batch_refills": refills,
                     "completions": completions,
                     "target": targets["amu"],
                     "paper_baseline_normalized": targets["baseline"],
                     "weight": 1.0,
-                    "average_mlp": (
-                        131.0
-                        if workload == "gups" and latency == 5.0
-                        else 16.0
-                    ),
+                    "outstanding_integral": average_mlp * occupancy_ticks,
+                    "occupancy_ticks": occupancy_ticks,
+                    "average_mlp": average_mlp,
+                    "peak_mlp": 131 if average_mlp == 131.0 else 16,
+                    "max_mlp": 256,
                     "baseline_checksum": checksum,
                     "amu_checksum": checksum,
                 }

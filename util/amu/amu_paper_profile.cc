@@ -596,14 +596,12 @@ prepareAndPrime(const Options &options, BenchmarkState &state)
 }
 
 void
-runGupsBaseline(const Options &options, BenchmarkState &state)
+runGupsBaseline(BenchmarkState &state)
 {
-    for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        for (size_t op = 0; op < state.gupsTable.size(); ++op) {
-            const size_t index = (op * 40503) & (state.gupsTable.size() - 1);
-            state.gupsTable[index] ^=
-                UINT64_C(0xd1b54a32d192ed03) ^ index;
-        }
+    for (size_t op = 0; op < state.gupsTable.size(); ++op) {
+        const size_t index = (op * 40503) & (state.gupsTable.size() - 1);
+        state.gupsTable[index] ^=
+            UINT64_C(0xd1b54a32d192ed03) ^ index;
     }
 }
 
@@ -620,46 +618,42 @@ refillGupsSlot(PersistentScheduler &scheduler, BenchmarkState &state,
 }
 
 void
-runGupsAmu(const Options &options, BenchmarkState &state,
-           PersistentScheduler &scheduler)
+runGupsAmu(BenchmarkState &state, PersistentScheduler &scheduler)
 {
-    for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        size_t nextOp = 0;
-        size_t completed = 0;
-        for (size_t slot = 0; slot < scheduler.capacity(); ++slot)
-            refillGupsSlot(scheduler, state, nextOp, slot);
+    size_t nextOp = 0;
+    size_t completed = 0;
+    for (size_t slot = 0; slot < scheduler.capacity(); ++slot)
+        refillGupsSlot(scheduler, state, nextOp, slot);
 
-        while (completed != state.gupsTable.size()) {
-            std::array<uint32_t, kCompletionBatch> completedOwners;
-            const size_t completionCount =
-                scheduler.waitCompletionOwners(completedOwners);
-            for (size_t completionIndex = 0;
-                 completionIndex < completionCount; ++completionIndex) {
-                const uint32_t owner = completedOwners[completionIndex];
-                const size_t slot_index =
-                    (owner >> kOwnerSlotShift) & kOwnerSlotMask;
-                const SlotPhase phase = static_cast<SlotPhase>(
-                    (owner >> kOwnerPhaseShift) & kOwnerPhaseMask);
-                const size_t op = scheduler.gupsOp(slot_index);
-                const size_t index =
-                    (op * 40503) & (state.gupsTable.size() - 1);
-                if (phase == SlotPhase::LoadPending) {
-                    scheduler.gupsPayload(slot_index) ^=
-                        UINT64_C(0xd1b54a32d192ed03) ^ index;
-                    scheduler.issueGupsStore(
-                        slot_index, &state.gupsTable[index]);
-                } else if (phase == SlotPhase::StorePending) {
-                    ++completed;
-                    refillGupsSlot(
-                        scheduler, state, nextOp, slot_index);
-                } else {
-                    throw std::runtime_error(
-                        "GUPS slot completed in wrong phase");
-                }
+    while (completed != state.gupsTable.size()) {
+        std::array<uint32_t, kCompletionBatch> completedOwners;
+        const size_t completionCount =
+            scheduler.waitCompletionOwners(completedOwners);
+        for (size_t completionIndex = 0;
+             completionIndex < completionCount; ++completionIndex) {
+            const uint32_t owner = completedOwners[completionIndex];
+            const size_t slot_index =
+                (owner >> kOwnerSlotShift) & kOwnerSlotMask;
+            const SlotPhase phase = static_cast<SlotPhase>(
+                (owner >> kOwnerPhaseShift) & kOwnerPhaseMask);
+            const size_t op = scheduler.gupsOp(slot_index);
+            const size_t index =
+                (op * 40503) & (state.gupsTable.size() - 1);
+            if (phase == SlotPhase::LoadPending) {
+                scheduler.gupsPayload(slot_index) ^=
+                    UINT64_C(0xd1b54a32d192ed03) ^ index;
+                scheduler.issueGupsStore(
+                    slot_index, &state.gupsTable[index]);
+            } else if (phase == SlotPhase::StorePending) {
+                ++completed;
+                refillGupsSlot(scheduler, state, nextOp, slot_index);
+            } else {
+                throw std::runtime_error(
+                    "GUPS slot completed in wrong phase");
             }
         }
-        scheduler.requireDrained();
     }
+    scheduler.requireDrained();
 }
 
 void
@@ -675,79 +669,73 @@ initializeHashQueries(size_t iteration, BenchmarkState &state)
 }
 
 void
-runHashJoinBaseline(const Options &options, BenchmarkState &state)
+runHashJoinBaseline(size_t iteration, BenchmarkState &state)
 {
-    for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        initializeHashQueries(iteration, state);
-        for (size_t depth = 0; depth < kHashDepth; ++depth) {
-            for (size_t query = 0; query < kWindowSlots; ++query) {
-                if (state.hashCurrent[query] < 0 || state.hashResults[query] != 0)
-                    continue;
-                const HashNode node = state.hashNodes[state.hashCurrent[query]];
-                if (node.key == state.hashKeys[query])
-                    state.hashResults[query] = node.value;
-                state.hashCurrent[query] = node.next;
-            }
+    initializeHashQueries(iteration, state);
+    for (size_t depth = 0; depth < kHashDepth; ++depth) {
+        for (size_t query = 0; query < kWindowSlots; ++query) {
+            if (state.hashCurrent[query] < 0 || state.hashResults[query] != 0)
+                continue;
+            const HashNode node = state.hashNodes[state.hashCurrent[query]];
+            if (node.key == state.hashKeys[query])
+                state.hashResults[query] = node.value;
+            state.hashCurrent[query] = node.next;
         }
     }
 }
 
 void
-runHashJoinAmu(const Options &options, BenchmarkState &state,
+runHashJoinAmu(size_t iteration, BenchmarkState &state,
                PersistentScheduler &scheduler)
 {
-    for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        initializeHashQueries(iteration, state);
-        for (size_t query = 0; query < kWindowSlots; ++query) {
-            scheduler.issueLoad(
-                query, query, &state.hashNodes[state.hashCurrent[query]], 0);
-        }
+    initializeHashQueries(iteration, state);
+    for (size_t query = 0; query < kWindowSlots; ++query) {
+        scheduler.issueLoad(
+            query, query, &state.hashNodes[state.hashCurrent[query]], 0);
+    }
 
-        size_t completed = 0;
-        while (completed != kWindowSlots) {
-            std::array<size_t, kCompletionBatch> completedSlots;
-            const size_t completionCount =
-                scheduler.waitCompletionBatch(completedSlots);
-            for (size_t completionIndex = 0;
-                 completionIndex < completionCount; ++completionIndex) {
-                const size_t slot_index = completedSlots[completionIndex];
-                Slot &slot = scheduler.slot(slot_index);
-                if (slot.phase != SlotPhase::LoadPending) {
-                    throw std::runtime_error(
-                        "hash-join slot completed in wrong phase");
-                }
-                const size_t query = slot.op;
-                const uint8_t next_stage = slot.stage + 1;
-                HashNode node{};
-                std::memcpy(&node, scheduler.payload<HashNode>(slot_index),
-                            sizeof(node));
-                if (node.key == state.hashKeys[query])
-                    state.hashResults[query] = node.value;
-                state.hashCurrent[query] = node.next;
-                scheduler.release(slot_index);
-                if (state.hashResults[query] != 0 || node.next < 0) {
-                    ++completed;
-                } else {
-                    scheduler.issueLoad(
-                        slot_index, query,
-                        &state.hashNodes[state.hashCurrent[query]], next_stage);
-                }
+    size_t completed = 0;
+    while (completed != kWindowSlots) {
+        std::array<size_t, kCompletionBatch> completedSlots;
+        const size_t completionCount =
+            scheduler.waitCompletionBatch(completedSlots);
+        for (size_t completionIndex = 0;
+             completionIndex < completionCount; ++completionIndex) {
+            const size_t slot_index = completedSlots[completionIndex];
+            Slot &slot = scheduler.slot(slot_index);
+            if (slot.phase != SlotPhase::LoadPending) {
+                throw std::runtime_error(
+                    "hash-join slot completed in wrong phase");
+            }
+            const size_t query = slot.op;
+            const uint8_t next_stage = slot.stage + 1;
+            HashNode node{};
+            std::memcpy(&node, scheduler.payload<HashNode>(slot_index),
+                        sizeof(node));
+            if (node.key == state.hashKeys[query])
+                state.hashResults[query] = node.value;
+            state.hashCurrent[query] = node.next;
+            scheduler.release(slot_index);
+            if (state.hashResults[query] != 0 || node.next < 0) {
+                ++completed;
+            } else {
+                scheduler.issueLoad(
+                    slot_index, query,
+                    &state.hashNodes[state.hashCurrent[query]], next_stage);
             }
         }
-        scheduler.requireDrained();
     }
+    scheduler.requireDrained();
 }
 
 void
-runStreamBaseline(const Options &options, BenchmarkState &state)
+runStreamBaseline(BenchmarkState &state)
 {
-    for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        for (size_t block = 0; block < kStreamBlocks; ++block) {
-            for (size_t word = 0; word < 64; ++word) {
-                state.streamA[block].words[word] =
-                    state.streamB[block].words[word] +
-                    3 * state.streamC[block].words[word];
-            }
+    for (size_t block = 0; block < kStreamBlocks; ++block) {
+        for (size_t word = 0; word < 64; ++word) {
+            state.streamA[block].words[word] =
+                state.streamB[block].words[word] +
+                3 * state.streamC[block].words[word];
         }
     }
 }
@@ -794,73 +782,70 @@ startStreamStoreIfReady(PersistentScheduler &scheduler,
 }
 
 void
-runStreamAmu(const Options &options, BenchmarkState &state,
-             PersistentScheduler &scheduler)
+runStreamAmu(BenchmarkState &state, PersistentScheduler &scheduler)
 {
-    for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        size_t nextBlock = 0;
-        size_t completed = 0;
-        const size_t pairCount = scheduler.capacity() / 2;
-        if (pairCount == 0)
-            throw std::runtime_error("STREAM requires two scheduler slots");
-        for (size_t pair = 0; pair < pairCount; ++pair)
-            refillStreamPair(scheduler, state, nextBlock, pair);
+    size_t nextBlock = 0;
+    size_t completed = 0;
+    const size_t pairCount = scheduler.capacity() / 2;
+    if (pairCount == 0)
+        throw std::runtime_error("STREAM requires two scheduler slots");
+    for (size_t pair = 0; pair < pairCount; ++pair)
+        refillStreamPair(scheduler, state, nextBlock, pair);
 
-        while (completed != kStreamBlocks) {
-            std::array<size_t, kCompletionBatch> completedSlots;
-            const size_t completionCount =
-                scheduler.waitCompletionBatch(completedSlots);
-            // waitCompletionBatch clears every completed ID before returning.
-            // Classify the whole batch before changing either slot in a pair:
-            // B and C can both occur in one batch, and transitioning on B
-            // would otherwise make C look like the newly issued store.
-            std::array<bool, kWindowSlots / 2> completedLoadPairs{};
-            for (size_t completionIndex = 0;
-                 completionIndex < completionCount; ++completionIndex) {
-                const size_t slot_index = completedSlots[completionIndex];
-                Slot &slot = scheduler.slot(slot_index);
-                if (slot.phase == SlotPhase::LoadPending) {
-                    completedLoadPairs[slot_index / 2] = true;
-                } else if (slot.phase == SlotPhase::StorePending) {
-                    if ((slot_index & 1) == 0 || slot.stage != 1)
-                        throw std::runtime_error(
-                            "STREAM store completed outside a C slot");
-                    const size_t pair = slot_index / 2;
-                    scheduler.release(slot_index);
-                    ++completed;
-                    refillStreamPair(scheduler, state, nextBlock, pair);
-                } else {
+    while (completed != kStreamBlocks) {
+        std::array<size_t, kCompletionBatch> completedSlots;
+        const size_t completionCount =
+            scheduler.waitCompletionBatch(completedSlots);
+        // waitCompletionBatch clears every completed ID before returning.
+        // Classify the whole batch before changing either slot in a pair:
+        // B and C can both occur in one batch, and transitioning on B would
+        // otherwise make C look like the newly issued store.
+        std::array<bool, kWindowSlots / 2> completedLoadPairs{};
+        for (size_t completionIndex = 0;
+             completionIndex < completionCount; ++completionIndex) {
+            const size_t slot_index = completedSlots[completionIndex];
+            Slot &slot = scheduler.slot(slot_index);
+            if (slot.phase == SlotPhase::LoadPending) {
+                completedLoadPairs[slot_index / 2] = true;
+            } else if (slot.phase == SlotPhase::StorePending) {
+                if ((slot_index & 1) == 0 || slot.stage != 1)
                     throw std::runtime_error(
-                        "STREAM slot completed in wrong phase");
-                }
-            }
-            for (size_t pair = 0; pair < pairCount; ++pair) {
-                if (completedLoadPairs[pair])
-                    startStreamStoreIfReady(scheduler, state, pair);
+                        "STREAM store completed outside a C slot");
+                const size_t pair = slot_index / 2;
+                scheduler.release(slot_index);
+                ++completed;
+                refillStreamPair(scheduler, state, nextBlock, pair);
+            } else {
+                throw std::runtime_error(
+                    "STREAM slot completed in wrong phase");
             }
         }
-        scheduler.requireDrained();
+        for (size_t pair = 0; pair < pairCount; ++pair) {
+            if (completedLoadPairs[pair])
+                startStreamStoreIfReady(scheduler, state, pair);
+        }
     }
+    scheduler.requireDrained();
 }
 
 void
-runKernel(const Options &options, BenchmarkState &state,
-          PersistentScheduler *scheduler)
+runKernelIteration(const Options &options, BenchmarkState &state,
+                   PersistentScheduler *scheduler, size_t iteration)
 {
     if (options.workload == "gups") {
         if (options.amu)
-            runGupsAmu(options, state, *scheduler);
+            runGupsAmu(state, *scheduler);
         else
-            runGupsBaseline(options, state);
+            runGupsBaseline(state);
     } else if (options.workload == "hj") {
         if (options.amu)
-            runHashJoinAmu(options, state, *scheduler);
+            runHashJoinAmu(iteration, state, *scheduler);
         else
-            runHashJoinBaseline(options, state);
+            runHashJoinBaseline(iteration, state);
     } else if (options.amu) {
-        runStreamAmu(options, state, *scheduler);
+        runStreamAmu(state, *scheduler);
     } else {
-        runStreamBaseline(options, state);
+        runStreamBaseline(state);
     }
 }
 
@@ -902,9 +887,12 @@ main(int argc, char **argv)
             scheduler = std::make_unique<PersistentScheduler>(
                 workloadGranularity(options));
         }
-        m5_work_begin(0, 0);
-        runKernel(options, state, scheduler.get());
-        m5_work_end(0, 0);
+        for (size_t iteration = 0; iteration < options.iterations;
+             ++iteration) {
+            m5_work_begin(iteration, 0);
+            runKernelIteration(options, state, scheduler.get(), iteration);
+            m5_work_end(iteration, 0);
+        }
         uint64_t digest = checksum(options, state);
         (void)m5_sum(static_cast<unsigned>(digest),
                      static_cast<unsigned>(digest >> 32), kChecksumMagic,

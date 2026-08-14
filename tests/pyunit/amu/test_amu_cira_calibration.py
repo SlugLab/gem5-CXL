@@ -39,6 +39,17 @@ PROXY = REPO / "util/amu/amu_paper_profile.cc"
 
 
 class CalibrationSourceTest(unittest.TestCase):
+    def test_proxy_emits_one_work_event_pair_per_iteration(self):
+        source = PROXY.read_text(encoding="utf-8")
+        main = source[source.index("\nmain(int argc") :]
+        self.assertIn(
+            "for (size_t iteration = 0; iteration < options.iterations;",
+            main,
+        )
+        self.assertIn("m5_work_begin(iteration, 0)", main)
+        self.assertIn("runKernelIteration(options, state, scheduler.get(), iteration)", main)
+        self.assertIn("m5_work_end(iteration, 0)", main)
+
     def test_proxy_scheduler_control_state_is_hoisted_before_roi(self):
         source = PROXY.read_text(encoding="utf-8")
         main = source[source.index("\nmain(int argc") :]
@@ -48,7 +59,7 @@ class CalibrationSourceTest(unittest.TestCase):
         for name, following in (
             ("runGupsAmu", "initializeHashQueries"),
             ("runHashJoinAmu", "runStreamBaseline"),
-            ("runStreamAmu", "runKernel"),
+            ("runStreamAmu", "runKernelIteration"),
         ):
             start = source.index(f"\n{name}(")
             body = source[start : source.index(f"\n{following}(", start)]
@@ -234,6 +245,45 @@ class CalibrationSourceTest(unittest.TestCase):
 
 
 class CalibrationFitTest(unittest.TestCase):
+    def test_mlp_capacity_analysis_proves_nonnegative_fit_infeasible(self):
+        measurements = calibration.paper_measurements_for_test()
+        point = next(
+            row
+            for row in measurements
+            if row["workload"] == "gups" and row["latency_us"] == 5.0
+        )
+        point.update(
+            {
+                "simulated_normalized_time": 4.42,
+                "normalizer_ticks": 1_000_000.0,
+                "occupancy_ticks": 4_420_000.0,
+                "outstanding_integral": 1_051_822_875.0,
+                "average_mlp": 237.9689762443439,
+                "peak_mlp": 256,
+                "max_mlp": 256,
+            }
+        )
+
+        result = calibration.analyze_amu_proxy_feasibility(measurements)
+
+        self.assertEqual(
+            result["status"], "INFEASIBLE_NONNEGATIVE_COSTS"
+        )
+        gups = result["points"]["gups@5"]
+        self.assertGreater(gups["required_average_mlp"], 1_020)
+        self.assertGreater(gups["mlp_capacity_floor"], 4.10)
+        self.assertGreater(gups["mlp_capacity_floor"], gups["target"])
+        self.assertIn("MLP_CAPACITY", gups["reasons"])
+        self.assertIn("ZERO_COST_PROXY", gups["reasons"])
+
+    def test_mlp_capacity_analysis_rejects_inconsistent_raw_stats(self):
+        measurements = calibration.paper_measurements_for_test()
+        measurements[0]["average_mlp"] += 1.0
+        with self.assertRaisesRegex(
+            calibration.CalibrationError, "average_mlp differs"
+        ):
+            calibration.analyze_amu_proxy_feasibility(measurements)
+
     def test_fit_uses_numeric_training_rows_and_reports_holdout(self):
         measurements = calibration.synthetic_measurements_for_test()
         result = calibration.fit_amu_control_costs(
@@ -368,6 +418,56 @@ class CalibrationRunnerTest(unittest.TestCase):
                         f"nonzero AMU failure counter .{suffix}",
                     ):
                         runner._parse_run(record)
+
+    def test_measurement_parser_preserves_mlp_capacity_evidence(self):
+        stats = {
+            "simTicks": 1000,
+            "board.asmc.metadataAccesses": 6,
+            "board.asmc.idBatchRefills": 1,
+            "board.asmc.completedLoads": 2,
+            "board.asmc.completedStores": 1,
+            "board.asmc.outstandingIntegral": 2500,
+            "board.asmc.occupancyTicks": 1000,
+            "board.asmc.avgOutstanding": 2.5,
+            "board.asmc.maxObservedOutstanding": 3,
+            "board.asmc.rejectedQueueFull": 0,
+            "board.asmc.rejectedSpmFull": 0,
+            "board.asmc.translationFaults": 0,
+            "board.asmc.pendingQueueFull": 0,
+            "board.asmc.farSpmFlagPackets": 0,
+            "board.asmc.spmMissingFlagPackets": 0,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            raw = run_dir / "checksum.raw"
+            raw.write_bytes(b"\0" * 8)
+            (run_dir / "config.ini").write_text(
+                "[board.asmc]\n"
+                "calibration_profile=paper-calibration-base\n"
+                "calibration_manifest_sha256=\n"
+                "spm_size=65536\n"
+                "pending_queue_entries=32\n"
+                "id_batch_entries=32\n"
+                "metadata_latency=0\n"
+                "id_refill_latency=0\n"
+                "completion_publish_latency=0\n"
+                "max_outstanding=256\n",
+                encoding="utf-8",
+            )
+            record = {
+                "run_dir": str(run_dir),
+                "raw": str(raw),
+                "kind": "amu",
+            }
+            with mock.patch(
+                "scripts.compare_gapbs_cxl_amu_cira.parse_stats",
+                return_value=stats,
+            ):
+                parsed = runner._parse_run(record)
+        self.assertEqual(parsed["outstanding_integral"], 2500)
+        self.assertEqual(parsed["occupancy_ticks"], 1000)
+        self.assertEqual(parsed["peak_mlp"], 3)
+        self.assertEqual(parsed["max_mlp"], 256)
 
     def test_collect_cli_requires_pdf_and_hardware_csv(self):
         common = [
@@ -1126,6 +1226,20 @@ class CalibrationRunnerTest(unittest.TestCase):
                         command[profile + 1], "paper-calibration-base"
                     )
 
+    def test_two_iteration_collect_switches_atomic_to_o3_before_warmup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            options = self._collect_options(temporary)
+            options.iterations = 2
+            plan = runner.collect_plan(options)
+        for run in plan["runs"]:
+            command = run["command"]
+            self.assertEqual(command[command.index("--cpu") + 1], "o3")
+            self.assertEqual(
+                command[command.index("--fast-forward-cpu") + 1], "atomic"
+            )
+            self.assertEqual(command[command.index("--iterations") + 1], "2")
+            self.assertEqual(command[command.index("--measure-trial") + 1], "1")
+
     def test_collection_rejects_nonzero_embedded_control_costs(self):
         source = (
             REPO
@@ -1216,6 +1330,63 @@ class CalibrationRunnerTest(unittest.TestCase):
             self.assertEqual(manifest["amu"]["validation"]["status"], "PASS")
             self.assertEqual(manifest["amu"]["proxy_isa"], "x86")
             self.assertEqual(manifest["amu"]["paper_isa"], "RISC-V")
+
+    def test_infeasible_proxy_uses_architecture_defaults_not_fake_fit(self):
+        rows = calibration.paper_measurements_for_test()
+        point = next(
+            row
+            for row in rows
+            if row["workload"] == "gups" and row["latency_us"] == 5.0
+        )
+        point.update(
+            {
+                "simulated_normalized_time": 4.42,
+                "normalizer_ticks": 1_000_000.0,
+                "occupancy_ticks": 4_420_000.0,
+                "outstanding_integral": 1_051_822_875.0,
+                "average_mlp": 237.9689762443439,
+                "peak_mlp": 256,
+                "max_mlp": 256,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            measurements = root / "measurements.csv"
+            output = root / "manifest.json"
+            runner.write_measurements(measurements, rows)
+            self.assertEqual(
+                runner.main(
+                    runner.fit_arguments(measurements, PDF, CSV, output)
+                ),
+                0,
+            )
+            manifest = runner.load_json(output)
+
+        amu = manifest["amu"]
+        self.assertEqual(amu["validation"]["status"], "PASS")
+        self.assertEqual(
+            amu["validation"]["proxy_feasibility_status"],
+            "INFEASIBLE_NONNEGATIVE_COSTS",
+        )
+        self.assertEqual(amu["fit"]["role"], "diagnostic_only")
+        self.assertEqual(
+            amu["formal_profile_selection"]["source"],
+            "asmc_architecture_defaults",
+        )
+        self.assertFalse(
+            amu["formal_profile_selection"]["fit_parameters_applied"]
+        )
+        self.assertEqual(
+            {
+                name: amu["formal_profile"][name]
+                for name in (
+                    "metadata_cycles",
+                    "id_refill_cycles",
+                    "completion_cycles",
+                )
+            },
+            calibration.AMU_ARCHITECTURE_DEFAULTS,
+        )
 
     def test_fit_cli_rejects_checksum_or_mlp_failure(self):
         rows = calibration.paper_measurements_for_test()

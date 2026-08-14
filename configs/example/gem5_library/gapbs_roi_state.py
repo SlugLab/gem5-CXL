@@ -30,8 +30,18 @@ def resolve_workload_shape(
 ):
     workload_scale = _workload_integer_option(arguments, "-g")
     workload_iterations = _workload_integer_option(arguments, "-n")
+    proxy_iterations = _workload_integer_option(arguments, "--iterations")
+
+    if workload_iterations is not None and proxy_iterations is not None:
+        raise ValueError("workload cannot combine -n and --iterations")
 
     if fast_forward:
+        if proxy_iterations is not None:
+            if configured_iterations != 2 or proxy_iterations != 2:
+                raise ValueError(
+                    "fast-forward proxy requires matching --iterations 2"
+                )
+            return configured_scale, configured_iterations
         if (
             configured_scale != 20
             or configured_iterations != 2
@@ -51,7 +61,11 @@ def resolve_workload_shape(
     iterations = (
         configured_iterations
         if configured_iterations is not None
-        else workload_iterations
+        else (
+            workload_iterations
+            if workload_iterations is not None
+            else proxy_iterations
+        )
     )
     return scale, iterations if iterations is not None else 1
 

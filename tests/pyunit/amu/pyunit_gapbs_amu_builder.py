@@ -393,6 +393,34 @@ class GapbsAmuBuilderTest(unittest.TestCase):
                         fast_forward=True,
                     )
 
+    def test_fast_forward_accepts_two_iteration_paper_proxy(self):
+        self.assertEqual(
+            self.roi_state.resolve_workload_shape(
+                arguments=[
+                    "--workload", "gups", "--iterations", "2", "--amu"
+                ],
+                configured_scale=None,
+                configured_iterations=2,
+                fast_forward=True,
+            ),
+            (None, 2),
+        )
+        for arguments, configured in (
+            (["--workload", "gups", "--iterations", "1"], 2),
+            (["--workload", "gups", "--iterations", "2"], 1),
+        ):
+            with self.subTest(arguments=arguments, configured=configured):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "fast-forward proxy requires matching --iterations 2",
+                ):
+                    self.roi_state.resolve_workload_shape(
+                        arguments=arguments,
+                        configured_scale=None,
+                        configured_iterations=configured,
+                        fast_forward=True,
+                    )
+
     def test_verify_dry_run_builds_atomic_to_timing_second_trial_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

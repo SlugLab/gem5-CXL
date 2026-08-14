@@ -30,6 +30,7 @@ MEASUREMENT_FIELDS = (
     "latency_us",
     "simulated_normalized_time",
     "normalizer_cycles",
+    "normalizer_ticks",
     "metadata_accesses",
     "id_batch_refills",
     "completions",
@@ -37,6 +38,10 @@ MEASUREMENT_FIELDS = (
     "paper_baseline_normalized",
     "weight",
     "average_mlp",
+    "outstanding_integral",
+    "occupancy_ticks",
+    "peak_mlp",
+    "max_mlp",
     "baseline_checksum",
     "amu_checksum",
 )
@@ -281,6 +286,7 @@ def build_manifest(options):
     rows, gups_5us_mlp = _validate_measurement_evidence(
         load_measurements(options.measurements)
     )
+    feasibility = calibration.analyze_amu_proxy_feasibility(rows)
     fit = calibration.fit_amu_control_costs(
         rows,
         holdout={
@@ -288,7 +294,37 @@ def build_manifest(options):
             "latency_us": options.holdout_latency,
         },
     )
-    validation = _validate_fit(fit, gups_5us_mlp, rows)
+    if feasibility["status"] == "INFEASIBLE_NONNEGATIVE_COSTS":
+        fit["role"] = "diagnostic_only"
+        holdout = next(iter(fit["holdout_residuals"].values()))
+        validation = {
+            "status": "PASS",
+            "status_role": (
+                "evidence-integrity-and-fail-closed-profile-selection"
+            ),
+            "proxy_feasibility_status": feasibility["status"],
+            "gups_5us_average_mlp": gups_5us_mlp,
+            "gups_5us_mlp_gate": ">130",
+            "diagnostic_holdout_relative_error": holdout["relative_error"],
+            "table4_role": "infeasibility-and-trend-diagnostic",
+        }
+        control_parameters = dict(calibration.AMU_ARCHITECTURE_DEFAULTS)
+        profile_selection = {
+            "source": "asmc_architecture_defaults",
+            "fit_parameters_applied": False,
+            "reason": "x86_proxy_infeasible_under_256_mlp_cap",
+        }
+    else:
+        fit["role"] = "formal"
+        validation = _validate_fit(fit, gups_5us_mlp, rows)
+        validation["status_role"] = "fit-and-evidence-validation"
+        validation["proxy_feasibility_status"] = feasibility["status"]
+        control_parameters = dict(fit["parameters"])
+        profile_selection = {
+            "source": "bounded_table4_fit",
+            "fit_parameters_applied": True,
+            "reason": "x86_proxy_feasible_with_nonnegative_control_costs",
+        }
     amu_source = calibration.load_amu_source(options.pdf)
     cira_source = calibration.load_cira_source(options.cira_csv)
     return {
@@ -310,6 +346,7 @@ def build_manifest(options):
                 "Table 4 is validation, not exact RISC-V reproduction."
             ),
             "fit": fit,
+            "proxy_feasibility": feasibility,
             "validation": validation,
             "formal_profile": {
                 "spm_bytes": amu_source["direct"]["spm_bytes"],
@@ -317,8 +354,9 @@ def build_manifest(options):
                     "pending_entries"
                 ],
                 "id_batch_entries": amu_source["direct"]["id_batch_entries"],
-                **fit["parameters"],
+                **control_parameters,
             },
+            "formal_profile_selection": profile_selection,
         },
         "cira": {
             "verified_workloads": cira_source["verified_workloads"],
@@ -424,6 +462,17 @@ def collect_plan(options):
                 else:
                     command.extend(
                         ["--asmc-profile", "paper-calibration-base"]
+                    )
+                if options.iterations == 2:
+                    command.extend(
+                        [
+                            "--iterations",
+                            "2",
+                            "--measure-trial",
+                            "1",
+                            "--fast-forward-cpu",
+                            "atomic",
+                        ]
                     )
                 runs.append(
                     {
@@ -584,6 +633,7 @@ def _gate_config(record, binary):
             "metadata_latency": "0",
             "id_refill_latency": "0",
             "completion_publish_latency": "0",
+            "max_outstanding": "256",
         }
         profile_mismatches = {
             name: {"expected": expected, "observed": asmc.get(name)}
@@ -1314,6 +1364,7 @@ def _parse_run(record):
             "metadata_latency": "0",
             "id_refill_latency": "0",
             "completion_publish_latency": "0",
+            "max_outstanding": "256",
         }
         if config is None:
             raise calibration.CalibrationError(
@@ -1353,6 +1404,20 @@ def _parse_run(record):
         "average_mlp": _stat_by_suffix(
             stats, ".avgOutstanding", required=record["kind"] == "amu"
         ),
+        "outstanding_integral": _stat_by_suffix(
+            stats, ".outstandingIntegral", required=record["kind"] == "amu"
+        ),
+        "occupancy_ticks": _stat_by_suffix(
+            stats, ".occupancyTicks", required=record["kind"] == "amu"
+        ),
+        "peak_mlp": _stat_by_suffix(
+            stats,
+            ".maxObservedOutstanding",
+            required=record["kind"] == "amu",
+        ),
+        "max_mlp": int(config["max_outstanding"])
+        if record["kind"] == "amu"
+        else 0,
     }
 
 
@@ -1378,6 +1443,7 @@ def _measurement_rows(plan):
                     "latency_us": latency_value,
                     "simulated_normalized_time": amu["roi_ticks"] / normalizer_ticks,
                     "normalizer_cycles": normalizer_cycles,
+                    "normalizer_ticks": normalizer_ticks,
                     "metadata_accesses": int(amu["metadata_accesses"]),
                     "id_batch_refills": int(amu["id_batch_refills"]),
                     "completions": int(amu["completions"]),
@@ -1385,6 +1451,10 @@ def _measurement_rows(plan):
                     "paper_baseline_normalized": target["baseline"],
                     "weight": 1.0,
                     "average_mlp": amu["average_mlp"],
+                    "outstanding_integral": amu["outstanding_integral"],
+                    "occupancy_ticks": amu["occupancy_ticks"],
+                    "peak_mlp": int(amu["peak_mlp"]),
+                    "max_mlp": amu["max_mlp"],
                     "baseline_checksum": baseline["checksum"],
                     "amu_checksum": amu["checksum"],
                 }

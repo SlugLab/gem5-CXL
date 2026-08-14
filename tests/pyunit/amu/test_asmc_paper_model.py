@@ -163,6 +163,10 @@ class AsmcPaperModelTest(unittest.TestCase):
             },
             "amu": {
                 "validation": {"status": "PASS"},
+                "formal_profile_selection": {
+                    "source": "bounded_table4_fit",
+                    "fit_parameters_applied": True,
+                },
                 "fit": {
                     "parameters": {
                         "metadata_cycles": 4,
@@ -198,6 +202,62 @@ class AsmcPaperModelTest(unittest.TestCase):
             path.write_text(json.dumps(candidate), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "differs from fitted"):
                 loader["load_amu_calibration"](path)
+
+    def test_manifest_loader_accepts_only_proven_infeasible_defaults(self):
+        loader = self.calibration_loader()
+        manifest = {
+            "schema": 1,
+            "sources": {
+                "amu_pdf": {"sha256": loader["AMU_PDF_SHA256"]},
+                "cira_csv": {"sha256": loader["CIRA_CSV_SHA256"]},
+            },
+            "amu": {
+                "validation": {
+                    "status": "PASS",
+                    "proxy_feasibility_status": (
+                        "INFEASIBLE_NONNEGATIVE_COSTS"
+                    ),
+                },
+                "formal_profile_selection": {
+                    "source": "asmc_architecture_defaults",
+                    "fit_parameters_applied": False,
+                },
+                "fit": {
+                    "parameters": {
+                        "metadata_cycles": 0,
+                        "id_refill_cycles": 0,
+                        "completion_cycles": 0,
+                    }
+                },
+                "formal_profile": {
+                    "spm_bytes": 64 * 1024,
+                    "pending_entries_per_state_machine": 32,
+                    "id_batch_entries": 32,
+                    "metadata_cycles": 10,
+                    "id_refill_cycles": 0,
+                    "completion_cycles": 0,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "calibration.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            profile, _ = loader["load_amu_calibration"](path)
+            self.assertEqual(profile["metadata_cycles"], 10)
+
+            for mutation, message in (
+                (("amu", "validation", "proxy_feasibility_status"), "infeasible"),
+                (("amu", "formal_profile", "metadata_cycles"), "architecture default"),
+                (("amu", "formal_profile_selection", "fit_parameters_applied"), "must not apply"),
+            ):
+                candidate = json.loads(json.dumps(manifest))
+                owner = candidate
+                for key in mutation[:-1]:
+                    owner = owner[key]
+                owner[mutation[-1]] = "FEASIBLE" if "status" in mutation[-1] else 8
+                path.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    loader["load_amu_calibration"](path)
 
     def test_async_window_submit_never_waits_and_consume_is_ordered(self):
         self.assertIn("class AsyncWindow", BUILDER)
