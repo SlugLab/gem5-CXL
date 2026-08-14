@@ -3,6 +3,7 @@
 
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -11,6 +12,53 @@ from scripts import prepare_m2ndp as prepare
 
 
 class PrepareM2NDPTest(unittest.TestCase):
+    def test_apply_patches_recognizes_fully_applied_overlapping_stack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", root], check=True)
+            subprocess.run(
+                ["git", "-C", root, "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", root, "config", "user.name", "Test"],
+                check=True,
+            )
+            source = root / "shared.txt"
+            source.write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "-C", root, "add", "shared.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", root, "commit", "-qm", "base"], check=True
+            )
+            first = root / "0001.patch"
+            second = root / "0002.patch"
+            first.write_text(
+                "diff --git a/shared.txt b/shared.txt\n"
+                "--- a/shared.txt\n+++ b/shared.txt\n"
+                "@@ -1 +1 @@\n-one\n+two\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "diff --git a/shared.txt b/shared.txt\n"
+                "--- a/shared.txt\n+++ b/shared.txt\n"
+                "@@ -1 +1 @@\n-two\n+three\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", root, "apply", first], check=True)
+            subprocess.run(["git", "-C", root, "apply", second], check=True)
+            with (
+                mock.patch.object(prepare, "PATCHES", (first, second)),
+                mock.patch.object(
+                    prepare, "PATCHED_PATHS", frozenset({"shared.txt"})
+                ),
+            ):
+                status = prepare.apply_patches(root)
+        self.assertEqual(
+            status,
+            {"0001.patch": "already-applied",
+             "0002.patch": "already-applied"},
+        )
+
     def test_patch_deduplicates_repeated_timing_kernel_registration(self):
         patch = "\n".join(path.read_text() for path in prepare.PATCHES)
         self.assertIn("src/m2ndp.cc", prepare.PATCHED_PATHS)
@@ -20,6 +68,9 @@ class PrepareM2NDPTest(unittest.TestCase):
         self.assertIn("delete ndp_kernel;", patch)
         self.assertIn("src/m2ndp_config.cc", prepare.PATCHED_PATHS)
         self.assertIn("src/m2ndp_config.h", prepare.PATCHED_PATHS)
+        self.assertIn("src/ldst_unit.cc", prepare.PATCHED_PATHS)
+        self.assertIn("src/ldst_unit.h", prepare.PATCHED_PATHS)
+        self.assertIn("src/register_unit.cc", prepare.PATCHED_PATHS)
         self.assertIn("m_core_cycle++;", patch)
         self.assertIn("M2NDP_CXL_PROBE_LATENCY_NS", patch)
         self.assertIn("host_response_extra_latency", patch)

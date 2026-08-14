@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 try:
@@ -23,6 +24,7 @@ PATCH = REPO / "util/m2ndp/patches"
 PATCHES = (
     PATCH / "0001-funcsim-strict-sequence.patch",
     PATCH / "0002-cxl-probe-precise-time.patch",
+    PATCH / "0003-canonical-workload-isa.patch",
 )
 PATCHED_PATHS = frozenset(
     {
@@ -39,11 +41,18 @@ PATCHED_PATHS = frozenset(
         "perf_runner/synthetic_traffic.h",
         "src/memory_map.cc",
         "src/memory_map.h",
+        "src/execution_unit.cc",
+        "src/ldst_unit.cc",
+        "src/ldst_unit.h",
         "src/cxl_link.cc",
         "src/cxl_link.h",
         "src/m2ndp.cc",
         "src/m2ndp_config.cc",
         "src/m2ndp_config.h",
+        "src/m2ndp_parser.cc",
+        "src/ndp_instruction.cc",
+        "src/ndp_instruction.h",
+        "src/register_unit.cc",
     }
 )
 
@@ -99,11 +108,72 @@ def _git_apply_check(root, patch, *arguments):
     )
 
 
+def _index_path_bytes(root, path, environment):
+    completed = subprocess.run(
+        ["git", "-C", str(root), "show", f":{path}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+    )
+    return None if completed.returncode else completed.stdout
+
+
+def _worktree_matches_index(root, environment):
+    root = Path(root)
+    for relative in PATCHED_PATHS:
+        expected = _index_path_bytes(root, relative, environment)
+        path = root / relative
+        actual = path.read_bytes() if path.is_file() else None
+        if actual != expected:
+            return False
+    return True
+
+
+def _applied_patch_prefix(root):
+    """Return the exact applied stack prefix, including overlapping patches."""
+    descriptor, index_name = tempfile.mkstemp(prefix="m2ndp-patch-index-")
+    os.close(descriptor)
+    os.unlink(index_name)
+    environment = os.environ.copy()
+    environment["GIT_INDEX_FILE"] = index_name
+    try:
+        subprocess.run(
+            ["git", "-C", str(root), "read-tree", "HEAD"],
+            env=environment, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        matched = 0 if _worktree_matches_index(root, environment) else None
+        for count, patch in enumerate(PATCHES, 1):
+            completed = subprocess.run(
+                ["git", "-C", str(root), "apply", "--cached", str(patch)],
+                env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            if completed.returncode != 0:
+                raise PrepareError(
+                    f"strict patch stack cannot apply {patch.name}: "
+                    + completed.stderr.strip()
+                )
+            if _worktree_matches_index(root, environment):
+                matched = count
+        return matched
+    finally:
+        Path(index_name).unlink(missing_ok=True)
+
+
 def apply_patches(root):
-    statuses = {}
     for patch in PATCHES:
         if not patch.is_file():
             raise PrepareError(f"strict patch missing: {patch}")
+    prefix = _applied_patch_prefix(root)
+    if prefix is None:
+        raise PrepareError(
+            "M2NDP checkout does not match any exact strict patch prefix"
+        )
+    statuses = {
+        patch.name: "already-applied" for patch in PATCHES[:prefix]
+    }
+    for patch in PATCHES[prefix:]:
         forward = _git_apply_check(root, patch, "--check")
         if forward.returncode == 0:
             subprocess.run(
@@ -112,13 +182,9 @@ def apply_patches(root):
             )
             statuses[patch.name] = "applied"
             continue
-        reverse = _git_apply_check(root, patch, "--reverse", "--check")
-        if reverse.returncode == 0:
-            statuses[patch.name] = "already-applied"
-            continue
         raise PrepareError(
-            f"strict patch {patch.name} is neither cleanly applicable nor "
-            "exactly applied: " + forward.stdout.strip()
+            f"strict patch {patch.name} is not cleanly applicable: "
+            + forward.stdout.strip()
         )
     return statuses
 

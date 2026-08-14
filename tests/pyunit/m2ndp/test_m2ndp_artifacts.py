@@ -24,6 +24,83 @@ def reference_header(num_nodes):
 
 
 class M2NDPArtifactTest(unittest.TestCase):
+    def test_funcsim_compares_every_named_typed_boundary_bit_exact(self):
+        expected = {
+            "rank": {"element_type": "f32", "word_bits": 32,
+                     "raw_words": [0x3F800000, 0x80000000]},
+            "residual": {"element_type": "f64", "word_bits": 64,
+                         "raw_words": [0x3FF0000000000000]},
+            "parent": {"element_type": "i64", "word_bits": 64,
+                       "raw_words": [0xFFFFFFFFFFFFFFFF, 7]},
+        }
+        evidence = artifacts.compare_funcsim_boundaries(
+            expected, expected, returncode=0,
+            expected_launches=9, completed_launches=9,
+        )
+        self.assertEqual(evidence["status"], "pass")
+        self.assertEqual(evidence["boundary_count"], 3)
+        self.assertEqual(evidence["compared_words"], 5)
+
+    def test_funcsim_boundary_mismatch_is_a_nonzero_exit(self):
+        expected = {
+            "rank": {"element_type": "f32", "word_bits": 32,
+                     "raw_words": [0x3F800000]},
+        }
+        observed = {
+            "rank": {"element_type": "f32", "word_bits": 32,
+                     "raw_words": [0x3F800001]},
+        }
+        self.assertEqual(
+            artifacts.funcsim_boundary_exit_code(expected, observed), 2
+        )
+        with self.assertRaisesRegex(artifacts.EvidenceError, r"rank\[0\]"):
+            artifacts.compare_funcsim_boundaries(
+                expected, observed, returncode=2,
+                expected_launches=1, completed_launches=1,
+            )
+
+    def test_funcsim_rejects_missing_boundary_or_launch(self):
+        boundary = {
+            "rank": {"element_type": "f32", "word_bits": 32,
+                     "raw_words": [0]},
+        }
+        with self.assertRaisesRegex(artifacts.EvidenceError, "boundary set"):
+            artifacts.compare_funcsim_boundaries(
+                boundary, {}, returncode=2,
+                expected_launches=1, completed_launches=1,
+            )
+        with self.assertRaisesRegex(artifacts.EvidenceError, "launch"):
+            artifacts.compare_funcsim_boundaries(
+                boundary, boundary, returncode=0,
+                expected_launches=2, completed_launches=1,
+            )
+
+    def test_ndpsim_timing_requires_funcsim_pass_and_one_cycle_calibration(self):
+        functional = {
+            "status": "pass", "boundary_count": 2,
+            "compared_words": 8, "expected_launches": 3,
+            "completed_launches": 3, "returncode": 0,
+        }
+        calibration = {
+            "passed": True, "cxl_delay": "1us",
+            "target_ns": "2012.652", "measured_ns": "2012.625",
+            "residual_ns": "0.027", "link_period_ns": "0.125",
+            "target_cxl_boundary_ticks": 2_012_652,
+        }
+        self.assertTrue(
+            artifacts.require_ndpsim_timing_gate(functional, calibration)
+        )
+        with self.assertRaisesRegex(artifacts.EvidenceError, "link cycle"):
+            artifacts.require_ndpsim_timing_gate(
+                functional,
+                {**calibration, "measured_ns": "2012.800",
+                 "residual_ns": "0.148"},
+            )
+        with self.assertRaisesRegex(artifacts.EvidenceError, "FuncSim"):
+            artifacts.require_ndpsim_timing_gate(
+                {**functional, "status": "failed"}, calibration
+            )
+
     def test_g4_metadata_passes_formal_profile(self):
         meta = artifacts.GraphMeta(
             graph_sha256=profiles.G4_SHA256,

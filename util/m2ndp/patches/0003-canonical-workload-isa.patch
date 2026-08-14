@@ -1,0 +1,554 @@
+diff --git a/functional_runner/main.cc b/functional_runner/main.cc
+index 823e50bb95..435c7c3e91 100644
+--- a/functional_runner/main.cc
++++ b/functional_runner/main.cc
+@@ -31,6 +31,9 @@ int functional_simulation(int argc, char** argv) {
+   cmd_parser.add_command_line_option<int>("option", "trace option");
+   cmd_parser.add_command_line_option<std::string>(
+       "sequence_file", "tab-separated trace and launch sequence");
++  cmd_parser.add_command_line_option<std::string>(
++      "canonical_sequence_file",
++      "canonical tab-separated trace and launch sequence");
+   cmd_parser.add_command_line_option<std::string>(
+       "strict_float32_base", "strict comparison base address");
+   cmd_parser.add_command_line_option<uint64_t>(
+@@ -51,6 +54,7 @@ int functional_simulation(int argc, char** argv) {
+   std::string config_path;
+   std::string launch_file_path;
+   std::string sequence_file_path;
++  std::string canonical_sequence_file_path;
+   std::string strict_float32_base;
+   std::string dump_float32_bits_path;
+   uint64_t strict_float32_count = 0;
+@@ -63,13 +67,77 @@ int functional_simulation(int argc, char** argv) {
+   cmd_parser.set_if_defined("config", &config_path);
+   cmd_parser.set_if_defined("option", (int*)&trace_option);
+   cmd_parser.set_if_defined("sequence_file", &sequence_file_path);
++  cmd_parser.set_if_defined("canonical_sequence_file",
++                            &canonical_sequence_file_path);
+   cmd_parser.set_if_defined("strict_float32_base", &strict_float32_base);
+   cmd_parser.set_if_defined("strict_float32_count", &strict_float32_count);
+   cmd_parser.set_if_defined("dump_float32_bits", &dump_float32_bits_path);
+ 
+   HashMemoryMap memory_map(memory_map_path);
+ 
+-  if (!sequence_file_path.empty()) {
++  if (!canonical_sequence_file_path.empty()) {
++    if (config_path.empty()) {
++      std::fprintf(stderr,
++                   "canonical sequence mode requires a config argument\n");
++      return 64;
++    }
++    std::ifstream sequence_file(canonical_sequence_file_path);
++    if (!sequence_file.good()) {
++      std::fprintf(stderr, "cannot open canonical sequence file\n");
++      return 64;
++    }
++    M2NDPConfig* config = new M2NDPConfig(config_path, 1);
++    const int num_ndp = config->get_num_ndp_units();
++    if (config->get_use_synthetic_memory())
++      memory_map.set_synthetic_memory(config->get_synthetic_base_address(),
++                                      config->get_synthetic_memory_size());
++    std::vector<std::unique_ptr<NdpUnit>> ndp_units;
++    for (int id = 0; id < num_ndp; ++id)
++      ndp_units.emplace_back(new NdpUnit(config, &memory_map, id));
++
++    std::string line;
++    uint64_t launches = 0;
++    uint64_t boundary_checks = 0;
++    uint64_t canonical_operations = 0;
++    while (std::getline(sequence_file, line)) {
++      if (line.empty()) continue;
++      const size_t delimiter = line.find('\t');
++      if (delimiter == std::string::npos || delimiter == 0 ||
++          delimiter + 1 >= line.size()) {
++        std::fprintf(stderr, "invalid canonical sequence line\n");
++        return 64;
++      }
++      const std::string trace_path = line.substr(0, delimiter);
++      const std::string launch_record = line.substr(delimiter + 1);
++      NdpKernel ndp_kernel;
++      M2NDPParser::parse_ndp_kernel(num_ndp, trace_path, &ndp_kernel, config);
++      for (const auto& body : ndp_kernel.kernel_body_insts) {
++        for (const auto& inst : body) {
++          if (inst.opcode == C_CHECK_U32 || inst.opcode == C_CHECK_U64)
++            ++boundary_checks;
++          else if (inst.CheckCanonicalOp())
++            ++canonical_operations;
++        }
++      }
++      for (int id = 0; id < num_ndp; ++id)
++        ndp_units[id]->Run(id, &ndp_kernel, launch_record);
++      ++launches;
++    }
++    if (launches == 0 || canonical_operations == 0) {
++      std::fprintf(stderr,
++                   "canonical sequence requires launches and operations\n");
++      return 64;
++    }
++    std::printf("M2NDP_CANONICAL_MODE=1\n");
++    std::printf("M2NDP_CANONICAL_LAUNCHES=%llu\n",
++                static_cast<unsigned long long>(launches));
++    std::printf("M2NDP_CANONICAL_BOUNDARIES=%llu\n",
++                static_cast<unsigned long long>(boundary_checks));
++    std::printf("M2NDP_CANONICAL_OPERATIONS=%llu\n",
++                static_cast<unsigned long long>(canonical_operations));
++    std::printf("M2NDP_CANONICAL_MATCH=PASS\n");
++    return 0;
++  } else if (!sequence_file_path.empty()) {
+     if (target_map_path.empty() || config_path.empty() ||
+         strict_float32_base.empty() || strict_float32_count == 0 ||
+         dump_float32_bits_path.empty()) {
+diff --git a/src/execution_unit.cc b/src/execution_unit.cc
+index 0fb7896e9b..6aae8c1bf4 100644
+--- a/src/execution_unit.cc
++++ b/src/execution_unit.cc
+@@ -66,6 +66,8 @@ void ExecutionUnit::cycle() {
+     if (inst.CheckDestWrite()) {
+       m_register_unit->SetReady(inst.dest);
+     }
++    if (inst.canonical_token_reg >= 0)
++      m_register_unit->SetReady(inst.canonical_token_reg);
+     if (inst.CheckBranchOp()) {
+       context.csr->block = false;
+       int branch_target = inst.IsBranch();
+@@ -107,6 +109,8 @@ void ExecutionUnit::process_default_execution_units(
+     if (inst.CheckDestWrite()) {
+       m_register_unit->SetReady(inst.dest);
+     }
++    if (inst.canonical_token_reg >= 0)
++      m_register_unit->SetReady(inst.canonical_token_reg);
+     if (context.last_inst) {
+       m_finished_contexts->push(context);
+     }
+@@ -166,8 +170,11 @@ Status ExecutionUnit::issue(NdpInstruction &inst, Context context) {
+   bool spad_op = false;
+   uint64_t base_addr = 0;
+   if (alu_op_type == ADDRESS_OP) {
+-    base_addr =
+-        MemoryMap::FormatAddr(m_register_unit->ReadXreg(inst.src[0], context));
++    const bool canonical_memory =
++        inst.opcode >= C_LOAD_U32 && inst.opcode <= C_STORE_F64;
++    base_addr = MemoryMap::FormatAddr(
++        canonical_memory ? static_cast<uint64_t>(inst.src[0]) :
++        m_register_unit->ReadXreg(inst.src[0], context));
+     spad_op =
+         MemoryMap::CheckScratchpad(base_addr);  // Scratch pad memory access
+   }
+@@ -211,7 +218,9 @@ Status ExecutionUnit::issue(NdpInstruction &inst, Context context) {
+       }
+       inst_issue_interval *= inst.addr_set.size();
+       if (inst.addr_set.empty()) throw std::runtime_error("addr set is empty");
+-    } else { 
++    } else if (inst.opcode >= C_LOAD_U32 && inst.opcode <= C_STORE_F64) {
++      inst.addr_set.insert(base_addr);
++    } else {
+       // General Load Store Address Calculation
+       int req_size = m_config->get_packet_size();
+       if(inst.opcode == VLE16 || inst.opcode == VSE16) req_size = 16;
+@@ -231,6 +240,8 @@ Status ExecutionUnit::issue(NdpInstruction &inst, Context context) {
+       if (inst.CheckDestWrite()) {
+         m_register_unit->SetNotReady(inst.dest);
+       }
++      if (inst.canonical_token_reg >= 0)
++        m_register_unit->SetNotReady(inst.canonical_token_reg);
+       unit.push({inst, context}, inst_latency, inst_issue_interval);
+       break;
+     }
+@@ -296,6 +307,11 @@ void ExecutionUnit::process_address_inst(ExecutionDelayQueue &address_unit) {
+ Status ExecutionUnit::check_dependency_fail(NdpInstruction &inst,
+                                             Context &context) {
+   WaitInstruction wait_reg(inst.sInst);
++  if (inst.canonical_token_reg >= 0 &&
++      !m_register_unit->CheckReady(inst.canonical_token_reg)) {
++    m_stats->add_wait_instruction({inst.sInst, 1, SRC0});
++    return SCALAR_DEPENDENCY_WAIT;
++  }
+   if (inst.CheckScalarOp()) {
+     switch (inst.opcode) {
+       case ADD:
+@@ -569,4 +585,4 @@ void ExecutionUnit::increase_issue_count(NdpInstruction &inst) {
+ 
+ }  // namespace NDPSim
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/ldst_unit.cc b/src/ldst_unit.cc
+index 71554f4157..5e1047b48a 100644
+--- a/src/ldst_unit.cc
++++ b/src/ldst_unit.cc
+@@ -253,6 +253,9 @@ void LDSTUnit::process_ldst_inst(ExecutionDelayQueue &ldst_unit) {
+       int bank_id =
+           m_config->get_bank_index(addr) % m_config->get_l1d_num_banks();
+       m_l1_latency_queue[bank_id].push(mf, m_l1_hit_latency);
++      if (inst.canonical_token_reg >= 0)
++        m_pending_canonical_stores[mf] = {
++            inst.canonical_token_reg, context.sub_core_id};
+       m_pending_write_count++;
+     }
+   }
+@@ -499,6 +502,14 @@ void LDSTUnit::handle_response(mem_fetch* mf) {
+     }
+   } else {
+     assert(mf->get_type() == WRITE_ACK);
++    auto canonical = m_pending_canonical_stores.find(mf);
++    if (canonical != m_pending_canonical_stores.end()) {
++      const int sub_core_id = canonical->second.second;
++      assert(!((*m_to_reg)[sub_core_id].full()));
++      int64_t *token = new int64_t(canonical->second.first);
++      (*m_to_reg)[sub_core_id].push(token);
++      m_pending_canonical_stores.erase(canonical);
++    }
+     m_pending_write_count--;
+   }
+   delete mf;
+diff --git a/src/ldst_unit.h b/src/ldst_unit.h
+index 090bdc16a1..c12c3075a5 100644
+--- a/src/ldst_unit.h
++++ b/src/ldst_unit.h
+@@ -68,6 +68,8 @@ class LDSTUnit {
+ 
+   robin_hood::unordered_map<mem_fetch*, NdpInstruction> m_pending_ldst;
+   robin_hood::unordered_map<mem_fetch*, Context> m_pending_ldst_context;
++  robin_hood::unordered_map<mem_fetch*, std::pair<int64_t, int>>
++      m_pending_canonical_stores;
+   uint32_t m_pending_write_count;
+   std::queue<Context> *m_finished_contexts;
+ 
+@@ -87,4 +89,4 @@ class LDSTUnit {
+ };
+ }  // namespace NDPSim
+ #endif
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/m2ndp_parser.cc b/src/m2ndp_parser.cc
+index ec5fd16ffb..724aa6116b 100644
+--- a/src/m2ndp_parser.cc
++++ b/src/m2ndp_parser.cc
+@@ -188,6 +188,23 @@ NdpInstruction ParseNdpInstruction(std::string line) {
+   }
+   assert(inst.opcode != Opcode::INVALID_INST && "Invalid instruction");
+   if (inst.opcode == Opcode::EXIT) return inst;
++  if (inst.opcode >= Opcode::C_LOAD_U32 &&
++      inst.opcode <= Opcode::C_CHECK_U64) {
++    inst.dest = GetRegValue(dest);
++    for (int field = 0; field < 4; ++field) {
++      const size_t delimiter = src.find(',');
++      const std::string value = delimiter == std::string::npos ?
++          src : src.substr(0, delimiter);
++      inst.src[field] = static_cast<int64_t>(std::stoull(value, nullptr, 0));
++      if (delimiter == std::string::npos) {
++        if (field != 3)
++          throw std::runtime_error("canonical instruction has too few fields");
++        break;
++      }
++      src = src.substr(delimiter + 1);
++    }
++    return inst;
++  }
+   inst.dest = GetRegValue(dest);
+   if (inst.opcode == Opcode::LI || inst.opcode == Opcode::CSRWI) {
+     inst.src[0] = std::stoll(src, NULL);
+@@ -943,4 +960,4 @@ void M2NDPParser::decode_memory_mapping(M2NDPConfig *config, std::string addr) {
+   }
+ }
+ 
+-}  // namespace NDPSim
+\ No newline at end of file
++}  // namespace NDPSim
+diff --git a/src/ndp_instruction.cc b/src/ndp_instruction.cc
+index 19ea73dd66..90148c22d5 100644
+--- a/src/ndp_instruction.cc
++++ b/src/ndp_instruction.cc
+@@ -1,5 +1,7 @@
+ #include "ndp_instruction.h"
+ 
++#include <algorithm>
++#include <cstring>
+ #include <set>
+ 
+ #include "memory_map.h"
+@@ -10,7 +12,22 @@ static const OpcodeSet float_ops = {
+     FADD,    FSUB,   FDIV,   FMUL,   FMV,    FLW,       FSW,
+     VFADD,   VFSUB,  VFRSUB, VFMUL,  VFWMUL, VFDIV,     VFMACC, 
+     VFWMACC, VFNCVT, VFCVT,  VFWCVT, VFMV,   VFREDOMAX, VFREDOSUM,
+-    FEXP,    VFEXP,  VFWSUB, VFMSUB, VFSQRT};
++    FEXP,    VFEXP,  VFWSUB, VFMSUB, VFSQRT,
++    C_F32_ADD, C_F32_MUL, C_F32_DIV, C_F64_ADD, C_F64_MAX,
++    C_F64_MUL, C_F64_SUB, C_F64_DIV, C_F64_SQRT, C_F64_MOV,
++    C_F64_ABS};
++
++static const OpcodeSet canonical_load_ops = {
++    C_LOAD_U32, C_LOAD_U64, C_LOAD_F32, C_LOAD_F64};
++static const OpcodeSet canonical_store_ops = {
++    C_STORE_U32, C_STORE_U64, C_STORE_F32, C_STORE_F64};
++static const OpcodeSet canonical_ops = {
++    C_LOAD_U32, C_LOAD_U64, C_LOAD_F32, C_LOAD_F64,
++    C_STORE_U32, C_STORE_U64, C_STORE_F32, C_STORE_F64,
++    C_F32_ADD, C_F32_MUL, C_F32_DIV, C_F64_ADD, C_I64_ADD,
++    C_I64_MIN, C_BARRIER, C_COMMIT, C_F64_MAX, C_F64_MUL,
++    C_F64_SUB, C_F64_DIV, C_F64_SQRT, C_F64_MOV, C_F64_ABS,
++    C_CHECK_U32, C_CHECK_U64};
+ 
+ static const OpcodeSet vector_ops = {
+     VADD, VSUB, VSRL, VRSUB, VMUL, VDIV, VMV, VFADD, VFSUB, VFRSUB, VFMUL, VFWMUL,
+@@ -135,24 +152,37 @@ bool NdpInstruction::CheckLoadOp() {
+   return opcode == VLE8 || opcode == VLE16 || opcode == VLE32 ||
+          opcode == VLE64 || opcode == LW || opcode == LD || opcode == LB ||
+          opcode == FLW || opcode == VLUXEI32 || opcode == VLUXEI64 ||
+-         opcode == VLSSEG || CheckAmoOp();
++         opcode == VLSSEG || canonical_load_ops.count(opcode) || CheckAmoOp();
++}
++
++bool NdpInstruction::CheckCanonicalOp() const {
++  return canonical_ops.count(opcode) != 0;
+ }
+ 
+ bool NdpInstruction::CheckStoreOp() {
+   return opcode == VSE8 || opcode == VSE16 || opcode == VSE32 ||
+          opcode == VSE64 || opcode == SW || opcode == SD || opcode == SB ||
+-         opcode == FSW || opcode == VSUXEI32;
++         opcode == FSW || opcode == VSUXEI32 || canonical_store_ops.count(opcode);
+ }
+ 
+ bool NdpInstruction::CheckDestWrite() {
+-  return !(opcode == VSETVLI || opcode == CSRWI || opcode == CSRW ||
++  return !(canonical_ops.count(opcode) || opcode == VSETVLI ||
++           opcode == CSRWI || opcode == CSRW ||
+            CheckStoreOp() || CheckAmoOp());
+ }
+ 
+ AluOpType NdpInstruction::GetAluOpType() {
+   if (CheckLoadOp() || CheckStoreOp()) return ADDRESS_OP;
++  if (opcode == C_F64_MAX || opcode == C_I64_MIN)
++    return opcode == C_F64_MAX ? FP_MAX_OP : INT_MAX_OP;
++  if (opcode == C_F32_MUL || opcode == C_F64_MUL)
++    return FP_MUL_OP;
++  if (opcode == C_I64_ADD || opcode == C_BARRIER || opcode == C_COMMIT)
++    return INT_ADD_OP;
+   if (opcode == DIV || opcode == FDIV || opcode == VDIV || opcode == VFDIV ||
+-      opcode == VFEXP || opcode == FEXP || opcode == VFSQRT)
++      opcode == C_F32_DIV || opcode == C_F64_DIV ||
++      opcode == C_F64_SQRT || opcode == VFEXP || opcode == FEXP ||
++      opcode == VFSQRT)
+     return SFU_OP;
+   if (CheckFloatOp()) {
+     if (opcode == VFMACC || opcode == VFMSUB) return FP_MAD_OP;
+@@ -276,7 +306,92 @@ void amo_loop(Context context, VectorData vmask, VectorData offsets,
+ }
+ 
+ void NdpInstruction::ExecuteScalar(Context& context) {
+-  if (opcode == ADD) {
++  const auto raw_float = [](uint32_t bits) {
++    float value;
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++  };
++  const auto float_raw = [](float value) {
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits;
++  };
++  const auto raw_double = [](uint64_t bits) {
++    double value;
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++  };
++  const auto double_raw = [](double value) {
++    uint64_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits;
++  };
++  const auto require = [&](uint64_t observed) {
++    if (observed != static_cast<uint64_t>(src[3]))
++      throw std::runtime_error(
++          "canonical operation result differs: observed=" +
++          std::to_string(observed) + " expected=" +
++          std::to_string(static_cast<uint64_t>(src[3])));
++  };
++  if (opcode == C_CHECK_U32 || opcode == C_CHECK_U64) {
++    VectorData data = MemoryMapLoad(context, static_cast<uint64_t>(src[0]));
++    const int width = opcode == C_CHECK_U32 ? 4 : 8;
++    const int index = (static_cast<uint64_t>(src[0]) % PACKET_SIZE) / width;
++    const uint64_t observed = width == 4 ?
++        static_cast<uint32_t>(data.GetIntData(index)) :
++        static_cast<uint64_t>(data.GetLongData(index));
++    if (observed != static_cast<uint64_t>(src[1]))
++      throw std::runtime_error("canonical boundary word differs");
++  } else if (canonical_load_ops.count(opcode)) {
++    VectorData data = MemoryMapLoad(context, static_cast<uint64_t>(src[0]));
++    const int index = (static_cast<uint64_t>(src[0]) % PACKET_SIZE) /
++        ((opcode == C_LOAD_U32 || opcode == C_LOAD_F32) ? 4 : 8);
++    uint64_t observed = 0;
++    if (opcode == C_LOAD_U32 || opcode == C_LOAD_F32)
++      observed = static_cast<uint32_t>(data.GetIntData(index));
++    else
++      observed = static_cast<uint64_t>(data.GetLongData(index));
++    require(observed);
++  } else if (canonical_store_ops.count(opcode)) {
++    const uint64_t address = static_cast<uint64_t>(src[0]);
++    VectorData data = MemoryMapLoad(context, address);
++    const int index = (address % PACKET_SIZE) /
++        ((opcode == C_STORE_U32 || opcode == C_STORE_F32) ? 4 : 8);
++    if (opcode == C_STORE_U32 || opcode == C_STORE_F32)
++      data.SetData(static_cast<int32_t>(src[1]), index);
++    else
++      data.SetData(static_cast<int64_t>(src[1]), index);
++    MemoryMapStore(context, address, data);
++    require(static_cast<uint64_t>(src[1]));
++  } else if (opcode == C_F32_ADD) {
++    require(float_raw(raw_float(src[1]) + raw_float(src[2])));
++  } else if (opcode == C_F32_MUL) {
++    require(float_raw(raw_float(src[1]) * raw_float(src[2])));
++  } else if (opcode == C_F32_DIV) {
++    require(float_raw(raw_float(src[1]) / raw_float(src[2])));
++  } else if (opcode == C_F64_ADD) {
++    require(double_raw(raw_double(src[1]) + raw_double(src[2])));
++  } else if (opcode == C_F64_MAX) {
++    require(double_raw(std::max(raw_double(src[1]), raw_double(src[2]))));
++  } else if (opcode == C_F64_MUL) {
++    require(double_raw(raw_double(src[1]) * raw_double(src[2])));
++  } else if (opcode == C_F64_SUB) {
++    require(double_raw(raw_double(src[1]) - raw_double(src[2])));
++  } else if (opcode == C_F64_DIV) {
++    require(double_raw(raw_double(src[1]) / raw_double(src[2])));
++  } else if (opcode == C_F64_SQRT) {
++    require(double_raw(std::sqrt(raw_double(src[1]))));
++  } else if (opcode == C_F64_MOV) {
++    require(static_cast<uint64_t>(src[1]));
++  } else if (opcode == C_F64_ABS) {
++    require(double_raw(std::fabs(raw_double(src[1]))));
++  } else if (opcode == C_I64_ADD) {
++    require(static_cast<uint64_t>(src[1]) + static_cast<uint64_t>(src[2]));
++  } else if (opcode == C_I64_MIN) {
++    require(static_cast<uint64_t>(std::min(src[1], src[2])));
++  } else if (opcode == C_BARRIER || opcode == C_COMMIT) {
++    require(static_cast<uint64_t>(src[3]));
++  } else if (opcode == ADD) {
+     int64_t rs1 = context.register_map->ReadXreg(src[0], context);
+     int64_t rs2 = context.register_map->ReadXreg(src[1], context);
+     context.register_map->WriteXreg(dest, rs1 + rs2, context);
+@@ -2338,4 +2453,4 @@ bool CheckMemoryMap(Context& context, uint64_t addr) {
+   return map->CheckAddr(addr);
+ }
+ 
+-}  // namespace NDPSim
+\ No newline at end of file
++}  // namespace NDPSim
+diff --git a/src/ndp_instruction.h b/src/ndp_instruction.h
+index c64aee7d74..5b64e2b19e 100644
+--- a/src/ndp_instruction.h
++++ b/src/ndp_instruction.h
+@@ -47,6 +47,31 @@ enum Opcode {
+   FMV,
+   FLW,
+   FSW,
++  C_LOAD_U32,
++  C_LOAD_U64,
++  C_LOAD_F32,
++  C_LOAD_F64,
++  C_STORE_U32,
++  C_STORE_U64,
++  C_STORE_F32,
++  C_STORE_F64,
++  C_F32_ADD,
++  C_F32_MUL,
++  C_F32_DIV,
++  C_F64_ADD,
++  C_I64_ADD,
++  C_I64_MIN,
++  C_BARRIER,
++  C_COMMIT,
++  C_F64_MAX,
++  C_F64_MUL,
++  C_F64_SUB,
++  C_F64_DIV,
++  C_F64_SQRT,
++  C_F64_MOV,
++  C_F64_ABS,
++  C_CHECK_U32,
++  C_CHECK_U64,
+   NUM_SCALAR_OPCODES,
+   /* Vector instruction sets*/
+   VSETVLI,
+@@ -208,6 +233,31 @@ static std::map<std::string, Opcode> opcode_type_map = {
+     {"fmv", FMV},
+     {"flw", FLW},
+     {"fsw", FSW},
++    {"c_load_u32", C_LOAD_U32},
++    {"c_load_u64", C_LOAD_U64},
++    {"c_load_f32", C_LOAD_F32},
++    {"c_load_f64", C_LOAD_F64},
++    {"c_store_u32", C_STORE_U32},
++    {"c_store_u64", C_STORE_U64},
++    {"c_store_f32", C_STORE_F32},
++    {"c_store_f64", C_STORE_F64},
++    {"c_f32_add", C_F32_ADD},
++    {"c_f32_mul", C_F32_MUL},
++    {"c_f32_div", C_F32_DIV},
++    {"c_f64_add", C_F64_ADD},
++    {"c_i64_add", C_I64_ADD},
++    {"c_i64_min", C_I64_MIN},
++    {"c_barrier", C_BARRIER},
++    {"c_commit", C_COMMIT},
++    {"c_f64_max", C_F64_MAX},
++    {"c_f64_mul", C_F64_MUL},
++    {"c_f64_sub", C_F64_SUB},
++    {"c_f64_div", C_F64_DIV},
++    {"c_f64_sqrt", C_F64_SQRT},
++    {"c_f64_mov", C_F64_MOV},
++    {"c_f64_abs", C_F64_ABS},
++    {"c_check_u32", C_CHECK_U32},
++    {"c_check_u64", C_CHECK_U64},
+     {"vsetvli", VSETVLI},
+     {"vadd", VADD},
+     {"vsub", VSUB},
+@@ -462,6 +512,7 @@ struct NdpInstruction {
+     last = other.last;
+     double_reg = other.double_reg;
+     doBranch = other.doBranch;
++    canonical_token_reg = other.canonical_token_reg;
+   }
+   ~NdpInstruction() {
+     addr_set.clear();
+@@ -479,6 +530,8 @@ struct NdpInstruction {
+   bool last;
+   bool double_reg;
+   bool doBranch = false;
++  int64_t canonical_token_reg = -1;
++  bool CheckCanonicalOp() const;
+   bool CheckScalarOp();
+   bool CheckFloatOp();
+   bool CheckVectorOp();
+@@ -505,4 +558,4 @@ struct NdpInstruction {
+   void ExecuteBranch(Context& context);
+ };
+ }  // namespace NDPSim
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/register_unit.cc b/src/register_unit.cc
+index 55e610b022..63db1eeed0 100644
+--- a/src/register_unit.cc
++++ b/src/register_unit.cc
+@@ -78,7 +78,10 @@ std::deque<NdpInstruction> RegisterUnit::Convert(
+     NdpInstruction renamed = inst;
+     try {
+       if (inst.opcode == VSETVLI) cvt_vlmul_status = inst.src[2];
+-      if (inst.CheckBranchOp()) {
++      if (inst.CheckCanonicalOp()) {
++        renamed.canonical_token_reg = px1;
++        if (inst.CheckLoadOp()) renamed.dest = px1;
++      } else if (inst.CheckBranchOp()) {
+         if (inst.opcode == Opcode::J) {
+           renamed.src[2] = inst.src[2];
+         } else {
+@@ -646,4 +649,4 @@ void RegisterUnit::DumpRegisterFile(int packet_id) {
+   }
+   std::cout << std::endl;
+ }
+-}  // namespace NDPSim
+\ No newline at end of file
++}  // namespace NDPSim

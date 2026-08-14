@@ -13,6 +13,7 @@ import os
 import re
 import struct
 from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -39,6 +40,143 @@ REFERENCE_KEYS = frozenset(
 
 class EvidenceError(RuntimeError):
     """Evidence is absent, malformed, or inconsistent."""
+
+
+_BOUNDARY_WIDTHS = {
+    "f32": 32, "u32": 32, "i32": 32,
+    "f64": 64, "u64": 64, "i64": 64,
+}
+
+
+def _checked_funcsim_boundaries(expected, observed):
+    if not isinstance(expected, dict) or not expected:
+        raise EvidenceError("FuncSim expected boundaries are missing")
+    if not isinstance(observed, dict) or set(observed) != set(expected):
+        raise EvidenceError("FuncSim output boundary set differs")
+    compared = 0
+    for name in sorted(expected):
+        wanted = expected[name]
+        actual = observed[name]
+        if not isinstance(wanted, dict) or not isinstance(actual, dict):
+            raise EvidenceError(f"FuncSim boundary {name} is invalid")
+        element_type = wanted.get("element_type")
+        bits = wanted.get("word_bits")
+        if element_type not in _BOUNDARY_WIDTHS or (
+            bits != _BOUNDARY_WIDTHS[element_type]
+        ):
+            raise EvidenceError(f"FuncSim boundary {name} type is invalid")
+        if (
+            actual.get("element_type") != element_type
+            or actual.get("word_bits") != bits
+        ):
+            raise EvidenceError(f"FuncSim boundary {name} type differs")
+        wanted_words = wanted.get("raw_words")
+        actual_words = actual.get("raw_words")
+        if not isinstance(wanted_words, list) or not isinstance(actual_words, list):
+            raise EvidenceError(f"FuncSim boundary {name} words are missing")
+        if len(actual_words) != len(wanted_words):
+            raise EvidenceError(f"FuncSim boundary {name} length differs")
+        width = bits // 4
+        for index, (want, got) in enumerate(zip(wanted_words, actual_words)):
+            if (
+                isinstance(want, bool) or not isinstance(want, int)
+                or isinstance(got, bool) or not isinstance(got, int)
+                or want < 0 or want >= 1 << bits
+                or got < 0 or got >= 1 << bits
+            ):
+                raise EvidenceError(
+                    f"FuncSim boundary {name}[{index}] is outside uint{bits}"
+                )
+            if want != got:
+                raise EvidenceError(
+                    f"FuncSim boundary {name}[{index}] expected "
+                    f"0x{want:0{width}x} actual 0x{got:0{width}x}"
+                )
+            compared += 1
+    return compared
+
+
+def funcsim_boundary_exit_code(expected, observed):
+    """Return the strict FuncSim-compatible status for all boundaries."""
+    try:
+        _checked_funcsim_boundaries(expected, observed)
+    except EvidenceError:
+        return 2
+    return 0
+
+
+def compare_funcsim_boundaries(
+    expected, observed, *, returncode, expected_launches, completed_launches
+):
+    compared = _checked_funcsim_boundaries(expected, observed)
+    for label, value in (
+        ("expected", expected_launches), ("completed", completed_launches)
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise EvidenceError(f"FuncSim {label} launch count is invalid")
+    if completed_launches != expected_launches:
+        raise EvidenceError(
+            "FuncSim launch count differs: "
+            f"expected {expected_launches}, completed {completed_launches}"
+        )
+    if returncode != 0:
+        raise EvidenceError(f"FuncSim exited with status {returncode}")
+    return {
+        "status": "pass",
+        "boundary_count": len(expected),
+        "compared_words": compared,
+        "expected_launches": expected_launches,
+        "completed_launches": completed_launches,
+        "returncode": returncode,
+    }
+
+
+def require_ndpsim_timing_gate(functional, calibration):
+    if not isinstance(functional, dict) or functional.get("status") != "pass":
+        raise EvidenceError("NDPSim timing requires complete FuncSim PASS")
+    boundary_gate = (
+        functional.get("boundary_count", 0) > 0
+        and functional.get("compared_words", 0) > 0
+    )
+    operation_gate = (
+        functional.get("functional_gate") == "operation_results"
+        and functional.get("compared_operations", 0) > 0
+    )
+    if (
+        not (boundary_gate or operation_gate)
+        or functional.get("expected_launches")
+        != functional.get("completed_launches")
+        or functional.get("returncode") != 0
+    ):
+        raise EvidenceError("NDPSim timing requires complete FuncSim evidence")
+    if not isinstance(calibration, dict):
+        raise EvidenceError("M2NDP CXL calibration is invalid")
+    if calibration.get("passed") is not True:
+        raise EvidenceError("M2NDP CXL calibration did not pass")
+    if calibration.get("cxl_delay") != "1us":
+        raise EvidenceError("M2NDP calibration is not bound to 1 us CXL")
+    try:
+        target = Decimal(calibration["target_ns"])
+        observed = Decimal(calibration["measured_ns"])
+        residual = Decimal(calibration["residual_ns"])
+        link_cycle = Decimal(calibration["link_period_ns"])
+        target_ticks = int(calibration["target_cxl_boundary_ticks"])
+    except (KeyError, ValueError, TypeError, InvalidOperation) as error:
+        raise EvidenceError("M2NDP calibration fields are invalid") from error
+    if any(
+        not value.is_finite() or value <= 0
+        for value in (target, observed, link_cycle)
+    ) or not residual.is_finite() or residual < 0:
+        raise EvidenceError("M2NDP calibration values are invalid")
+    if target_ticks != int(target * 1000) or Decimal(target_ticks) != target * 1000:
+        raise EvidenceError("M2NDP calibration target ticks differ")
+    if residual != abs(observed - target):
+        raise EvidenceError("M2NDP calibration residual differs")
+    if residual > link_cycle:
+        raise EvidenceError(
+            "M2NDP 1 us calibration differs by more than one link cycle"
+        )
+    return True
 
 
 @dataclasses.dataclass(frozen=True)

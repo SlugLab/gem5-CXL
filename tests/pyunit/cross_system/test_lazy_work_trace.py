@@ -4,6 +4,7 @@
 import hashlib
 import dataclasses
 import itertools
+import json
 import struct
 import tempfile
 import tracemalloc
@@ -133,9 +134,19 @@ class LazyTraceTest(unittest.TestCase):
     def test_schema_two_round_trip_preserves_descriptors(self):
         bundle = self.make_bundle()
         self.assertEqual(bundle.meta["schema"], 2)
+        self.assertRegex(bundle.meta["input_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(bundle.arrays[0].name, "x")
         self.assertEqual(bundle.invocations[0].kernel, "fixture_add")
         self.assertEqual(bundle.dynamic_work["primitive_records"], 8)
+
+    def test_claimed_input_hash_drift_is_rejected(self):
+        self.make_bundle()
+        descriptor = self.root / "trace.v2.json"
+        value = json.loads(descriptor.read_text())
+        value["meta"]["input_sha256"] = digest("caller-controlled")
+        descriptor.write_text(json.dumps(value, sort_keys=True) + "\n")
+        with self.assertRaisesRegex(lazy.LazyTraceError, "input SHA-256"):
+            lazy.read_bundle(self.root)
 
     def test_lazy_expansion_matches_eager_and_is_batch_invariant(self):
         bundle = self.make_bundle()

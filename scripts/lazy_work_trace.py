@@ -187,6 +187,36 @@ def _canonical_payload(meta, arrays, invocations, dynamic_work):
     }
 
 
+def initial_state_sha256(meta, arrays):
+    """Return the canonical identity of schema-2 initial memory."""
+    payload = {
+        "schema": "canonical-lazy-input-v1",
+        "arrays": [
+            {
+                "name": array.name,
+                "role": array.role,
+                "element_type": array.element_type,
+                "count": array.count,
+                "logical_base": array.logical_base,
+                "sha256": array.sha256,
+            }
+            for array in sorted(arrays, key=lambda value: value.name)
+        ],
+        "scalars": [
+            {
+                "name": name,
+                "logical_base": meta["scalar_addresses"][name],
+                "raw_word": value,
+            }
+            for name, value in sorted(meta["initial_scalars"].items())
+        ],
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _atomic_json(path, value):
     payload = (
         json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
@@ -208,7 +238,9 @@ def _validate_meta(meta):
     if not isinstance(meta, dict) or meta.get("schema") != 2:
         raise LazyTraceError("lazy trace metadata schema must be 2")
     _name(meta.get("workload"), "workload")
-    for field in ("source_sha256", "binary_sha256", "config_sha256"):
+    for field in (
+        "source_sha256", "binary_sha256", "config_sha256", "input_sha256"
+    ):
         _digest(meta.get(field), field.removesuffix("_sha256"))
     scalars = meta.get("initial_scalars", {})
     addresses = meta.get("scalar_addresses", {})
@@ -318,9 +350,16 @@ def write_bundle(root, meta, arrays, invocations, dynamic_work):
         _default_scalar_addresses(meta.get("initial_scalars", {})),
     )
     arrays = tuple(arrays)
+    derived_input = initial_state_sha256(meta, arrays)
+    claimed_input = meta.get("input_sha256")
+    if claimed_input is not None and claimed_input != derived_input:
+        raise LazyTraceError("lazy input SHA-256 differs from initial state")
+    meta["input_sha256"] = derived_input
     _validate_meta(meta)
     _validate_dynamic_work(dynamic_work)
     _validate_arrays(root, arrays)
+    if initial_state_sha256(meta, arrays) != meta["input_sha256"]:
+        raise LazyTraceError("lazy input SHA-256 differs from initial state")
     _validate_scalar_ranges(meta, arrays)
     _validate_invocations(invocations)
     _atomic_json(path, _canonical_payload(
@@ -345,6 +384,8 @@ def read_bundle(root):
     _validate_meta(meta)
     _validate_dynamic_work(dynamic_work)
     _validate_arrays(root, arrays)
+    if initial_state_sha256(meta, arrays) != meta["input_sha256"]:
+        raise LazyTraceError("lazy input SHA-256 differs from initial state")
     _validate_scalar_ranges(meta, arrays)
     _validate_invocations(invocations)
     return LazyBundle(root, meta, arrays, invocations, dynamic_work)
