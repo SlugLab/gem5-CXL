@@ -108,10 +108,57 @@ class ScalingRunnerTest(unittest.TestCase):
     def test_complete_requires_all_sixteen_passed_points(self):
         state = scaling.new_state(self.options)
         for entry in scaling.build_matrix()[:-1]:
-            scaling.record_pass(state, entry, {"summary": sha(str(entry))})
+            scaling.record_pass(
+                state, entry, {"summary": sha(str(entry))},
+                latency_seconds=str(entry.scale),
+                output_elements=1 << entry.scale,
+                mechanism={"verification": "pass"},
+            )
         self.assertFalse(scaling.is_complete(state))
-        scaling.record_pass(state, scaling.build_matrix()[-1], {"summary": "f" * 64})
+        last = scaling.build_matrix()[-1]
+        scaling.record_pass(
+            state, last, {"summary": "f" * 64},
+            latency_seconds=str(last.scale),
+            output_elements=1 << last.scale,
+            mechanism={"verification": "pass"},
+        )
         self.assertTrue(scaling.is_complete(state))
+        self.assertEqual(state["points"]["g20:m2ndp"]["speedup"], "1")
+
+    def test_record_pass_recomputes_speedup_from_absolute_seconds(self):
+        state = scaling.new_state(self.options)
+        vanilla = scaling.MatrixEntry(4, "vanilla")
+        amu = scaling.MatrixEntry(4, "amu")
+        common = {
+            "output_elements": 16,
+            "mechanism": {"verification": "pass"},
+        }
+        scaling.record_pass(
+            state, vanilla, {"summary": sha("vanilla")},
+            latency_seconds="4", **common,
+        )
+        scaling.record_pass(
+            state, amu, {"summary": sha("amu")},
+            latency_seconds="2", **common,
+        )
+        self.assertEqual(state["points"][amu.key]["latency_seconds"], "2")
+        self.assertEqual(state["points"][amu.key]["speedup"], "2")
+
+    def test_record_pass_rejects_nonpositive_time_or_missing_mechanism(self):
+        state = scaling.new_state(self.options)
+        entry = scaling.MatrixEntry(4, "vanilla")
+        with self.assertRaisesRegex(scaling.ScalingError, "latency"):
+            scaling.record_pass(
+                state, entry, {"summary": sha("x")},
+                latency_seconds="0", output_elements=16,
+                mechanism={"verification": "pass"},
+            )
+        with self.assertRaisesRegex(scaling.ScalingError, "mechanism"):
+            scaling.record_pass(
+                state, entry, {"summary": sha("x")},
+                latency_seconds="1", output_elements=16,
+                mechanism={},
+            )
 
     def test_state_identity_changes_when_gem5_or_config_changes(self):
         original = scaling.new_state(self.options)

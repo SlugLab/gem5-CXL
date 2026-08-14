@@ -340,13 +340,32 @@ def new_state(options):
                 "full_e2e": entry.full_e2e,
                 "status": "pending",
                 "outputs": {},
+                "latency_seconds": None,
+                "speedup": None,
+                "output_elements": 1 << entry.scale,
+                "mechanism": {},
             }
             for entry in build_matrix()
         },
     }
 
 
-def record_pass(state, entry, output_hashes):
+def _positive_decimal_value(value, label):
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ScalingError(f"{label} must be an exact decimal")
+    try:
+        result = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ScalingError(f"{label} is not a decimal") from error
+    if not result.is_finite() or result <= 0:
+        raise ScalingError(f"{label} must be finite and positive")
+    return result
+
+
+def record_pass(
+    state, entry, output_hashes, *, latency_seconds, output_elements,
+    mechanism,
+):
     if entry.key not in state.get("points", {}):
         raise ScalingError(f"unknown matrix point: {entry.key}")
     if not isinstance(output_hashes, dict) or not output_hashes:
@@ -354,9 +373,34 @@ def record_pass(state, entry, output_hashes):
     for label, digest in output_hashes.items():
         if not isinstance(label, str) or _SHA256.fullmatch(str(digest)) is None:
             raise ScalingError(f"invalid output SHA-256 for {label}")
+    seconds = _positive_decimal_value(latency_seconds, "latency seconds")
+    if (
+        not isinstance(output_elements, int)
+        or isinstance(output_elements, bool)
+        or output_elements != 1 << entry.scale
+    ):
+        raise ScalingError("output element count differs from graph scale")
+    if (
+        not isinstance(mechanism, dict)
+        or mechanism.get("verification") != "pass"
+    ):
+        raise ScalingError("mechanism evidence is not a verified record")
+    baseline = state["points"][f"g{entry.scale}:vanilla"]
+    if entry.system == "vanilla":
+        speedup = Decimal(1)
+    else:
+        if baseline.get("status") != "passed":
+            raise ScalingError("Vanilla latency must pass before accelerator points")
+        speedup = _positive_decimal_value(
+            baseline.get("latency_seconds"), "Vanilla latency seconds"
+        ) / seconds
     point = state["points"][entry.key]
     point["status"] = "passed"
     point["outputs"] = dict(sorted(output_hashes.items()))
+    point["latency_seconds"] = str(seconds)
+    point["speedup"] = str(speedup)
+    point["output_elements"] = output_elements
+    point["mechanism"] = dict(sorted(mechanism.items()))
     return state
 
 
@@ -468,6 +512,39 @@ def _point_outputs(entry, options):
     }
 
 
+def _point_measurement(entry, options):
+    """Return publisher-ready absolute time and causal evidence."""
+    root = Path(options.root).resolve() / "scales" / f"g{entry.scale}"
+    if entry.system == "vanilla":
+        row = _read_single_csv(root / "m2ndp/gem5/run/summary.csv")
+        validate_mechanism_row("vanilla", row)
+        seconds = Decimal(_integer(row, "sim_ticks")) / Decimal(10**12)
+    elif entry.system in {"amu", "cira"}:
+        row = _read_single_csv(root / entry.system / "summary.csv")
+        validate_mechanism_row(entry.system, row)
+        seconds = Decimal(_integer(row, "sim_ticks")) / Decimal(10**12)
+    else:
+        row = _read_single_csv(root / "m2ndp/summary.csv")
+        if row.get("verification") != "pass" or row.get("funcsim_strict") != "pass":
+            raise ScalingError("M2NDP publisher mechanism evidence did not pass")
+        seconds = _positive_decimal_value(
+            row.get("m2ndp_seconds"), "M2NDP latency seconds"
+        )
+    seconds = _positive_decimal_value(seconds, f"{entry.key} latency seconds")
+    mechanism = {
+        str(name): str(value)
+        for name, value in sorted(row.items())
+        if value is not None
+    }
+    if mechanism.get("verification") != "pass":
+        raise ScalingError(f"{entry.key} verification is not pass")
+    return {
+        "latency_seconds": str(seconds),
+        "output_elements": 1 << entry.scale,
+        "mechanism": mechanism,
+    }
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
@@ -515,8 +592,18 @@ def main(argv=None):
             contract.atomic_write_json(state_path, state)
         for entry in build_matrix():
             if state["points"][entry.key]["status"] == "passed":
-                current = _point_outputs(entry, options)
-                if current != state["points"][entry.key]["outputs"]:
+                current_outputs = _point_outputs(entry, options)
+                current_measurement = _point_measurement(entry, options)
+                point = state["points"][entry.key]
+                if (
+                    current_outputs != point["outputs"]
+                    or current_measurement["latency_seconds"]
+                    != point.get("latency_seconds")
+                    or current_measurement["output_elements"]
+                    != point.get("output_elements")
+                    or current_measurement["mechanism"]
+                    != point.get("mechanism")
+                ):
                     raise ScalingError(
                         f"{entry.key} passed outputs changed before resume"
                     )
@@ -527,7 +614,10 @@ def main(argv=None):
                 raise ScalingError(
                     f"{entry.key} exited {completed.returncode}"
                 )
-            record_pass(state, entry, _point_outputs(entry, options))
+            record_pass(
+                state, entry, _point_outputs(entry, options),
+                **_point_measurement(entry, options),
+            )
             contract.atomic_write_json(state_path, state)
         if not is_complete(state):
             raise ScalingError("scaling state stopped before 16/16 passed")
