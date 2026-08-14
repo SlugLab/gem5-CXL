@@ -63,23 +63,28 @@ class AmuBatchCompletionTest(unittest.TestCase):
             PROFILE.index("void\nprimeSpm")
         ]
         self.assertIn("waitCompletionBatch", scheduler)
+        self.assertIn("waitCompletionOwners", scheduler)
         self.assertIn("findOwnerToken(token)", scheduler)
-        self.assertIn("entry.id != owner.id", scheduler)
-        self.assertIn("entry.id & kCompletionTokenMask", scheduler)
-        self.assertIn("expected != entry.phase", scheduler)
+        self.assertIn("ownerWords[owner_index]", scheduler)
+        self.assertIn("(entry.id & kCompletionTokenMask) != token", scheduler)
+        self.assertIn("entry.phase != expected", scheduler)
         self.assertNotIn("profileGetfin()", scheduler)
 
-    def test_profile_owner_lookup_is_fixed_four_way_set_associative(self):
+    def test_profile_owner_lookup_is_direct_and_packed(self):
         scheduler = PROFILE[
             PROFILE.index("class PersistentScheduler"):
             PROFILE.index("void\nprimeSpm")
         ]
         lookup = scheduler[
             scheduler.index("size_t findOwnerToken"):
-            scheduler.index("void insertOwner")
+            scheduler.index("void registerId")
         ]
-        self.assertIn("constexpr size_t kOwnerWays = 4", PROFILE)
-        self.assertIn("way < kOwnerWays", lookup)
+        self.assertIn(
+            "constexpr size_t kOwnerEntries = 1 << kCompletionTokenBits",
+            PROFILE,
+        )
+        self.assertIn("ownerWords[token] & kOwnerLive", lookup)
+        self.assertNotIn("for (", lookup)
         self.assertIn("duplicate live token", scheduler)
         self.assertNotIn("overflowOwners", scheduler)
         self.assertNotIn("overflowCounts", scheduler)
@@ -89,10 +94,19 @@ class AmuBatchCompletionTest(unittest.TestCase):
             PROFILE.count(
                 "std::array<size_t, kCompletionBatch> completedSlots;"
             ),
-            3,
+            2,
+        )
+        self.assertEqual(
+            PROFILE.count(
+                "std::array<uint32_t, kCompletionBatch> completedOwners;"
+            ),
+            2,
         )
         self.assertNotIn(
             "std::array<size_t, kCompletionBatch> completedSlots{}", PROFILE
+        )
+        self.assertNotIn(
+            "std::array<uint32_t, kCompletionBatch> completedOwners{}", PROFILE
         )
 
     def test_o3_smoke_checks_every_packed_token_and_spm_value(self):

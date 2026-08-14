@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -26,10 +27,13 @@ constexpr unsigned kCompletionCountBits = 3;
 constexpr unsigned kCompletionTokenBits = 15;
 constexpr uint64_t kCompletionTokenMask =
     (UINT64_C(1) << kCompletionTokenBits) - 1;
-constexpr size_t kOwnerSets = 128;
-constexpr size_t kOwnerWays = 4;
-constexpr size_t kOwnerEntries = kOwnerSets * kOwnerWays;
+constexpr size_t kOwnerEntries = 1 << kCompletionTokenBits;
 constexpr size_t kOwnerNotFound = kOwnerEntries;
+constexpr unsigned kOwnerSlotShift = kCompletionTokenBits;
+constexpr uint32_t kOwnerSlotMask = 0xff;
+constexpr unsigned kOwnerPhaseShift = kOwnerSlotShift + 8;
+constexpr uint32_t kOwnerPhaseMask = 0x3;
+constexpr uint32_t kOwnerLive = UINT32_C(1) << (kOwnerPhaseShift + 2);
 constexpr size_t kCacheLineBytes = 64;
 constexpr size_t kGupsEntries = 1 << 16;
 constexpr size_t kHashBuckets = 16000;
@@ -81,23 +85,16 @@ enum class SlotPhase {
 
 struct Slot {
     size_t op = 0;
-    size_t spmOffset = 0;
-    const void *source = nullptr;
     void *destination = nullptr;
     uint64_t id = 0;
     SlotPhase phase = SlotPhase::Free;
     uint8_t stage = 0;
 };
 
-struct IdOwner {
-    uint64_t id = 0;
-    uint16_t slot = 0;
-    SlotPhase expected = SlotPhase::Free;
-    bool live = false;
-};
-
-static_assert((kOwnerSets & (kOwnerSets - 1)) == 0,
-              "owner set count must be a power of two");
+static_assert(sizeof(Slot) * kWindowSlots <= 8 * 1024,
+              "AMU scheduler control must fit in 8 KiB");
+static_assert(sizeof(uint32_t) * kOwnerEntries <= 128 * 1024,
+              "packed AMU token owner map must fit in 128 KiB");
 
 alignas(64) std::array<uint8_t, kSpmBytes> spmArena{};
 size_t queueSafeSlots = 0;
@@ -263,8 +260,6 @@ class PersistentScheduler
         if (activeSlots == 0)
             throw std::runtime_error("SPM arena has no usable slots");
         configure(granularity);
-        for (size_t index = 0; index < kWindowSlots; ++index)
-            slots[index].spmOffset = index * stride;
     }
 
     size_t capacity() const { return activeSlots; }
@@ -282,7 +277,8 @@ class PersistentScheduler
     {
         if (sizeof(T) > granularity)
             throw std::runtime_error("payload exceeds configured granularity");
-        return reinterpret_cast<T *>(spmArena.data() + slot(index).spmOffset);
+        (void)slot(index);
+        return reinterpret_cast<T *>(spmArena.data() + index * stride);
     }
 
     void issueLoad(size_t index, size_t op, const void *source, uint8_t stage)
@@ -291,13 +287,13 @@ class PersistentScheduler
         if (entry.phase != SlotPhase::Free)
             throw std::runtime_error("load issued into a non-free slot");
         entry.op = op;
-        entry.source = source;
         entry.destination = nullptr;
         entry.stage = stage;
         entry.phase = SlotPhase::LoadPending;
-        entry.id = profileAload(
-            spmArena.data() + entry.spmOffset, source);
-        registerId(index, entry.id, SlotPhase::LoadPending);
+        const uint64_t id = profileAload(
+            spmArena.data() + index * stride, source);
+        registerId(index, id, SlotPhase::LoadPending);
+        entry.id = id;
     }
 
     void readyToStore(size_t index, void *destination)
@@ -315,18 +311,40 @@ class PersistentScheduler
         if (entry.phase != SlotPhase::ReadyToStore || !entry.destination)
             throw std::runtime_error("store issued from an unready slot");
         entry.phase = SlotPhase::StorePending;
-        entry.id = profileAstore(
-            spmArena.data() + entry.spmOffset, entry.destination);
-        registerId(index, entry.id, SlotPhase::StorePending);
+        const uint64_t id = profileAstore(
+            spmArena.data() + index * stride, entry.destination);
+        registerId(index, id, SlotPhase::StorePending);
+        entry.id = id;
     }
 
-    size_t waitCompletionBatch(
-        std::array<size_t, kCompletionBatch> &completedSlots)
+    void issueGupsLoad(size_t index, size_t op, const uint64_t *source)
     {
-        // Do not value-initialize this buffer immediately before the m5op.
-        // O3 may retain those zeroing stores in its store queue while the
-        // functional pseudo instruction writes the completed IDs, allowing
-        // the older stores to overwrite or forward zeros after the m5op.
+        if (index >= activeSlots)
+            throw std::runtime_error("GUPS slot index is out of range");
+        gupsOps[index] = op;
+        const uint64_t id = profileAload(
+            spmArena.data() + index * stride, source);
+        registerId(index, id, SlotPhase::LoadPending);
+    }
+
+    void issueGupsStore(size_t index, uint64_t *destination)
+    {
+        const uint64_t id = profileAstore(
+            spmArena.data() + index * stride, destination);
+        registerId(index, id, SlotPhase::StorePending);
+    }
+
+    uint64_t &gupsPayload(size_t index)
+    {
+        return *reinterpret_cast<uint64_t *>(
+            spmArena.data() + index * stride);
+    }
+
+    size_t gupsOp(size_t index) const { return gupsOps[index]; }
+
+    size_t waitCompletionOwners(
+        std::array<uint32_t, kCompletionBatch> &completedOwners)
+    {
         uint64_t packed = 0;
         size_t count = 0;
         while (count == 0) {
@@ -343,32 +361,54 @@ class PersistentScheduler
                             index * kCompletionTokenBits)) &
                 kCompletionTokenMask;
             const size_t owner_index = findOwnerToken(token);
-            if (owner_index == kOwnerNotFound) {
-                throw std::runtime_error(
-                    "AMU returned an unknown or stale ID");
+            if (owner_index == kOwnerNotFound)
+                throw std::runtime_error("AMU returned an unknown or stale ID");
+            const uint32_t owner = ownerWords[owner_index];
+            const size_t owner_slot =
+                (owner >> kOwnerSlotShift) & kOwnerSlotMask;
+            const SlotPhase expected = static_cast<SlotPhase>(
+                (owner >> kOwnerPhaseShift) & kOwnerPhaseMask);
+            if (owner_slot >= activeSlots ||
+                (expected != SlotPhase::LoadPending &&
+                 expected != SlotPhase::StorePending)) {
+                throw std::runtime_error("AMU completion has an invalid owner");
             }
-            const IdOwner owner = idOwners[owner_index];
-            if (owner.slot >= activeSlots) {
+            if (liveRequests == 0)
                 throw std::runtime_error(
-                    "AMU completion has an invalid owner");
-            }
-            Slot &entry = slots[owner.slot];
-            const SlotPhase expected = owner.expected;
-            if (entry.id != owner.id ||
-                (entry.id & kCompletionTokenMask) != token ||
-                expected != entry.phase) {
+                    "AMU live-request accounting underflow");
+            ownerWords[owner_index] = 0;
+            --liveRequests;
+            completedOwners[index] = owner;
+        }
+        return count;
+    }
+
+    size_t waitCompletionBatch(
+        std::array<size_t, kCompletionBatch> &completedSlots)
+    {
+        // Do not value-initialize this buffer immediately before the m5op.
+        // O3 may retain those zeroing stores in its store queue while the
+        // functional pseudo instruction writes the completed IDs, allowing
+        // the older stores to overwrite or forward zeros after the m5op.
+        std::array<uint32_t, kCompletionBatch> completedOwners;
+        const size_t count = waitCompletionOwners(completedOwners);
+
+        for (size_t index = 0; index < count; ++index) {
+            const uint32_t owner = completedOwners[index];
+            const uint64_t token = owner & kCompletionTokenMask;
+            const size_t owner_slot =
+                (owner >> kOwnerSlotShift) & kOwnerSlotMask;
+            const SlotPhase expected = static_cast<SlotPhase>(
+                (owner >> kOwnerPhaseShift) & kOwnerPhaseMask);
+            Slot &entry = slots[owner_slot];
+            if ((entry.id & kCompletionTokenMask) != token ||
+                entry.phase != expected) {
                 throw std::runtime_error(
                     "AMU completion owner/phase mismatch");
             }
 
-            eraseOwner(owner_index);
             entry.id = 0;
-            if (liveRequests == 0) {
-                throw std::runtime_error(
-                    "AMU live-request accounting underflow");
-            }
-            --liveRequests;
-            completedSlots[index] = owner.slot;
+            completedSlots[index] = owner_slot;
         }
         return count;
     }
@@ -381,9 +421,7 @@ class PersistentScheduler
              entry.phase != SlotPhase::StorePending)) {
             throw std::runtime_error("invalid scheduler slot release");
         }
-        const size_t offset = entry.spmOffset;
         entry = {};
-        entry.spmOffset = offset;
     }
 
     void requireDrained() const
@@ -398,44 +436,7 @@ class PersistentScheduler
   private:
     size_t findOwnerToken(uint64_t token) const
     {
-        const size_t set = static_cast<size_t>(token) & (kOwnerSets - 1);
-        const size_t base = set * kOwnerWays;
-        for (size_t way = 0; way < kOwnerWays; ++way) {
-            const size_t location = base + way;
-            const IdOwner &owner = idOwners[location];
-            if (owner.live &&
-                (owner.id & kCompletionTokenMask) == token)
-                return location;
-        }
-        return kOwnerNotFound;
-    }
-
-    void insertOwner(const IdOwner &owner)
-    {
-        const uint64_t token = owner.id & kCompletionTokenMask;
-        const size_t set = static_cast<size_t>(token) & (kOwnerSets - 1);
-        const size_t base = set * kOwnerWays;
-        size_t free_location = kOwnerNotFound;
-        for (size_t way = 0; way < kOwnerWays; ++way) {
-            const size_t location = base + way;
-            const IdOwner &existing = idOwners[location];
-            if (!existing.live) {
-                if (free_location == kOwnerNotFound)
-                    free_location = location;
-            } else if ((existing.id & kCompletionTokenMask) == token) {
-                throw std::runtime_error("AMU returned a duplicate live token");
-            }
-        }
-        if (free_location == kOwnerNotFound)
-            throw std::runtime_error("AMU owner set exceeds four live IDs");
-        idOwners[free_location] = owner;
-    }
-
-    void eraseOwner(size_t location)
-    {
-        if (location >= kOwnerEntries || !idOwners[location].live)
-            throw std::runtime_error("AMU owner location is invalid");
-        idOwners[location] = {};
+        return ownerWords[token] & kOwnerLive ? token : kOwnerNotFound;
     }
 
     void registerId(size_t index, uint64_t id, SlotPhase expected)
@@ -444,9 +445,14 @@ class PersistentScheduler
             throw std::runtime_error("AMU request admission failed");
         if (liveRequests >= kWindowSlots)
             throw std::runtime_error("AMU request window exceeded 256 IDs");
-        insertOwner(IdOwner{
-            id, static_cast<uint16_t>(index), expected, true
-        });
+        const uint64_t token = id & kCompletionTokenMask;
+        if (ownerWords[token] != 0)
+            throw std::runtime_error("AMU returned a duplicate live token");
+        ownerWords[token] =
+            static_cast<uint32_t>(token) |
+            (static_cast<uint32_t>(index) << kOwnerSlotShift) |
+            (static_cast<uint32_t>(expected) << kOwnerPhaseShift) |
+            kOwnerLive;
         ++liveRequests;
     }
 
@@ -455,7 +461,8 @@ class PersistentScheduler
     const size_t activeSlots;
     size_t liveRequests = 0;
     std::array<Slot, kWindowSlots> slots{};
-    std::array<IdOwner, kOwnerEntries> idOwners{};
+    std::array<size_t, kWindowSlots> gupsOps{};
+    std::array<uint32_t, kOwnerEntries> ownerWords{};
 };
 
 void
@@ -608,43 +615,40 @@ refillGupsSlot(PersistentScheduler &scheduler, BenchmarkState &state,
         return false;
     const size_t op = next_op++;
     const size_t index = (op * 40503) & (state.gupsTable.size() - 1);
-    scheduler.issueLoad(slot_index, op, &state.gupsTable[index], 0);
+    scheduler.issueGupsLoad(slot_index, op, &state.gupsTable[index]);
     return true;
 }
 
 void
-runGupsAmu(const Options &options, BenchmarkState &state)
+runGupsAmu(const Options &options, BenchmarkState &state,
+           PersistentScheduler &scheduler)
 {
     for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        PersistentScheduler scheduler(sizeof(uint64_t));
         size_t nextOp = 0;
         size_t completed = 0;
         for (size_t slot = 0; slot < scheduler.capacity(); ++slot)
             refillGupsSlot(scheduler, state, nextOp, slot);
 
         while (completed != state.gupsTable.size()) {
-            std::array<size_t, kCompletionBatch> completedSlots;
+            std::array<uint32_t, kCompletionBatch> completedOwners;
             const size_t completionCount =
-                scheduler.waitCompletionBatch(completedSlots);
+                scheduler.waitCompletionOwners(completedOwners);
             for (size_t completionIndex = 0;
                  completionIndex < completionCount; ++completionIndex) {
-                const size_t slot_index = completedSlots[completionIndex];
-                Slot &slot = scheduler.slot(slot_index);
+                const uint32_t owner = completedOwners[completionIndex];
+                const size_t slot_index =
+                    (owner >> kOwnerSlotShift) & kOwnerSlotMask;
+                const SlotPhase phase = static_cast<SlotPhase>(
+                    (owner >> kOwnerPhaseShift) & kOwnerPhaseMask);
+                const size_t op = scheduler.gupsOp(slot_index);
                 const size_t index =
-                    (slot.op * 40503) & (state.gupsTable.size() - 1);
-                if (slot.phase == SlotPhase::LoadPending) {
-                    uint64_t value = 0;
-                    std::memcpy(
-                        &value, scheduler.payload<uint64_t>(slot_index),
-                        sizeof(value));
-                    value ^= UINT64_C(0xd1b54a32d192ed03) ^ index;
-                    std::memcpy(scheduler.payload<uint64_t>(slot_index),
-                                &value, sizeof(value));
-                    scheduler.readyToStore(
+                    (op * 40503) & (state.gupsTable.size() - 1);
+                if (phase == SlotPhase::LoadPending) {
+                    scheduler.gupsPayload(slot_index) ^=
+                        UINT64_C(0xd1b54a32d192ed03) ^ index;
+                    scheduler.issueGupsStore(
                         slot_index, &state.gupsTable[index]);
-                    scheduler.issueStore(slot_index);
-                } else if (slot.phase == SlotPhase::StorePending) {
-                    scheduler.release(slot_index);
+                } else if (phase == SlotPhase::StorePending) {
                     ++completed;
                     refillGupsSlot(
                         scheduler, state, nextOp, slot_index);
@@ -689,11 +693,11 @@ runHashJoinBaseline(const Options &options, BenchmarkState &state)
 }
 
 void
-runHashJoinAmu(const Options &options, BenchmarkState &state)
+runHashJoinAmu(const Options &options, BenchmarkState &state,
+               PersistentScheduler &scheduler)
 {
     for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
         initializeHashQueries(iteration, state);
-        PersistentScheduler scheduler(sizeof(HashNode));
         for (size_t query = 0; query < kWindowSlots; ++query) {
             scheduler.issueLoad(
                 query, query, &state.hashNodes[state.hashCurrent[query]], 0);
@@ -790,10 +794,10 @@ startStreamStoreIfReady(PersistentScheduler &scheduler,
 }
 
 void
-runStreamAmu(const Options &options, BenchmarkState &state)
+runStreamAmu(const Options &options, BenchmarkState &state,
+             PersistentScheduler &scheduler)
 {
     for (size_t iteration = 0; iteration < options.iterations; ++iteration) {
-        PersistentScheduler scheduler(sizeof(StreamBlock));
         size_t nextBlock = 0;
         size_t completed = 0;
         const size_t pairCount = scheduler.capacity() / 2;
@@ -840,20 +844,21 @@ runStreamAmu(const Options &options, BenchmarkState &state)
 }
 
 void
-runKernel(const Options &options, BenchmarkState &state)
+runKernel(const Options &options, BenchmarkState &state,
+          PersistentScheduler *scheduler)
 {
     if (options.workload == "gups") {
         if (options.amu)
-            runGupsAmu(options, state);
+            runGupsAmu(options, state, *scheduler);
         else
             runGupsBaseline(options, state);
     } else if (options.workload == "hj") {
         if (options.amu)
-            runHashJoinAmu(options, state);
+            runHashJoinAmu(options, state, *scheduler);
         else
             runHashJoinBaseline(options, state);
     } else if (options.amu) {
-        runStreamAmu(options, state);
+        runStreamAmu(options, state, *scheduler);
     } else {
         runStreamBaseline(options, state);
     }
@@ -892,8 +897,13 @@ main(int argc, char **argv)
         const Options options = parseOptions(argc, argv);
         BenchmarkState state;
         prepareAndPrime(options, state);
+        std::unique_ptr<PersistentScheduler> scheduler;
+        if (options.amu) {
+            scheduler = std::make_unique<PersistentScheduler>(
+                workloadGranularity(options));
+        }
         m5_work_begin(0, 0);
-        runKernel(options, state);
+        runKernel(options, state, scheduler.get());
         m5_work_end(0, 0);
         uint64_t digest = checksum(options, state);
         (void)m5_sum(static_cast<unsigned>(digest),

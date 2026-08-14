@@ -421,6 +421,10 @@ def collect_plan(options):
                 ]
                 if kind == "baseline":
                     command.append("--no-asmc")
+                else:
+                    command.extend(
+                        ["--asmc-profile", "paper-calibration-base"]
+                    )
                 runs.append(
                     {
                         "workload": workload,
@@ -571,6 +575,26 @@ def _gate_config(record, binary):
         )
     if record["kind"] == "amu":
         asmc = sections.get("board.asmc", {})
+        required_profile = {
+            "calibration_profile": "paper-calibration-base",
+            "calibration_manifest_sha256": "",
+            "spm_size": str(64 * 1024),
+            "pending_queue_entries": "32",
+            "id_batch_entries": "32",
+            "metadata_latency": "0",
+            "id_refill_latency": "0",
+            "completion_publish_latency": "0",
+        }
+        profile_mismatches = {
+            name: {"expected": expected, "observed": asmc.get(name)}
+            for name, expected in required_profile.items()
+            if asmc.get(name) != expected
+        }
+        if profile_mismatches:
+            raise calibration.CalibrationError(
+                "GUPS gate embedded nonzero or unapproved control costs: "
+                f"{profile_mismatches} in {config_path}"
+            )
         adapter = sections.get("board.asmc_io_cache", {})
         membus = sections.get("board.cache_hierarchy.membus", {})
         if (
@@ -1278,6 +1302,33 @@ def _parse_run(record):
                 raise calibration.CalibrationError(
                     f"nonzero AMU failure counter {suffix}: {value:g}"
                 )
+        config = _ini_sections(
+            _require_file(run_dir / "config.ini", "proxy config")
+        ).get("board.asmc")
+        required_profile = {
+            "calibration_profile": "paper-calibration-base",
+            "calibration_manifest_sha256": "",
+            "spm_size": str(64 * 1024),
+            "pending_queue_entries": "32",
+            "id_batch_entries": "32",
+            "metadata_latency": "0",
+            "id_refill_latency": "0",
+            "completion_publish_latency": "0",
+        }
+        if config is None:
+            raise calibration.CalibrationError(
+                f"AMU proxy config has no board.asmc section: {run_dir}"
+            )
+        mismatches = {
+            name: {"expected": expected, "observed": config.get(name)}
+            for name, expected in required_profile.items()
+            if config.get(name) != expected
+        }
+        if mismatches:
+            raise calibration.CalibrationError(
+                "AMU proxy collection embedded nonzero or unapproved "
+                f"control costs: {mismatches}"
+            )
     raw = _require_file(record["raw"], "proxy checksum")
     payload = raw.read_bytes()
     if len(payload) != 8:

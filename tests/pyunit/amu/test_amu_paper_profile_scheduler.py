@@ -178,22 +178,23 @@ class AmuPaperProfileSchedulerTest(unittest.TestCase):
         self.assertIn("LoadPending", SOURCE)
         self.assertIn("ReadyToStore", SOURCE)
         self.assertIn("StorePending", SOURCE)
-        self.assertIn("struct IdOwner", SOURCE)
-        self.assertIn("constexpr size_t kOwnerSets = 128", SOURCE)
-        self.assertIn("constexpr size_t kOwnerWays = 4", SOURCE)
-        self.assertIn("constexpr size_t kOwnerEntries", SOURCE)
-        self.assertIn("std::array<IdOwner, kOwnerEntries> idOwners", SOURCE)
-        self.assertIn("findOwner", SOURCE)
-        self.assertIn("eraseOwner", SOURCE)
-        self.assertIn("insertOwner", SOURCE)
-        self.assertNotIn("std::vector<IdOwner> idOwners", SOURCE)
-        self.assertNotIn("std::unordered_map<uint64_t, IdOwner>", SOURCE)
-        self.assertNotIn("idOwners.find", SOURCE)
-        self.assertNotIn("idOwners.erase", SOURCE)
+        self.assertIn(
+            "constexpr size_t kOwnerEntries = 1 << kCompletionTokenBits",
+            SOURCE,
+        )
+        self.assertIn(
+            "std::array<uint32_t, kOwnerEntries> ownerWords", SOURCE
+        )
+        self.assertIn("findOwnerToken", SOURCE)
+        self.assertIn("ownerWords[token] & kOwnerLive", SOURCE)
+        self.assertIn("ownerWords[token] != 0", SOURCE)
+        self.assertIn("duplicate live token", SOURCE)
+        self.assertNotIn("struct IdOwner", SOURCE)
+        self.assertNotIn("idOwners", SOURCE)
         self.assertNotIn("overflowOwners", SOURCE)
         self.assertNotIn("overflowCounts", SOURCE)
         self.assertNotIn("std::find", SOURCE)
-        self.assertIn("expected != entry.phase", SOURCE)
+        self.assertIn("entry.phase != expected", SOURCE)
 
     def test_slots_refill_before_waiting_for_another_completion(self):
         completion = SOURCE[

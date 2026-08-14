@@ -92,6 +92,14 @@ def write_config(path, binary, *, kind, delay=5000000, extra_core=False,
             [
                 "[board.asmc]",
                 "mem_side_port=board.asmc_io_cache.cpu_side",
+                "calibration_profile=paper-calibration-base",
+                "calibration_manifest_sha256=",
+                "spm_size=65536",
+                "pending_queue_entries=32",
+                "id_batch_entries=32",
+                "metadata_latency=0",
+                "id_refill_latency=0",
+                "completion_publish_latency=0",
                 "[board.asmc_io_cache]",
                 "cpu_side=board.asmc.mem_side_port",
                 f"mem_side={cache_mem_side}",
@@ -196,6 +204,7 @@ class AmuGupsGateTest(unittest.TestCase):
             "workload_exact",
             "amu_exact",
             "topology",
+            "profile",
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
@@ -264,6 +273,15 @@ class AmuGupsGateTest(unittest.TestCase):
                     write_config(
                         Path(amu["run_dir"], "config.ini"),
                         binary.resolve(), kind="amu", connected=False,
+                    )
+                elif mutation == "profile":
+                    config = Path(amu["run_dir"], "config.ini")
+                    config.write_text(
+                        config.read_text(encoding="utf-8").replace(
+                            "calibration_profile=paper-calibration-base",
+                            "calibration_profile=legacy",
+                        ),
+                        encoding="utf-8",
                     )
 
                 with self.assertRaises(calibration.CalibrationError):

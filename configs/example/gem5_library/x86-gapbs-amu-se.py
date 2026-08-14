@@ -334,7 +334,12 @@ parser.add_argument(
 parser.add_argument("--no-asmc", action="store_true")
 parser.add_argument(
     "--asmc-profile",
-    choices=("legacy", "paper-calibrated", "paper-sensitivity-256k"),
+    choices=(
+        "legacy",
+        "paper-calibration-base",
+        "paper-calibrated",
+        "paper-sensitivity-256k",
+    ),
     default="legacy",
 )
 parser.add_argument("--asmc-calibration-manifest", type=Path)
@@ -410,6 +415,21 @@ amu_profile = {
 if args.asmc_profile == "legacy":
     if args.asmc_calibration_manifest is not None:
         parser.error("legacy AMU profile cannot bind a calibration manifest")
+elif args.asmc_profile == "paper-calibration-base":
+    if args.no_asmc:
+        parser.error("paper calibration base requires ASMC to be enabled")
+    if args.asmc_calibration_manifest is not None:
+        parser.error("paper calibration base cannot bind a fitted manifest")
+    if args.asmc_spm_size != "64KiB":
+        parser.error("paper calibration base requires --asmc-spm-size 64KiB")
+    amu_profile = {
+        "pending_entries_per_state_machine": 32,
+        "id_batch_entries": 32,
+        "metadata_cycles": 0,
+        "id_refill_cycles": 0,
+        "completion_cycles": 0,
+    }
+    print("AMU_CALIBRATION_BASE profile=zero-control")
 elif args.no_asmc:
     parser.error("a calibrated AMU profile requires ASMC to be enabled")
 else:

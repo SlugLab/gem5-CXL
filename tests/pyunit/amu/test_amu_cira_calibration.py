@@ -1,6 +1,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
+import inspect
 import math
 import os
 import subprocess
@@ -38,6 +39,55 @@ PROXY = REPO / "util/amu/amu_paper_profile.cc"
 
 
 class CalibrationSourceTest(unittest.TestCase):
+    def test_proxy_scheduler_control_state_is_hoisted_before_roi(self):
+        source = PROXY.read_text(encoding="utf-8")
+        main = source[source.index("\nmain(int argc") :]
+        scheduler = main.index("std::make_unique<PersistentScheduler>")
+        roi = main.index("m5_work_begin")
+        self.assertLess(scheduler, roi)
+        for name, following in (
+            ("runGupsAmu", "initializeHashQueries"),
+            ("runHashJoinAmu", "runStreamBaseline"),
+            ("runStreamAmu", "runKernel"),
+        ):
+            start = source.index(f"\n{name}(")
+            body = source[start : source.index(f"\n{following}(", start)]
+            self.assertNotIn("PersistentScheduler scheduler", body)
+
+    def test_proxy_scheduler_uses_a_direct_packed_token_owner_map(self):
+        source = PROXY.read_text(encoding="utf-8")
+        scheduler = source[
+            source.index("class PersistentScheduler"):
+            source.index("\nvoid\nprimeSpm", source.index("class PersistentScheduler"))
+        ]
+        self.assertNotIn("IdOwner", scheduler)
+        self.assertNotIn("idOwners", scheduler)
+        self.assertIn("ownerWords", scheduler)
+        self.assertIn("findOwnerToken", scheduler)
+        self.assertIn("static_assert(sizeof(Slot) * kWindowSlots <= 8 * 1024", source)
+        self.assertIn("kOwnerEntries = 1 << kCompletionTokenBits", source)
+        self.assertIn("return ownerWords[token] & kOwnerLive", scheduler)
+        self.assertIn("ownerWords[token] != 0", scheduler)
+        self.assertIn("static_assert(sizeof(uint32_t) * kOwnerEntries <= 128 * 1024", source)
+
+    def test_gups_uses_the_paper_handwritten_completion_hot_path(self):
+        source = PROXY.read_text(encoding="utf-8")
+        scheduler = source[
+            source.index("class PersistentScheduler"):
+            source.index("\nvoid\nprimeSpm", source.index("class PersistentScheduler"))
+        ]
+        start = source.index("\nrefillGupsSlot(")
+        body = source[start : source.index("\nvoid\ninitializeHashQueries", start)]
+        self.assertIn("waitCompletionOwners", scheduler)
+        self.assertIn("issueGupsLoad", scheduler)
+        self.assertIn("issueGupsStore", scheduler)
+        self.assertIn("scheduler.waitCompletionOwners", body)
+        self.assertIn("scheduler.issueGupsLoad", body)
+        self.assertNotIn("scheduler.waitCompletionBatch", body)
+        self.assertNotIn("scheduler.issueLoad", body)
+        self.assertNotIn("scheduler.slot", body)
+        self.assertNotIn("scheduler.payload", body)
+
     def test_amu_source_hash_and_direct_parameters(self):
         facts = calibration.load_amu_source(PDF)
         self.assertEqual(facts["sha256"], calibration.AMU_PDF_SHA256)
@@ -1068,8 +1118,27 @@ class CalibrationRunnerTest(unittest.TestCase):
                 self.assertIn(run["latency"], command)
                 if run["kind"] == "baseline":
                     self.assertIn("--no-asmc", command)
+                    self.assertNotIn("paper-calibration-base", command)
                 else:
                     self.assertNotIn("--no-asmc", command)
+                    profile = command.index("--asmc-profile")
+                    self.assertEqual(
+                        command[profile + 1], "paper-calibration-base"
+                    )
+
+    def test_collection_rejects_nonzero_embedded_control_costs(self):
+        source = (
+            REPO
+            / "configs/example/gem5_library/x86-gapbs-amu-se.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"paper-calibration-base"', source)
+        self.assertIn('args.asmc_profile == "paper-calibration-base"', source)
+        self.assertIn('"metadata_cycles": 0', source)
+        self.assertIn('"id_refill_cycles": 0', source)
+        self.assertIn('"completion_cycles": 0', source)
+        parse_run = inspect.getsource(runner._parse_run)
+        self.assertIn('"calibration_profile": "paper-calibration-base"', parse_run)
+        self.assertIn('"metadata_latency": "0"', parse_run)
 
     def test_register_checksum_transport_is_tagged_and_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
