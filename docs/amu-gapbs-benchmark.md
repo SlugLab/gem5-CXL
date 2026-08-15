@@ -509,6 +509,7 @@ checkpoint; `state.json` advances only after a complete passed point:
 systemd-run --unit=cira-amu-m2ndp-pr-scaling-formal --collect \
   --description='Formal four-thread all-CXL 1us PR scaling' \
   --property=WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv \
+  --setenv=PATH=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/m2ndp_toolchain/venv311/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   /usr/bin/python3 scripts/run_cira_amu_m2ndp_scaling.py \
   --inputs "${SCALING_ROOT}/inputs.json" \
   --calibration /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73.calibration.json \
