@@ -129,6 +129,7 @@ def command_for(entry, options):
             *common,
             "--cxlmemuring", str(Path(options.cxlmemuring).resolve()),
             "--m2ndp-root", str(Path(options.m2ndp_root).resolve()),
+            "--m5-library", str(Path(options.m5_library).resolve()),
             "--outdir", str(scale_root / "m2ndp"),
         ]
         if entry.system == "vanilla":
@@ -386,6 +387,7 @@ def new_state(options):
             if row["scale"] == 20
         ),
         "gem5_sha256": _sha256_file(options.gem5),
+        "m5_library_sha256": _sha256_file(options.m5_library),
         "config_sha256": _sha256_file(options.config),
         "points": {
             entry.key: {
@@ -612,6 +614,7 @@ def parse_args(argv=None):
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--gem5", type=Path, required=True)
+    parser.add_argument("--m5-library", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--cxlmemuring", type=Path, required=True)
     parser.add_argument("--m2ndp-root", type=Path, required=True)
@@ -644,6 +647,7 @@ def main(argv=None):
                 "graph_set_sha256",
                 "g20_graph_sha256",
                 "gem5_sha256",
+                "m5_library_sha256",
                 "config_sha256",
             ):
                 if state.get(field) != expected[field]:

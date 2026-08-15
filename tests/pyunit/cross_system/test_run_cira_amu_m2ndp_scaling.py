@@ -73,11 +73,15 @@ class ScalingRunnerTest(unittest.TestCase):
         self.calibration.write_text("{}\n", encoding="utf-8")
         self.gem5 = self.root / "gem5.opt"
         self.gem5.write_bytes(b"gem5")
+        self.m5_library = self.root / "frozen/libm5.a"
+        self.m5_library.parent.mkdir()
+        self.m5_library.write_bytes(b"m5 library")
         self.config = self.root / "config.py"
         self.config.write_text("config = 1\n", encoding="utf-8")
         self.options = SimpleNamespace(
             inputs=self.inputs, calibration=self.calibration,
             root=self.root / "evidence", gem5=self.gem5,
+            m5_library=self.m5_library,
             config=self.config, cxlmemuring=self.root / "CXLMemUring",
             m2ndp_root=self.root / "M2NDP", variants_build_root=self.root / "variants",
             timeout=0, resume=False,
@@ -143,6 +147,11 @@ class ScalingRunnerTest(unittest.TestCase):
                 "pr-scaling-4thread-1us",
             )
             self.assertIn("--graph-manifest", command)
+            if system in {"vanilla", "m2ndp"}:
+                self.assertEqual(
+                    command[command.index("--m5-library") + 1],
+                    str(self.m5_library.resolve()),
+                )
 
     def test_vanilla_stops_after_baseline_and_m2ndp_resumes_it(self):
         vanilla = scaling.command_for(scaling.MatrixEntry(14, "vanilla"), self.options)
@@ -263,7 +272,7 @@ class ScalingRunnerTest(unittest.TestCase):
                 mechanism={},
             )
 
-    def test_state_identity_changes_when_gem5_or_config_changes(self):
+    def test_state_identity_changes_when_gem5_m5_library_or_config_changes(self):
         original = scaling.new_state(self.options)
         self.config.write_text("config = 2\n", encoding="utf-8")
         changed_config = scaling.new_state(self.options)
@@ -274,6 +283,12 @@ class ScalingRunnerTest(unittest.TestCase):
         changed_gem5 = scaling.new_state(self.options)
         self.assertNotEqual(
             changed_config["gem5_sha256"], changed_gem5["gem5_sha256"]
+        )
+        self.m5_library.write_bytes(b"different m5 library")
+        changed_m5 = scaling.new_state(self.options)
+        self.assertNotEqual(
+            changed_gem5["m5_library_sha256"],
+            changed_m5["m5_library_sha256"],
         )
 
     def test_runner_rejects_general_breadth_manifest(self):

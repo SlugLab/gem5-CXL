@@ -24,6 +24,8 @@ class OrchestratorTest(unittest.TestCase):
         self.outdir.mkdir()
         self.graph = root / "g20.sg"
         self.graph.write_bytes(b"graph")
+        (root / "frozen").mkdir()
+        (root / "frozen/libm5.a").write_bytes(b"m5 library")
         self.options = runner.Options(
             graph=self.graph,
             graph_scale=20,
@@ -35,8 +37,15 @@ class OrchestratorTest(unittest.TestCase):
             resume=False,
             timeout=0,
             stop_after=None,
+            m5_library=root / "frozen/libm5.a",
         )
         self.paths = runner.make_paths(self.options)
+
+    def test_explicit_m5_library_does_not_depend_on_gem5_location(self):
+        self.assertEqual(
+            self.paths.m5_library,
+            self.options.m5_library.resolve(),
+        )
 
     def state_with(self, stage, *, status, outputs=None):
         state = runner.new_state(self.options)

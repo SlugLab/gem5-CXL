@@ -514,6 +514,7 @@ systemd-run --unit=cira-amu-m2ndp-pr-scaling-formal --collect \
   --calibration /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73.calibration.json \
   --root "${SCALING_ROOT}/run" \
   --gem5 /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73/inputs/gem5 \
+  --m5-library /home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/util/m5/build/x86/out/libm5.a \
   --config configs/example/gem5_library/x86-gapbs-amu-se.py \
   --cxlmemuring /home/victoryang00/CXLMemUring \
   --m2ndp-root /mnt/disk0/M2NDP-public \

@@ -87,6 +87,7 @@ class Options:
     profile: str = "g20-2thread-1us"
     cxl_link_delay: str = "1us"
     profile_manifest: Path | None = None
+    m5_library: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +115,11 @@ class RunPaths:
 def make_paths(options):
     root = Path(options.outdir).resolve()
     gem5_root = Path(options.gem5).resolve().parents[2]
+    m5_library = (
+        Path(options.m5_library).resolve()
+        if options.m5_library is not None
+        else gem5_root / "util/m5/build/x86/out/libm5.a"
+    )
     return RunPaths(
         root=root,
         status=root / "status.json",
@@ -132,7 +138,7 @@ def make_paths(options):
         funcsim_dump=root / "funcsim/scores.u32",
         calibration=root / "calibration",
         ndpsim_log=root / "logs/ndpsim.log",
-        m5_library=gem5_root / "util/m5/build/x86/out/libm5.a",
+        m5_library=m5_library,
     )
 
 
@@ -199,6 +205,7 @@ def _profile_manifest_sha256(options):
 
 def new_state(options):
     profile = _experiment_profile(options)
+    paths = make_paths(options)
     return {
         "schema": 1,
         "contract": {
@@ -224,6 +231,8 @@ def new_state(options):
             "checkpoint_boundary": "trial0_entry",
             "warmup_execution": "full_cxl_trial0",
             "measured_interval": "trial1_init_through_final_drain",
+            "m5_library": str(paths.m5_library),
+            "m5_library_sha256": artifacts.sha256_file(paths.m5_library),
         },
         "stages": {stage: _stage_record() for stage in STAGES},
     }
@@ -1078,26 +1087,30 @@ def _migrate_legacy_g20_contract(state, expected_contract):
     if expected_contract.get("profile") != "g20-2thread-1us":
         return False
     legacy_contracts = []
-    for fields in (
-        ("profile", "graph_sha256", "threads"),
-        (
-            "profile", "graph_sha256", "threads",
-            "profile_manifest", "profile_manifest_sha256",
-        ),
-        (
-            "profile", "graph_sha256", "threads",
-            "checkpoint_boundary", "warmup_execution", "measured_interval",
-        ),
-        (
-            "profile", "graph_sha256", "threads",
-            "profile_manifest", "profile_manifest_sha256",
-            "checkpoint_boundary", "warmup_execution", "measured_interval",
-        ),
-    ):
-        legacy = dict(expected_contract)
-        for field in fields:
-            legacy.pop(field)
-        legacy_contracts.append(legacy)
+    for strip_m5_identity in (False, True):
+        for fields in (
+            ("profile", "graph_sha256", "threads"),
+            (
+                "profile", "graph_sha256", "threads",
+                "profile_manifest", "profile_manifest_sha256",
+            ),
+            (
+                "profile", "graph_sha256", "threads",
+                "checkpoint_boundary", "warmup_execution", "measured_interval",
+            ),
+            (
+                "profile", "graph_sha256", "threads",
+                "profile_manifest", "profile_manifest_sha256",
+                "checkpoint_boundary", "warmup_execution", "measured_interval",
+            ),
+        ):
+            legacy = dict(expected_contract)
+            if strip_m5_identity:
+                legacy.pop("m5_library")
+                legacy.pop("m5_library_sha256")
+            for field in fields:
+                legacy.pop(field)
+            legacy_contracts.append(legacy)
     if state.get("contract") not in legacy_contracts:
         return False
     state["contract"] = expected_contract
@@ -1186,6 +1199,7 @@ def parse_args(argv=None):
     parser.add_argument("--cxlmemuring", type=Path, required=True)
     parser.add_argument("--m2ndp-root", type=Path, required=True)
     parser.add_argument("--gem5", type=Path, required=True)
+    parser.add_argument("--m5-library", type=Path)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -1208,6 +1222,10 @@ def parse_args(argv=None):
         profile_manifest=(
             args.profile_manifest.resolve()
             if args.profile_manifest is not None else None
+        ),
+        m5_library=(
+            args.m5_library.resolve()
+            if args.m5_library is not None else None
         ),
     )
 
