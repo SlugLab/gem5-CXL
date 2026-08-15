@@ -8,6 +8,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import m2ndp_artifacts as artifacts
 
@@ -150,7 +151,7 @@ class PrepareGapbsPrGraphTest(unittest.TestCase):
                 str(graph.resolve()),
             ]
             cases = (
-                ({"scale": 13}, "scale must be 12 or 14"),
+                ({"scale": 13}, "scale must be 4, 12, 14, or 20"),
                 ({"num_nodes": (1 << 14) - 1}, "node count"),
                 ({"directed_edges": 0}, "edge count"),
                 ({"generator_command": []}, "generator command"),
@@ -223,6 +224,128 @@ class PrepareGapbsPrGraphTest(unittest.TestCase):
             self.assertEqual(first["num_nodes"], 1 << 12)
             self.assertEqual(first["directed_edges"], 2)
             self.assertNotIn("profile", first)
+
+    def test_adopt_existing_endpoint_graph_is_read_only_and_frozen(self):
+        graph_prep = self.load_module()
+        self.assertIsNotNone(graph_prep)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "g4.sg"
+            generator = root / "converter"
+            output = root / "g4.manifest.json"
+            write_serialized_graph(graph, nodes=16, edges=7)
+            generator.write_bytes(b"fixed generator")
+            os.chmod(generator, 0o755)
+            before = graph.read_bytes()
+            digest = artifacts.sha256_file(graph)
+
+            with mock.patch.dict(
+                graph_prep.profiles.SCALING_GRAPH_HASHES,
+                {4: digest},
+                clear=True,
+            ):
+                manifest = graph_prep.adopt_existing_graph(
+                    graph=graph,
+                    scale=4,
+                    generator=generator,
+                    output=output,
+                )
+
+            self.assertEqual(graph.read_bytes(), before)
+            self.assertEqual(manifest["graph_sha256"], digest)
+            self.assertEqual(
+                manifest["generator_command"],
+                [
+                    str(generator.resolve()),
+                    "-g",
+                    "4",
+                    "-b",
+                    str(graph.resolve()),
+                ],
+            )
+            self.assertEqual(output.stat().st_mode & 0o777, 0o444)
+
+    def test_adoption_rejects_nonendpoint_scale(self):
+        graph_prep = self.load_module()
+        self.assertIsNotNone(graph_prep)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "g12.sg"
+            generator = root / "converter"
+            write_serialized_graph(graph, nodes=1 << 12, edges=2)
+            generator.write_bytes(b"fixed generator")
+            os.chmod(generator, 0o755)
+
+            with self.assertRaisesRegex(
+                graph_prep.GraphPreparationError,
+                "g4 or g20",
+            ):
+                graph_prep.adopt_existing_graph(
+                    graph=graph,
+                    scale=12,
+                    generator=generator,
+                    output=root / "manifest.json",
+                )
+
+    def test_adoption_rejects_endpoint_hash_drift(self):
+        graph_prep = self.load_module()
+        self.assertIsNotNone(graph_prep)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "g20.sg"
+            generator = root / "converter"
+            write_serialized_graph(graph, nodes=1 << 20, edges=2)
+            generator.write_bytes(b"fixed generator")
+            os.chmod(generator, 0o755)
+
+            with mock.patch.dict(
+                graph_prep.profiles.SCALING_GRAPH_HASHES,
+                {20: "0" * 64},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    graph_prep.GraphPreparationError,
+                    "g20 graph SHA-256 differs",
+                ):
+                    graph_prep.adopt_existing_graph(
+                        graph=graph,
+                        scale=20,
+                        generator=generator,
+                        output=root / "manifest.json",
+                    )
+
+    def test_cli_adopts_existing_endpoint_graph(self):
+        graph_prep = self.load_module()
+        self.assertIsNotNone(graph_prep)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "g4.sg"
+            generator = root / "converter"
+            output = root / "g4.manifest.json"
+            write_serialized_graph(graph, nodes=16, edges=4)
+            generator.write_bytes(b"fixed generator")
+            os.chmod(generator, 0o755)
+            digest = artifacts.sha256_file(graph)
+
+            with mock.patch.dict(
+                graph_prep.profiles.SCALING_GRAPH_HASHES,
+                {4: digest},
+                clear=True,
+            ):
+                graph_prep.main(
+                    [
+                        "--scale",
+                        "4",
+                        "--existing-graph",
+                        str(graph),
+                        "--generator",
+                        str(generator),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(json.loads(output.read_text())["scale"], 4)
 
 
 if __name__ == "__main__":

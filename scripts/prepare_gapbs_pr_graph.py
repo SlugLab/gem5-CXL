@@ -61,8 +61,8 @@ def write_graph_manifest(
     scale = _require_plain_int(scale, "scale")
     num_nodes = _require_plain_int(num_nodes, "node count")
     directed_edges = _require_plain_int(directed_edges, "edge count")
-    if scale not in (12, 14):
-        raise GraphPreparationError("scale must be 12 or 14")
+    if scale not in profiles.SCALING_SCALES:
+        raise GraphPreparationError("scale must be 4, 12, 14, or 20")
     if num_nodes != 1 << scale:
         raise GraphPreparationError("node count does not match scale")
     if directed_edges <= 0:
@@ -146,6 +146,39 @@ def write_graph_manifest(
     return manifest
 
 
+def adopt_existing_graph(
+    *, graph: Path, scale: int, generator: Path, output: Path
+) -> dict:
+    """Freeze a selected endpoint graph without modifying its bytes."""
+    if scale not in (4, 20):
+        raise GraphPreparationError(
+            "existing graph adoption supports g4 or g20"
+        )
+    graph = Path(graph).resolve()
+    generator = Path(generator).resolve()
+    if not graph.is_file():
+        raise GraphPreparationError(f"graph does not exist: {graph}")
+    if not generator.is_file() or not os.access(generator, os.X_OK):
+        raise GraphPreparationError(
+            f"generator is not an executable file: {generator}"
+        )
+    nodes, edges, _ = inspect_serialized_graph(graph)
+    if nodes != 1 << scale:
+        raise GraphPreparationError("node count does not match scale")
+    if artifacts.sha256_file(graph) != profiles.SCALING_GRAPH_HASHES[scale]:
+        raise GraphPreparationError(f"g{scale} graph SHA-256 differs")
+    command = [str(generator), "-g", str(scale), "-b", str(graph)]
+    return write_graph_manifest(
+        graph=graph,
+        scale=scale,
+        generator=generator,
+        generator_command=command,
+        num_nodes=nodes,
+        directed_edges=edges,
+        output=output,
+    )
+
+
 def prepare_graph(*, scale: int, root: Path, generator: Path) -> dict:
     if scale not in (12, 14):
         raise GraphPreparationError("scale must be 12 or 14")
@@ -197,18 +230,41 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate and freeze a deterministic GAPBS PR graph."
     )
-    parser.add_argument("--scale", type=int, choices=(12, 14), required=True)
-    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--scale", type=int, choices=profiles.SCALING_SCALES, required=True
+    )
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--existing-graph", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--generator", type=Path, default=DEFAULT_GENERATOR)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.existing_graph is None:
+        if args.root is None:
+            parser.error("--root is required when generating a graph")
+        if args.output is not None:
+            parser.error("--output requires --existing-graph")
+    else:
+        if args.root is not None:
+            parser.error("--root and --existing-graph are mutually exclusive")
+        if args.output is None:
+            parser.error("--output is required with --existing-graph")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
-        manifest = prepare_graph(
-            scale=args.scale, root=args.root, generator=args.generator
-        )
+        if args.existing_graph is None:
+            manifest = prepare_graph(
+                scale=args.scale, root=args.root, generator=args.generator
+            )
+        else:
+            manifest = adopt_existing_graph(
+                graph=args.existing_graph,
+                scale=args.scale,
+                generator=args.generator,
+                output=args.output,
+            )
     except (GraphPreparationError, profiles.ProfileError) as error:
         raise SystemExit(str(error)) from error
     print(json.dumps(manifest, sort_keys=True, indent=2, allow_nan=False))
