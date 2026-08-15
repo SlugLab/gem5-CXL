@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import hashlib
+import csv
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+from scripts import freeze_pr_scaling_inputs as freeze
 from scripts import run_cira_amu_m2ndp_scaling as scaling
 
 
@@ -21,22 +25,49 @@ class ScalingRunnerTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         graphs = []
+        frozen_rows = []
         for scale in (4, 12, 14, 20):
             graph = self.root / f"g{scale}.sg"
             manifest = self.root / f"g{scale}.manifest.json"
+            generator = self.root / f"converter-{scale}"
             graph.write_bytes(f"graph-{scale}".encode())
             manifest.write_text("{}\n", encoding="utf-8")
+            generator.write_bytes(f"generator-{scale}".encode())
+            os.chmod(generator, 0o755)
+            command = [
+                str(generator.resolve()), "-g", str(scale), "-b",
+                str(graph.resolve()),
+            ]
             graphs.append({
                 "scale": scale, "path": str(graph.resolve()),
                 "sha256": sha(f"graph-{scale}"),
                 "manifest": str(manifest.resolve()),
                 "manifest_sha256": sha("{}\n"),
                 "num_nodes": 1 << scale, "directed_edges": scale,
+                "generator": str(generator.resolve()),
+                "generator_sha256": sha(f"generator-{scale}"),
+                "generator_command": command,
             })
+            frozen_rows.append(freeze.profiles.FrozenGraphManifest(
+                schema=1, scale=scale, graph=str(graph.resolve()),
+                graph_sha256=sha(f"graph-{scale}"),
+                generator=str(generator.resolve()),
+                generator_sha256=sha(f"generator-{scale}"),
+                generator_command=tuple(command), num_nodes=1 << scale,
+                directed_edges=scale,
+            ))
+        profile_patch = mock.patch.object(
+            freeze.profiles,
+            "load_scaling_graphs",
+            return_value=tuple(frozen_rows),
+        )
+        profile_patch.start()
+        self.addCleanup(profile_patch.stop)
         self.inputs = self.root / "inputs.json"
         self.inputs.write_text(json.dumps({
-            "schema": 1, "status": "accepted", "graphs": graphs,
-            "workloads": {},
+            "schema": 1, "status": "accepted", "scope": "pr_scaling",
+            "profile": "pr-scaling-4thread-1us", "graphs": graphs,
+            "graph_set_sha256": freeze.graph_set_sha256(graphs),
         }) + "\n", encoding="utf-8")
         self.calibration = self.root / "calibration.json"
         self.calibration.write_text("{}\n", encoding="utf-8")
@@ -51,6 +82,43 @@ class ScalingRunnerTest(unittest.TestCase):
             m2ndp_root=self.root / "M2NDP", variants_build_root=self.root / "variants",
             timeout=0, resume=False,
         )
+
+    def write_real_config(
+        self, *, delay="1000000", cores=4, link_range="0:4294967296",
+        path=None,
+    ):
+        config = Path(path) if path is not None else self.root / "config.ini"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        sections = [
+            "[board]",
+            "type=System",
+            "mem_ranges=0:4294967296",
+            "[board.cxl_mem_link0]",
+            "type=SerialLink",
+            f"delay={delay}",
+            f"ranges={link_range}",
+            "cpu_side_port=board.cache_hierarchy.membus.mem_side_ports[0]",
+            "mem_side_port=board.cxl_device_xbar0.cpu_side_ports[0]",
+            "[board.cxl_device_xbar0]",
+            "type=NoncoherentXBar",
+            "cpu_side_ports=board.cxl_mem_link0.mem_side_port",
+            "mem_side_ports=board.memory.mem_ctrl.port",
+            "[board.memory.mem_ctrl]",
+            "type=MemCtrl",
+            "port=board.cxl_device_xbar0.mem_side_ports[0]",
+            "[board.memory.mem_ctrl.dram]",
+            "type=DRAMInterface",
+            "range=0:4294967296",
+        ]
+        for index in range(cores):
+            sections.extend(
+                (
+                    f"[board.processor.cores{index}.core]",
+                    "type=BaseTimingSimpleCPU",
+                )
+            )
+        config.write_text("\n".join(sections) + "\n", encoding="utf-8")
+        return config
 
     def test_matrix_is_four_scales_by_four_systems_at_1us(self):
         matrix = scaling.build_matrix()
@@ -85,13 +153,48 @@ class ScalingRunnerTest(unittest.TestCase):
                          m2ndp[m2ndp.index("--outdir") + 1])
 
     def test_config_must_be_four_core_all_cxl_one_microsecond(self):
-        config = self.root / "config.ini"
-        config.write_text(
-            "delay=500000\nnum_cpus=4\nall_memory_cxl=true\n",
-            encoding="utf-8",
-        )
+        config = self.write_real_config(delay="500000")
         with self.assertRaisesRegex(scaling.ScalingError, "delay"):
             scaling.validate_config(config)
+
+    def test_config_accepts_real_four_core_all_cxl_shape(self):
+        topology = scaling.validate_config(self.write_real_config())
+        self.assertEqual(topology["cores"], 4)
+        self.assertEqual(topology["range"], "0:4294967296")
+
+    def test_config_rejects_missing_core_or_range_bypass(self):
+        config = self.write_real_config(cores=3)
+        with self.assertRaisesRegex(scaling.ScalingError, "four cores"):
+            scaling.validate_config(config)
+
+        config = self.write_real_config(link_range="4096:8192")
+        with self.assertRaisesRegex(scaling.ScalingError, "range mismatch"):
+            scaling.validate_config(config)
+
+    def test_vanilla_point_validates_its_generated_config(self):
+        base = self.options.root / "scales/g4/m2ndp"
+        run_dir = base / "gem5/run/m5out"
+        summary = base / "gem5/run/summary.csv"
+        summary.parent.mkdir(parents=True, exist_ok=True)
+        with summary.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=("status", "verification", "run_dir"),
+            )
+            writer.writeheader()
+            writer.writerow({
+                "status": "ok", "verification": "pass",
+                "run_dir": str(run_dir),
+            })
+        reference = base / "reference/scores.raw"
+        reference.parent.mkdir(parents=True, exist_ok=True)
+        reference.write_bytes(b"\x00" * (16 * 4))
+        self.write_real_config(delay="500000", path=run_dir / "config.ini")
+
+        with self.assertRaisesRegex(scaling.ScalingError, "delay"):
+            scaling._point_outputs(
+                scaling.MatrixEntry(4, "vanilla"), self.options
+            )
 
     def test_post_trial0_checkpoint_is_rejected(self):
         with self.assertRaisesRegex(scaling.ScalingError, "trial0_entry"):
@@ -171,6 +274,26 @@ class ScalingRunnerTest(unittest.TestCase):
         changed_gem5 = scaling.new_state(self.options)
         self.assertNotEqual(
             changed_config["gem5_sha256"], changed_gem5["gem5_sha256"]
+        )
+
+    def test_runner_rejects_general_breadth_manifest(self):
+        value = json.loads(self.inputs.read_text())
+        value["scope"] = "scaling_and_breadth"
+        self.inputs.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(scaling.ScalingError, "scope"):
+            scaling.load_inputs(self.inputs)
+
+    def test_state_records_graph_set_and_g20_identity(self):
+        inputs = scaling.load_inputs(self.inputs)
+        state = scaling.new_state(self.options)
+        self.assertEqual(
+            state["graph_set_sha256"], inputs["graph_set_sha256"]
+        )
+        self.assertEqual(
+            state["g20_graph_sha256"],
+            next(
+                row for row in inputs["graphs"] if row["scale"] == 20
+            )["sha256"],
         )
 
     def test_amu_queue_error_and_cira_inactive_core_fail_mechanism_gate(self):

@@ -5,6 +5,7 @@
 """Run the formal four-scale Vanilla/AMU/CIRA/M2NDP comparison."""
 
 import argparse
+import configparser
 import csv
 import dataclasses
 import hashlib
@@ -17,8 +18,10 @@ from pathlib import Path
 
 try:
     from scripts import cross_system_contract as contract
+    from scripts import freeze_pr_scaling_inputs as scaling_inputs
 except ImportError:
     import cross_system_contract as contract
+    import freeze_pr_scaling_inputs as scaling_inputs
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -73,6 +76,7 @@ def _code_sha256():
     for path in (
         Path(__file__).resolve(),
         REPO / "scripts/compare_gapbs_cxl_amu_cira.py",
+        REPO / "scripts/freeze_pr_scaling_inputs.py",
         REPO / "scripts/gapbs_pr_experiment_profiles.py",
         REPO / "scripts/run_gapbs_matched_pr_spmv_variants.py",
         REPO / "scripts/run_m2ndp_g20_pr_spmv.py",
@@ -95,30 +99,10 @@ def _load_json(path, label):
 
 
 def load_inputs(path):
-    value = _load_json(path, "frozen input manifest")
-    if value.get("schema") != 1 or value.get("status") != "accepted":
-        raise ScalingError("frozen input manifest is not accepted schema 1")
-    graphs = value.get("graphs")
-    if not isinstance(graphs, list) or tuple(
-        row.get("scale") for row in graphs if isinstance(row, dict)
-    ) != SCALES:
-        raise ScalingError("frozen graphs must be ordered g4,g12,g14,g20")
-    for row in graphs:
-        if row.get("num_nodes") != 1 << row["scale"]:
-            raise ScalingError(f"g{row['scale']} node count differs from scale")
-        for field, hash_field in (
-            ("path", "sha256"),
-            ("manifest", "manifest_sha256"),
-        ):
-            candidate = Path(row.get(field, ""))
-            expected = row.get(hash_field)
-            if not candidate.is_absolute() or not candidate.is_file():
-                raise ScalingError(f"g{row['scale']} {field} is missing")
-            if not isinstance(expected, str) or _SHA256.fullmatch(expected) is None:
-                raise ScalingError(f"g{row['scale']} {hash_field} is invalid")
-            if _sha256_file(candidate) != expected:
-                raise ScalingError(f"g{row['scale']} {field} SHA-256 changed")
-    return value
+    try:
+        return scaling_inputs.load_and_validate(path)
+    except scaling_inputs.ScalingInputError as error:
+        raise ScalingError(str(error)) from error
 
 
 def _graph_for(entry, options):
@@ -178,26 +162,90 @@ def command_for(entry, options):
 
 
 def validate_config(path):
+    path = Path(path)
+    parser = configparser.ConfigParser(
+        interpolation=None, strict=True, delimiters=("=",)
+    )
+    parser.optionxform = str
     try:
-        lines = Path(path).read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
-    except OSError as error:
+        with path.open(encoding="utf-8") as stream:
+            parser.read_file(stream)
+    except (OSError, configparser.Error) as error:
         raise ScalingError(f"cannot read gem5 config: {error}") from error
-    fields = {}
-    for line in lines:
-        if "=" in line:
-            key, value = line.split("=", 1)
-            fields.setdefault(key.strip(), []).append(value.strip())
-    if fields.get("delay") != ["1000000"]:
+
+    def value(section, key):
+        try:
+            return parser[section][key].strip()
+        except KeyError as error:
+            raise ScalingError(
+                f"gem5 config is missing [{section}] {key}"
+            ) from error
+
+    delay = value("board.cxl_mem_link0", "delay")
+    if delay != "1000000":
         raise ScalingError(
-            f"CXL delay is {fields.get('delay')!r}, expected ['1000000']"
+            f"CXL delay is {delay!r}, expected '1000000'"
         )
-    if "num_cpus" in fields and fields["num_cpus"] != ["4"]:
-        raise ScalingError("gem5 config does not use four cores")
-    if "all_memory_cxl" in fields and fields["all_memory_cxl"] != ["true"]:
-        raise ScalingError("gem5 config is not all-memory-CXL")
-    return fields
+    board_range = value("board", "mem_ranges")
+    link_range = value("board.cxl_mem_link0", "ranges")
+    dram_range = value("board.memory.mem_ctrl.dram", "range")
+    if not board_range or not (
+        board_range == link_range == dram_range
+    ):
+        raise ScalingError(
+            "all-CXL range mismatch: "
+            f"board={board_range!r} link={link_range!r} "
+            f"dram={dram_range!r}"
+        )
+    expected_topology = {
+        ("board.cxl_mem_link0", "type"): "SerialLink",
+        ("board.cxl_mem_link0", "cpu_side_port"): (
+            "board.cache_hierarchy.membus.mem_side_ports[0]"
+        ),
+        ("board.cxl_mem_link0", "mem_side_port"): (
+            "board.cxl_device_xbar0.cpu_side_ports[0]"
+        ),
+        ("board.cxl_device_xbar0", "type"): "NoncoherentXBar",
+        ("board.cxl_device_xbar0", "cpu_side_ports"): (
+            "board.cxl_mem_link0.mem_side_port"
+        ),
+        ("board.cxl_device_xbar0", "mem_side_ports"): (
+            "board.memory.mem_ctrl.port"
+        ),
+        ("board.memory.mem_ctrl", "port"): (
+            "board.cxl_device_xbar0.mem_side_ports[0]"
+        ),
+    }
+    for (section, key), expected in expected_topology.items():
+        actual = value(section, key)
+        if actual != expected:
+            raise ScalingError(
+                f"all-CXL topology [{section}] {key}={actual!r}, "
+                f"expected {expected!r}"
+            )
+    core_pattern = re.compile(r"board\.processor\.cores([0-9]+)\.core")
+    core_sections = {
+        int(match.group(1)): section
+        for section in parser.sections()
+        if (match := core_pattern.fullmatch(section)) is not None
+    }
+    if set(core_sections) != {0, 1, 2, 3}:
+        raise ScalingError(
+            "gem5 config does not use exactly four cores: "
+            f"indices={sorted(core_sections)}"
+        )
+    for index, section in core_sections.items():
+        cpu_type = value(section, "type")
+        if cpu_type != "BaseTimingSimpleCPU":
+            raise ScalingError(
+                f"core {index} type is {cpu_type!r}, expected timing CPU"
+            )
+    return {
+        "delay": int(delay),
+        "cores": len(core_sections),
+        "range": board_range,
+        "all_memory_cxl": True,
+    }
 
 
 def validate_checkpoint_manifest(manifest):
@@ -321,6 +369,7 @@ def validate_mechanism_row(system, row):
 
 
 def new_state(options):
+    inputs = load_inputs(options.inputs)
     input_hash = _sha256_file(options.inputs)
     calibration_hash = _sha256_file(options.calibration)
     return {
@@ -330,6 +379,12 @@ def new_state(options):
         "code_sha256": _code_sha256(),
         "inputs_sha256": input_hash,
         "calibration_sha256": calibration_hash,
+        "graph_set_sha256": inputs["graph_set_sha256"],
+        "g20_graph_sha256": next(
+            row["sha256"]
+            for row in inputs["graphs"]
+            if row["scale"] == 20
+        ),
         "gem5_sha256": _sha256_file(options.gem5),
         "config_sha256": _sha256_file(options.config),
         "points": {
@@ -430,9 +485,15 @@ def _point_outputs(entry, options):
         summary = base / "gem5/run/summary.csv"
         row = _read_single_csv(summary)
         validate_mechanism_row("vanilla", row)
+        config = Path(row.get("run_dir", "")) / "config.ini"
+        validate_config(config)
         rank = base / "reference/scores.raw"
         validate_rank_bits(rank, rank, expected_words=1 << entry.scale)
-        return {"summary": _sha256_file(summary), "rank": _sha256_file(rank)}
+        return {
+            "summary": _sha256_file(summary),
+            "config": _sha256_file(config),
+            "rank": _sha256_file(rank),
+        }
     if entry.system in {"amu", "cira"}:
         base = root / entry.system
         summary = base / "summary.csv"
@@ -580,6 +641,8 @@ def main(argv=None):
                 "code_sha256",
                 "inputs_sha256",
                 "calibration_sha256",
+                "graph_set_sha256",
+                "g20_graph_sha256",
                 "gem5_sha256",
                 "config_sha256",
             ):
