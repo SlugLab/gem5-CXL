@@ -448,3 +448,91 @@ The formal jobs use their application-level recovery mechanisms instead:
 This policy intentionally provides no periodic live-process snapshots. A
 service restart can repeat simulator work, but it cannot authorize or preserve
 a partial paper result.
+
+## Formal four-scale CIRA/AMU/M2NDP PR scaling
+
+The formal scaling profile is `pr-scaling-4thread-1us`: g4, g12, g14, and g20;
+Vanilla, AMU, CIRA, and M2NDP; four host timing cores/threads; all memory behind
+the modeled CXL link; exactly 1 us link delay; two trials; and 20 synchronous
+double-buffered PageRank iterations. Trial 0 is the complete CXL warmup and
+trial 1 is measured through final mechanism drain. A point is reusable only
+after the full rank vector is bit-exact and all mechanism/configuration gates
+pass.
+
+Scaling input identity is independent of the six-workload breadth record. This
+does not relax breadth: `freeze_cross_system_inputs.py` must continue to emit
+`failed_input` until the real MCF, AMG, LULESH, NPB CG, and NPB MG paper inputs
+are bound. The eventual combined publisher permits different scoped input
+hashes but requires identical calibration and g20 graph SHA-256 values.
+
+Freeze the selected endpoint graphs without regenerating them, then bind the
+four ordered manifests:
+
+```sh
+SCALING_SHA=$(git rev-parse --short=12 HEAD)
+SCALING_ROOT=/mnt/disk0/gem5-CXL-eval/pr-scaling-${SCALING_SHA}
+CONVERTER=/home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_baseline_bins_latency_g20/src/gapbs/converter
+mkdir -p "${SCALING_ROOT}/graphs"
+python3 scripts/prepare_gapbs_pr_graph.py --scale 4 \
+  --existing-graph /home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_graphs/g4.sg \
+  --generator "${CONVERTER}" \
+  --output "${SCALING_ROOT}/graphs/g4.manifest.json"
+python3 scripts/prepare_gapbs_pr_graph.py --scale 20 \
+  --existing-graph /home/victoryang00/gem5-CXL/.worktrees/gapbs-latency-table/m5out/gapbs_graphs/g20.sg \
+  --generator "${CONVERTER}" \
+  --output "${SCALING_ROOT}/graphs/g20.manifest.json"
+python3 scripts/freeze_pr_scaling_inputs.py \
+  --graph-manifest "${SCALING_ROOT}/graphs/g4.manifest.json" \
+  --graph-manifest /mnt/disk0/gem5-CXL-g14-eval/graphs/g12.manifest.json \
+  --graph-manifest /mnt/disk0/gem5-CXL-g14-eval/graphs/g14.manifest.json \
+  --graph-manifest "${SCALING_ROOT}/graphs/g20.manifest.json" \
+  --output "${SCALING_ROOT}/inputs.json"
+```
+
+The immutable graph hashes are
+`f234532690f6cfc30e993c4d9a1839e65002a618e7da20ea6a4242818b9c6c3d`
+for g4,
+`759003842b672ad90eabbd5b045980e9ddf43a95bffb01b318db7fc4b8b551f1`
+for g12,
+`72fb08147f63112b4ea3fcff8a14b1713fdf8b097b2cf459a1ecdc217baf6524`
+for g14, and
+`ce900a7147a073835a7450e8f1afedf9f13db6833652bf2f9647819be26bedb3`
+for g20. The accepted AMU calibration is
+`/mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73.calibration.json`
+with SHA-256
+`e62f01b90dc6377e5c05e5e5358c40486cee351b78ab82001201ca55f24ae4ab`.
+
+Start the matrix as an unlimited transient service. There is no periodic live
+checkpoint; `state.json` advances only after a complete passed point:
+
+```sh
+systemd-run --unit=cira-amu-m2ndp-pr-scaling-formal --collect \
+  --description='Formal four-thread all-CXL 1us PR scaling' \
+  --property=WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv \
+  /usr/bin/python3 scripts/run_cira_amu_m2ndp_scaling.py \
+  --inputs "${SCALING_ROOT}/inputs.json" \
+  --calibration /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73.calibration.json \
+  --root "${SCALING_ROOT}/run" \
+  --gem5 /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73/inputs/gem5 \
+  --config configs/example/gem5_library/x86-gapbs-amu-se.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m2ndp-root /mnt/disk0/M2NDP-public \
+  --variants-build-root "${SCALING_ROOT}/builds" \
+  --timeout 0
+```
+
+Only `run/complete.json` with exactly 16 passed points is publishable:
+
+```sh
+python3 scripts/generate_pr_scaling_artifacts.py \
+  --scaling "${SCALING_ROOT}/run/complete.json" \
+  --output-root "${SCALING_ROOT}/publication"
+```
+
+The publication root contains lossless `pr-scaling-raw.json`, rectangular
+`pr-scaling-raw.csv`, `pr-scaling-table.tex`, and hash-bound
+`pr-scaling-evidence.json`. The `fig/` directory contains PDF and SVG versions
+of speedup scaling, absolute end-to-end log latency, grouped normalized bars,
+and the system-by-scale speedup heatmap. Each raw row includes exact latency,
+the native gem5 tick or NDPSim cycle count, recomputed speedup, rank/summary
+hashes, mechanism evidence, and graph/input/calibration/code/config identities.

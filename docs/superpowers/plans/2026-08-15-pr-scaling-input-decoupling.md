@@ -722,10 +722,15 @@ are provided.
 Run:
 
 ```bash
-PYTHONPATH=. python3 -m unittest discover -s tests/pyunit -p 'test_*.py' -v
+PYTHONPATH=. python3 -m unittest discover -s tests/pyunit/amu -p 'test_*.py' -v
+PYTHONPATH=. python3 -m unittest discover -s tests/pyunit/m2ndp -p 'test_*.py' -v
+PYTHONPATH=. python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_*.py' -v
 ```
 
 Expected: all tests pass with no failure or error.
+
+Do not run discovery from `tests/pyunit`: its `test_run.py` is a gem5 TestLib
+registration entrypoint and requires TestLib initialization.
 
 - [ ] **Step 3: Run static compile gates for touched Python**
 
