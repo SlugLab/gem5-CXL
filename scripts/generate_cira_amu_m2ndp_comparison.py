@@ -233,14 +233,16 @@ def load_data(scaling_path, breadth_path):
     breadth_path = Path(breadth_path).resolve()
     scaling = _load_json(scaling_path, "scaling evidence")
     breadth = _load_json(breadth_path, "breadth evidence")
-    scaling_input = scaling.get("inputs_sha256")
     scaling_calibration = scaling.get("calibration_sha256")
     identity = breadth.get("identity", {})
-    if (
-        identity.get("input_manifest_sha256") != scaling_input
-        or identity.get("calibration_manifest_sha256") != scaling_calibration
-    ):
-        raise ComparisonError("scaling and breadth evidence roots are mixed")
+    if identity.get("calibration_manifest_sha256") != scaling_calibration:
+        raise ComparisonError(
+            "scaling and breadth calibration identities differ"
+        )
+    if breadth.get("g20_graph_sha256") != scaling.get("g20_graph_sha256"):
+        raise ComparisonError(
+            "scaling and breadth g20 graph identities differ"
+        )
     rows = tuple(_scaling_rows(scaling) + _breadth_rows(breadth))
     return ComparisonData(
         rows=rows,

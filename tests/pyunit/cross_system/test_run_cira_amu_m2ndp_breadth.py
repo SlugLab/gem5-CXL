@@ -96,7 +96,9 @@ def mechanism(system, *, bad=False, timing=False):
 
 
 def functional_state():
-    state = breadth.new_state(identity(), specs())
+    state = breadth.new_state(
+        identity(), specs(), g20_graph_sha256=sha("g20")
+    )
     breadth.record_reference(state, "mcf", boundaries())
     for system in breadth.FUNCTIONAL_SYSTEMS:
         breadth.record_functional(
@@ -118,8 +120,28 @@ def functional_state():
 
 
 class BreadthRunnerTest(unittest.TestCase):
+    def test_breadth_state_records_g20_graph_identity(self):
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20")
+        )
+        self.assertEqual(state["g20_graph_sha256"], sha("g20"))
+
+    def test_breadth_input_g20_graph_matches_pr_workload(self):
+        inputs = {
+            "graphs": [{"scale": 20, "sha256": sha("g20")}],
+            "workloads": {
+                "pr_spmv": {"input_sha256": sha("g20")}
+            },
+        }
+        self.assertEqual(breadth._g20_graph_sha256(inputs), sha("g20"))
+        inputs["workloads"]["pr_spmv"]["input_sha256"] = sha("other")
+        with self.assertRaisesRegex(breadth.BreadthError, "g20 graph"):
+            breadth._g20_graph_sha256(inputs)
+
     def test_functional_pass_precedes_timing(self):
-        state = breadth.new_state(identity(), specs())
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20")
+        )
         self.assertEqual(breadth.next_action(state).stage, "reference")
         breadth.record_reference(state, "mcf", boundaries())
         self.assertEqual(breadth.next_action(state).stage, "functional")
@@ -224,7 +246,9 @@ class BreadthRunnerTest(unittest.TestCase):
         )
 
     def test_error_counter_propagation_fails_closed(self):
-        state = breadth.new_state(identity(), specs())
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20")
+        )
         breadth.record_reference(state, "mcf", boundaries())
         with self.assertRaisesRegex(breadth.BreadthError, "error counters"):
             breadth.record_functional(
@@ -244,7 +268,9 @@ class BreadthRunnerTest(unittest.TestCase):
         self.assertEqual(state["status"], "failed")
 
     def test_missing_mechanism_activity_is_rejected(self):
-        state = breadth.new_state(identity(), specs())
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20")
+        )
         breadth.record_reference(state, "mcf", boundaries())
         with self.assertRaisesRegex(breadth.BreadthError, "issued_loads"):
             breadth.record_functional(
@@ -258,7 +284,9 @@ class BreadthRunnerTest(unittest.TestCase):
             )
 
     def test_amu_per_request_drain_is_rejected(self):
-        state = breadth.new_state(identity(), specs())
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20")
+        )
         breadth.record_reference(state, "mcf", boundaries())
         row = mechanism("amu")
         row["drains"] = 8
@@ -425,7 +453,9 @@ class BreadthRunnerTest(unittest.TestCase):
             self.assertIn("prepared formal breadth manifest", failure["error"])
 
     def test_action_driver_reaches_complete_only_after_bit_exact_timing(self):
-        state = breadth.new_state(identity(), specs())
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20")
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sequence = 0

@@ -137,9 +137,14 @@ def _validate_specs(specifications):
     return normalized
 
 
-def new_state(identity, workload_specs):
+def new_state(identity, workload_specs, *, g20_graph_sha256):
     if not isinstance(identity, contract.ExperimentIdentity):
         raise BreadthError("experiment identity has the wrong type")
+    if (
+        not isinstance(g20_graph_sha256, str)
+        or _SHA256.fullmatch(g20_graph_sha256) is None
+    ):
+        raise BreadthError("g20 graph SHA-256 is invalid")
     specifications = _validate_specs(workload_specs)
     workloads = {}
     for workload, specification in specifications.items():
@@ -170,6 +175,7 @@ def new_state(identity, workload_specs):
         "reason": "",
         "identity": dataclasses.asdict(identity),
         "identity_sha256": identity.digest(),
+        "g20_graph_sha256": g20_graph_sha256,
         "workload_order": list(specifications),
         "workloads": workloads,
         "results": {},
@@ -1123,6 +1129,28 @@ def _load_json(path, label):
     return value
 
 
+def _g20_graph_sha256(inputs):
+    graphs = inputs.get("graphs")
+    if not isinstance(graphs, list):
+        raise BreadthError("frozen inputs do not contain graph records")
+    matches = [
+        row for row in graphs
+        if isinstance(row, dict) and row.get("scale") == 20
+    ]
+    if len(matches) != 1:
+        raise BreadthError("frozen inputs must contain exactly one g20 graph")
+    digest = matches[0].get("sha256")
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise BreadthError("g20 graph SHA-256 is invalid")
+    try:
+        workload_digest = inputs["workloads"]["pr_spmv"]["input_sha256"]
+    except (KeyError, TypeError) as error:
+        raise BreadthError("PR workload g20 graph identity is missing") from error
+    if workload_digest != digest:
+        raise BreadthError("PR workload and scaling g20 graph identities differ")
+    return digest
+
+
 def _preflight_identity_unchecked(options):
     inputs = _load_json(options.inputs, "frozen inputs")
     if inputs.get("schema") != 1 or inputs.get("status") != "accepted":
@@ -1182,7 +1210,7 @@ def _preflight_identity_unchecked(options):
         trace_sha256=_sha256_file(prepared),
         config_sha256=config_hash,
     )
-    return identity, specifications
+    return identity, specifications, _g20_graph_sha256(inputs)
 
 
 def _preflight_identity(options):
@@ -1196,7 +1224,7 @@ def main(argv=None):
     options = parse_args(argv)
     root = Path(options.root).resolve()
     try:
-        identity, specifications = _preflight_identity(options)
+        identity, specifications, g20_graph_sha256 = _preflight_identity(options)
         manifest = _load_json(root / "prepared/manifest.json", "prepared breadth manifest")
         bind_or_resume(root, identity, resume=options.resume)
         state_path = root / "state.json"
@@ -1206,7 +1234,11 @@ def main(argv=None):
                 raise BreadthError("resume has no valid boundary checkpoint")
             state = selected["state"]
         else:
-            state = new_state(identity, specifications)
+            state = new_state(
+                identity,
+                specifications,
+                g20_graph_sha256=g20_graph_sha256,
+            )
         contract.atomic_write_json(state_path, state)
         collect(state, root=root, executor=ManifestExecutor(manifest, root=root))
         if state.get("status") == "complete":

@@ -54,6 +54,7 @@ class ComparisonPublisherTest(unittest.TestCase):
             "profile": "pr-scaling-4thread-1us",
             "inputs_sha256": sha("inputs"),
             "calibration_sha256": sha("calibration"),
+            "g20_graph_sha256": sha("g20"),
             "points": points,
         }, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -96,9 +97,10 @@ class ComparisonPublisherTest(unittest.TestCase):
             "schema": 1,
             "status": "complete",
             "identity": {
-                "input_manifest_sha256": sha("inputs"),
+                "input_manifest_sha256": sha("breadth-inputs"),
                 "calibration_manifest_sha256": sha("calibration"),
             },
+            "g20_graph_sha256": sha("g20"),
             "results": results,
             "workload_order": list(WORKLOADS),
             "workloads": workloads,
@@ -131,6 +133,20 @@ class ComparisonPublisherTest(unittest.TestCase):
                    if row.scope == "breadth" and row.item == "mcf"
                    and row.system == "amu")
         self.assertIsNone(row.speedup)
+
+    def test_rejects_mixed_calibration_or_g20_graph_identity(self):
+        value = json.loads(self.breadth.read_text())
+        value["g20_graph_sha256"] = sha("different-g20")
+        self.breadth.write_text(json.dumps(value) + "\n")
+        with self.assertRaisesRegex(comparison.ComparisonError, "g20 graph"):
+            comparison.load_data(self.scaling, self.breadth)
+
+        self._write_inputs()
+        value = json.loads(self.breadth.read_text())
+        value["identity"]["calibration_manifest_sha256"] = sha("other")
+        self.breadth.write_text(json.dumps(value) + "\n")
+        with self.assertRaisesRegex(comparison.ComparisonError, "calibration"):
+            comparison.load_data(self.scaling, self.breadth)
 
     def test_publish_writes_one_page_figure_table_and_hash_bound_evidence(self):
         data = comparison.load_data(self.scaling, self.breadth)
