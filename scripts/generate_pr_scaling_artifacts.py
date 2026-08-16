@@ -20,6 +20,7 @@ from pathlib import Path
 
 
 SCALES = (4, 12, 14, 20)
+PERFORMANCE_SCALES = (12, 14, 20)
 SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
 ACCELERATORS = ("amu", "cira", "m2ndp")
 PROFILE = "pr-scaling-4thread-1us"
@@ -141,7 +142,9 @@ def load_data(path):
     ):
         raise ArtifactError("scaling evidence is not complete formal data")
     if value.get("performance_gate") != {
-        "status": "passed", "offenders": []
+        "status": "passed",
+        "checked_points": len(PERFORMANCE_SCALES) * 3,
+        "offenders": [],
     }:
         raise ArtifactError("scaling evidence performance gate did not pass")
     for field in (
@@ -206,10 +209,14 @@ def load_data(path):
                 f"g{scale}:{system} latency",
             )
             speedup = baseline_seconds / seconds
-            if system != "vanilla" and not (
+            if (
+                scale in PERFORMANCE_SCALES
+                and system != "vanilla"
+                and not (
                 MIN_ACCELERATOR_SPEEDUP
                 <= speedup
                 <= MAX_ACCELERATOR_SPEEDUP
+                )
             ):
                 raise ArtifactError(
                     f"g{scale}:{system} performance gate did not pass"

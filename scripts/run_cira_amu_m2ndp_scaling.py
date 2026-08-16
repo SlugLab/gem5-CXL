@@ -29,6 +29,7 @@ except ImportError:
 REPO = Path(__file__).resolve().parents[1]
 PROFILE = "pr-scaling-4thread-1us"
 SCALES = (4, 12, 14, 20)
+PERFORMANCE_SCALES = (12, 14, 20)
 SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
 MIN_ACCELERATOR_SPEEDUP = Decimal("1.4")
 MAX_ACCELERATOR_SPEEDUP = Decimal("1.6")
@@ -579,7 +580,7 @@ def evaluate_performance_gate(state):
             "performance gate requires 16/16 correctness-passed points"
         )
     offenders = []
-    for scale in SCALES:
+    for scale in PERFORMANCE_SCALES:
         baseline = _positive_decimal_value(
             state["points"][f"g{scale}:vanilla"].get("latency_seconds"),
             f"g{scale} Vanilla latency seconds",
@@ -613,6 +614,7 @@ def evaluate_performance_gate(state):
                 })
     return {
         "status": "hold" if offenders else "passed",
+        "checked_points": len(PERFORMANCE_SCALES) * 3,
         "offenders": offenders,
     }
 

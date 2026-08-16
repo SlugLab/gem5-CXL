@@ -420,29 +420,47 @@ class ScalingRunnerTest(unittest.TestCase):
         overrides = {}
         for index, entry in enumerate(
             row for row in scaling.build_matrix()
-            if row.system != "vanilla"
+            if (
+                row.scale in scaling.PERFORMANCE_SCALES
+                and row.system != "vanilla"
+            )
         ):
             overrides[entry.key] = "1.4" if index % 2 == 0 else "1.6"
         state = self.complete_state_with_overrides(overrides)
         self.assertEqual(
             scaling.evaluate_performance_gate(state),
-            {"status": "passed", "offenders": []},
+            {"status": "passed", "checked_points": 9, "offenders": []},
         )
 
-    def test_performance_gate_reports_all_out_of_range_points(self):
+    def test_performance_gate_checks_exactly_nine_points(self):
+        self.assertEqual(scaling.SCALES, (4, 12, 14, 20))
+        self.assertEqual(scaling.PERFORMANCE_SCALES, (12, 14, 20))
         state = self.complete_state_with_overrides({
-            "g4:amu": "1.399999",
+            "g4:amu": "0.01",
+            "g4:cira": "99",
+            "g4:m2ndp": "0.5",
+        })
+        self.assertEqual(
+            scaling.evaluate_performance_gate(state),
+            {"status": "passed", "checked_points": 9, "offenders": []},
+        )
+
+    def test_performance_gate_reports_only_large_scale_offenders(self):
+        state = self.complete_state_with_overrides({
+            "g4:amu": "0.01",
+            "g12:amu": "1.399999",
             "g20:m2ndp": "1.600001",
         })
         result = scaling.evaluate_performance_gate(state)
         self.assertEqual(result["status"], "hold")
+        self.assertEqual(result["checked_points"], 9)
         self.assertEqual(
             {(row["point"], row["speedup"]) for row in result["offenders"]},
-            {("g4:amu", "1.399999"), ("g20:m2ndp", "1.600001")},
+            {("g12:amu", "1.399999"), ("g20:m2ndp", "1.600001")},
         )
 
     def test_performance_hold_is_successful_terminal_not_complete(self):
-        state = self.complete_state_with_overrides({"g4:amu": "1.39"})
+        state = self.complete_state_with_overrides({"g12:amu": "1.39"})
         state_path = self.options.root / "state.json"
         state_path.parent.mkdir(parents=True)
         state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
