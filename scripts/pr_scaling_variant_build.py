@@ -13,6 +13,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    from scripts import cira_lead_policy
+except ImportError:
+    import cira_lead_policy
+
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -41,6 +46,7 @@ def _load_json(path, label):
 
 def build_command(
     *, baseline_build, staging, final, cxlmemuring, m5_library, calibration,
+    graph_scale,
 ):
     return [
         sys.executable,
@@ -54,6 +60,7 @@ def build_command(
         "--calibration-manifest", str(Path(calibration).resolve()),
         "--cira-row-batch", "64",
         "--cira-policy-latency-ns", "1000",
+        "--graph-scale", str(graph_scale),
     ]
 
 
@@ -110,7 +117,7 @@ def _validate_embedded_reference(
 
 
 def validate_variant_build(
-    output, *, baseline_build, calibration, recorded_root=None,
+    output, *, baseline_build, calibration, graph_scale, recorded_root=None,
 ):
     output = Path(output).resolve()
     recorded_root = (
@@ -121,6 +128,7 @@ def validate_variant_build(
     baseline_manifest = Path(baseline_build).resolve() / "manifest.json"
     expected = {
         "benchmark": "pr_spmv",
+        "graph_scale": graph_scale,
         "page_rank_iterations": 20,
         "fixed_iterations": True,
         "fp_contract": False,
@@ -133,6 +141,7 @@ def validate_variant_build(
         "baseline_manifest_sha256": "baseline manifest",
         "cira_mode": "CIRA mode",
         "cira_policy_latency_ns": "CIRA policy latency",
+        "graph_scale": "graph scale",
     }
     for field, expected_value in expected.items():
         if manifest.get(field) != expected_value:
@@ -148,6 +157,13 @@ def validate_variant_build(
         or policy.get("calibration_manifest_sha256") != calibration_hash
     ):
         raise VariantBuildError("calibration manifest hash differs")
+    expected_derived = cira_lead_policy.effective_lead_for_scale(
+        graph_scale,
+        num_threads=4,
+        calibrated_lead_blocks=policy.get("base_1us_lead_blocks", 0),
+    )
+    if policy.get("scale_derived") != expected_derived:
+        raise VariantBuildError("scale-derived CIRA policy differs")
     rows = manifest.get("variants")
     if not isinstance(rows, list):
         raise VariantBuildError("variant manifest must contain AMU and CIRA")
@@ -187,12 +203,15 @@ def validate_variant_build(
         "calibration_sha256": calibration_hash,
         "cira_mode": manifest["cira_mode"],
         "cira_policy_latency_ns": manifest["cira_policy_latency_ns"],
+        "graph_scale": graph_scale,
+        "cira_policy": policy,
         "binary_sha256": binary_hashes,
     }
 
 
 def ensure_variant_build(
-    final, *, baseline_build, cxlmemuring, m5_library, calibration, log,
+    final, *, baseline_build, cxlmemuring, m5_library, calibration,
+    graph_scale, log,
 ):
     final = Path(final).resolve()
     if final.exists():
@@ -200,6 +219,7 @@ def ensure_variant_build(
             final,
             baseline_build=baseline_build,
             calibration=calibration,
+            graph_scale=graph_scale,
         )
     final.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(
@@ -212,6 +232,7 @@ def ensure_variant_build(
         cxlmemuring=cxlmemuring,
         m5_library=m5_library,
         calibration=calibration,
+        graph_scale=graph_scale,
     )
     try:
         log = Path(log)
@@ -233,6 +254,7 @@ def ensure_variant_build(
             staging,
             baseline_build=baseline_build,
             calibration=calibration,
+            graph_scale=graph_scale,
             recorded_root=final,
         )
         os.rename(staging, final)
@@ -240,6 +262,7 @@ def ensure_variant_build(
             final,
             baseline_build=baseline_build,
             calibration=calibration,
+            graph_scale=graph_scale,
         )
         result["command"] = [str(item) for item in command]
         return result

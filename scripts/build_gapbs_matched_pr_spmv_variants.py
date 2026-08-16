@@ -156,6 +156,8 @@ def compile_command(
     cira_prefetch_distance,
     cira_row_batch,
     cira_max_outstanding,
+    cira_lead_rows=None,
+    cira_batch_rows=None,
 ):
     command = [
         cxx,
@@ -171,7 +173,6 @@ def compile_command(
     elif kind == "cira":
         command += [
             f"-DGAPBS_CIRA_PREFETCH_DISTANCE={cira_prefetch_distance}",
-            f"-DGAPBS_CIRA_LEAD_BLOCKS={cira_prefetch_distance}",
             "-DGAPBS_CIRA_ROW_BLOCK_SIZE=64",
             f"-DGAPBS_CIRA_MAX_OUTSTANDING={cira_max_outstanding}",
             "-DGAPBS_CIRA_RANGE_LIMIT=0",
@@ -180,6 +181,17 @@ def compile_command(
             "-I",
             str(REPO / "util/cira"),
         ]
+        if cira_lead_rows is None:
+            command.append(
+                f"-DGAPBS_CIRA_LEAD_BLOCKS={cira_prefetch_distance}"
+            )
+        else:
+            if cira_batch_rows is None:
+                raise ValueError("scale-derived CIRA batch rows are missing")
+            command += [
+                f"-DGAPBS_CIRA_LEAD_ROWS={cira_lead_rows}",
+                f"-DGAPBS_CIRA_BATCH_ROWS={cira_batch_rows}",
+            ]
     else:
         raise ValueError(f"unknown matched variant: {kind}")
     command += [
@@ -312,6 +324,14 @@ def build_variant(
         cira_prefetch_distance=cira_prefetch_distance,
         cira_row_batch=cira_row_batch,
         cira_max_outstanding=cira_max_outstanding,
+        cira_lead_rows=(
+            cira_policy["scale_derived"]["effective_rows"]
+            if cira_policy is not None else None
+        ),
+        cira_batch_rows=(
+            cira_policy["scale_derived"]["batch_rows"]
+            if cira_policy is not None else None
+        ),
     )
     baseline_builder.run(command)
     evidence = {
@@ -358,6 +378,7 @@ def main(argv=None):
     parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--cira-source-row", choices=("A", "B", "C"))
     parser.add_argument("--cira-policy-latency-ns", type=int, default=1000)
+    parser.add_argument("--graph-scale", type=int)
     args = parser.parse_args(argv)
 
     source_root = args.baseline_build / "src/gapbs"
@@ -384,6 +405,10 @@ def main(argv=None):
     else:
         if args.calibration_manifest is None:
             parser.error("calibrated CIRA mode requires --calibration-manifest")
+        if args.graph_scale not in (4, 12, 14, 20):
+            parser.error(
+                "calibrated CIRA mode requires --graph-scale 4, 12, 14, or 20"
+            )
         if args.cira_mode != "few-shot-online" and args.cira_source_row is not None:
             parser.error("only few-shot-online accepts --cira-source-row")
         try:
@@ -408,6 +433,11 @@ def main(argv=None):
             "base_1us_lead_blocks": base_1us_distance,
             "effective_lead_blocks": cira_distance,
             "effective_latency_ns": args.cira_policy_latency_ns,
+            "scale_derived": cira_lead_policy.effective_lead_for_scale(
+                args.graph_scale,
+                num_threads=4,
+                calibrated_lead_blocks=cira_distance,
+            ),
         }
 
     cira_distance, profiles, override = cira_builder.resolve_profile(
@@ -443,6 +473,7 @@ def main(argv=None):
     manifest = {
         "schema": 1,
         "benchmark": "pr_spmv",
+        "graph_scale": args.graph_scale,
         "page_rank_iterations": 20,
         "fixed_iterations": True,
         "fp_contract": False,

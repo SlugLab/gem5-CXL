@@ -438,6 +438,7 @@ def _variant_build_inputs(scale, options):
         root / f"scales/g{scale}/m2ndp/build/manifest.json"
     )
     return {
+        "graph_scale": scale,
         "baseline_manifest_sha256": _sha256_file(baseline_manifest),
         "calibration_sha256": _sha256_file(options.calibration),
         "m5_library_sha256": _sha256_file(options.m5_library),
@@ -473,6 +474,7 @@ def ensure_variants_for_scale(scale, state, options):
                 final,
                 baseline_build=baseline_build,
                 calibration=options.calibration,
+                graph_scale=scale,
             )
         except variant_build.VariantBuildError as error:
             raise ScalingError(str(error)) from error
@@ -495,6 +497,7 @@ def ensure_variants_for_scale(scale, state, options):
             cxlmemuring=options.cxlmemuring,
             m5_library=options.m5_library,
             calibration=options.calibration,
+            graph_scale=scale,
             log=log,
         )
     except (variant_build.VariantBuildError, OSError) as error:

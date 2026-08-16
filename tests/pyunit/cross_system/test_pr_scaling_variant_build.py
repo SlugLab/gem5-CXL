@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import pr_scaling_variant_build as stage
+from scripts import cira_lead_policy
 
 
 def sha256_file(path):
@@ -56,6 +57,7 @@ class PRScalingVariantBuildTest(unittest.TestCase):
         self.manifest = {
             "schema": 1,
             "benchmark": "pr_spmv",
+            "graph_scale": 12,
             "page_rank_iterations": 20,
             "fixed_iterations": True,
             "fp_contract": False,
@@ -68,7 +70,11 @@ class PRScalingVariantBuildTest(unittest.TestCase):
             "cira_policy": {
                 "calibration_manifest_sha256": sha256_file(
                     self.calibration
-                )
+                ),
+                "base_1us_lead_blocks": 32,
+                "scale_derived": cira_lead_policy.effective_lead_for_scale(
+                    12, num_threads=4, calibrated_lead_blocks=32
+                ),
             },
             "variants": rows,
         }
@@ -85,6 +91,7 @@ class PRScalingVariantBuildTest(unittest.TestCase):
             self.output,
             baseline_build=self.baseline,
             calibration=self.calibration,
+            graph_scale=12,
         )
 
     def write_staged_build(self, staging, final):
@@ -182,6 +189,7 @@ class PRScalingVariantBuildTest(unittest.TestCase):
             cxlmemuring=self.root / "CXLMemUring",
             m5_library=self.root / "libm5.a",
             calibration=self.calibration,
+            graph_scale=12,
         )
         expected = {
             "--cira-mode": "pgo-selected",
@@ -189,6 +197,7 @@ class PRScalingVariantBuildTest(unittest.TestCase):
             "--cira-row-batch": "64",
             "--m5-library": str((self.root / "libm5.a").resolve()),
             "--recorded-outdir": str(self.output.resolve()),
+            "--graph-scale": "12",
         }
         for option, value in expected.items():
             self.assertEqual(command[command.index(option) + 1], value)
@@ -209,6 +218,7 @@ class PRScalingVariantBuildTest(unittest.TestCase):
                 cxlmemuring=self.root / "CXLMemUring",
                 m5_library=self.root / "libm5.a",
                 calibration=self.calibration,
+                graph_scale=12,
                 log=self.root / "variant.log",
             )
 
@@ -234,6 +244,7 @@ class PRScalingVariantBuildTest(unittest.TestCase):
                     cxlmemuring=self.root / "CXLMemUring",
                     m5_library=self.root / "libm5.a",
                     calibration=self.calibration,
+                    graph_scale=12,
                     log=self.root / "variant.log",
                 )
 
@@ -252,11 +263,26 @@ class PRScalingVariantBuildTest(unittest.TestCase):
                     cxlmemuring=self.root / "CXLMemUring",
                     m5_library=self.root / "libm5.a",
                     calibration=self.calibration,
+                    graph_scale=12,
                     log=self.root / "variant.log",
                 )
 
         self.assertFalse(final.exists())
         self.assertEqual(list(self.root.glob(".failed-g20.staging-*")), [])
+
+    def test_validate_build_rejects_scale_or_derived_policy_drift(self):
+        self.manifest["graph_scale"] = 14
+        self.write_manifest()
+        with self.assertRaisesRegex(stage.VariantBuildError, "graph scale"):
+            self.validate()
+
+        self.manifest["graph_scale"] = 12
+        self.manifest["cira_policy"]["scale_derived"][
+            "effective_rows"
+        ] = 2048
+        self.write_manifest()
+        with self.assertRaisesRegex(stage.VariantBuildError, "derived"):
+            self.validate()
 
 
 if __name__ == "__main__":

@@ -208,10 +208,10 @@ class MatchedVariantSourceTest(unittest.TestCase):
         self.assertIn("-DGAPBS_AMU_BATCH_SIZE=64", command)
         self.assertNotIn("-ffast-math", command)
 
-    def test_cira_compile_command_sets_frozen_64_row_lead_policy(self):
+    def test_cira_compile_command_sets_scale_derived_row_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            command = variants.compile_command(
+            g4_command = variants.compile_command(
                 kind="cira",
                 cxx="g++",
                 source=root / "pr_spmv.cc",
@@ -223,12 +223,35 @@ class MatchedVariantSourceTest(unittest.TestCase):
                 cira_prefetch_distance=2,
                 cira_row_batch=256,
                 cira_max_outstanding=256,
+                cira_lead_rows=1,
+                cira_batch_rows=1,
+            )
+            g12_command = variants.compile_command(
+                kind="cira",
+                cxx="g++",
+                source=root / "pr_spmv.cc",
+                gapbs_root=root / "gapbs",
+                generated_dir=root / "generated",
+                output=root / "bin/pr_spmv",
+                m5_library=root / "libm5.a",
+                amu_batch_size=64,
+                cira_prefetch_distance=8,
+                cira_row_batch=64,
+                cira_max_outstanding=256,
+                cira_lead_rows=512,
+                cira_batch_rows=64,
             )
 
-        self.assertIn("-DGAPBS_CIRA_LEAD_BLOCKS=2", command)
-        self.assertIn("-DGAPBS_CIRA_ROW_BLOCK_SIZE=64", command)
-        self.assertNotIn("-DGAPBS_CIRA_NODE_DISTANCE=2", command)
-        self.assertNotIn("-DGAPBS_CIRA_ROW_BATCH=256", command)
+        self.assertIn("-DGAPBS_CIRA_LEAD_ROWS=1", g4_command)
+        self.assertIn("-DGAPBS_CIRA_BATCH_ROWS=1", g4_command)
+        self.assertIn("-DGAPBS_CIRA_LEAD_ROWS=512", g12_command)
+        self.assertIn("-DGAPBS_CIRA_BATCH_ROWS=64", g12_command)
+        for command in (g4_command, g12_command):
+            self.assertNotIn("-DGAPBS_CIRA_NODE_DISTANCE=2", command)
+            self.assertFalse(any(
+                flag.startswith("-DGAPBS_CIRA_LEAD_BLOCKS=")
+                for flag in command
+            ))
 
 
 class MatchedVariantBitGateTest(unittest.TestCase):
