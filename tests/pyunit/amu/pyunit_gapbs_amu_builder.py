@@ -57,6 +57,13 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         self.assertIn("amu_aload", issue_body)
         self.assertNotIn("amu_getfin", issue_body)
 
+    def test_formal_line_cache_uses_the_production_header_and_backend(self):
+        header = self.builder.AMU_HEADER
+        self.assertIn('#include "gapbs_amu_line_cache.h"', header)
+        self.assertIn("class Gem5LineBackend", header)
+        self.assertIn("return amu_aload(destination, source);", header)
+        self.assertIn("uint64_t getfin() { return amu_getfin(); }", header)
+
     def test_load_values_uses_the_window(self):
         header = self.builder.AMU_HEADER
         wrapper = header[header.index("static inline void load_values") :]

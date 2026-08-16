@@ -20,6 +20,7 @@ except ImportError:
 
 
 REPO = Path(__file__).resolve().parents[1]
+AMU_LINE_CACHE_HEADER = REPO / "util/amu/gapbs_amu_line_cache.h"
 
 
 class VariantBuildError(RuntimeError):
@@ -189,6 +190,12 @@ def validate_variant_build(
         actual_hash = sha256_file(binary)
         if row.get("binary_sha256") != actual_hash:
             raise VariantBuildError(f"{kind} binary hash differs")
+        if (
+            kind == "amu"
+            and row.get("amu_line_cache_sha256")
+            != sha256_file(AMU_LINE_CACHE_HEADER)
+        ):
+            raise VariantBuildError("AMU line-cache header hash differs")
         _validate_embedded_reference(
             kind,
             row,

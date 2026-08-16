@@ -31,6 +31,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 FIXED_SOURCE = REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
+AMU_LINE_CACHE_HEADER = REPO / "util/amu/gapbs_amu_line_cache.h"
 COMMON_FLAGS = (
     "-std=c++11",
     "-O3",
@@ -347,6 +348,10 @@ def build_variant(
     }
     if kind == "cira" and cira_policy is not None:
         evidence["cira_policy"] = cira_policy
+    if kind == "amu":
+        evidence["amu_line_cache_sha256"] = artifacts.sha256_file(
+            AMU_LINE_CACHE_HEADER
+        )
     return evidence
 
 

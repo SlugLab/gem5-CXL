@@ -53,6 +53,11 @@ class PRScalingVariantBuildTest(unittest.TestCase):
                 "binary": str(binary.resolve()),
                 "binary_sha256": sha256_file(binary),
                 "reference_raw": str(reference.resolve()),
+                **({
+                    "amu_line_cache_sha256": sha256_file(
+                        stage.AMU_LINE_CACHE_HEADER
+                    )
+                } if kind == "amu" else {}),
             })
         self.manifest = {
             "schema": 1,
@@ -115,6 +120,11 @@ class PRScalingVariantBuildTest(unittest.TestCase):
                 "binary": str((final / kind / "bin/pr_spmv").resolve()),
                 "binary_sha256": sha256_file(physical),
                 "reference_raw": str(reference.resolve()),
+                **({
+                    "amu_line_cache_sha256": sha256_file(
+                        stage.AMU_LINE_CACHE_HEADER
+                    )
+                } if kind == "amu" else {}),
             })
         value["variants"] = rows
         (staging / "manifest.json").write_text(
@@ -151,6 +161,16 @@ class PRScalingVariantBuildTest(unittest.TestCase):
         self.manifest["cira_policy"]["calibration_manifest_sha256"] = "0" * 64
         self.write_manifest()
         with self.assertRaisesRegex(stage.VariantBuildError, "calibration"):
+            self.validate()
+
+    def test_validate_build_rejects_line_cache_header_drift(self):
+        amu = next(
+            row for row in self.manifest["variants"]
+            if row["kind"] == "amu"
+        )
+        amu["amu_line_cache_sha256"] = "0" * 64
+        self.write_manifest()
+        with self.assertRaisesRegex(stage.VariantBuildError, "line-cache"):
             self.validate()
 
     def test_validate_build_rejects_missing_or_duplicate_kind(self):
