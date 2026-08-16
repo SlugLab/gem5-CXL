@@ -210,17 +210,79 @@ def owner_for_row(total_rows, num_threads, row):
     raise LeadPolicyError("row has no static-partition owner")
 
 
-def future_block(total_rows, num_threads, thread_id, current, lead_blocks):
-    if lead_blocks <= 0:
-        raise LeadPolicyError("lead must be a positive whole block count")
+def effective_lead_for_scale(
+    scale, *, num_threads, calibrated_lead_blocks
+):
+    if scale < 0 or num_threads <= 0 or calibrated_lead_blocks <= 0:
+        raise LeadPolicyError("scale-aware lead inputs must be positive")
+    total_rows = 1 << scale
+    spans = [
+        end - begin
+        for begin, end in (
+            static_partition(total_rows, num_threads, thread_id)
+            for thread_id in range(num_threads)
+        )
+    ]
+    minimum = min(spans)
+    calibrated_rows = calibrated_lead_blocks * ROW_BLOCK_SIZE
+    if minimum < 2 * ROW_BLOCK_SIZE:
+        effective_rows = 1
+        effective_blocks = None
+        batch_rows = 1
+        fallback = True
+    else:
+        half_aligned = (
+            minimum // 2 // ROW_BLOCK_SIZE
+        ) * ROW_BLOCK_SIZE
+        effective_rows = min(calibrated_rows, half_aligned)
+        effective_blocks = effective_rows // ROW_BLOCK_SIZE
+        batch_rows = ROW_BLOCK_SIZE
+        fallback = False
+    return {
+        "graph_scale": scale,
+        "total_rows": total_rows,
+        "num_threads": num_threads,
+        "minimum_thread_rows": minimum,
+        "calibrated_rows": calibrated_rows,
+        "calibrated_blocks": calibrated_lead_blocks,
+        "effective_rows": effective_rows,
+        "effective_blocks": effective_blocks,
+        "batch_rows": batch_rows,
+        "correctness_fallback": fallback,
+    }
+
+
+def future_window(
+    total_rows,
+    num_threads,
+    thread_id,
+    current,
+    effective_rows,
+    batch_rows,
+):
+    if effective_rows <= 0 or batch_rows <= 0:
+        raise LeadPolicyError("lead and batch must be positive row counts")
     thread_begin, thread_end = static_partition(
         total_rows, num_threads, thread_id
     )
     if current < thread_begin or current >= thread_end:
         raise LeadPolicyError("current row is not owned by the issuing thread")
-    if (current - thread_begin) % ROW_BLOCK_SIZE:
+    if batch_rows != 1 and (current - thread_begin) % ROW_BLOCK_SIZE:
         return None
-    first = current + lead_blocks * ROW_BLOCK_SIZE
+    first = current + effective_rows
     if first >= thread_end:
         return None
-    return first, min(ROW_BLOCK_SIZE, thread_end - first)
+    return first, min(batch_rows, thread_end - first)
+
+
+def future_block(total_rows, num_threads, thread_id, current, lead_blocks):
+    if lead_blocks <= 0:
+        raise LeadPolicyError("lead must be a positive whole block count")
+    return future_window(
+        total_rows,
+        num_threads,
+        thread_id,
+        current,
+        lead_blocks * ROW_BLOCK_SIZE,
+        ROW_BLOCK_SIZE,
+    )

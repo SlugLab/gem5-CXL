@@ -157,6 +157,85 @@ class CiraLeadPolicyTest(unittest.TestCase):
                     policy.owner_for_row(total_rows, num_threads, first), tid
                 )
 
+    def test_effective_lead_is_derived_from_scale_and_partition(self):
+        expected = {
+            4: {
+                "effective_rows": 1,
+                "effective_blocks": None,
+                "correctness_fallback": True,
+                "minimum_thread_rows": 4,
+            },
+            12: {
+                "effective_rows": 512,
+                "effective_blocks": 8,
+                "correctness_fallback": False,
+                "minimum_thread_rows": 1024,
+            },
+            14: {
+                "effective_rows": 2048,
+                "effective_blocks": 32,
+                "correctness_fallback": False,
+                "minimum_thread_rows": 4096,
+            },
+            20: {
+                "effective_rows": 2048,
+                "effective_blocks": 32,
+                "correctness_fallback": False,
+                "minimum_thread_rows": 262144,
+            },
+        }
+        for scale, fields in expected.items():
+            actual = policy.effective_lead_for_scale(
+                scale, num_threads=4, calibrated_lead_blocks=32
+            )
+            for name, value in fields.items():
+                with self.subTest(scale=scale, field=name):
+                    self.assertEqual(actual[name], value)
+
+    def test_scale_aware_windows_are_future_owned_and_bounded(self):
+        for scale in (4, 12, 14, 20):
+            total_rows = 1 << scale
+            derived = policy.effective_lead_for_scale(
+                scale, num_threads=4, calibrated_lead_blocks=32
+            )
+            windows_per_thread = [0] * 4
+            for thread_id in range(4):
+                thread_begin, thread_end = policy.static_partition(
+                    total_rows, 4, thread_id
+                )
+                for current in range(thread_begin, thread_end):
+                    window = policy.future_window(
+                        total_rows,
+                        4,
+                        thread_id,
+                        current,
+                        derived["effective_rows"],
+                        derived["batch_rows"],
+                    )
+                    if window is None:
+                        continue
+                    windows_per_thread[thread_id] += 1
+                    first, count = window
+                    self.assertGreater(first, current)
+                    self.assertGreater(count, 0)
+                    self.assertLessEqual(count, derived["batch_rows"])
+                    self.assertLessEqual(first + count, thread_end)
+                    self.assertEqual(
+                        policy.owner_for_row(total_rows, 4, first), thread_id
+                    )
+            if scale == 4:
+                self.assertTrue(all(count > 0 for count in windows_per_thread))
+
+    def test_scale_aware_lead_rejects_invalid_inputs(self):
+        for kwargs in (
+            {"scale": -1, "num_threads": 4, "calibrated_lead_blocks": 32},
+            {"scale": 12, "num_threads": 0, "calibrated_lead_blocks": 32},
+            {"scale": 12, "num_threads": 4, "calibrated_lead_blocks": 0},
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaises(policy.LeadPolicyError):
+                    policy.effective_lead_for_scale(**kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()
