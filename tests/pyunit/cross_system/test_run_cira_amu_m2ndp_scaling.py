@@ -161,6 +161,78 @@ class ScalingRunnerTest(unittest.TestCase):
         self.assertEqual(vanilla[vanilla.index("--outdir") + 1],
                          m2ndp[m2ndp.index("--outdir") + 1])
 
+    def test_only_amu_and_cira_require_scale_local_variant_builds(self):
+        required = {
+            entry.key for entry in scaling.build_matrix()
+            if scaling.needs_variant_build(entry)
+        }
+        self.assertEqual(
+            required,
+            {
+                f"g{scale}:{system}"
+                for scale in (4, 12, 14, 20)
+                for system in ("amu", "cira")
+            },
+        )
+
+    def test_amu_lazily_builds_scale_variants_after_vanilla(self):
+        state_value = scaling.new_state(self.options)
+        baseline = self.options.root / "scales/g4/m2ndp/build"
+        baseline.mkdir(parents=True)
+        (baseline / "manifest.json").write_text(
+            '{"schema": 1}\n', encoding="utf-8"
+        )
+        scaling.record_pass(
+            state_value,
+            scaling.MatrixEntry(4, "vanilla"),
+            {"summary": sha("vanilla")},
+            latency_seconds="4",
+            output_elements=16,
+            mechanism={"verification": "pass"},
+        )
+        build_record = {
+            "manifest_sha256": sha("variant"),
+            "baseline_manifest_sha256": sha("baseline"),
+            "calibration_sha256": sha("calibration"),
+            "cira_mode": "pgo-selected",
+            "cira_policy_latency_ns": 1000,
+            "binary_sha256": {
+                "amu": sha("amu"), "cira": sha("cira")
+            },
+        }
+        with mock.patch.object(
+            scaling.variant_build,
+            "ensure_variant_build",
+            return_value=build_record,
+        ) as ensure:
+            scaling.ensure_variants_for_scale(
+                4, state_value, self.options
+            )
+
+        ensure.assert_called_once()
+        call = ensure.call_args
+        self.assertEqual(
+            Path(call.args[0]),
+            self.options.variants_build_root / "g4",
+        )
+        self.assertEqual(
+            Path(call.kwargs["baseline_build"]),
+            self.options.root / "scales/g4/m2ndp/build",
+        )
+        record = state_value["variant_builds"]["g4"]
+        self.assertEqual(record["status"], "passed")
+        self.assertEqual(record["outputs"], build_record)
+
+    def test_new_state_has_one_pending_variant_build_per_scale(self):
+        state_value = scaling.new_state(self.options)
+        self.assertEqual(set(state_value["variant_builds"]), {
+            "g4", "g12", "g14", "g20",
+        })
+        self.assertTrue(all(
+            row["status"] == "pending"
+            for row in state_value["variant_builds"].values()
+        ))
+
     def test_config_must_be_four_core_all_cxl_one_microsecond(self):
         config = self.write_real_config(delay="500000")
         with self.assertRaisesRegex(scaling.ScalingError, "delay"):
@@ -309,6 +381,24 @@ class ScalingRunnerTest(unittest.TestCase):
             next(
                 row for row in inputs["graphs"] if row["scale"] == 20
             )["sha256"],
+        )
+
+    def test_code_identity_includes_variant_builder_and_orchestrator(self):
+        paths = []
+
+        def record(path):
+            paths.append(Path(path).resolve())
+            return sha(str(Path(path).resolve()))
+
+        with mock.patch.object(scaling, "_sha256_file", side_effect=record):
+            scaling._code_sha256()
+
+        self.assertIn(
+            scaling.REPO / "scripts/pr_scaling_variant_build.py", paths
+        )
+        self.assertIn(
+            scaling.REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py",
+            paths,
         )
 
     def test_amu_queue_error_and_cira_inactive_core_fail_mechanism_gate(self):

@@ -19,9 +19,11 @@ from pathlib import Path
 try:
     from scripts import cross_system_contract as contract
     from scripts import freeze_pr_scaling_inputs as scaling_inputs
+    from scripts import pr_scaling_variant_build as variant_build
 except ImportError:
     import cross_system_contract as contract
     import freeze_pr_scaling_inputs as scaling_inputs
+    import pr_scaling_variant_build as variant_build
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -63,6 +65,10 @@ def build_matrix():
     )
 
 
+def needs_variant_build(entry):
+    return entry.system in {"amu", "cira"}
+
+
 def _sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -78,6 +84,8 @@ def _code_sha256():
         REPO / "scripts/compare_gapbs_cxl_amu_cira.py",
         REPO / "scripts/freeze_pr_scaling_inputs.py",
         REPO / "scripts/gapbs_pr_experiment_profiles.py",
+        REPO / "scripts/pr_scaling_variant_build.py",
+        REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py",
         REPO / "scripts/run_gapbs_matched_pr_spmv_variants.py",
         REPO / "scripts/run_m2ndp_g20_pr_spmv.py",
     ):
@@ -389,6 +397,17 @@ def new_state(options):
         "gem5_sha256": _sha256_file(options.gem5),
         "m5_library_sha256": _sha256_file(options.m5_library),
         "config_sha256": _sha256_file(options.config),
+        "variant_builds": {
+            f"g{scale}": {
+                "status": "pending",
+                "command": [],
+                "inputs": {},
+                "outputs": {},
+                "log": None,
+                "error": None,
+            }
+            for scale in SCALES
+        },
         "points": {
             entry.key: {
                 "scale": entry.scale,
@@ -405,6 +424,86 @@ def new_state(options):
             for entry in build_matrix()
         },
     }
+
+
+def _variant_build_inputs(scale, options):
+    root = Path(options.root).resolve()
+    baseline_manifest = (
+        root / f"scales/g{scale}/m2ndp/build/manifest.json"
+    )
+    return {
+        "baseline_manifest_sha256": _sha256_file(baseline_manifest),
+        "calibration_sha256": _sha256_file(options.calibration),
+        "m5_library_sha256": _sha256_file(options.m5_library),
+        "builder_sha256": _sha256_file(
+            REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py"
+        ),
+        "orchestrator_sha256": _sha256_file(
+            REPO / "scripts/pr_scaling_variant_build.py"
+        ),
+    }
+
+
+def ensure_variants_for_scale(scale, state, options):
+    if scale not in SCALES:
+        raise ScalingError(f"unsupported variant scale: {scale}")
+    vanilla = state.get("points", {}).get(f"g{scale}:vanilla", {})
+    if vanilla.get("status") != "passed":
+        raise ScalingError(
+            f"g{scale} Vanilla must pass before building variants"
+        )
+    root = Path(options.root).resolve()
+    baseline_build = root / f"scales/g{scale}/m2ndp/build"
+    final = Path(options.variants_build_root).resolve() / f"g{scale}"
+    log = root / f"scales/g{scale}/variant-build.log"
+    key = f"g{scale}"
+    record = state["variant_builds"][key]
+    inputs = _variant_build_inputs(scale, options)
+    if record.get("status") == "passed":
+        if record.get("inputs") != inputs:
+            raise ScalingError(f"{key} variant build inputs changed")
+        try:
+            outputs = variant_build.validate_variant_build(
+                final,
+                baseline_build=baseline_build,
+                calibration=options.calibration,
+            )
+        except variant_build.VariantBuildError as error:
+            raise ScalingError(str(error)) from error
+        if record.get("outputs") != outputs:
+            raise ScalingError(f"{key} variant build outputs changed")
+        return outputs
+    record.update({
+        "status": "running",
+        "command": [],
+        "inputs": inputs,
+        "outputs": {},
+        "log": str(log),
+        "error": None,
+    })
+    contract.atomic_write_json(root / "state.json", state)
+    try:
+        outputs = variant_build.ensure_variant_build(
+            final,
+            baseline_build=baseline_build,
+            cxlmemuring=options.cxlmemuring,
+            m5_library=options.m5_library,
+            calibration=options.calibration,
+            log=log,
+        )
+    except (variant_build.VariantBuildError, OSError) as error:
+        record.update(status="failed", error=str(error))
+        contract.atomic_write_json(root / "state.json", state)
+        raise ScalingError(str(error)) from error
+    command = outputs.pop("command", [])
+    record.update({
+        "status": "passed",
+        "command": command,
+        "outputs": outputs,
+        "error": None,
+    })
+    contract.atomic_write_json(root / "state.json", state)
+    return outputs
 
 
 def _positive_decimal_value(value, label):
@@ -675,6 +774,8 @@ def main(argv=None):
                         f"{entry.key} passed outputs changed before resume"
                     )
                 continue
+            if needs_variant_build(entry):
+                ensure_variants_for_scale(entry.scale, state, options)
             command = command_for(entry, options)
             completed = subprocess.run(command, cwd=REPO, check=False)
             if completed.returncode != 0:
