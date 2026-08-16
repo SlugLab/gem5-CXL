@@ -15,6 +15,38 @@ FIXED_SOURCE = REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
 
 
 class MatchedVariantSourceTest(unittest.TestCase):
+    def test_rebase_manifest_paths_records_final_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / ".g4.staging"
+            final = root / "g4"
+            manifest = {"variants": [{
+                "binary": str((staging / "amu/bin/pr_spmv").resolve()),
+                "reference_raw": str(
+                    (staging / "reference/amu.u32").resolve()
+                ),
+                "generated_source": str(
+                    (staging / "amu/generated/pr_spmv.cc").resolve()
+                ),
+                "command": [
+                    "g++", str(staging / "amu/generated/pr_spmv.cc")
+                ],
+            }]}
+
+            rebased = variants.rebase_output_paths(
+                manifest, staging, final
+            )
+
+        row = rebased["variants"][0]
+        self.assertEqual(
+            row["binary"], str((final / "amu/bin/pr_spmv").resolve())
+        )
+        self.assertEqual(
+            row["reference_raw"],
+            str((final / "reference/amu.u32").resolve()),
+        )
+        self.assertIn(str(staging), " ".join(row["command"]))
+
     def test_calibrated_build_policy_binds_mode_source_and_hoist(self):
         calibration = {
             "schema": 1,

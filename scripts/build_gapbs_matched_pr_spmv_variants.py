@@ -240,6 +240,23 @@ def _sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def rebase_output_paths(manifest, physical_root, recorded_root):
+    physical_root = Path(physical_root).resolve()
+    recorded_root = Path(recorded_root).resolve()
+    result = json.loads(json.dumps(manifest))
+    for row in result.get("variants", []):
+        for field in ("binary", "reference_raw", "generated_source"):
+            path = Path(row[field]).resolve()
+            try:
+                relative = path.relative_to(physical_root)
+            except ValueError as error:
+                raise VariantEvidenceError(
+                    f"{field} is outside physical output root: {path}"
+                ) from error
+            row[field] = str(recorded_root / relative)
+    return result
+
+
 def build_variant(
     *,
     kind,
@@ -315,6 +332,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-build", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
+    parser.add_argument("--recorded-outdir", type=Path)
     parser.add_argument(
         "--cxlmemuring",
         type=Path,
@@ -441,6 +459,10 @@ def main(argv=None):
         "cira_policy": cira_policy,
         "variants": variant_rows,
     }
+    if args.recorded_outdir is not None:
+        manifest = rebase_output_paths(
+            manifest, args.outdir, args.recorded_outdir
+        )
     artifacts.atomic_write_json(args.outdir / "manifest.json", manifest)
     print(f"Wrote {args.outdir / 'manifest.json'}")
 
