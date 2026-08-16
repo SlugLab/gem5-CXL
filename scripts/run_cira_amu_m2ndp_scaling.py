@@ -91,6 +91,7 @@ def _code_sha256():
         REPO / "scripts/freeze_pr_scaling_inputs.py",
         REPO / "scripts/gapbs_pr_experiment_profiles.py",
         REPO / "scripts/pr_scaling_variant_build.py",
+        REPO / "scripts/qualify_pr_scaling_g12.py",
         REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py",
         REPO / "scripts/run_gapbs_matched_pr_spmv_variants.py",
         REPO / "scripts/run_m2ndp_g20_pr_spmv.py",
@@ -398,8 +399,96 @@ def validate_mechanism_row(system, row):
     raise ScalingError(f"unsupported system: {system}")
 
 
+def load_qualification(path, options):
+    value = _load_json(path, "g12 qualification")
+    if (
+        value.get("schema") != 1
+        or value.get("status") != "passed"
+        or value.get("profile") != "pr-scaling-g12-qualification"
+    ):
+        raise ScalingError("g12 qualification is not PASS")
+    inputs = load_inputs(options.inputs)
+    expected_identity = {
+        "code_sha256": _code_sha256(),
+        "inputs_sha256": _sha256_file(options.inputs),
+        "calibration_sha256": _sha256_file(options.calibration),
+        "gem5_sha256": _sha256_file(options.gem5),
+        "m5_library_sha256": _sha256_file(options.m5_library),
+        "config_sha256": _sha256_file(options.config),
+        "g12_graph_sha256": next(
+            row["sha256"] for row in inputs["graphs"]
+            if row["scale"] == 12
+        ),
+    }
+    for field, expected in expected_identity.items():
+        if value.get(field) != expected:
+            raise ScalingError(f"qualification identity differs: {field}")
+    try:
+        variant_manifest = Path(value["variant_manifest"]).resolve()
+    except (KeyError, TypeError) as error:
+        raise ScalingError("qualification variant manifest is missing") from error
+    if (
+        not variant_manifest.is_file()
+        or value.get("variant_manifest_sha256")
+        != _sha256_file(variant_manifest)
+    ):
+        raise ScalingError("qualification variant manifest hash differs")
+
+    points = value.get("points")
+    expected_points = {
+        "g12:vanilla", "g12:amu", "g12:cira"
+    }
+    if not isinstance(points, dict) or set(points) != expected_points:
+        raise ScalingError("qualification must contain exactly three g12 points")
+    ranks = set()
+    for key in sorted(expected_points):
+        row = points[key]
+        if (
+            not isinstance(row, dict)
+            or row.get("status") != "passed"
+            or row.get("mechanism", {}).get("verification") != "pass"
+        ):
+            raise ScalingError(f"qualification point is not PASS: {key}")
+        try:
+            ranks.add(row["outputs"]["rank"])
+        except (KeyError, TypeError) as error:
+            raise ScalingError("qualification rank evidence is missing") from error
+    if len(ranks) != 1:
+        raise ScalingError("qualification rank hashes differ")
+
+    baseline = _positive_decimal_value(
+        points["g12:vanilla"].get("latency_seconds"),
+        "qualification Vanilla latency",
+    )
+    recomputed = {}
+    for system in ("amu", "cira"):
+        key = f"g12:{system}"
+        speedup = baseline / _positive_decimal_value(
+            points[key].get("latency_seconds"),
+            f"qualification {system} latency",
+        )
+        stored = _positive_decimal_value(
+            points[key].get("speedup"),
+            f"qualification {system} speedup",
+        )
+        if stored != speedup:
+            raise ScalingError(f"qualification {system} speedup differs")
+        if not MIN_ACCELERATOR_SPEEDUP <= speedup <= MAX_ACCELERATOR_SPEEDUP:
+            raise ScalingError(f"qualification {system} performance is outside gate")
+        recomputed[system] = format(speedup.normalize(), "f")
+    if value.get("performance_gate") != {
+        "status": "passed",
+        "checked_points": 2,
+        "speedups": recomputed,
+        "offenders": [],
+    }:
+        raise ScalingError("qualification performance gate differs")
+    return value
+
+
 def new_state(options):
     inputs = load_inputs(options.inputs)
+    qualification = load_qualification(options.qualification, options)
     input_hash = _sha256_file(options.inputs)
     calibration_hash = _sha256_file(options.calibration)
     return {
@@ -418,6 +507,10 @@ def new_state(options):
         "gem5_sha256": _sha256_file(options.gem5),
         "m5_library_sha256": _sha256_file(options.m5_library),
         "config_sha256": _sha256_file(options.config),
+        "qualification_sha256": _sha256_file(options.qualification),
+        "qualification_variant_manifest_sha256": qualification[
+            "variant_manifest_sha256"
+        ],
         "variant_builds": {
             f"g{scale}": {
                 "status": "pending",
@@ -829,6 +922,7 @@ def parse_args(argv=None):
     parser.add_argument("--cxlmemuring", type=Path, required=True)
     parser.add_argument("--m2ndp-root", type=Path, required=True)
     parser.add_argument("--variants-build-root", type=Path, required=True)
+    parser.add_argument("--qualification", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
@@ -871,6 +965,8 @@ def main(argv=None):
                 "gem5_sha256",
                 "m5_library_sha256",
                 "config_sha256",
+                "qualification_sha256",
+                "qualification_variant_manifest_sha256",
             ):
                 if state.get(field) != expected[field]:
                     raise ScalingError("resume state identity differs")

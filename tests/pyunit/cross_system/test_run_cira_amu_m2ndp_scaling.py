@@ -87,6 +87,66 @@ class ScalingRunnerTest(unittest.TestCase):
             m2ndp_root=self.root / "M2NDP", variants_build_root=self.root / "variants",
             timeout=0, resume=False,
         )
+        self.qualification_variant_manifest = (
+            self.root / "qualification-build/g12/manifest.json"
+        )
+        self.qualification_variant_manifest.parent.mkdir(parents=True)
+        self.qualification_variant_manifest.write_text(
+            '{"schema":1}\n', encoding="utf-8"
+        )
+        self.qualification = self.root / "qualification.json"
+        qualification_points = {
+            f"g12:{system}": {
+                "status": "passed",
+                "latency_seconds": "8" if system == "vanilla" else "5",
+                "speedup": "1" if system == "vanilla" else "1.6",
+                "outputs": {"rank": sha("g12-rank")},
+                "mechanism": {"verification": "pass"},
+            }
+            for system in ("vanilla", "amu", "cira")
+        }
+        self.qualification.write_text(json.dumps({
+            "schema": 1,
+            "status": "passed",
+            "profile": "pr-scaling-g12-qualification",
+            "code_sha256": scaling._code_sha256(),
+            "inputs_sha256": scaling._sha256_file(self.inputs),
+            "calibration_sha256": scaling._sha256_file(self.calibration),
+            "gem5_sha256": scaling._sha256_file(self.gem5),
+            "m5_library_sha256": scaling._sha256_file(self.m5_library),
+            "config_sha256": scaling._sha256_file(self.config),
+            "g12_graph_sha256": sha("graph-12"),
+            "variant_manifest": str(
+                self.qualification_variant_manifest.resolve()
+            ),
+            "variant_manifest_sha256": scaling._sha256_file(
+                self.qualification_variant_manifest
+            ),
+            "performance_gate": {
+                "status": "passed", "checked_points": 2,
+                "speedups": {"amu": "1.6", "cira": "1.6"},
+                "offenders": [],
+            },
+            "points": qualification_points,
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        self.options.qualification = self.qualification
+
+    def resign_qualification(self):
+        value = json.loads(self.qualification.read_text())
+        value.update({
+            "code_sha256": scaling._code_sha256(),
+            "inputs_sha256": scaling._sha256_file(self.inputs),
+            "calibration_sha256": scaling._sha256_file(self.calibration),
+            "gem5_sha256": scaling._sha256_file(self.gem5),
+            "m5_library_sha256": scaling._sha256_file(self.m5_library),
+            "config_sha256": scaling._sha256_file(self.config),
+            "variant_manifest_sha256": scaling._sha256_file(
+                self.qualification_variant_manifest
+            ),
+        })
+        self.qualification.write_text(
+            json.dumps(value, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     def write_real_config(
         self, *, delay="1000000", cores=4, link_range="0:4294967296",
@@ -534,16 +594,25 @@ class ScalingRunnerTest(unittest.TestCase):
     def test_state_identity_changes_when_gem5_m5_library_or_config_changes(self):
         original = scaling.new_state(self.options)
         self.config.write_text("config = 2\n", encoding="utf-8")
+        with self.assertRaisesRegex(scaling.ScalingError, "qualification"):
+            scaling.new_state(self.options)
+        self.resign_qualification()
         changed_config = scaling.new_state(self.options)
         self.assertNotEqual(
             original["config_sha256"], changed_config["config_sha256"]
         )
         self.gem5.write_bytes(b"different gem5")
+        with self.assertRaisesRegex(scaling.ScalingError, "qualification"):
+            scaling.new_state(self.options)
+        self.resign_qualification()
         changed_gem5 = scaling.new_state(self.options)
         self.assertNotEqual(
             changed_config["gem5_sha256"], changed_gem5["gem5_sha256"]
         )
         self.m5_library.write_bytes(b"different m5 library")
+        with self.assertRaisesRegex(scaling.ScalingError, "qualification"):
+            scaling.new_state(self.options)
+        self.resign_qualification()
         changed_m5 = scaling.new_state(self.options)
         self.assertNotEqual(
             changed_gem5["m5_library_sha256"],
@@ -569,6 +638,41 @@ class ScalingRunnerTest(unittest.TestCase):
                 row for row in inputs["graphs"] if row["scale"] == 20
             )["sha256"],
         )
+        self.assertEqual(
+            state["qualification_sha256"],
+            scaling._sha256_file(self.qualification),
+        )
+
+    def test_qualification_must_be_fresh_pass_and_identity_bound(self):
+        accepted = scaling.load_qualification(
+            self.qualification, self.options
+        )
+        self.assertEqual(accepted["status"], "passed")
+        original = json.loads(self.qualification.read_text())
+        cases = (
+            ("status", "performance_hold", "PASS"),
+            ("code_sha256", "0" * 64, "identity"),
+            ("g12_graph_sha256", "0" * 64, "identity"),
+            ("variant_manifest_sha256", "0" * 64, "variant"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(original))
+                changed[field] = value
+                self.qualification.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(scaling.ScalingError, message):
+                    scaling.load_qualification(
+                        self.qualification, self.options
+                    )
+        self.qualification.write_text(json.dumps(original) + "\n")
+
+    def test_missing_qualification_cannot_create_formal_state(self):
+        self.options.qualification = self.root / "missing-qualification.json"
+        with mock.patch.object(
+            scaling, "parse_args", return_value=self.options
+        ):
+            self.assertEqual(scaling.main([]), 1)
+        self.assertFalse((self.options.root / "state.json").exists())
 
     def test_code_identity_includes_variant_builder_and_orchestrator(self):
         paths = []
