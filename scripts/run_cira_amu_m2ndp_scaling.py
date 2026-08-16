@@ -31,6 +31,9 @@ PROFILE = "pr-scaling-4thread-1us"
 SCALES = (4, 12, 14, 20)
 SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+PRE_LAZY_VARIANT_CODE_SHA256 = (
+    "438735b038266173d5337d86db3fdbcf26321794336f8af52180081ef08f94d3"
+)
 
 
 class ScalingError(RuntimeError):
@@ -568,6 +571,48 @@ def is_complete(state):
     )
 
 
+def migrate_pre_lazy_variant_state(state, expected, options):
+    """Migrate only the exact, validated one-point pre-variant state."""
+    if state.get("code_sha256") != PRE_LAZY_VARIANT_CODE_SHA256:
+        raise ScalingError("legacy scaling state code identity differs")
+    variants_root = Path(options.variants_build_root).resolve()
+    published = [
+        variants_root / f"g{scale}"
+        for scale in SCALES
+        if (variants_root / f"g{scale}").exists()
+    ]
+    if published:
+        raise ScalingError(
+            "legacy scaling state has a published variant directory"
+        )
+
+    entry = MatrixEntry(4, "vanilla")
+    candidate = json.loads(json.dumps(expected))
+    candidate["code_sha256"] = PRE_LAZY_VARIANT_CODE_SHA256
+    candidate.pop("variant_builds")
+    record_pass(
+        candidate,
+        entry,
+        _point_outputs(entry, options),
+        **_point_measurement(entry, options),
+    )
+    if state != candidate:
+        raise ScalingError(
+            "legacy scaling state is not the exact g4 Vanilla prefix"
+        )
+
+    migrated = json.loads(json.dumps(expected))
+    migrated["points"][entry.key] = json.loads(
+        json.dumps(candidate["points"][entry.key])
+    )
+    migrated["resume_lineage"] = {
+        "previous_code_sha256": PRE_LAZY_VARIANT_CODE_SHA256,
+        "current_code_sha256": expected["code_sha256"],
+        "retained_points": [entry.key],
+    }
+    return migrated
+
+
 def _read_single_csv(path):
     try:
         with Path(path).open(newline="", encoding="utf-8") as stream:
@@ -737,6 +782,15 @@ def main(argv=None):
             if not options.resume:
                 raise ScalingError(f"state exists; use --resume: {state_path}")
             state = _load_json(state_path, "scaling state")
+            if (
+                state.get("code_sha256")
+                == PRE_LAZY_VARIANT_CODE_SHA256
+                and state.get("code_sha256") != expected["code_sha256"]
+            ):
+                state = migrate_pre_lazy_variant_state(
+                    state, expected, options
+                )
+                contract.atomic_write_json(state_path, state)
             for field in (
                 "schema",
                 "profile",
@@ -756,6 +810,7 @@ def main(argv=None):
                 raise ScalingError("--resume requested but scaling state is missing")
             state = expected
             contract.atomic_write_json(state_path, state)
+        stale_failure_cleared = False
         for entry in build_matrix():
             if state["points"][entry.key]["status"] == "passed":
                 current_outputs = _point_outputs(entry, options)
@@ -774,6 +829,9 @@ def main(argv=None):
                         f"{entry.key} passed outputs changed before resume"
                     )
                 continue
+            if not stale_failure_cleared:
+                failed_path.unlink(missing_ok=True)
+                stale_failure_cleared = True
             if needs_variant_build(entry):
                 ensure_variants_for_scale(entry.scale, state, options)
             command = command_for(entry, options)

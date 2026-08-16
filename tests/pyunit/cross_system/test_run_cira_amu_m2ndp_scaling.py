@@ -124,6 +124,39 @@ class ScalingRunnerTest(unittest.TestCase):
         config.write_text("\n".join(sections) + "\n", encoding="utf-8")
         return config
 
+    def real_legacy_state_with_passed_g4_vanilla(self):
+        base = self.options.root / "scales/g4/m2ndp"
+        run_dir = base / "gem5/run/m5out"
+        summary = base / "gem5/run/summary.csv"
+        summary.parent.mkdir(parents=True, exist_ok=True)
+        with summary.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=("status", "verification", "run_dir", "sim_ticks"),
+            )
+            writer.writeheader()
+            writer.writerow({
+                "status": "ok",
+                "verification": "pass",
+                "run_dir": str(run_dir),
+                "sim_ticks": "4000000",
+            })
+        reference = base / "reference/scores.raw"
+        reference.parent.mkdir(parents=True, exist_ok=True)
+        reference.write_bytes(b"\x00" * (16 * 4))
+        self.write_real_config(path=run_dir / "config.ini")
+        legacy = scaling.new_state(self.options)
+        legacy["code_sha256"] = scaling.PRE_LAZY_VARIANT_CODE_SHA256
+        legacy.pop("variant_builds")
+        entry = scaling.MatrixEntry(4, "vanilla")
+        scaling.record_pass(
+            legacy,
+            entry,
+            scaling._point_outputs(entry, self.options),
+            **scaling._point_measurement(entry, self.options),
+        )
+        return legacy
+
     def test_matrix_is_four_scales_by_four_systems_at_1us(self):
         matrix = scaling.build_matrix()
         self.assertEqual(len(matrix), 16)
@@ -232,6 +265,51 @@ class ScalingRunnerTest(unittest.TestCase):
             row["status"] == "pending"
             for row in state_value["variant_builds"].values()
         ))
+
+    def test_exact_prefixed_one_point_state_migrates_with_lineage(self):
+        legacy = self.real_legacy_state_with_passed_g4_vanilla()
+        expected = scaling.new_state(self.options)
+
+        migrated = scaling.migrate_pre_lazy_variant_state(
+            legacy, expected, self.options
+        )
+
+        self.assertEqual(
+            migrated["points"]["g4:vanilla"]["status"], "passed"
+        )
+        self.assertEqual(
+            migrated["variant_builds"]["g4"]["status"], "pending"
+        )
+        self.assertEqual(migrated["resume_lineage"], {
+            "previous_code_sha256": scaling.PRE_LAZY_VARIANT_CODE_SHA256,
+            "current_code_sha256": expected["code_sha256"],
+            "retained_points": ["g4:vanilla"],
+        })
+
+    def test_migration_rejects_any_nonexact_legacy_shape(self):
+        cases = ("second-point", "wrong-code", "changed-measurement")
+        for case in cases:
+            with self.subTest(case=case):
+                legacy = self.real_legacy_state_with_passed_g4_vanilla()
+                if case == "second-point":
+                    legacy["points"]["g4:amu"]["status"] = "passed"
+                elif case == "wrong-code":
+                    legacy["code_sha256"] = "0" * 64
+                else:
+                    legacy["points"]["g4:vanilla"]["latency_seconds"] = "5"
+                with self.assertRaises(scaling.ScalingError):
+                    scaling.migrate_pre_lazy_variant_state(
+                        legacy, scaling.new_state(self.options), self.options
+                    )
+
+    def test_migration_rejects_existing_published_variant_directory(self):
+        legacy = self.real_legacy_state_with_passed_g4_vanilla()
+        published = self.options.variants_build_root / "g4"
+        published.mkdir(parents=True)
+        with self.assertRaisesRegex(scaling.ScalingError, "variant"):
+            scaling.migrate_pre_lazy_variant_state(
+                legacy, scaling.new_state(self.options), self.options
+            )
 
     def test_config_must_be_four_core_all_cxl_one_microsecond(self):
         config = self.write_real_config(delay="500000")
