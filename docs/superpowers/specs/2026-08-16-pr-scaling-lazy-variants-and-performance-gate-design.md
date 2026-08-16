@@ -46,7 +46,9 @@ the run.
 
 Each scale gains a variant-build record with status, command, input hashes,
 output hashes, timestamps, and error. The top-level evidence identity continues
-to bind code, graph set, calibration, gem5, `libm5.a`, and configuration.
+to bind code, graph set, calibration, gem5, `libm5.a`, and configuration. Its
+code digest includes the new orchestration module and the matched-variant
+builder, so either implementation changing invalidates ordinary resume.
 
 On resume:
 
