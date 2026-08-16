@@ -69,6 +69,46 @@ def _physical_output_path(recorded_path, *, physical_root, recorded_root):
     return Path(physical_root).resolve() / relative
 
 
+def _validate_embedded_reference(
+    kind, row, binary, *, physical_root, recorded_root,
+):
+    try:
+        expected = str(Path(row["reference_raw"]).resolve())
+    except KeyError as error:
+        raise VariantBuildError(
+            f"{kind} embedded reference path is missing"
+        ) from error
+    header = (
+        Path(physical_root).resolve()
+        / kind / "generated/m2ndp_experiment_config.h"
+    )
+    try:
+        header_text = header.read_text(encoding="utf-8")
+        binary_bytes = Path(binary).read_bytes()
+    except (OSError, UnicodeDecodeError) as error:
+        raise VariantBuildError(
+            f"{kind} embedded reference path evidence is unreadable: {error}"
+        ) from error
+    if f'M2NDP_REFERENCE_RAW_PATH "{expected}"' not in header_text:
+        raise VariantBuildError(
+            f"{kind} embedded reference path differs in generated header"
+        )
+    if expected.encode() not in binary_bytes:
+        raise VariantBuildError(
+            f"{kind} embedded reference path differs in binary"
+        )
+    physical_root = Path(physical_root).resolve()
+    recorded_root = Path(recorded_root).resolve()
+    staged_reference = physical_root / "reference" / f"{kind}.u32"
+    if (
+        physical_root != recorded_root
+        and str(staged_reference).encode() in binary_bytes
+    ):
+        raise VariantBuildError(
+            f"{kind} binary retains a staging embedded reference path"
+        )
+
+
 def validate_variant_build(
     output, *, baseline_build, calibration, recorded_root=None,
 ):
@@ -133,6 +173,13 @@ def validate_variant_build(
         actual_hash = sha256_file(binary)
         if row.get("binary_sha256") != actual_hash:
             raise VariantBuildError(f"{kind} binary hash differs")
+        _validate_embedded_reference(
+            kind,
+            row,
+            binary,
+            physical_root=output,
+            recorded_root=recorded_root,
+        )
         binary_hashes[kind] = actual_hash
     return {
         "manifest_sha256": sha256_file(manifest_path),

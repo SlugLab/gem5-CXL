@@ -79,7 +79,22 @@ class AsmcCoherentSpmWritebackTest(unittest.TestCase):
             SOURCE.index("ASMC::recvTimingResp"):
             SOURCE.index("ASMC::recvReqRetry")
         ]
-        self.assertIn("MemCmd::WriteLineReq", response)
+        self.assertIn("MemCmd::WriteReq", response)
+        self.assertIn(
+            "pkt->getAddr() + sender_state->fragmentOffset", response
+        )
+        self.assertIn("sender_state->fragmentSize", response)
+        self.assertNotIn("Request::INVALIDATE", response)
+        mshr = (REPO / "src/mem/cache/mshr.cc").read_text()
+        self.assertIn("pkt->req->isSpmAccess() &&", mshr)
+        self.assertIn("pkt->cmd == MemCmd::WriteReq", mshr)
+        self.assertNotIn("completeSpmWriteback", SOURCE)
+        self.assertNotIn("pkt->senderState = nullptr", SOURCE[
+            SOURCE.index("ASMC::trySpmSend"):
+            SOURCE.index("ASMC::recvTimingResp")
+        ])
+        self.assertNotIn("MemCmd::WritebackDirty", response)
+        self.assertNotIn("MemCmd::WriteLineReq", response)
         self.assertIn("sender_state->fragmentOffset", response)
         self.assertIn("sender_state->fragmentSize", response)
         self.assertIn("state.spmWritebacks", response)

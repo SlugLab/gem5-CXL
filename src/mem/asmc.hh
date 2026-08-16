@@ -74,6 +74,13 @@ class ASMC : public ClockedObject
         SpmWriteback,
     };
 
+    struct ThreadConfig
+    {
+        uint64_t granularity;
+        uint64_t maxOutstanding;
+        Tick configuredLatency;
+    };
+
     struct RequestState
     {
         uint64_t id = 0;
@@ -84,6 +91,7 @@ class ASMC : public ClockedObject
         Addr spmAddr = 0;
         Addr memAddr = 0;
         uint64_t size = 0;
+        Tick configuredLatency = 0;
         Tick issueTick = 0;
         std::vector<uint8_t> data;
         std::vector<TranslationChunk> memoryChunks;
@@ -171,6 +179,8 @@ class ASMC : public ClockedObject
 
     uint64_t issue(ThreadContext *tc, ReqType type, Addr spm_addr,
                    Addr mem_addr);
+    ThreadConfig &configFor(ThreadContext *tc);
+    const ThreadConfig &configFor(ThreadContext *tc) const;
     bool translate(ThreadContext *tc, Addr vaddr, uint64_t size,
                    BaseMMU::Mode mode,
                    std::vector<TranslationChunk> &chunks) const;
@@ -220,9 +230,7 @@ class ASMC : public ClockedObject
     const Tick issueLatency;
     const Tick completionLatency;
 
-    uint64_t granularity;
-    uint64_t maxOutstanding;
-    Tick configuredLatency;
+    const ThreadConfig defaultConfig;
     uint64_t nextId = 1;
     uint64_t spmUsed = 0;
     uint64_t metadataPending = 0;
@@ -231,6 +239,8 @@ class ASMC : public ClockedObject
     Tick lastOccupancyTick = 0;
 
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
+    std::unordered_map<ThreadContext *, ThreadConfig> threadConfigs;
+    std::unordered_map<ThreadContext *, uint64_t> outstandingPerThread;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;
     std::unordered_map<ThreadContext *, Tick> pollWaitStart;
     std::unordered_set<ThreadContext *> completionWaiters;

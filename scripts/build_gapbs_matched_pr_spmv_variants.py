@@ -263,6 +263,7 @@ def build_variant(
     baseline_build,
     outdir,
     reference_raw,
+    embedded_reference_raw,
     cxx,
     m5_library,
     amu_batch_size,
@@ -279,7 +280,8 @@ def build_variant(
     generated_dir.mkdir(parents=True, exist_ok=True)
     binary_dir.mkdir(parents=True, exist_ok=True)
     baseline_builder.write_experiment_header(
-        generated_dir / "m2ndp_experiment_config.h", reference_raw
+        generated_dir / "m2ndp_experiment_config.h",
+        embedded_reference_raw,
     )
 
     if kind == "amu":
@@ -413,6 +415,10 @@ def main(argv=None):
     )
     reference_dir = args.outdir / "reference"
     reference_dir.mkdir(parents=True, exist_ok=True)
+    recorded_reference_dir = (
+        args.recorded_outdir if args.recorded_outdir is not None
+        else args.outdir
+    ) / "reference"
     variant_rows = []
     for kind in ("amu", "cira"):
         variant_rows.append(
@@ -421,6 +427,9 @@ def main(argv=None):
                 baseline_build=args.baseline_build,
                 outdir=args.outdir,
                 reference_raw=reference_dir / f"{kind}.u32",
+                embedded_reference_raw=(
+                    recorded_reference_dir / f"{kind}.u32"
+                ),
                 cxx=args.cxx,
                 m5_library=args.m5_library,
                 amu_batch_size=args.amu_batch_size,

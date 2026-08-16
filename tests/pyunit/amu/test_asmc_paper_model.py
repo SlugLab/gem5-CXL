@@ -65,10 +65,42 @@ class AsmcPaperModelTest(unittest.TestCase):
             SOURCE.index("ASMC::issue(ThreadContext") :
             SOURCE.index("ASMC::startInitialAccess")
         ]
-        self.assertIn("outstanding.size() >= maxOutstanding", issue)
+        self.assertIn(
+            "outstandingPerThread[tc] >= config.maxOutstanding", issue
+        )
         self.assertIn("metadataPending >= pendingQueueEntries", issue)
         self.assertIn("startInitialAccess", HEADER + SOURCE)
         self.assertIn("metadataPending--", SOURCE)
+
+    def test_runtime_registers_are_isolated_per_thread_context(self):
+        """Mixed 8-byte NodeID and 4-byte score loads must not race."""
+        self.assertIn("struct ThreadConfig", HEADER)
+        self.assertIn(
+            "std::unordered_map<ThreadContext *, ThreadConfig> threadConfigs",
+            HEADER,
+        )
+        self.assertIn(
+            "std::unordered_map<ThreadContext *, uint64_t> outstandingPerThread",
+            HEADER,
+        )
+        issue = SOURCE[
+            SOURCE.index("ASMC::issue(ThreadContext") :
+            SOURCE.index("ASMC::startInitialAccess")
+        ]
+        self.assertIn("ThreadConfig &config = configFor(tc)", issue)
+        self.assertIn("state->size = config.granularity", issue)
+        self.assertNotIn("state->size = granularity", issue)
+        cfg_write = SOURCE[
+            SOURCE.index("ASMC::cfgWrite") : SOURCE.index("ASMC::cfgRead")
+        ]
+        self.assertIn("ThreadConfig &config = configFor(tc)", cfg_write)
+        self.assertIn("config.granularity = value ? value : 1", cfg_write)
+        cfg_read = SOURCE[
+            SOURCE.index("ASMC::cfgRead") :
+            SOURCE.index("ASMC::deleteQueuedPacket", SOURCE.index("ASMC::cfgRead"))
+        ]
+        self.assertIn("outstandingPerThread.find(tc)", cfg_read)
+        self.assertNotIn("return outstanding.size()", cfg_read)
 
     def test_id_batches_refill_only_at_batch_boundary(self):
         self.assertIn("idsRemaining", HEADER)
@@ -107,6 +139,8 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("++stats.emptyGetfinPolls", getfin)
         self.assertIn("++stats.successfulGetfin", getfin)
         self.assertIn("pollWaitStart", getfin)
+        self.assertIn("outstandingPerThread.find(tc)", getfin)
+        self.assertNotIn("!outstanding.empty()", getfin)
         self.assertNotIn("getfinLatency", getfin)
 
     def test_reset_clears_new_resource_state(self):

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -211,6 +212,43 @@ class GapbsCheckpointRunnerContractTest(unittest.TestCase):
             "checkpoint_restores",
         }
         self.assertTrue(expected <= set(self.runner.SUMMARY_FIELDS))
+
+    def test_checkpoint_save_command_uses_neutral_nocache_topology(self):
+        args = SimpleNamespace(
+            gem5=Path("gem5"),
+            config=Path("config.py"),
+            graph_scale=4,
+            iterations=2,
+            measure_trial=1,
+            cores=4,
+            mem_size="4GiB",
+            env=["OMP_NUM_THREADS=4"],
+        )
+        command = self.runner.checkpoint_save_command(
+            args,
+            binary=Path("pr_spmv"),
+            workload_arguments=["-f", "g4.sg", "-n", "2", "-v"],
+            temporary=Path("checkpoint"),
+        )
+        self.assertIn("--no-asmc", command)
+        self.assertNotIn("--cira", command)
+        self.assertNotIn("--asmc-profile", command)
+        self.assertEqual(command[command.index("--cpu") + 1], "atomic")
+        self.assertEqual(
+            command[command.index("--cxl-link-delay") + 1], "0ns"
+        )
+
+    def test_checkpoint_identity_versions_neutral_save_contract(self):
+        parameters = self.runner.checkpoint_model_parameters(
+            SimpleNamespace(env=[]), "baseline"
+        )
+        self.assertEqual(
+            parameters["checkpoint_save_contract"],
+            "atomic-local-nocache-no-asmc-v2",
+        )
+        legacy_parameters = dict(parameters)
+        legacy_parameters.pop("checkpoint_save_contract")
+        self.assertNotEqual(parameters, legacy_parameters)
 
     def test_dry_run_builds_local_save_and_cxl_restore_commands(self):
         with tempfile.TemporaryDirectory() as tmp:

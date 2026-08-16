@@ -48,6 +48,19 @@ static inline void invalidate_spm_slot(void *slot)
   __asm__ volatile("clflush (%0)" : : "r"(slot) : "memory");
 }
 
+static inline size_t physical_slot(size_t logical)
+{
+  static_assert(
+      (GAPBS_AMU_WINDOW_SIZE & (GAPBS_AMU_WINDOW_SIZE - 1)) == 0,
+      "AMU window size must be a power of two");
+  size_t reversed = 0;
+  for (size_t span = GAPBS_AMU_WINDOW_SIZE; span > 1; span >>= 1) {
+    reversed = (reversed << 1) | (logical & 1);
+    logical >>= 1;
+  }
+  return reversed;
+}
+
 static inline void configure(uint64_t granularity)
 {
   static thread_local uint64_t current_granularity = 0;
@@ -107,11 +120,12 @@ class AsyncWindow {
   {
     assert(!full());
     assert(ids_[tail_] == 0);
-    invalidate_spm_slot(spm_[tail_]);
+    const size_t physical = physical_slot(tail_);
+    invalidate_spm_slot(spm_[physical]);
     __asm__ volatile("mfence" : : : "memory");
     configure(sizeof(T));
     do {
-      ids_[tail_] = amu_aload(spm_[tail_], addr);
+      ids_[tail_] = amu_aload(spm_[physical], addr);
     } while (ids_[tail_] == 0);
     ready_[tail_] = false;
     tail_ = (tail_ + 1) % GAPBS_AMU_WINDOW_SIZE;
@@ -132,7 +146,7 @@ class AsyncWindow {
       dispatch_deferred();
     }
     T value;
-    memcpy(&value, spm_[head_], sizeof(T));
+    memcpy(&value, spm_[physical_slot(head_)], sizeof(T));
     ids_[head_] = 0;
     ready_[head_] = false;
     head_ = (head_ + 1) % GAPBS_AMU_WINDOW_SIZE;
@@ -202,11 +216,11 @@ class LoadWindow {
       return;
     }
     for (size_t i = 0; i < count_; ++i)
-      invalidate_spm_slot(spm_[i]);
+      invalidate_spm_slot(spm_[physical_slot(i)]);
     __asm__ volatile("mfence" : : : "memory");
     for (size_t i = 0; i < count_; ++i) {
       configure(sizes_[i]);
-      ids_[i] = amu_aload(spm_[i], addrs_[i]);
+      ids_[i] = amu_aload(spm_[physical_slot(i)], addrs_[i]);
       assert(ids_[i] != 0);
     }
   }
@@ -222,7 +236,7 @@ class LoadWindow {
       bool matched = false;
       for (size_t i = 0; i < count_; ++i) {
         if (ids_[i] == id) {
-          memcpy(values_[i], spm_[i], sizes_[i]);
+          memcpy(values_[i], spm_[physical_slot(i)], sizes_[i]);
           ids_[i] = 0;
           ++done;
           matched = true;

@@ -73,11 +73,15 @@ class GapbsAmuBuilderTest(unittest.TestCase):
 
     def test_window_invalidates_spm_before_issue(self):
         header = self.builder.AMU_HEADER
-        self.assertIn("invalidate_spm_slot(spm_[i])", header)
-        invalidate = header.index("invalidate_spm_slot(spm_[i])")
-        issue = header.index("amu_aload(spm_[i]", invalidate)
+        self.assertIn("invalidate_spm_slot(spm_[physical_slot(i)])", header)
+        invalidate = header.index(
+            "invalidate_spm_slot(spm_[physical_slot(i)])"
+        )
+        issue = header.index("amu_aload(spm_[physical_slot(i)]", invalidate)
         completion = header.index("uint64_t id = amu_getfin()", issue)
-        copy_value = header.index("memcpy(values_[i], spm_[i]", completion)
+        copy_value = header.index(
+            "memcpy(values_[i], spm_[physical_slot(i)]", completion
+        )
         self.assertLess(invalidate, issue)
         self.assertLess(issue, completion)
         self.assertLess(completion, copy_value)
@@ -89,10 +93,24 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         issue_body = header[
             header.index("void issue_all()") : header.index("void wait_all()")
         ]
-        invalidate = issue_body.index("invalidate_spm_slot(spm_[i])")
-        issue = issue_body.index("amu_aload(spm_[i]")
+        invalidate = issue_body.index(
+            "invalidate_spm_slot(spm_[physical_slot(i)])"
+        )
+        issue = issue_body.index("amu_aload(spm_[physical_slot(i)]")
         self.assertLess(invalidate, issue)
         self.assertEqual(issue_body.count("mfence"), 1)
+
+    def test_spm_slots_use_bit_reversal_to_avoid_hw_prefetch_aliases(self):
+        header = self.builder.AMU_HEADER
+        self.assertIn("static inline size_t physical_slot", header)
+        self.assertIn("GAPBS_AMU_WINDOW_SIZE &", header)
+        self.assertIn("reversed = (reversed << 1)", header)
+        async_window = header[
+            header.index("class AsyncWindow") : header.index("class LoadWindow")
+        ]
+        self.assertIn("physical_slot(tail_)", async_window)
+        self.assertIn("physical_slot(head_)", async_window)
+        self.assertNotIn("amu_aload(spm_[tail_]", async_window)
 
     def transform_source(self, benchmark, patch_function):
         source = CXLMEMURING / "bench" / "gapbs" / "src" / f"{benchmark}.cc"

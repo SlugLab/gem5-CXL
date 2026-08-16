@@ -36,12 +36,22 @@ class PRScalingVariantBuildTest(unittest.TestCase):
         for kind in ("amu", "cira"):
             binary = self.output / kind / "bin/pr_spmv"
             binary.parent.mkdir(parents=True)
-            binary.write_bytes(f"{kind}-binary".encode())
+            reference = self.output / "reference" / f"{kind}.u32"
+            header = self.output / kind / "generated/m2ndp_experiment_config.h"
+            header.parent.mkdir(parents=True)
+            header.write_text(
+                f'#define M2NDP_REFERENCE_RAW_PATH "{reference.resolve()}"\n',
+                encoding="utf-8",
+            )
+            binary.write_bytes(
+                f"{kind}-binary\0{reference.resolve()}\0".encode()
+            )
             self.binaries[kind] = binary
             rows.append({
                 "kind": kind,
                 "binary": str(binary.resolve()),
                 "binary_sha256": sha256_file(binary),
+                "reference_raw": str(reference.resolve()),
             })
         self.manifest = {
             "schema": 1,
@@ -83,11 +93,21 @@ class PRScalingVariantBuildTest(unittest.TestCase):
         for kind in ("amu", "cira"):
             physical = staging / kind / "bin/pr_spmv"
             physical.parent.mkdir(parents=True, exist_ok=True)
-            physical.write_bytes(f"atomic-{kind}".encode())
+            reference = final / "reference" / f"{kind}.u32"
+            header = staging / kind / "generated/m2ndp_experiment_config.h"
+            header.parent.mkdir(parents=True)
+            header.write_text(
+                f'#define M2NDP_REFERENCE_RAW_PATH "{reference.resolve()}"\n',
+                encoding="utf-8",
+            )
+            physical.write_bytes(
+                f"atomic-{kind}\0{reference.resolve()}\0".encode()
+            )
             rows.append({
                 "kind": kind,
                 "binary": str((final / kind / "bin/pr_spmv").resolve()),
                 "binary_sha256": sha256_file(physical),
+                "reference_raw": str(reference.resolve()),
             })
         value["variants"] = rows
         (staging / "manifest.json").write_text(
@@ -138,6 +158,20 @@ class PRScalingVariantBuildTest(unittest.TestCase):
             self.validate()
         self.binaries["amu"].unlink()
         with self.assertRaisesRegex(stage.VariantBuildError, "binary.*missing"):
+            self.validate()
+
+    def test_validate_build_rejects_staging_reference_embedded_in_binary(self):
+        row = next(
+            item for item in self.manifest["variants"]
+            if item["kind"] == "amu"
+        )
+        stale = self.root / ".g4.staging-old/reference/amu.u32"
+        self.binaries["amu"].write_bytes(f"amu-binary\0{stale}\0".encode())
+        row["binary_sha256"] = sha256_file(self.binaries["amu"])
+        self.write_manifest()
+        with self.assertRaisesRegex(
+            stage.VariantBuildError, "embedded reference path"
+        ):
             self.validate()
 
     def test_build_command_pins_policy_and_final_recorded_root(self):

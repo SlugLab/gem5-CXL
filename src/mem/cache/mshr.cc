@@ -428,8 +428,11 @@ MSHR::handleSnoop(PacketPtr pkt, Counter _order)
     // when we snoop packets the needsWritable and isInvalidate flags
     // should always be the same, however, this assumes that we never
     // snoop writes as they are currently not marked as invalidations
+    const bool spm_fragment_write =
+        pkt->req->isSpmAccess() && pkt->cmd == MemCmd::WriteReq;
     panic_if((pkt->needsWritable() != pkt->isInvalidate()) &&
-             !pkt->req->isCacheMaintenance(),
+             !pkt->req->isCacheMaintenance() &&
+             !spm_fragment_write,
              "%s got snoop %s where needsWritable, "
              "does not match isInvalidate", name(), pkt->print());
 

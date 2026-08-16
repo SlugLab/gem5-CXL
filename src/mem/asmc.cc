@@ -126,9 +126,8 @@ ASMC::ASMC(const Params &p)
       completionPublishLatency(p.completion_publish_latency),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
-      granularity(p.default_granularity ? p.default_granularity : 1),
-      maxOutstanding(p.max_outstanding),
-      configuredLatency(p.asmc_latency),
+      defaultConfig({p.default_granularity ? p.default_granularity : 1,
+                     p.max_outstanding, p.asmc_latency}),
       farSendEvent([this] { tryFarSend(); }, name() + ".far_send"),
       stats(*this, p.port_spm_side_ports_connection_count)
 {
@@ -219,6 +218,21 @@ uint64_t
 ASMC::issueAstore(ThreadContext *tc, Addr spm_addr, Addr mem_addr)
 {
     return issue(tc, ReqType::Store, spm_addr, mem_addr);
+}
+
+ASMC::ThreadConfig &
+ASMC::configFor(ThreadContext *tc)
+{
+    panic_if(!tc, "ASMC configuration requires a thread context");
+    return threadConfigs.try_emplace(tc, defaultConfig).first->second;
+}
+
+const ASMC::ThreadConfig &
+ASMC::configFor(ThreadContext *tc) const
+{
+    panic_if(!tc, "ASMC configuration requires a thread context");
+    const auto it = threadConfigs.find(tc);
+    return it == threadConfigs.end() ? defaultConfig : it->second;
 }
 
 bool
@@ -382,8 +396,9 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
         return 0;
     }
     const unsigned target_core = static_cast<unsigned>(context);
+    ThreadConfig &config = configFor(tc);
 
-    if (outstanding.size() >= maxOutstanding) {
+    if (outstandingPerThread[tc] >= config.maxOutstanding) {
         ++stats.rejectedQueueFull;
         return 0;
     }
@@ -393,7 +408,7 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
         return 0;
     }
 
-    if (spmUsed + granularity > spmSize) {
+    if (spmUsed + config.granularity > spmSize) {
         ++stats.rejectedSpmFull;
         return 0;
     }
@@ -401,7 +416,8 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     std::vector<TranslationChunk> memory_chunks;
     const auto memory_mode = type == ReqType::Load ?
         BaseMMU::Read : BaseMMU::Write;
-    if (!translate(tc, mem_addr, granularity, memory_mode, memory_chunks)) {
+    if (!translate(tc, mem_addr, config.granularity, memory_mode,
+                   memory_chunks)) {
         ++stats.translationFaults;
         return 0;
     }
@@ -409,7 +425,7 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     std::vector<TranslationChunk> spm_chunks;
     const auto spm_mode = type == ReqType::Load ?
         BaseMMU::Write : BaseMMU::Read;
-    if (!translate(tc, spm_addr, granularity, spm_mode, spm_chunks)) {
+    if (!translate(tc, spm_addr, config.granularity, spm_mode, spm_chunks)) {
         ++stats.translationFaults;
         return 0;
     }
@@ -439,9 +455,10 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     state->tc = tc;
     state->spmAddr = spm_addr;
     state->memAddr = mem_addr;
-    state->size = granularity;
+    state->size = config.granularity;
+    state->configuredLatency = config.configuredLatency;
     state->issueTick = curTick();
-    state->data.resize(granularity);
+    state->data.resize(config.granularity);
     state->memoryChunks = std::move(memory_chunks);
     state->spmChunks = std::move(spm_chunks);
     state->reservedFarPackets = memory_packets;
@@ -450,6 +467,7 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     updateOccupancyIntegral();
     spmUsed += state->size;
     outstanding[id] = std::move(state);
+    ++outstandingPerThread[tc];
     stats.maxObservedOutstanding = std::max(
         outstanding.size(),
         static_cast<size_t>(stats.maxObservedOutstanding.value()));
@@ -477,7 +495,7 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
             type == ReqType::Load ? "aload" : "astore",
             static_cast<unsigned long long>(spm_addr),
             static_cast<unsigned long long>(mem_addr),
-            static_cast<unsigned long long>(granularity),
+            static_cast<unsigned long long>(config.granularity),
             outstanding[id]->memoryChunks.size());
 
     auto *event = new EventFunctionWrapper(
@@ -575,7 +593,7 @@ ASMC::finishCompletionService(uint64_t id)
                      static_cast<unsigned long long>(id)),
             true);
         schedule(event, curTick() + completionLatency +
-                        configuredLatency +
+                        state.configuredLatency +
                         cyclesToTicks(completionPublishLatency));
     }
 
@@ -759,11 +777,11 @@ ASMC::trySpmSend(PortID target_core)
             queue.pop_front();
         }
 
+        auto *sender_state =
+            dynamic_cast<PacketSenderState *>(pkt->senderState);
+        panic_if(!sender_state || sender_state->targetCore != target_core,
+                 "ASMC SPM packet/port ownership mismatch");
         if (spmSidePorts[target_core]->sendTimingReq(pkt)) {
-            auto *sender_state =
-                dynamic_cast<PacketSenderState *>(pkt->senderState);
-            panic_if(!sender_state || sender_state->targetCore != target_core,
-                     "ASMC SPM packet/port ownership mismatch");
             if (sender_state->read)
                 ++stats.spmReadPackets[target_core];
             else
@@ -822,19 +840,21 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
                      "ASMC invalid SPM acquire response for request %#llx",
                      static_cast<unsigned long long>(id));
 
-            PacketPtr writeback = new Packet(
-                pkt->req, MemCmd::WriteLineReq);
+            RequestPtr write_req = std::make_shared<Request>(
+                pkt->getAddr() + sender_state->fragmentOffset,
+                sender_state->fragmentSize, pkt->req->getFlags(),
+                pkt->req->requestorId());
+            write_req->taskId(context_switch_task_id::DMA);
+            PacketPtr writeback = new Packet(write_req, MemCmd::WriteReq);
             writeback->allocate();
-            std::memcpy(writeback->getPtr<uint8_t>(),
-                        pkt->getConstPtr<uint8_t>(), cacheLineSize);
             std::memcpy(
-                writeback->getPtr<uint8_t>() + sender_state->fragmentOffset,
+                writeback->getPtr<uint8_t>(),
                 state.data.data() + sender_state->byteOffset,
                 sender_state->fragmentSize);
             writeback->senderState = new PacketSenderState(
                 id, RequestPhase::SpmWriteback, target_core,
-                sender_state->byteOffset, cacheLineSize, false,
-                sender_state->fragmentOffset,
+                sender_state->byteOffset, sender_state->fragmentSize, false,
+                0,
                 sender_state->fragmentSize);
             state.spmWritebacks.push_back(writeback);
             state.pendingPackets--;
@@ -893,7 +913,7 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
                              static_cast<unsigned long long>(id)),
                     true);
                 schedule(event, curTick() + completionLatency +
-                                configuredLatency +
+                                state.configuredLatency +
                                 cyclesToTicks(completionPublishLatency));
             }
         }
@@ -964,6 +984,11 @@ ASMC::completeRequest(uint64_t id)
             static_cast<unsigned long long>(curTick() - state.issueTick));
 
     updateOccupancyIntegral();
+    auto count = outstandingPerThread.find(tc);
+    panic_if(count == outstandingPerThread.end() || count->second == 0,
+             "ASMC per-thread outstanding accounting underflow");
+    if (--count->second == 0)
+        outstandingPerThread.erase(count);
     outstanding.erase(it);
 
     constexpr size_t completionWakeBatch = 4;
@@ -994,8 +1019,11 @@ ASMC::getFinished(ThreadContext *tc)
     auto &queue = finished[tc];
     if (queue.empty()) {
         ++stats.emptyGetfinPolls;
-        if (!outstanding.empty() && !pollWaitStart.count(tc))
+        const auto pending = outstandingPerThread.find(tc);
+        if (pending != outstandingPerThread.end() &&
+            pending->second != 0 && !pollWaitStart.count(tc)) {
             pollWaitStart[tc] = curTick();
+        }
         return 0;
     }
 
@@ -1032,15 +1060,16 @@ ASMC::quiesceUntilCompletion(ThreadContext *tc)
 uint64_t
 ASMC::cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value)
 {
+    ThreadConfig &config = configFor(tc);
     switch (reg) {
       case 0:
-        granularity = value ? value : 1;
+        config.granularity = value ? value : 1;
         return 1;
       case 1:
-        maxOutstanding = value;
+        config.maxOutstanding = value;
         return 1;
       case 2:
-        configuredLatency = value * sim_clock::as_int::ns;
+        config.configuredLatency = value * sim_clock::as_int::ns;
         return 1;
       case 3:
         reset();
@@ -1053,15 +1082,18 @@ ASMC::cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value)
 uint64_t
 ASMC::cfgRead(ThreadContext *tc, uint64_t reg) const
 {
+    const ThreadConfig &config = configFor(tc);
     switch (reg) {
       case 0:
-        return granularity;
+        return config.granularity;
       case 1:
-        return maxOutstanding;
+        return config.maxOutstanding;
       case 2:
-        return configuredLatency / sim_clock::as_int::ns;
-      case 3:
-        return outstanding.size();
+        return config.configuredLatency / sim_clock::as_int::ns;
+      case 3: {
+        const auto it = outstandingPerThread.find(tc);
+        return it == outstandingPerThread.end() ? 0 : it->second;
+      }
       case 4: {
         const auto it = finished.find(tc);
         return it == finished.end() ? 0 : it->second.size();
@@ -1122,6 +1154,7 @@ ASMC::reset()
         state->spmWritebacks.clear();
     }
     outstanding.clear();
+    outstandingPerThread.clear();
     finished.clear();
     for (ThreadContext *tc : completionWaiters)
         tc->activate();

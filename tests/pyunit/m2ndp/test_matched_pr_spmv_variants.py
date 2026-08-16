@@ -15,6 +15,19 @@ FIXED_SOURCE = REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
 
 
 class MatchedVariantSourceTest(unittest.TestCase):
+    def test_recorded_root_is_embedded_before_compilation(self):
+        source = (
+            REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("embedded_reference_raw=", source)
+        self.assertIn("recorded_reference_dir", source)
+        self.assertIn(
+            "write_experiment_header(\n"
+            "        generated_dir / \"m2ndp_experiment_config.h\",\n"
+            "        embedded_reference_raw",
+            source,
+        )
+
     def test_rebase_manifest_paths_records_final_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

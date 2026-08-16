@@ -924,10 +924,14 @@ def append_kind_args(cmd, args, kind):
         raise ValueError(kind)
 
 
+CHECKPOINT_SAVE_CONTRACT = "atomic-local-nocache-no-asmc-v2"
+
+
 def checkpoint_model_parameters(args, kind):
     parameters = {
         "kind": kind,
         "env": "\0".join(args.env),
+        "checkpoint_save_contract": CHECKPOINT_SAVE_CONTRACT,
     }
     if kind == "amu":
         parameters.update(
@@ -1015,6 +1019,28 @@ def checkpoint_common_command(
     ]
 
 
+def checkpoint_save_command(
+    args, *, binary, workload_arguments, temporary
+):
+    command = checkpoint_common_command(
+        args,
+        binary=binary,
+        workload_arguments=workload_arguments,
+        outdir=temporary / "gem5-out",
+        cpu="atomic",
+        link_delay="0ns",
+    )
+    command += [
+        "--checkpoint-save", str(temporary),
+        # Checkpoint before trial 0 with an empty, mechanism-neutral cache
+        # topology. AMU/CIRA are instantiated only in the timing restore.
+        "--no-asmc",
+    ]
+    for env in args.env:
+        command += ["--env", env]
+    return command
+
+
 def checkpoint_identity(args, binary, kind, workload_arguments):
     return build_identity(
         binary=binary,
@@ -1043,18 +1069,12 @@ def ensure_checkpoint(args, binary, kind, run_dir, workload_arguments):
         temporary = (
             args.checkpoint_root / f".{checkpoint_id}.tmp-dry-run"
         )
-        save_cmd = checkpoint_common_command(
+        save_cmd = checkpoint_save_command(
             args,
             binary=binary,
             workload_arguments=workload_arguments,
-            outdir=temporary / "gem5-out",
-            cpu="atomic",
-            link_delay="0ns",
+            temporary=temporary,
         )
-        save_cmd += ["--checkpoint-save", str(temporary)]
-        append_kind_args(save_cmd, args, kind)
-        for env in args.env:
-            save_cmd += ["--env", env]
         print(" ".join(save_cmd), flush=True)
         return checkpoint_dir, manifest_path, identity, checkpoint_id
 
@@ -1074,18 +1094,12 @@ def ensure_checkpoint(args, binary, kind, run_dir, workload_arguments):
         )
     )
     save_log = temporary / "checkpoint.log"
-    save_cmd = checkpoint_common_command(
+    save_cmd = checkpoint_save_command(
         args,
         binary=binary,
         workload_arguments=workload_arguments,
-        outdir=temporary / "gem5-out",
-        cpu="atomic",
-        link_delay="0ns",
+        temporary=temporary,
     )
-    save_cmd += ["--checkpoint-save", str(temporary)]
-    append_kind_args(save_cmd, args, kind)
-    for env in args.env:
-        save_cmd += ["--env", env]
     print(" ".join(save_cmd), flush=True)
     try:
         with save_log.open("w") as log:
