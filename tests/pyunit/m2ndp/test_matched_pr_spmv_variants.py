@@ -100,36 +100,32 @@ class MatchedVariantSourceTest(unittest.TestCase):
         )
         self.assertNotIn("schedule(dynamic, 16384)", source)
 
-    def test_amu_rolls_loads_but_commits_float_adds_in_csr_order(self):
+    def test_amu_line_pipeline_commits_float_adds_in_csr_order(self):
         generated = variants.transform_source(
             FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
         )
 
-        node_bounds = generated.index(
-            "AMU_INVALID_NODE node=%lld num_nodes=%lld"
-        )
-        score_submit = generated.index(
-            "score_window.submit(&outgoing_contrib[node])"
-        )
-        node_submit = generated.index("node_window.submit(&*v_it)")
-        drain_nodes = generated.index("while (!node_window.empty())")
-        drain_scores = generated.index("while (!score_window.empty())")
-        self.assertLess(node_bounds, score_submit)
-        self.assertNotIn("return;", generated[node_bounds:score_submit])
-        self.assertLess(node_submit, drain_nodes)
-        self.assertLess(drain_nodes, drain_scores)
-        self.assertEqual(generated.count("node_window.consume_next()"), 2)
+        self.assertIn("gapbs_amu::thread_store().begin_trial()", generated)
+        self.assertIn("gapbs_amu::thread_store().reset_iteration()", generated)
+        self.assertIn("gapbs_amu::LineBatch<", generated)
+        self.assertIn("current_batch.issue_all()", generated)
+        self.assertIn("current_batch.wait_all()", generated)
         self.assertEqual(
             generated.count(
-                "incoming_total = incoming_total + score_window.consume_next()"
+                "incoming_total = incoming_total + "
+                "current_batch.value<ScoreT>(score_slots[i])"
             ),
-            2,
+            1,
         )
         self.assertIn("constexpr int kPageRankIterations = 20;", generated)
-        self.assertIn("gapbs_amu::AsyncWindow<NodeID>", generated)
-        self.assertIn("gapbs_amu::AsyncWindow<ScoreT>", generated)
+        self.assertNotIn("gapbs_amu::AsyncWindow", generated)
         self.assertNotIn("gapbs_amu::load_values(", generated)
         self.assertNotIn("gapbs_amu::load_value(", generated)
+        self.assertNotIn("incoming_total +=", generated)
+
+        work_end = generated.index("m5_work_end(trial, 0)")
+        report = generated.index("gapbs_amu::report_trial(trial)")
+        self.assertLess(work_end, report)
 
     def test_amu_has_no_variant_only_trial_zero_priming(self):
         generated = variants.transform_source(

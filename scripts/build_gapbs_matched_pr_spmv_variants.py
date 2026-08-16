@@ -49,31 +49,75 @@ _PULL_LOOP = (
 )
 _AMU_PULL_LOOP = (
     "      auto neigh = g.in_neigh(u);\n"
-    "      gapbs_amu::AsyncWindow<NodeID> node_window;\n"
-    "      gapbs_amu::AsyncWindow<ScoreT> score_window;\n"
-    "      auto submit_score = [&](NodeID node) {\n"
-    "        if (static_cast<uint64_t>(node) >=\n"
-    "              static_cast<uint64_t>(g.num_nodes())) {\n"
-    "          std::fprintf(stderr,\n"
-    "                       \"AMU_INVALID_NODE node=%lld num_nodes=%lld\\n\",\n"
-    "                       static_cast<long long>(node),\n"
-    "                       static_cast<long long>(g.num_nodes()));\n"
+    "      auto v_it = neigh.begin();\n"
+    "      NodeID current_nodes[GAPBS_AMU_BATCH_SIZE];\n"
+    "      NodeID next_nodes[GAPBS_AMU_BATCH_SIZE];\n"
+    "      size_t current_node_slots[GAPBS_AMU_BATCH_SIZE];\n"
+    "      size_t next_node_slots[GAPBS_AMU_BATCH_SIZE];\n"
+    "      size_t score_slots[GAPBS_AMU_BATCH_SIZE];\n"
+    "      size_t current_count = 0;\n"
+    "      size_t next_count = 0;\n"
+    "      gapbs_amu::LineBatch<gapbs_amu::Gem5LineBackend> initial_batch(\n"
+    "          gapbs_amu::thread_store());\n"
+    "      for (; v_it != neigh.end() &&\n"
+    "             current_count < GAPBS_AMU_BATCH_SIZE; ++v_it)\n"
+    "        current_node_slots[current_count++] = initial_batch.add(&*v_it);\n"
+    "      initial_batch.issue_all();\n"
+    "      initial_batch.wait_all();\n"
+    "      for (size_t i = 0; i < current_count; ++i) {\n"
+    "        current_nodes[i] =\n"
+    "            initial_batch.value<NodeID>(current_node_slots[i]);\n"
+    "        if (static_cast<uint64_t>(current_nodes[i]) >=\n"
+    "            static_cast<uint64_t>(g.num_nodes()))\n"
     "          m5_fail(0, 2);\n"
-    "          node = 0;\n"
-    "        }\n"
-    "        if (score_window.full())\n"
-    "          incoming_total = incoming_total + score_window.consume_next();\n"
-    "        score_window.submit(&outgoing_contrib[node]);\n"
-    "      };\n"
-    "      for (auto v_it = neigh.begin(); v_it != neigh.end(); ++v_it) {\n"
-    "        if (node_window.full())\n"
-    "          submit_score(node_window.consume_next());\n"
-    "        node_window.submit(&*v_it);\n"
     "      }\n"
-    "      while (!node_window.empty())\n"
-    "        submit_score(node_window.consume_next());\n"
-    "      while (!score_window.empty())\n"
-    "        incoming_total = incoming_total + score_window.consume_next();"
+    "      while (current_count != 0) {\n"
+    "        gapbs_amu::LineBatch<gapbs_amu::Gem5LineBackend> current_batch(\n"
+    "            gapbs_amu::thread_store());\n"
+    "        for (size_t i = 0; i < current_count; ++i)\n"
+    "          score_slots[i] = current_batch.add(\n"
+    "              &outgoing_contrib[current_nodes[i]]);\n"
+    "        for (; v_it != neigh.end() &&\n"
+    "               next_count < GAPBS_AMU_BATCH_SIZE; ++v_it)\n"
+    "          next_node_slots[next_count++] = current_batch.add(&*v_it);\n"
+    "        current_batch.issue_all();\n"
+    "        current_batch.wait_all();\n"
+    "        for (size_t i = 0; i < current_count; ++i)\n"
+    "          incoming_total = incoming_total + current_batch.value<ScoreT>(score_slots[i]);\n"
+    "        for (size_t i = 0; i < next_count; ++i) {\n"
+    "          next_nodes[i] =\n"
+    "              current_batch.value<NodeID>(next_node_slots[i]);\n"
+    "          if (static_cast<uint64_t>(next_nodes[i]) >=\n"
+    "              static_cast<uint64_t>(g.num_nodes()))\n"
+    "            m5_fail(0, 2);\n"
+    "        }\n"
+    "        current_batch.clear();\n"
+    "        for (size_t i = 0; i < next_count; ++i)\n"
+    "          current_nodes[i] = next_nodes[i];\n"
+    "        current_count = next_count;\n"
+    "        next_count = 0;\n"
+    "      }"
+)
+
+_AMU_INIT_LOOP = (
+    "#pragma omp parallel\n"
+    "  {\n"
+    "    gapbs_amu::thread_store().begin_trial();\n"
+    "#pragma omp for\n"
+    "    for (NodeID node = 0; node < g.num_nodes(); ++node)\n"
+    "      scores[node] = init_score;\n"
+    "  }"
+)
+
+_AMU_ITERATION_BEGIN = (
+    "  for (int iteration = 0; iteration < kPageRankIterations; ++iteration) {\n"
+    "#pragma omp parallel\n"
+    "    {\n"
+    "      gapbs_amu::thread_store().reset_iteration();\n"
+    "#pragma omp for\n"
+    "      for (NodeID node = 0; node < g.num_nodes(); ++node)\n"
+    "        outgoing_contrib[node] = scores[node] / g.out_degree(node);\n"
+    "#pragma omp for schedule(static)"
 )
 _CIRA_PULL_LOOP = (
     "      NodeID pf_begin, pf_count;\n"
@@ -141,6 +185,53 @@ def transform_source(source, kind):
         _AMU_PULL_LOOP if kind == "amu" else _CIRA_PULL_LOOP,
         1,
     )
+    if kind == "amu":
+        init_loop = (
+            "#pragma omp parallel for\n"
+            "  for (NodeID node = 0; node < g.num_nodes(); ++node)\n"
+            "    scores[node] = init_score;"
+        )
+        iteration_begin = (
+            "  for (int iteration = 0; iteration < kPageRankIterations; "
+            "++iteration) {\n"
+            "#pragma omp parallel for\n"
+            "    for (NodeID node = 0; node < g.num_nodes(); ++node)\n"
+            "      outgoing_contrib[node] = scores[node] / g.out_degree(node);\n"
+            "#pragma omp parallel for schedule(static)"
+        )
+        iteration_end = (
+            "      scores[u] = base_score + product;\n"
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        if transformed.count(init_loop) != 1:
+            raise VariantEvidenceError("fixed source init loop differs")
+        if transformed.count(iteration_begin) != 1:
+            raise VariantEvidenceError("fixed source iteration loop differs")
+        if transformed.count(iteration_end) != 1:
+            raise VariantEvidenceError("fixed source iteration end differs")
+        transformed = transformed.replace(init_loop, _AMU_INIT_LOOP, 1)
+        transformed = transformed.replace(
+            iteration_begin, _AMU_ITERATION_BEGIN, 1
+        )
+        transformed = transformed.replace(
+            iteration_end,
+            "      scores[u] = base_score + product;\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}",
+            1,
+        )
+        work_end = "    m5_work_end(trial, 0);"
+        if transformed.count(work_end) != 1:
+            raise VariantEvidenceError("fixed source work-end marker differs")
+        transformed = transformed.replace(
+            work_end,
+            work_end + "\n    gapbs_amu::report_trial(trial);",
+            1,
+        )
     return transformed
 
 

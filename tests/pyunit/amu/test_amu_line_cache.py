@@ -154,6 +154,37 @@ static int success_cases() {
     require(reversed.value<uint32_t>(second) == 0x99aabbcc,
             "reverse completion changed second value");
   }
+
+  alignas(64) unsigned char float_source[3 * 64] = {};
+  const float ordered_values[] = {1.0e20f, -1.0e20f, 3.25f};
+  for (size_t index = 0; index < 3; ++index)
+    memcpy(float_source + index * 64, &ordered_values[index], sizeof(float));
+  float scalar_total = 0.0f;
+  for (size_t index = 0; index < 3; ++index)
+    scalar_total = scalar_total + ordered_values[index];
+
+  FakeBackend float_backend;
+  float_backend.reverse = true;
+  gapbs_amu::LineStore<FakeBackend> float_store(float_backend);
+  gapbs_amu::LineBatch<FakeBackend> float_batch(float_store);
+  size_t float_slots[3];
+  for (size_t index = 0; index < 3; ++index) {
+    float_slots[index] = float_batch.add(
+        reinterpret_cast<const float *>(float_source + index * 64));
+  }
+  float_batch.issue_all();
+  float_batch.wait_all();
+  float pipeline_total = 0.0f;
+  for (size_t index = 0; index < 3; ++index) {
+    pipeline_total = pipeline_total +
+        float_batch.value<float>(float_slots[index]);
+  }
+  uint32_t scalar_bits = 0;
+  uint32_t pipeline_bits = 0;
+  memcpy(&scalar_bits, &scalar_total, sizeof(scalar_bits));
+  memcpy(&pipeline_bits, &pipeline_total, sizeof(pipeline_bits));
+  require(scalar_bits == pipeline_bits,
+          "reverse completion changed float accumulation bits");
   return 0;
 }
 
