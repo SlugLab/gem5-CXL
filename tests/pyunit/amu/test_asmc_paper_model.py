@@ -307,14 +307,19 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("amu_getfin", consume)
         self.assertIn("head_", consume)
 
-    def test_matched_pr_uses_two_rolling_windows_in_program_order(self):
+    def test_matched_pr_uses_ordered_line_batches(self):
         loop = MATCHED[
             MATCHED.index("_AMU_PULL_LOOP") : MATCHED.index("_CIRA_PULL_LOOP")
         ]
-        self.assertIn("AsyncWindow<NodeID> node_window", loop)
-        self.assertIn("AsyncWindow<ScoreT> score_window", loop)
-        self.assertIn("score_window.submit", loop)
-        self.assertIn("score_window.consume_next()", loop)
+        self.assertIn("LineBatch<gapbs_amu::Gem5LineBackend> initial_batch", loop)
+        self.assertIn("LineBatch<gapbs_amu::Gem5LineBackend> current_batch", loop)
+        self.assertLess(loop.index("current_batch.issue_all()"),
+                        loop.index("current_batch.wait_all()"))
+        self.assertIn(
+            "incoming_total = incoming_total + current_batch.value<ScoreT>",
+            loop,
+        )
+        self.assertNotIn("AsyncWindow", loop)
         self.assertNotIn("load_values", loop)
         self.assertNotIn("load_value", loop)
 

@@ -79,6 +79,8 @@ FIELDNAMES = (
     "amu_pdf_doi", "amu_pdf_sha256", "cira_csv_sha256",
     "measured_cycles", "core_period_seconds", *REAL_CXL_FIELDS,
     "asmc_loads", "asmc_completed", "cira_prefetches", "cira_completed",
+    "amu_logical_values", "amu_line_requests", "amu_line_cache_hits",
+    "amu_coalesced_misses",
     "cira_indexed_prefetches", "cira_csr_prefetches",
     "cira_issued_per_core", "cira_completed_per_core", "cira_csr_per_core",
     "cira_rejected_queue_full", "cira_dropped_csr_descriptors",
@@ -496,7 +498,9 @@ def collect_rows(sweep_root):
             typed = dict(source_row)
             for field in ("scale", "iterations", "measured_trial", "cores",
                           "checkpoint_restores", "sim_ticks", "asmc_loads",
-                          "asmc_completed", "cira_prefetches", "cira_completed",
+                          "asmc_completed", "amu_logical_values",
+                          "amu_line_requests", "amu_line_cache_hits",
+                          "amu_coalesced_misses", "cira_prefetches", "cira_completed",
                           "cira_indexed_prefetches", "cira_csr_prefetches"):
                 typed[field] = int(typed.get(field, 0))
             typed["all_memory_cxl"] = source_row.get("all_memory_cxl") == "True"
@@ -517,6 +521,8 @@ def collect_rows(sweep_root):
                     ),
                 )
             for field in ("asmc_loads", "asmc_completed", "cira_prefetches",
+                          "amu_logical_values", "amu_line_requests",
+                          "amu_line_cache_hits", "amu_coalesced_misses",
                           "cira_completed", "cira_indexed_prefetches",
                           "cira_csr_prefetches", "cira_issued_per_core",
                           "cira_completed_per_core", "cira_csr_per_core",
