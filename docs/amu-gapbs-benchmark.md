@@ -523,7 +523,33 @@ systemd-run --unit=cira-amu-m2ndp-pr-scaling-formal --collect \
   --timeout 0
 ```
 
-Only `run/complete.json` with exactly 16 passed points is publishable:
+AMU/CIRA binaries are not a manually populated prerequisite. After each
+scale's Vanilla point passes, the runner builds that scale's matched variants
+with the PGO-selected CIRA policy, a 1000 ns policy latency, and a row batch of
+64. It stages the build in a unique sibling directory, validates the baseline,
+calibration, binary hashes, recorded final paths, and policy metadata, and only
+then atomically publishes `builds/g<scale>/`. `state.json` records the build
+inputs, outputs, command, and log independently from simulator timing.
+
+To resume the existing evidence root, use the identical command and append
+`--resume`; retain the pinned `PATH` above. The only automatic code-version
+migration accepts the exact historical state with only `g4:vanilla` passed,
+recomputes and revalidates that point, requires that no scale-local variant has
+already been published, and records `resume_lineage`. Any other state or code
+drift fails closed and requires a new evidence root.
+
+Correctness and performance are separate terminal gates. All 16 points must
+first pass bit-exact and mechanism checks. The runner then recomputes each of
+the 12 accelerator speedups from the matched absolute Vanilla and accelerator
+latencies. The inclusive acceptance interval is `1.4 <= speedup <= 1.6`. A
+correctness/runtime failure writes `failed.json` and returns failure. If every
+point is correct but any speedup is outside the interval, the runner preserves
+all real measurements in `performance-hold.json`, names every offender, does
+not write `complete.json`, and returns success as an expected terminal hold.
+Do not tune, clamp, omit, or publish held measurements.
+
+Only `run/complete.json` with exactly 16 passed points and a passed performance
+gate is publishable:
 
 ```sh
 python3 scripts/generate_pr_scaling_artifacts.py \
