@@ -24,6 +24,8 @@ SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
 ACCELERATORS = ("amu", "cira", "m2ndp")
 PROFILE = "pr-scaling-4thread-1us"
 TICKS_PER_SECOND = Decimal(10**12)
+MIN_ACCELERATOR_SPEEDUP = Decimal("1.4")
+MAX_ACCELERATOR_SPEEDUP = Decimal("1.6")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -138,6 +140,10 @@ def load_data(path):
         or value.get("profile") != PROFILE
     ):
         raise ArtifactError("scaling evidence is not complete formal data")
+    if value.get("performance_gate") != {
+        "status": "passed", "offenders": []
+    }:
+        raise ArtifactError("scaling evidence performance gate did not pass")
     for field in (
         "graph_set_sha256",
         "g20_graph_sha256",
@@ -200,6 +206,14 @@ def load_data(path):
                 f"g{scale}:{system} latency",
             )
             speedup = baseline_seconds / seconds
+            if system != "vanilla" and not (
+                MIN_ACCELERATOR_SPEEDUP
+                <= speedup
+                <= MAX_ACCELERATOR_SPEEDUP
+            ):
+                raise ArtifactError(
+                    f"g{scale}:{system} performance gate did not pass"
+                )
             stored = _decimal(
                 point.get("speedup"), f"g{scale}:{system} stored speedup"
             )

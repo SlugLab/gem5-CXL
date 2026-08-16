@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -156,6 +157,34 @@ class ScalingRunnerTest(unittest.TestCase):
             **scaling._point_measurement(entry, self.options),
         )
         return legacy
+
+    def complete_state_with_overrides(self, overrides=None):
+        state = scaling.new_state(self.options)
+        overrides = overrides or {}
+        for scale in scaling.SCALES:
+            desired = {
+                system: Decimal(overrides.get(f"g{scale}:{system}", "1.5"))
+                for system in scaling.SYSTEMS
+                if system != "vanilla"
+            }
+            baseline = Decimal(1)
+            for speedup in desired.values():
+                baseline *= speedup
+            for system in scaling.SYSTEMS:
+                entry = scaling.MatrixEntry(scale, system)
+                seconds = (
+                    baseline if system == "vanilla"
+                    else baseline / desired[system]
+                )
+                scaling.record_pass(
+                    state,
+                    entry,
+                    {"summary": sha(entry.key)},
+                    latency_seconds=str(seconds),
+                    output_elements=1 << entry.scale,
+                    mechanism={"verification": "pass"},
+                )
+        return state
 
     def test_matrix_is_four_scales_by_four_systems_at_1us(self):
         matrix = scaling.build_matrix()
@@ -386,6 +415,68 @@ class ScalingRunnerTest(unittest.TestCase):
         )
         self.assertTrue(scaling.is_complete(state))
         self.assertEqual(state["points"]["g20:m2ndp"]["speedup"], "1")
+
+    def test_performance_gate_accepts_exact_boundaries(self):
+        overrides = {}
+        for index, entry in enumerate(
+            row for row in scaling.build_matrix()
+            if row.system != "vanilla"
+        ):
+            overrides[entry.key] = "1.4" if index % 2 == 0 else "1.6"
+        state = self.complete_state_with_overrides(overrides)
+        self.assertEqual(
+            scaling.evaluate_performance_gate(state),
+            {"status": "passed", "offenders": []},
+        )
+
+    def test_performance_gate_reports_all_out_of_range_points(self):
+        state = self.complete_state_with_overrides({
+            "g4:amu": "1.399999",
+            "g20:m2ndp": "1.600001",
+        })
+        result = scaling.evaluate_performance_gate(state)
+        self.assertEqual(result["status"], "hold")
+        self.assertEqual(
+            {(row["point"], row["speedup"]) for row in result["offenders"]},
+            {("g4:amu", "1.399999"), ("g20:m2ndp", "1.600001")},
+        )
+
+    def test_performance_hold_is_successful_terminal_not_complete(self):
+        state = self.complete_state_with_overrides({"g4:amu": "1.39"})
+        state_path = self.options.root / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+        failed = self.options.root / "failed.json"
+        failed.write_text('{"status":"failed"}\n', encoding="utf-8")
+        self.options.resume = True
+
+        def outputs(entry, _options):
+            return state["points"][entry.key]["outputs"]
+
+        def measurement(entry, _options):
+            point = state["points"][entry.key]
+            return {
+                "latency_seconds": point["latency_seconds"],
+                "output_elements": point["output_elements"],
+                "mechanism": point["mechanism"],
+            }
+
+        with (
+            mock.patch.object(scaling, "parse_args", return_value=self.options),
+            mock.patch.object(scaling, "_point_outputs", side_effect=outputs),
+            mock.patch.object(
+                scaling, "_point_measurement", side_effect=measurement
+            ),
+        ):
+            self.assertEqual(scaling.main([]), 0)
+
+        held = json.loads(
+            (self.options.root / "performance-hold.json").read_text()
+        )
+        self.assertEqual(held["status"], "performance_hold")
+        self.assertEqual(len(held["points"]), 16)
+        self.assertFalse((self.options.root / "complete.json").exists())
+        self.assertFalse(failed.exists())
 
     def test_record_pass_recomputes_speedup_from_absolute_seconds(self):
         state = scaling.new_state(self.options)

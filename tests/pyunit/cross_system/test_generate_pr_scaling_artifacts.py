@@ -30,12 +30,12 @@ class PrScalingArtifactTest(unittest.TestCase):
         for scale in SCALES:
             vanilla = Decimal(scale * 12)
             for index, system in enumerate(SYSTEMS):
-                divisor = Decimal(1 if system == "vanilla" else index + 1)
+                divisor = Decimal("1" if system == "vanilla" else "1.5")
                 latency = vanilla / divisor
                 mechanism = {"verification": "pass"}
                 if system == "m2ndp":
                     mechanism.update(
-                        ndpsim_measured_cycles=str(scale * 300),
+                        ndpsim_measured_cycles=str(scale * 800),
                         ndpsim_core_period_seconds="0.01",
                     )
                 else:
@@ -70,6 +70,9 @@ class PrScalingArtifactTest(unittest.TestCase):
                     "code_sha256": sha("code"),
                     "gem5_sha256": sha("gem5"),
                     "config_sha256": sha("config"),
+                    "performance_gate": {
+                        "status": "passed", "offenders": []
+                    },
                     "points": points,
                 },
                 sort_keys=True,
@@ -81,10 +84,26 @@ class PrScalingArtifactTest(unittest.TestCase):
     def test_load_recomputes_speedup_and_native_counts(self):
         data = artifacts.load_data(self.complete)
         rows = {(row.scale, row.system): row for row in data.rows}
-        self.assertEqual(rows[(20, "amu")].speedup, Decimal("2"))
+        self.assertEqual(rows[(20, "amu")].speedup, Decimal("1.5"))
         self.assertEqual(rows[(20, "amu")].native_time_kind, "gem5_ticks")
         self.assertEqual(rows[(20, "m2ndp")].native_time_kind, "ndpsim_cycles")
-        self.assertEqual(rows[(20, "m2ndp")].native_time_count, 6000)
+        self.assertEqual(rows[(20, "m2ndp")].native_time_count, 16000)
+
+    def test_rejects_performance_hold_or_unpassed_gate(self):
+        value = json.loads(self.complete.read_text())
+        value["status"] = "performance_hold"
+        value["performance_gate"] = {
+            "status": "hold",
+            "offenders": [{"point": "g4:amu", "speedup": "1.39"}],
+        }
+        self.complete.write_text(json.dumps(value))
+        with self.assertRaisesRegex(artifacts.ArtifactError, "complete|gate"):
+            artifacts.load_data(self.complete)
+
+        value["status"] = "complete"
+        self.complete.write_text(json.dumps(value))
+        with self.assertRaisesRegex(artifacts.ArtifactError, "gate"):
+            artifacts.load_data(self.complete)
 
     def test_rejects_incomplete_or_unverified_matrix(self):
         original = json.loads(self.complete.read_text())

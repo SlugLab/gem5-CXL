@@ -30,6 +30,8 @@ REPO = Path(__file__).resolve().parents[1]
 PROFILE = "pr-scaling-4thread-1us"
 SCALES = (4, 12, 14, 20)
 SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
+MIN_ACCELERATOR_SPEEDUP = Decimal("1.4")
+MAX_ACCELERATOR_SPEEDUP = Decimal("1.6")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PRE_LAZY_VARIANT_CODE_SHA256 = (
     "438735b038266173d5337d86db3fdbcf26321794336f8af52180081ef08f94d3"
@@ -571,6 +573,50 @@ def is_complete(state):
     )
 
 
+def evaluate_performance_gate(state):
+    if not is_complete(state):
+        raise ScalingError(
+            "performance gate requires 16/16 correctness-passed points"
+        )
+    offenders = []
+    for scale in SCALES:
+        baseline = _positive_decimal_value(
+            state["points"][f"g{scale}:vanilla"].get("latency_seconds"),
+            f"g{scale} Vanilla latency seconds",
+        )
+        for system in SYSTEMS:
+            if system == "vanilla":
+                continue
+            key = f"g{scale}:{system}"
+            point = state["points"][key]
+            seconds = _positive_decimal_value(
+                point.get("latency_seconds"), f"{key} latency seconds"
+            )
+            speedup = baseline / seconds
+            stored = _positive_decimal_value(
+                point.get("speedup"), f"{key} stored speedup"
+            )
+            if stored != speedup:
+                raise ScalingError(f"{key} stored speedup differs")
+            if not (
+                MIN_ACCELERATOR_SPEEDUP
+                <= speedup
+                <= MAX_ACCELERATOR_SPEEDUP
+            ):
+                offenders.append({
+                    "point": key,
+                    "scale": scale,
+                    "system": system,
+                    "speedup": str(speedup),
+                    "minimum": str(MIN_ACCELERATOR_SPEEDUP),
+                    "maximum": str(MAX_ACCELERATOR_SPEEDUP),
+                })
+    return {
+        "status": "hold" if offenders else "passed",
+        "offenders": offenders,
+    }
+
+
 def migrate_pre_lazy_variant_state(state, expected, options):
     """Migrate only the exact, validated one-point pre-variant state."""
     if state.get("code_sha256") != PRE_LAZY_VARIANT_CODE_SHA256:
@@ -773,6 +819,9 @@ def main(argv=None):
     state_path = Path(options.root).resolve() / "state.json"
     complete_path = Path(options.root).resolve() / "complete.json"
     failed_path = Path(options.root).resolve() / "failed.json"
+    performance_hold_path = (
+        Path(options.root).resolve() / "performance-hold.json"
+    )
     try:
         load_inputs(options.inputs)
         if options.timeout < 0:
@@ -847,9 +896,23 @@ def main(argv=None):
             contract.atomic_write_json(state_path, state)
         if not is_complete(state):
             raise ScalingError("scaling state stopped before 16/16 passed")
+        gate = evaluate_performance_gate(state)
+        state["performance_gate"] = gate
+        if gate["status"] == "hold":
+            state["status"] = "performance_hold"
+            contract.atomic_write_json(state_path, state)
+            contract.atomic_write_json(performance_hold_path, state)
+            complete_path.unlink(missing_ok=True)
+            failed_path.unlink(missing_ok=True)
+            print(
+                "SCALING_PERFORMANCE_HOLD "
+                f"offenders={len(gate['offenders'])}"
+            )
+            return 0
         state["status"] = "complete"
         contract.atomic_write_json(state_path, state)
         contract.atomic_write_json(complete_path, state)
+        performance_hold_path.unlink(missing_ok=True)
         failed_path.unlink(missing_ok=True)
         print(f"SCALING_COMPLETE points=16 manifest={complete_path}")
         return 0
