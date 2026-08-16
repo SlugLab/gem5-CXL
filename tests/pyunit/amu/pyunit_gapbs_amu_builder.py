@@ -202,6 +202,51 @@ class GapbsAmuBuilderTest(unittest.TestCase):
             log.write_text("Trial Time: 1.0\n")
             self.assertEqual(self.runner.parse_verification(log), "missing")
 
+    def test_parse_measured_trial_line_cache_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "gem5.log"
+            log.write_text(
+                "AMU_LINE_CACHE trial=0 logical_values=100 "
+                "line_requests=50 cache_hits=10 coalesced_misses=40\n"
+                "AMU_LINE_CACHE trial=1 logical_values=200 "
+                "line_requests=80 cache_hits=20 coalesced_misses=100\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.runner.parse_amu_line_cache(log, measured_trial=1),
+                {
+                    "amu_logical_values": 200,
+                    "amu_line_requests": 80,
+                    "amu_line_cache_hits": 20,
+                    "amu_coalesced_misses": 100,
+                },
+            )
+
+    def test_line_cache_marker_fails_closed(self):
+        cases = {
+            "missing": "Verification: PASS\n",
+            "duplicate": (
+                "AMU_LINE_CACHE trial=1 logical_values=200 "
+                "line_requests=80 cache_hits=20 coalesced_misses=100\n"
+                "AMU_LINE_CACHE trial=1 logical_values=200 "
+                "line_requests=80 cache_hits=20 coalesced_misses=100\n"
+            ),
+            "negative": (
+                "AMU_LINE_CACHE trial=1 logical_values=200 "
+                "line_requests=-1 cache_hits=20 coalesced_misses=100\n"
+            ),
+            "malformed": (
+                "AMU_LINE_CACHE trial=1 logical_values=200 "
+                "line_requests=80 cache_hits=twenty coalesced_misses=100\n"
+            ),
+        }
+        for name, payload in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "gem5.log"
+                log.write_text(payload, encoding="utf-8")
+                with self.assertRaises(self.runner.StatsError):
+                    self.runner.parse_amu_line_cache(log, measured_trial=1)
+
     def test_config_can_continue_after_roi_for_verification(self):
         config = CONFIG_PATH.read_text(encoding="utf-8")
         self.assertIn('parser.add_argument("--continue-after-roi"', config)

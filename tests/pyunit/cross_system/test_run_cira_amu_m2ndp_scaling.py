@@ -594,6 +594,9 @@ class ScalingRunnerTest(unittest.TestCase):
             "asmc_completed": 8, "asmc_queue_full_errors": 1,
             "asmc_spm_full_errors": 0, "asmc_translation_errors": 0,
             "asmc_pending_errors": 0, "asmc_spm_flag_errors": 0,
+            "amu_logical_values": 24, "amu_line_requests": 8,
+            "amu_line_cache_hits": 4, "amu_coalesced_misses": 12,
+            "scale": 12,
         }
         with self.assertRaisesRegex(scaling.ScalingError, "AMU error"):
             scaling.validate_mechanism_row("amu", amu)
@@ -608,6 +611,29 @@ class ScalingRunnerTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(scaling.ScalingError, "four active cores"):
             scaling.validate_mechanism_row("cira", cira)
+
+    def test_formal_amu_gate_requires_line_compression_evidence(self):
+        base = {
+            "status": "ok", "verification": "pass", "scale": 12,
+            "asmc_loads": 8, "asmc_completed": 8,
+            "asmc_queue_full_errors": 0, "asmc_spm_full_errors": 0,
+            "asmc_translation_errors": 0, "asmc_pending_errors": 0,
+            "asmc_spm_flag_errors": 0, "amu_logical_values": 24,
+            "amu_line_requests": 8, "amu_line_cache_hits": 4,
+            "amu_coalesced_misses": 12,
+        }
+        self.assertIs(scaling.validate_mechanism_row("amu", base), base)
+        for field, value, message in (
+            ("amu_line_requests", 7, "line requests differ"),
+            ("amu_logical_values", 8, "fewer line requests"),
+            ("amu_line_cache_hits", 0, "cache hits"),
+            ("amu_coalesced_misses", 0, "coalesced misses"),
+        ):
+            with self.subTest(field=field):
+                changed = dict(base)
+                changed[field] = value
+                with self.assertRaisesRegex(scaling.ScalingError, message):
+                    scaling.validate_mechanism_row("amu", changed)
 
     def test_m2ndp_requires_strict_funcsim_and_link_cycle_calibration(self):
         row = {

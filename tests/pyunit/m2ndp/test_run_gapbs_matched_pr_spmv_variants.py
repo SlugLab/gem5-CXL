@@ -233,6 +233,29 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(runner.VariantRunError, "AMU error"):
             runner.validate_row(row, "amu", smoke_test=False)
 
+    def test_amu_row_requires_line_compression_evidence(self):
+        cases = (
+            ("amu_line_requests", 31, "line requests differ"),
+            ("amu_logical_values", 32, "fewer line requests"),
+            ("amu_line_cache_hits", 0, "cache hits"),
+            ("amu_coalesced_misses", 0, "coalesced misses"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                row = self.valid_row("amu")
+                row[field] = value
+                with self.assertRaisesRegex(runner.VariantRunError, message):
+                    runner.validate_row(row, "amu", smoke_test=False)
+
+        g4 = self.valid_row("amu")
+        g4.update(scale=4, amu_line_cache_hits=0, amu_coalesced_misses=0)
+        self.assertIs(
+            runner.validate_row(
+                g4, "amu", smoke_test=True
+            ),
+            g4,
+        )
+
     def test_cira_row_requires_a_real_descriptor_and_completion(self):
         row = self.valid_row("cira")
         row.update(
@@ -308,6 +331,10 @@ class MatchedVariantRunnerTest(unittest.TestCase):
             "asmc_translation_errors": 0,
             "asmc_pending_errors": 0,
             "asmc_spm_flag_errors": 0,
+            "amu_logical_values": 96 if kind == "amu" else 0,
+            "amu_line_requests": 32 if kind == "amu" else 0,
+            "amu_line_cache_hits": 8 if kind == "amu" else 0,
+            "amu_coalesced_misses": 56 if kind == "amu" else 0,
             "cira_prefetches": 64 if kind == "cira" else 0,
             "cira_completed": 64 if kind == "cira" else 0,
             "cira_indexed_prefetches": 0,

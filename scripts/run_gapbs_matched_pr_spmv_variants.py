@@ -173,6 +173,10 @@ def validate_row(
     if kind == "amu":
         issued = _integer(row, "asmc_loads")
         completed = _integer(row, "asmc_completed")
+        logical_values = _integer(row, "amu_logical_values")
+        line_requests = _integer(row, "amu_line_requests")
+        cache_hits = _integer(row, "amu_line_cache_hits")
+        coalesced_misses = _integer(row, "amu_coalesced_misses")
         errors = sum(_integer(row, field) for field in (
             "asmc_queue_full_errors",
             "asmc_spm_full_errors",
@@ -188,6 +192,19 @@ def validate_row(
             raise VariantRunError(
                 f"AMU issued/completed load mismatch: {issued}/{completed}"
             )
+        if line_requests != issued:
+            raise VariantRunError(
+                "AMU line requests differ from issued loads"
+            )
+        if not 0 < line_requests < logical_values:
+            raise VariantRunError(
+                "AMU requires fewer line requests than logical values"
+            )
+        if row.get("scale") in (12, 14, 20):
+            if cache_hits <= 0:
+                raise VariantRunError("AMU cache hits must be nonzero")
+            if coalesced_misses <= 0:
+                raise VariantRunError("AMU coalesced misses must be nonzero")
     elif kind == "cira":
         descriptors = (
             _integer(row, "cira_prefetches")

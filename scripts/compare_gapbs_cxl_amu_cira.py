@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -179,6 +180,13 @@ CIRA_PER_CORE_STATS = {
 CPU_SWITCH_MARKER = "Switching from fast-forward CPU to timing CPU!"
 CHECKPOINT_SAVE_MARKER = "GAPBS_CHECKPOINT_SAVED path="
 CHECKPOINT_RESTORE_MARKER = "GAPBS_CHECKPOINT_RESTORED path="
+AMU_LINE_CACHE_RE = re.compile(
+    r"^AMU_LINE_CACHE trial=(?P<trial>[0-9]+) "
+    r"logical_values=(?P<logical_values>[0-9]+) "
+    r"line_requests=(?P<line_requests>[0-9]+) "
+    r"cache_hits=(?P<cache_hits>[0-9]+) "
+    r"coalesced_misses=(?P<coalesced_misses>[0-9]+)$"
+)
 SUMMARY_FIELDS = (
     "benchmark",
     "label",
@@ -214,6 +222,10 @@ SUMMARY_FIELDS = (
     "asmc_translation_errors",
     "asmc_pending_errors",
     "asmc_spm_flag_errors",
+    "amu_logical_values",
+    "amu_line_requests",
+    "amu_line_cache_hits",
+    "amu_coalesced_misses",
     "cira_prefetches",
     "cira_completed",
     "cira_indexed_prefetches",
@@ -315,6 +327,35 @@ def parse_verification(path):
         elif "Verification: FAIL" in line:
             return "fail"
     return verification
+
+
+def parse_amu_line_cache(path, *, measured_trial):
+    if not Path(path).is_file():
+        raise StatsError(f"missing AMU line-cache log: {path}")
+    records = []
+    for line in Path(path).read_text(errors="replace").splitlines():
+        if not line.startswith("AMU_LINE_CACHE"):
+            continue
+        match = AMU_LINE_CACHE_RE.fullmatch(line)
+        if match is None:
+            raise StatsError(f"malformed AMU line-cache marker: {line}")
+        record = {name: int(value) for name, value in match.groupdict().items()}
+        if record["trial"] == measured_trial:
+            records.append(record)
+    if len(records) != 1:
+        raise StatsError(
+            f"AMU measured trial {measured_trial} marker count is "
+            f"{len(records)}, expected 1"
+        )
+    record = records[0]
+    if record["logical_values"] <= 0 or record["line_requests"] <= 0:
+        raise StatsError("AMU line-cache work counts must be positive")
+    return {
+        "amu_logical_values": record["logical_values"],
+        "amu_line_requests": record["line_requests"],
+        "amu_line_cache_hits": record["cache_hits"],
+        "amu_coalesced_misses": record["coalesced_misses"],
+    }
 
 
 def unique_directional_stat(stats, prefix):
@@ -1323,6 +1364,16 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         if evidence_failure != "inactive-cira-core" or not args.allow_zero_cira:
             status = evidence_failure or status
 
+    line_cache_evidence = {}
+    if kind == "amu":
+        try:
+            line_cache_evidence = parse_amu_line_cache(
+                log_path, measured_trial=args.measure_trial
+            )
+        except StatsError:
+            if status == "ok":
+                status = "invalid-amu-line-cache"
+
     return {
         "benchmark": benchmark,
         "label": label,
@@ -1335,6 +1386,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         "sim_insts": stats.get("simInsts", ""),
         **provenance,
         **owned_metrics,
+        **line_cache_evidence,
         **cira_evidence,
         **diagnostic_metrics,
         "run_dir": str(run_dir),
@@ -1461,6 +1513,16 @@ def run_one(args, benchmark, label, binary_dir, kind):
         if evidence_failure != "inactive-cira-core" or not args.allow_zero_cira:
             status = evidence_failure or status
 
+    line_cache_evidence = {}
+    if kind == "amu":
+        try:
+            line_cache_evidence = parse_amu_line_cache(
+                log_path, measured_trial=args.measure_trial
+            )
+        except StatsError:
+            if status == "ok":
+                status = "invalid-amu-line-cache"
+
     return {
         "benchmark": benchmark,
         "label": label,
@@ -1479,6 +1541,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         "sim_ticks": stats.get("simTicks", ""),
         "sim_insts": stats.get("simInsts", ""),
         **owned_metrics,
+        **line_cache_evidence,
         **cira_evidence,
         **diagnostic_metrics,
         **real_cxl_metrics,

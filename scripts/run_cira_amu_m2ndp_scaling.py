@@ -330,6 +330,10 @@ def validate_mechanism_row(system, row):
     if system == "amu":
         issued = _integer(row, "asmc_loads")
         completed = _integer(row, "asmc_completed")
+        logical_values = _integer(row, "amu_logical_values")
+        line_requests = _integer(row, "amu_line_requests")
+        cache_hits = _integer(row, "amu_line_cache_hits")
+        coalesced_misses = _integer(row, "amu_coalesced_misses")
         errors = sum(_integer(row, field) for field in (
             "asmc_queue_full_errors",
             "asmc_spm_full_errors",
@@ -341,6 +345,17 @@ def validate_mechanism_row(system, row):
             raise ScalingError(f"AMU error counters are nonzero: {errors}")
         if issued <= 0 or issued != completed:
             raise ScalingError("AMU issued/completed work differs")
+        if line_requests != issued:
+            raise ScalingError("AMU line requests differ from issued loads")
+        if not 0 < line_requests < logical_values:
+            raise ScalingError(
+                "AMU requires fewer line requests than logical values"
+            )
+        if _integer(row, "scale") in PERFORMANCE_SCALES:
+            if cache_hits <= 0:
+                raise ScalingError("AMU cache hits must be nonzero")
+            if coalesced_misses <= 0:
+                raise ScalingError("AMU coalesced misses must be nonzero")
         return row
     if system == "cira":
         issued = _integer(row, "cira_prefetches")
