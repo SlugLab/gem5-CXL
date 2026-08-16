@@ -502,6 +502,36 @@ for g20. The accepted AMU calibration is
 with SHA-256
 `e62f01b90dc6377e5c05e5e5358c40486cee351b78ab82001201ca55f24ae4ab`.
 
+Before starting the matrix, run an isolated g12 qualification. It uses a
+separate root, builds separate scale-local variants and checkpoints, and
+requires bit-exact Vanilla/AMU/CIRA output, active balanced mechanisms, and
+both AMU and CIRA speedups in the inclusive `1.4` to `1.6` interval. A correct
+but out-of-range run writes `performance-hold.json`; it must not be tuned into
+the interval or reused as formal evidence:
+
+```sh
+EVAL_SHA=$(git rev-parse --short=12 HEAD)
+INPUTS=/mnt/disk0/gem5-CXL-eval/pr-scaling-5ed1d7369b-bitexact/inputs.json
+QUAL_ROOT=/mnt/disk0/gem5-CXL-eval/pr-scaling-${EVAL_SHA}-g12-qualification
+PATH=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/m2ndp_toolchain/venv311/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+python3 scripts/qualify_pr_scaling_g12.py \
+  --inputs "${INPUTS}" \
+  --calibration /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73.calibration.json \
+  --root "${QUAL_ROOT}" \
+  --gem5 build/X86/gem5.opt \
+  --m5-library util/m5/build/x86/out/libm5.a \
+  --config configs/example/gem5_library/x86-gapbs-amu-se.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m2ndp-root /mnt/disk0/M2NDP-public \
+  --variants-build-root "${QUAL_ROOT}/builds" \
+  --timeout 0
+```
+
+Only `qualification.json` with status `passed` authorizes a formal run. The
+formal runner independently recomputes the qualification speedups and binds
+its code, inputs, calibration, gem5, m5 library, config, g12 graph, and live
+variant-manifest hashes before creating `state.json`.
+
 Start the matrix as an unlimited transient service. There is no periodic live
 checkpoint; `state.json` advances only after a complete passed point:
 
@@ -511,7 +541,8 @@ systemd-run --unit=cira-amu-m2ndp-pr-scaling-formal --collect \
   --property=WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv \
   --setenv=PATH=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/m5out/m2ndp_toolchain/venv311/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   /usr/bin/python3 scripts/run_cira_amu_m2ndp_scaling.py \
-  --inputs "${SCALING_ROOT}/inputs.json" \
+  --inputs "${INPUTS}" \
+  --qualification "${QUAL_ROOT}/qualification.json" \
   --calibration /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73.calibration.json \
   --root "${SCALING_ROOT}/run" \
   --gem5 /mnt/disk0/gem5-CXL-g14-eval/amu-paper-full-2c07da6b73/inputs/gem5 \
@@ -539,9 +570,11 @@ already been published, and records `resume_lineage`. Any other state or code
 drift fails closed and requires a new evidence root.
 
 Correctness and performance are separate terminal gates. All 16 points must
-first pass bit-exact and mechanism checks. The runner then recomputes each of
-the 12 accelerator speedups from the matched absolute Vanilla and accelerator
-latencies. The inclusive acceptance interval is `1.4 <= speedup <= 1.6`. A
+first pass bit-exact and mechanism checks. g4 is a correctness-only smoke point
+and is retained in raw data without a performance interval. The runner then
+recomputes exactly the nine g12/g14/g20 accelerator speedups from matched
+absolute Vanilla and accelerator latencies. The inclusive acceptance interval
+is `1.4 <= speedup <= 1.6`. A
 correctness/runtime failure writes `failed.json` and returns failure. If every
 point is correct but any speedup is outside the interval, the runner preserves
 all real measurements in `performance-hold.json`, names every offender, does
@@ -564,3 +597,7 @@ of speedup scaling, absolute end-to-end log latency, grouped normalized bars,
 and the system-by-scale speedup heatmap. Each raw row includes exact latency,
 the native gem5 tick or NDPSim cycle count, recomputed speedup, rank/summary
 hashes, mechanism evidence, and graph/input/calibration/code/config identities.
+AMU rows also preserve `amu_logical_values`, `amu_line_requests`,
+`amu_line_cache_hits`, and `amu_coalesced_misses`; formal paper scales require
+line requests to match ASMC issued loads, remain below logical values, and show
+nonzero cache hits and coalescing.
