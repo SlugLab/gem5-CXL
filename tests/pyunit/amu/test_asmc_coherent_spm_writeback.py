@@ -9,12 +9,23 @@ REPO = Path(__file__).resolve().parents[3]
 ASMC_PY = (REPO / "src/mem/ASMC.py").read_text(encoding="utf-8")
 HEADER = (REPO / "src/mem/asmc.hh").read_text(encoding="utf-8")
 SOURCE = (REPO / "src/mem/asmc.cc").read_text(encoding="utf-8")
+BASE_CACHE = (REPO / "src/mem/cache/base.cc").read_text(encoding="utf-8")
 CONFIG = (
     REPO / "configs/example/gem5_library/x86-gapbs-amu-se.py"
 ).read_text(encoding="utf-8")
 
 
 class AsmcCoherentSpmWritebackTest(unittest.TestCase):
+    def test_cache_clean_does_not_mark_an_already_satisfied_snoop_twice(self):
+        begin = BASE_CACHE.index("BaseCache::sendMSHRQueuePacket")
+        send = BASE_CACHE[
+            begin:BASE_CACHE.index("BaseCache::sendWriteQueuePacket", begin)
+        ]
+        self.assertIn("const bool satisfy_clean =", send)
+        self.assertIn("!pkt->satisfied()", send)
+        self.assertEqual(send.count("if (satisfy_clean)"), 2)
+        self.assertIn("pkt->setSatisfied();", send)
+
     def test_asmc_exposes_one_coherent_spm_request_port_per_core(self):
         self.assertIn("spm_side_ports = VectorRequestPort", ASMC_PY)
         self.assertIn("spm_send_queue_size = Param.Unsigned(", ASMC_PY)

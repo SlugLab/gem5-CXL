@@ -29,6 +29,20 @@ namespace gapbs_amu
                   "AMU data must use 16 KiB per thread");
     static_assert(kTotalDataBytes == 64 * 1024,
                   "four AMU workers must use exactly 64 KiB");
+    static_assert(
+        (kStagingLinesPerThread & (kStagingLinesPerThread - 1)) == 0,
+        "AMU staging line count must be a power of two");
+
+    static inline size_t physical_staging_slot(size_t logical)
+    {
+        size_t reversed = 0;
+        for (size_t span = kStagingLinesPerThread; span > 1; span >>= 1)
+        {
+            reversed = (reversed << 1) | (logical & 1);
+            logical >>= 1;
+        }
+        return reversed;
+    }
 
     struct LineCounters
     {
@@ -72,7 +86,7 @@ namespace gapbs_amu
         {
             if (line_slot >= kStagingLinesPerThread)
                 fail("AMU staging line is outside the fixed budget");
-            return staging_[line_slot];
+            return staging_[physical_staging_slot(line_slot)];
         }
 
         bool cache_lookup(uintptr_t line_address, unsigned char *destination)
@@ -241,7 +255,8 @@ namespace gapbs_amu
             const size_t batch_line = logical_lines_[logical_slot];
             memcpy(
                 &result,
-                store_.staging_[batch_line] + logical_offsets_[logical_slot],
+                store_.staging_line(batch_line) +
+                    logical_offsets_[logical_slot],
                 sizeof(Value));
             return result;
         }

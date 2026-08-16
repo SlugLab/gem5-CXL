@@ -74,6 +74,24 @@ static int success_cases() {
                 "thread budget differs");
   static_assert(gapbs_amu::kTotalDataBytes == 65536,
                 "four-thread budget differs");
+    require(gapbs_amu::physical_staging_slot(0) == 0,
+      "staging slot zero differs");
+    require(gapbs_amu::physical_staging_slot(1) == 64,
+      "adjacent staging slot was not bit reversed");
+    require(gapbs_amu::physical_staging_slot(2) == 32,
+      "second staging bit reversal differs");
+    require(gapbs_amu::physical_staging_slot(127) == 127,
+      "last staging bit reversal differs");
+    bool physical_slots[gapbs_amu::kStagingLinesPerThread] = {};
+    for (size_t logical = 0;
+         logical < gapbs_amu::kStagingLinesPerThread; ++logical) {
+      const size_t physical = gapbs_amu::physical_staging_slot(logical);
+      require(physical < gapbs_amu::kStagingLinesPerThread,
+        "physical staging slot is outside the budget");
+      require(!physical_slots[physical],
+        "physical staging mapping is not bijective");
+      physical_slots[physical] = true;
+    }
 
   alignas(64) unsigned char source[129 * 64] = {};
   *reinterpret_cast<uint32_t *>(source + 4) = 0x11223344;

@@ -65,8 +65,9 @@ class Gem5LineBackend {
 
     [[noreturn]] void fail(const char *message)
     {
-        (void)message;
-        assert(false && "AMU line-cache contract failure");
+        fprintf(stderr, "AMU_LINE_CACHE_FAIL %s\n", message);
+        fflush(stderr);
+        m5_fail(0, 3);
         abort();
     }
 };

@@ -64,6 +64,18 @@ class GapbsAmuBuilderTest(unittest.TestCase):
         self.assertIn("return amu_aload(destination, source);", header)
         self.assertIn("uint64_t getfin() { return amu_getfin(); }", header)
 
+    def test_formal_line_cache_failure_is_observable_and_fail_closed(self):
+        header = self.builder.AMU_HEADER
+        failure = header[
+            header.index("[[noreturn]] void fail(const char *message)"):
+            header.index("};", header.index(
+                "[[noreturn]] void fail(const char *message)"
+            ))
+        ]
+        self.assertIn('"AMU_LINE_CACHE_FAIL %s\\n"', failure)
+        self.assertIn("fflush(stderr)", failure)
+        self.assertIn("m5_fail(0, 3)", failure)
+
     def test_load_values_uses_the_window(self):
         header = self.builder.AMU_HEADER
         wrapper = header[header.index("static inline void load_values") :]

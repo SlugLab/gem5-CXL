@@ -122,6 +122,8 @@ class MatchedVariantSourceTest(unittest.TestCase):
         self.assertNotIn("gapbs_amu::load_values(", generated)
         self.assertNotIn("gapbs_amu::load_value(", generated)
         self.assertNotIn("incoming_total +=", generated)
+        self.assertEqual(generated.count("AMU_INVALID_NODE node=%lld"), 2)
+        self.assertEqual(generated.count("fflush(stderr)"), 2)
 
         work_end = generated.index("m5_work_end(trial, 0)")
         report = generated.index("gapbs_amu::report_trial(trial)")
