@@ -150,7 +150,7 @@ class ScalingRunnerTest(unittest.TestCase):
 
     def write_real_config(
         self, *, delay="1000000", cores=4, link_range="0:4294967296",
-        path=None,
+        path=None, cira_device_port=False,
     ):
         config = Path(path) if path is not None else self.root / "config.ini"
         config.parent.mkdir(parents=True, exist_ok=True)
@@ -166,7 +166,12 @@ class ScalingRunnerTest(unittest.TestCase):
             "mem_side_port=board.cxl_device_xbar0.cpu_side_ports[0]",
             "[board.cxl_device_xbar0]",
             "type=NoncoherentXBar",
-            "cpu_side_ports=board.cxl_mem_link0.mem_side_port",
+            (
+                "cpu_side_ports=board.cxl_mem_link0.mem_side_port "
+                "board.cira.csr_mem_side_port"
+                if cira_device_port
+                else "cpu_side_ports=board.cxl_mem_link0.mem_side_port"
+            ),
             "mem_side_ports=board.memory.mem_ctrl.port",
             "[board.memory.mem_ctrl]",
             "type=MemCtrl",
@@ -409,6 +414,22 @@ class ScalingRunnerTest(unittest.TestCase):
         topology = scaling.validate_config(self.write_real_config())
         self.assertEqual(topology["cores"], 4)
         self.assertEqual(topology["range"], "0:4294967296")
+
+    def test_config_accepts_cira_local_csr_device_port_only(self):
+        topology = scaling.validate_config(
+            self.write_real_config(cira_device_port=True)
+        )
+        self.assertEqual(topology["cores"], 4)
+
+        config = self.write_real_config()
+        text = config.read_text(encoding="utf-8").replace(
+            "cpu_side_ports=board.cxl_mem_link0.mem_side_port",
+            "cpu_side_ports=board.cxl_mem_link0.mem_side_port "
+            "board.untrusted.mem_side_port",
+        )
+        config.write_text(text, encoding="utf-8")
+        with self.assertRaisesRegex(scaling.ScalingError, "cpu_side_ports"):
+            scaling.validate_config(config)
 
     def test_config_rejects_missing_core_or_range_bypass(self):
         config = self.write_real_config(cores=3)

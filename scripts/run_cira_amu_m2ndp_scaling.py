@@ -222,9 +222,6 @@ def validate_config(path):
             "board.cxl_device_xbar0.cpu_side_ports[0]"
         ),
         ("board.cxl_device_xbar0", "type"): "NoncoherentXBar",
-        ("board.cxl_device_xbar0", "cpu_side_ports"): (
-            "board.cxl_mem_link0.mem_side_port"
-        ),
         ("board.cxl_device_xbar0", "mem_side_ports"): (
             "board.memory.mem_ctrl.port"
         ),
@@ -239,6 +236,22 @@ def validate_config(path):
                 f"all-CXL topology [{section}] {key}={actual!r}, "
                 f"expected {expected!r}"
             )
+    device_cpu_side_ports = value(
+        "board.cxl_device_xbar0", "cpu_side_ports"
+    )
+    allowed_device_cpu_side_ports = {
+        "board.cxl_mem_link0.mem_side_port",
+        (
+            "board.cxl_mem_link0.mem_side_port "
+            "board.cira.csr_mem_side_port"
+        ),
+    }
+    if device_cpu_side_ports not in allowed_device_cpu_side_ports:
+        raise ScalingError(
+            "all-CXL topology [board.cxl_device_xbar0] "
+            f"cpu_side_ports={device_cpu_side_ports!r}, expected the CXL "
+            "link with only the optional CIRA CSR device-local port"
+        )
     core_pattern = re.compile(r"board\.processor\.cores([0-9]+)\.core")
     core_sections = {
         int(match.group(1)): section
