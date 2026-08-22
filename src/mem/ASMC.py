@@ -41,6 +41,15 @@ class ASMC(ClockedObject):
     metadata_latency = Param.Cycles(10, "Cycles for one metadata service")
     id_refill_latency = Param.Cycles(0, "Additional cycles at an ID batch boundary")
     completion_publish_latency = Param.Cycles(0, "Cycles to publish a completion")
+    pr_descriptor_entries = Param.Unsigned(
+        16, "Maximum accepted PageRank row descriptors"
+    )
+    pr_read_entries = Param.Unsigned(
+        256, "Maximum PageRank payload read packets in flight"
+    )
+    pr_fp_add_cycles = Param.Cycles(1, "PageRank float32 add latency")
+    pr_fp_mul_cycles = Param.Cycles(1, "PageRank float32 multiply latency")
+    pr_fp_div_cycles = Param.Cycles(4, "PageRank float32 divide latency")
     issue_latency = Param.Latency(
         "1ns", "Delay from m5op issue to first ASMC memory packet send"
     )

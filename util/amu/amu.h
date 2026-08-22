@@ -9,6 +9,8 @@
 
 #include <gem5/m5ops.h>
 
+#include "../pr_offload/pr_row_offload.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,6 +39,12 @@ static inline uint64_t
 amu_astore(const void *spm_addr, void *mem_addr)
 {
     return m5_amu_astore(spm_addr, mem_addr);
+}
+
+static inline uint64_t
+amu_pr_rows(const struct pr_row_offload_desc *desc)
+{
+    return m5_amu_pr_rows(desc);
 }
 
 static inline uint64_t

@@ -6,6 +6,7 @@
 #ifndef __MEM_ASMC_HH__
 #define __MEM_ASMC_HH__
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -22,6 +23,8 @@
 #include "mem/request.hh"
 #include "params/ASMC.hh"
 #include "sim/clocked_object.hh"
+
+#include "../../util/pr_offload/pr_row_offload.h"
 
 namespace gem5
 {
@@ -46,6 +49,7 @@ class ASMC : public ClockedObject
 
     uint64_t issueAload(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
     uint64_t issueAstore(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
+    uint64_t issuePrRows(ThreadContext *tc, Addr desc_addr);
     uint64_t getFinished(ThreadContext *tc);
     bool quiesceUntilCompletion(ThreadContext *tc);
     uint64_t cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value);
@@ -72,6 +76,28 @@ class ASMC : public ClockedObject
         MemoryAccess,
         SpmAcquire,
         SpmWriteback,
+    };
+
+    enum class PrStage
+    {
+        StartRow,
+        ContribRead,
+        ContribCompute,
+        PullOffsets,
+        PullNeighbors,
+        PullContributions,
+        PullCompute,
+        WriteResult,
+    };
+
+    enum class PrPacketRole
+    {
+        Score,
+        Degree,
+        Offsets,
+        Neighbor,
+        Contribution,
+        Result,
     };
 
     struct ThreadConfig
@@ -102,6 +128,29 @@ class ASMC : public ClockedObject
         uint32_t reservedSpmPackets = 0;
     };
 
+    struct PrDescriptorState
+    {
+        uint64_t id = 0;
+        ThreadContext *tc = nullptr;
+        pr_row_offload_desc desc = {};
+        PrStage stage = PrStage::StartRow;
+        uint64_t row = 0;
+        uint64_t edgeBegin = 0;
+        uint64_t edgeEnd = 0;
+        uint64_t nextRead = 0;
+        uint32_t pendingPackets = 0;
+        uint32_t reservedInitialPackets = 0;
+        Tick issueTick = 0;
+        Tick stallStart = 0;
+        bool queueStalled = false;
+        std::array<uint8_t, 4> scoreData = {};
+        std::array<uint8_t, 8> degreeData = {};
+        std::array<uint8_t, 16> offsetsData = {};
+        std::vector<int32_t> neighbors;
+        std::vector<float> contributions;
+        float result = 0.0f;
+    };
+
     struct PacketSenderState : public Packet::SenderState
     {
         PacketSenderState(uint64_t request_id, RequestPhase request_phase,
@@ -112,7 +161,18 @@ class ASMC : public ClockedObject
             : id(request_id), phase(request_phase), targetCore(target_core),
               byteOffset(byte_offset), size(packet_size), read(is_read),
               fragmentOffset(fragment_offset),
-              fragmentSize(fragment_size ? fragment_size : packet_size)
+              fragmentSize(fragment_size ? fragment_size : packet_size),
+              prPacket(false), prRole(PrPacketRole::Score), prIndex(0)
+        {}
+
+        PacketSenderState(uint64_t request_id, PrPacketRole role,
+                          uint64_t index, Addr byte_offset,
+                          unsigned packet_size, bool is_read)
+            : id(request_id), phase(RequestPhase::MemoryAccess),
+              targetCore(InvalidPortID), byteOffset(byte_offset),
+              size(packet_size), read(is_read), fragmentOffset(0),
+              fragmentSize(packet_size), prPacket(true), prRole(role),
+              prIndex(index)
         {}
 
         uint64_t id;
@@ -123,6 +183,9 @@ class ASMC : public ClockedObject
         bool read;
         unsigned fragmentOffset;
         unsigned fragmentSize;
+        bool prPacket;
+        PrPacketRole prRole;
+        uint64_t prIndex;
     };
 
     class MemoryPort : public RequestPort
@@ -173,12 +236,36 @@ class ASMC : public ClockedObject
         statistics::Scalar emptyGetfinPolls;
         statistics::Scalar successfulGetfin;
         statistics::Scalar consumerWaitTicks;
+        statistics::Scalar issuedPrDescriptors;
+        statistics::Scalar completedPrDescriptors;
+        statistics::Scalar prRows;
+        statistics::Scalar prReadPackets;
+        statistics::Scalar prWritePackets;
+        statistics::Scalar prComputeTicks;
+        statistics::Scalar prQueueStallTicks;
         statistics::Formula avgLatency;
         statistics::Formula avgOutstanding;
     };
 
     uint64_t issue(ThreadContext *tc, ReqType type, Addr spm_addr,
                    Addr mem_addr);
+    bool readGuest(ThreadContext *tc, Addr addr, void *data,
+                   uint64_t size) const;
+    bool validatePrDescriptor(ThreadContext *tc,
+                              const pr_row_offload_desc &desc) const;
+    bool reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+                       PrPacketRole role, uint64_t index, uint8_t *target);
+    bool reservePrWrite(PrDescriptorState &state, Addr addr,
+                        const void *data, uint64_t size);
+    void processPrDescriptors();
+    bool processPrDescriptor(PrDescriptorState &state);
+    bool recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state);
+    void schedulePrService(Tick when);
+    void schedulePrCompute(uint64_t id, Cycles cycles);
+    void finishPrCompute(uint64_t id);
+    void advancePrRow(PrDescriptorState &state);
+    void completePrDescriptor(uint64_t id);
+    uint64_t totalOutstanding() const;
     ThreadConfig &configFor(ThreadContext *tc);
     const ThreadConfig &configFor(ThreadContext *tc) const;
     bool translate(ThreadContext *tc, Addr vaddr, uint64_t size,
@@ -229,6 +316,11 @@ class ASMC : public ClockedObject
     const Cycles completionPublishLatency;
     const Tick issueLatency;
     const Tick completionLatency;
+    const uint64_t prDescriptorEntries;
+    const uint64_t prReadEntries;
+    const Cycles prFpAddCycles;
+    const Cycles prFpMulCycles;
+    const Cycles prFpDivCycles;
 
     const ThreadConfig defaultConfig;
     uint64_t nextId = 1;
@@ -249,12 +341,18 @@ class ASMC : public ClockedObject
     PacketPtr farRetryPkt = nullptr;
     bool farRetryReady = false;
     uint64_t reservedFarSendSlots = 0;
+    uint64_t pendingPrReads = 0;
+    uint64_t reservedPrReadSlots = 0;
     EventFunctionWrapper farSendEvent;
+    EventFunctionWrapper prServiceEvent;
     std::vector<std::deque<PacketPtr>> spmSendQueues;
     std::vector<PacketPtr> spmRetryPkts;
     std::vector<bool> spmRetryReady;
     std::vector<uint64_t> reservedSpmSendSlots;
     std::vector<std::unique_ptr<EventFunctionWrapper>> spmSendEvents;
+    std::unordered_map<uint64_t, std::unique_ptr<PrDescriptorState>>
+        prOutstanding;
+    std::deque<uint64_t> prServiceQueue;
 
     ASMCStats stats;
 };

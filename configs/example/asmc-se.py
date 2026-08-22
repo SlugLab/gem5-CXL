@@ -58,6 +58,7 @@ if not args.no_asmc:
         asmc_latency=args.asmc_latency,
     )
     system.asmc.mem_side_port = system.membus.cpu_side_ports
+    system.asmc.spm_side_ports = system.membus.cpu_side_ports
 
 system.workload = SEWorkload.init_compatible(args.binary)
 process = Process()

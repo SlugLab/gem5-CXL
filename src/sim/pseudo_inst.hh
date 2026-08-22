@@ -118,6 +118,7 @@ uint64_t amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr);
 uint64_t amuGetfin(ThreadContext *tc);
 uint64_t amuGetfinBatch(ThreadContext *tc);
 void amuWaitfin(ThreadContext *tc);
+uint64_t amuPrRows(ThreadContext *tc, GuestAddr desc);
 uint64_t amuCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
 uint64_t amuCfgrd(ThreadContext *tc, uint64_t reg);
 uint64_t ciraPrefetch(ThreadContext *tc, GuestAddr addr, uint64_t size);
@@ -270,6 +271,10 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
 
       case M5OP_AMU_WAITFIN:
         invokeSimcall<ABI>(tc, amuWaitfin);
+        return true;
+
+      case M5OP_AMU_PR_ROWS:
+        result = invokeSimcall<ABI, store_ret>(tc, amuPrRows);
         return true;
 
       case M5OP_AMU_CFGWR:

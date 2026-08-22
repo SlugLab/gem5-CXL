@@ -85,6 +85,7 @@
 #define M5OP_DIST_TOGGLE_SYNC   0x62
 #define M5OP_AMU_GETFIN_BATCH   0x63
 #define M5OP_AMU_WAITFIN        0x64
+#define M5OP_AMU_PR_ROWS       0x65
 
 #define M5OP_WORKLOAD           0x70
 
@@ -128,6 +129,7 @@
     M5OP(m5_dist_toggle_sync, M5OP_DIST_TOGGLE_SYNC)            \
     M5OP(m5_amu_getfin_batch, M5OP_AMU_GETFIN_BATCH)            \
     M5OP(m5_amu_waitfin, M5OP_AMU_WAITFIN)                      \
+    M5OP(m5_amu_pr_rows, M5OP_AMU_PR_ROWS)                      \
     M5OP(m5_workload, M5OP_WORKLOAD)                            \
 
 #define M5OP_MERGE_TOKENS_I(a, b) a##b

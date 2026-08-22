@@ -22,9 +22,100 @@ BUILDER = (
 MATCHED = (
     REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py"
 ).read_text(encoding="utf-8")
+M5OPS = (
+    REPO / "include/gem5/asm/generic/m5ops.h"
+).read_text(encoding="utf-8")
+PSEUDO = (REPO / "src/sim/pseudo_inst.cc").read_text(encoding="utf-8")
+AMU_HEADER = (REPO / "util/amu/amu.h").read_text(encoding="utf-8")
+PR_MATH = REPO / "src/mem/pr_row_math.hh"
+PR_SMOKE = (
+    REPO / "tests/test-progs/amu-smoke/amu_pr_rows_smoke.c"
+).read_text(encoding="utf-8")
 
 
 class AsmcPaperModelTest(unittest.TestCase):
+    def test_amu_pr_descriptor_has_real_model_dispatch(self):
+        self.assertIn("M5OP_AMU_PR_ROWS       0x65", M5OPS)
+        self.assertIn("asmc->issuePrRows(tc, desc.addr)", PSEUDO)
+        self.assertIn(
+            "uint64_t issuePrRows(ThreadContext *tc, Addr desc_addr);",
+            HEADER,
+        )
+        self.assertIn("m5_amu_pr_rows(const void *desc)", (
+            REPO / "include/gem5/m5ops.h"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("amu_pr_rows", AMU_HEADER)
+
+    def test_amu_pr_stats_fail_closed_on_unfinished_work(self):
+        for name in (
+            "issuedPrDescriptors",
+            "completedPrDescriptors",
+            "prRows",
+            "prReadPackets",
+            "prWritePackets",
+            "prComputeTicks",
+            "prQueueStallTicks",
+        ):
+            self.assertIn(name, SOURCE)
+
+    def test_amu_pr_has_bounded_calibratable_resources_and_f32_math(self):
+        for token in (
+            'pr_descriptor_entries = Param.Unsigned(',
+            'pr_read_entries = Param.Unsigned(',
+            'pr_fp_add_cycles = Param.Cycles(',
+            'pr_fp_mul_cycles = Param.Cycles(',
+            'pr_fp_div_cycles = Param.Cycles(',
+        ):
+            self.assertIn(token, ASMC_PY)
+        self.assertTrue(PR_MATH.is_file())
+        math = PR_MATH.read_text(encoding="utf-8")
+        for helper, operation in (
+            ("prF32Div", "left / right"),
+            ("prF32Add", "left + right"),
+            ("prF32Mul", "left * right"),
+        ):
+            self.assertIn(helper, math)
+            self.assertIn(operation, math)
+        self.assertGreaterEqual(math.count("volatile float value"), 3)
+
+    def test_amu_pr_reschedules_each_row_and_reduces_in_csr_order(self):
+        self.assertIn(
+            "return prOutstanding.count(id) != 0;", SOURCE
+        )
+        self.assertIn(
+            "for (float contribution : state.contributions)", SOURCE
+        )
+        self.assertIn("sum = prF32Add(sum, contribution);", SOURCE)
+        self.assertIn(
+            "pendingPrReads + reservedPrReadSlots + packets > "
+            "prReadEntries",
+            SOURCE,
+        )
+        self.assertIn("reservedInitialPackets", HEADER + SOURCE)
+        self.assertIn("reservedPrReadSlots", HEADER + SOURCE)
+        self.assertIn(
+            "reservedFarSendSlots += initialPacketCount", SOURCE
+        )
+        self.assertIn(
+            "reservedPrReadSlots += initialPacketCount", SOURCE
+        )
+        self.assertIn("state.neighbors[sender_state->prIndex]", SOURCE)
+        completion = SOURCE[
+            SOURCE.index("ASMC::completePrDescriptor"):
+            SOURCE.index("ASMC::configFor", SOURCE.index(
+                "ASMC::completePrDescriptor"
+            ))
+        ]
+        self.assertIn("completionWaiters.count(tc) != 0", completion)
+        self.assertIn("!hasOutstanding", completion)
+        self.assertLess(
+            completion.index("!hasOutstanding"),
+            completion.index("completionWaiters.erase(tc)"),
+        )
+        self.assertIn("PR_ROW_CONTRIB", PR_SMOKE)
+        self.assertIn("PR_ROW_PULL", PR_SMOKE)
+        self.assertIn("bits(next_scores[row]) != bits(expected)", PR_SMOKE)
+
     @staticmethod
     def calibration_loader():
         tree = ast.parse(CONFIG)

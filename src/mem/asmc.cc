@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 #include "arch/generic/mmu.hh"
@@ -15,6 +16,8 @@
 #include "base/trace.hh"
 #include "cpu/thread_context.hh"
 #include "debug/ASMC.hh"
+#include "mem/pr_row_math.hh"
+#include "mem/se_translating_port_proxy.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -91,6 +94,20 @@ ASMC::ASMCStats::ASMCStats(ASMC &owner, size_t num_cores)
                "getfin calls that returned a completed request"),
       ADD_STAT(consumerWaitTicks, statistics::units::Tick::get(),
                "Ticks from first empty getfin poll to a successful poll"),
+      ADD_STAT(issuedPrDescriptors, statistics::units::Count::get(),
+               "AMU PageRank row descriptors accepted"),
+      ADD_STAT(completedPrDescriptors, statistics::units::Count::get(),
+               "AMU PageRank row descriptors completed"),
+      ADD_STAT(prRows, statistics::units::Count::get(),
+               "PageRank rows completed by the AMU executor"),
+      ADD_STAT(prReadPackets, statistics::units::Count::get(),
+               "PageRank timing payload read packets sent"),
+      ADD_STAT(prWritePackets, statistics::units::Count::get(),
+               "PageRank timing payload write packets sent"),
+      ADD_STAT(prComputeTicks, statistics::units::Tick::get(),
+               "Modeled PageRank float32 compute ticks"),
+      ADD_STAT(prQueueStallTicks, statistics::units::Tick::get(),
+               "PageRank descriptor ticks stalled on bounded queues"),
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
                "Average AMU request latency",
                totalLatency / (completedLoads + completedStores)),
@@ -126,9 +143,16 @@ ASMC::ASMC(const Params &p)
       completionPublishLatency(p.completion_publish_latency),
       issueLatency(p.issue_latency),
       completionLatency(p.completion_latency),
+      prDescriptorEntries(p.pr_descriptor_entries),
+      prReadEntries(p.pr_read_entries),
+      prFpAddCycles(p.pr_fp_add_cycles),
+      prFpMulCycles(p.pr_fp_mul_cycles),
+      prFpDivCycles(p.pr_fp_div_cycles),
       defaultConfig({p.default_granularity ? p.default_granularity : 1,
                      p.max_outstanding, p.asmc_latency}),
       farSendEvent([this] { tryFarSend(); }, name() + ".far_send"),
+      prServiceEvent(
+          [this] { processPrDescriptors(); }, name() + ".pr_service"),
       stats(*this, p.port_spm_side_ports_connection_count)
 {
     const size_t num_cores = p.port_spm_side_ports_connection_count;
@@ -140,6 +164,10 @@ ASMC::ASMC(const Params &p)
              "ASMC pending_queue_entries must be non-zero");
     panic_if(idBatchEntries == 0,
              "ASMC id_batch_entries must be non-zero");
+    panic_if(prDescriptorEntries == 0,
+             "ASMC pr_descriptor_entries must be non-zero");
+    panic_if(prReadEntries < 2,
+             "ASMC pr_read_entries must provide at least two credits");
     spmSidePorts.reserve(num_cores);
     spmSendEvents.reserve(num_cores);
     for (PortID core = 0; core < num_cores; ++core) {
@@ -185,7 +213,7 @@ ASMC::resetStats()
     ClockedObject::resetStats();
     lastOccupancyTick = curTick();
     pollWaitStart.clear();
-    stats.maxObservedOutstanding = outstanding.size();
+    stats.maxObservedOutstanding = totalOutstanding();
 }
 
 Port &
@@ -218,6 +246,559 @@ uint64_t
 ASMC::issueAstore(ThreadContext *tc, Addr spm_addr, Addr mem_addr)
 {
     return issue(tc, ReqType::Store, spm_addr, mem_addr);
+}
+
+bool
+ASMC::readGuest(ThreadContext *tc, Addr addr, void *data, uint64_t size) const
+{
+    SETranslatingPortProxy proxy(tc);
+    return proxy.tryReadBlob(addr, data, size);
+}
+
+bool
+ASMC::validatePrDescriptor(
+    ThreadContext *tc, const pr_row_offload_desc &desc) const
+{
+    if ((desc.phase != PR_ROW_CONTRIB && desc.phase != PR_ROW_PULL) ||
+        desc.row_count == 0 || desc.node_count == 0 ||
+        desc.row_count == std::numeric_limits<uint64_t>::max() ||
+        desc.row_begin > desc.node_count ||
+        desc.row_count > desc.node_count - desc.row_begin ||
+        desc.in_offsets_addr == 0 || desc.in_neighbors_addr == 0 ||
+        desc.out_degree_addr == 0 || desc.scores_in_addr == 0 ||
+        desc.contributions_addr == 0 || desc.scores_out_addr == 0) {
+        return false;
+    }
+
+    auto translated = [this, tc](Addr base, uint64_t first,
+                                  uint64_t count, uint64_t width,
+                                  BaseMMU::Mode mode) {
+        if (first > std::numeric_limits<uint64_t>::max() / width ||
+            count > std::numeric_limits<uint64_t>::max() / width)
+            return false;
+        const uint64_t offset = first * width;
+        const uint64_t size = count * width;
+        if (base > std::numeric_limits<Addr>::max() - offset)
+            return false;
+        const Addr start = base + offset;
+        if (size > std::numeric_limits<Addr>::max() - start)
+            return false;
+        std::vector<TranslationChunk> chunks;
+        return size != 0 && translate(tc, start, size, mode, chunks);
+    };
+
+    if (desc.phase == PR_ROW_CONTRIB) {
+        return translated(desc.scores_in_addr, desc.row_begin,
+                          desc.row_count, sizeof(float), BaseMMU::Read) &&
+               translated(desc.out_degree_addr, desc.row_begin,
+                          desc.row_count, sizeof(int64_t), BaseMMU::Read) &&
+               translated(desc.contributions_addr, desc.row_begin,
+                          desc.row_count, sizeof(float), BaseMMU::Write);
+    }
+
+    return translated(desc.in_offsets_addr, desc.row_begin,
+                      desc.row_count + 1, sizeof(uint64_t), BaseMMU::Read) &&
+           translated(desc.in_neighbors_addr, 0, 1, sizeof(int32_t),
+                      BaseMMU::Read) &&
+           translated(desc.contributions_addr, 0, desc.node_count,
+                      sizeof(float), BaseMMU::Read) &&
+           translated(desc.scores_out_addr, desc.row_begin,
+                      desc.row_count, sizeof(float), BaseMMU::Write);
+}
+
+uint64_t
+ASMC::issuePrRows(ThreadContext *tc, Addr desc_addr)
+{
+    if (!tc || desc_addr == 0 ||
+        prOutstanding.size() >= prDescriptorEntries ||
+        outstandingPerThread[tc] >= configFor(tc).maxOutstanding) {
+        ++stats.rejectedQueueFull;
+        return 0;
+    }
+
+    pr_row_offload_desc desc = {};
+    if (!readGuest(tc, desc_addr, &desc, sizeof(desc))) {
+        DPRINTF(ASMC, "reject PR descriptor at %#llx: descriptor read fault\n",
+                static_cast<unsigned long long>(desc_addr));
+        ++stats.translationFaults;
+        return 0;
+    }
+    if (!validatePrDescriptor(tc, desc)) {
+        DPRINTF(ASMC,
+                "reject PR descriptor phase=%u rows=[%llu,%llu) nodes=%llu "
+                "offsets=%#llx neighbors=%#llx degrees=%#llx scores=%#llx "
+                "contrib=%#llx output=%#llx\n",
+                desc.phase, static_cast<unsigned long long>(desc.row_begin),
+                static_cast<unsigned long long>(
+                    desc.row_begin + desc.row_count),
+                static_cast<unsigned long long>(desc.node_count),
+                static_cast<unsigned long long>(desc.in_offsets_addr),
+                static_cast<unsigned long long>(desc.in_neighbors_addr),
+                static_cast<unsigned long long>(desc.out_degree_addr),
+                static_cast<unsigned long long>(desc.scores_in_addr),
+                static_cast<unsigned long long>(desc.contributions_addr),
+                static_cast<unsigned long long>(desc.scores_out_addr));
+        ++stats.translationFaults;
+        return 0;
+    }
+
+    auto initialPackets = [this, tc](Addr addr, uint64_t size) {
+        std::vector<TranslationChunk> chunks;
+        if (!translate(tc, addr, size, BaseMMU::Read, chunks))
+            return uint32_t{0};
+        return countPackets(chunks);
+    };
+    uint32_t initialPacketCount = 0;
+    if (desc.phase == PR_ROW_CONTRIB) {
+        initialPacketCount = initialPackets(
+            desc.scores_in_addr + desc.row_begin * sizeof(float),
+            sizeof(float));
+        const uint32_t degreePackets = initialPackets(
+            desc.out_degree_addr + desc.row_begin * sizeof(int64_t),
+            sizeof(int64_t));
+        if (initialPacketCount == 0 || degreePackets == 0 ||
+            initialPacketCount >
+                std::numeric_limits<uint32_t>::max() - degreePackets) {
+            ++stats.translationFaults;
+            return 0;
+        }
+        initialPacketCount += degreePackets;
+    } else {
+        initialPacketCount = initialPackets(
+            desc.in_offsets_addr + desc.row_begin * sizeof(uint64_t),
+            2 * sizeof(uint64_t));
+        if (initialPacketCount == 0) {
+            ++stats.translationFaults;
+            return 0;
+        }
+    }
+    const uint64_t farOccupied = farSendQueue.size() +
+        (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
+    if (pendingPrReads + reservedPrReadSlots + initialPacketCount >
+            prReadEntries ||
+        farOccupied + initialPacketCount > maxSendQueue) {
+        ++stats.rejectedQueueFull;
+        return 0;
+    }
+
+    const uint64_t id = nextId++;
+    auto state = std::make_unique<PrDescriptorState>();
+    state->id = id;
+    state->tc = tc;
+    state->desc = desc;
+    state->row = desc.row_begin;
+    state->issueTick = curTick();
+    state->reservedInitialPackets = initialPacketCount;
+
+    updateOccupancyIntegral();
+    prOutstanding.emplace(id, std::move(state));
+    prServiceQueue.push_back(id);
+    reservedFarSendSlots += initialPacketCount;
+    reservedPrReadSlots += initialPacketCount;
+    ++outstandingPerThread[tc];
+    ++stats.issuedPrDescriptors;
+    stats.maxObservedOutstanding = std::max(
+        totalOutstanding(),
+        static_cast<uint64_t>(stats.maxObservedOutstanding.value()));
+    schedulePrService(curTick() + issueLatency);
+    return id;
+}
+
+bool
+ASMC::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+                    PrPacketRole role, uint64_t index, uint8_t *target)
+{
+    (void)target;
+    std::vector<TranslationChunk> chunks;
+    if (!translate(state.tc, addr, size, BaseMMU::Read, chunks))
+        panic("ASMC accepted PR descriptor encountered a read translation "
+              "fault at %#llx", static_cast<unsigned long long>(addr));
+    const uint32_t packets = countPackets(chunks);
+    if (state.reservedInitialPackets != 0) {
+        panic_if(packets > state.reservedInitialPackets ||
+                 packets > reservedFarSendSlots ||
+                 packets > reservedPrReadSlots,
+                 "ASMC PR initial packet reservation underflow");
+        state.reservedInitialPackets -= packets;
+        reservedFarSendSlots -= packets;
+        reservedPrReadSlots -= packets;
+    } else {
+        const uint64_t farOccupied = farSendQueue.size() +
+            (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
+        if (pendingPrReads + reservedPrReadSlots + packets > prReadEntries ||
+            farOccupied + packets > maxSendQueue) {
+            if (!state.queueStalled) {
+                state.queueStalled = true;
+                state.stallStart = curTick();
+            }
+            return false;
+        }
+    }
+    if (state.queueStalled) {
+        stats.prQueueStallTicks += curTick() - state.stallStart;
+        state.queueStalled = false;
+    }
+
+    for (const auto &chunk : chunks) {
+        Addr chunkOffset = 0;
+        while (chunkOffset < chunk.size) {
+            const uint64_t lineRemaining = cacheLineSize -
+                ((chunk.paddr + chunkOffset) % cacheLineSize);
+            const auto packetSize = static_cast<unsigned>(std::min<uint64_t>(
+                chunk.size - chunkOffset, lineRemaining));
+            Request::Flags flags = chunk.flags;
+            flags.set(Request::UNCACHEABLE);
+            RequestPtr req = std::make_shared<Request>(
+                chunk.paddr + chunkOffset, packetSize, flags, requestorId);
+            req->taskId(context_switch_task_id::DMA);
+            PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+            pkt->allocate();
+            pkt->senderState = new PacketSenderState(
+                state.id, role, index, chunk.offset + chunkOffset,
+                packetSize, true);
+            ++state.pendingPackets;
+            ++pendingPrReads;
+            enqueueFarPacket(pkt);
+            chunkOffset += packetSize;
+        }
+    }
+    scheduleFarSend(curTick());
+    return true;
+}
+
+bool
+ASMC::reservePrWrite(PrDescriptorState &state, Addr addr,
+                     const void *data, uint64_t size)
+{
+    std::vector<TranslationChunk> chunks;
+    if (!translate(state.tc, addr, size, BaseMMU::Write, chunks))
+        panic("ASMC accepted PR descriptor encountered a write translation "
+              "fault at %#llx", static_cast<unsigned long long>(addr));
+    const uint32_t packets = countPackets(chunks);
+    const uint64_t farOccupied = farSendQueue.size() +
+        (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
+    if (farOccupied + packets > maxSendQueue) {
+        if (!state.queueStalled) {
+            state.queueStalled = true;
+            state.stallStart = curTick();
+        }
+        return false;
+    }
+    if (state.queueStalled) {
+        stats.prQueueStallTicks += curTick() - state.stallStart;
+        state.queueStalled = false;
+    }
+
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    for (const auto &chunk : chunks) {
+        Addr chunkOffset = 0;
+        while (chunkOffset < chunk.size) {
+            const uint64_t lineRemaining = cacheLineSize -
+                ((chunk.paddr + chunkOffset) % cacheLineSize);
+            const auto packetSize = static_cast<unsigned>(std::min<uint64_t>(
+                chunk.size - chunkOffset, lineRemaining));
+            RequestPtr req = std::make_shared<Request>(
+                chunk.paddr + chunkOffset, packetSize, chunk.flags,
+                requestorId);
+            req->taskId(context_switch_task_id::DMA);
+            PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+            pkt->allocate();
+            std::memcpy(pkt->getPtr<uint8_t>(),
+                        bytes + chunk.offset + chunkOffset, packetSize);
+            pkt->senderState = new PacketSenderState(
+                state.id, PrPacketRole::Result, 0,
+                chunk.offset + chunkOffset, packetSize, false);
+            ++state.pendingPackets;
+            enqueueFarPacket(pkt);
+            chunkOffset += packetSize;
+        }
+    }
+    scheduleFarSend(curTick());
+    return true;
+}
+
+void
+ASMC::schedulePrService(Tick when)
+{
+    if (prServiceQueue.empty())
+        return;
+    if (prServiceEvent.scheduled()) {
+        if (when < prServiceEvent.when())
+            reschedule(prServiceEvent, when);
+        return;
+    }
+    schedule(prServiceEvent, when);
+}
+
+void
+ASMC::processPrDescriptors()
+{
+    const size_t descriptors = prServiceQueue.size();
+    bool retryWithoutResponse = false;
+    for (size_t index = 0; index < descriptors; ++index) {
+        const uint64_t id = prServiceQueue.front();
+        prServiceQueue.pop_front();
+        const auto it = prOutstanding.find(id);
+        if (it == prOutstanding.end())
+            continue;
+        retryWithoutResponse |= processPrDescriptor(*it->second);
+        if (prOutstanding.count(id))
+            prServiceQueue.push_back(id);
+    }
+    if (retryWithoutResponse)
+        schedulePrService(clockEdge(Cycles(1)));
+}
+
+bool
+ASMC::processPrDescriptor(PrDescriptorState &state)
+{
+    while (true) {
+        switch (state.stage) {
+          case PrStage::StartRow:
+            panic_if(state.pendingPackets != 0,
+                     "ASMC PR row started with pending packets");
+            state.nextRead = 0;
+            state.neighbors.clear();
+            state.contributions.clear();
+            state.scoreData.fill(0);
+            state.degreeData.fill(0);
+            state.offsetsData.fill(0);
+            state.stage = state.desc.phase == PR_ROW_CONTRIB ?
+                PrStage::ContribRead : PrStage::PullOffsets;
+            continue;
+
+          case PrStage::ContribRead:
+            while (state.nextRead < 2) {
+                const bool score = state.nextRead == 0;
+                const Addr base = score ? state.desc.scores_in_addr :
+                                          state.desc.out_degree_addr;
+                const uint64_t width = score ? sizeof(float) :
+                                               sizeof(int64_t);
+                const Addr addr = base + state.row * width;
+                if (!reservePrRead(
+                        state, addr, width,
+                        score ? PrPacketRole::Score : PrPacketRole::Degree,
+                        0, score ? state.scoreData.data() :
+                                   state.degreeData.data())) {
+                    return state.pendingPackets == 0;
+                }
+                ++state.nextRead;
+            }
+            if (state.pendingPackets != 0)
+                return false;
+            state.stage = PrStage::ContribCompute;
+            schedulePrCompute(state.id, prFpDivCycles);
+            return false;
+
+          case PrStage::PullOffsets:
+            if (state.nextRead == 0) {
+                const Addr addr = state.desc.in_offsets_addr +
+                    state.row * sizeof(uint64_t);
+                if (!reservePrRead(state, addr, state.offsetsData.size(),
+                                   PrPacketRole::Offsets, 0,
+                                   state.offsetsData.data())) {
+                    return state.pendingPackets == 0;
+                }
+                state.nextRead = 1;
+            }
+            if (state.pendingPackets != 0)
+                return false;
+            std::memcpy(&state.edgeBegin, state.offsetsData.data(),
+                        sizeof(state.edgeBegin));
+            std::memcpy(&state.edgeEnd,
+                        state.offsetsData.data() + sizeof(state.edgeBegin),
+                        sizeof(state.edgeEnd));
+            panic_if(state.edgeEnd < state.edgeBegin ||
+                     state.edgeEnd - state.edgeBegin >
+                        std::numeric_limits<uint32_t>::max(),
+                     "ASMC PR row has an invalid CSR edge interval");
+            state.neighbors.assign(state.edgeEnd - state.edgeBegin, 0);
+            state.contributions.assign(state.edgeEnd - state.edgeBegin,
+                                       0.0f);
+            state.nextRead = 0;
+            state.stage = PrStage::PullNeighbors;
+            continue;
+
+          case PrStage::PullNeighbors:
+            while (state.nextRead < state.neighbors.size()) {
+                const uint64_t edge = state.edgeBegin + state.nextRead;
+                panic_if(edge > std::numeric_limits<Addr>::max() /
+                                    sizeof(int32_t) ||
+                         state.desc.in_neighbors_addr >
+                            std::numeric_limits<Addr>::max() -
+                                edge * sizeof(int32_t),
+                         "ASMC PR neighbor address overflow");
+                const Addr addr = state.desc.in_neighbors_addr +
+                    edge * sizeof(int32_t);
+                if (!reservePrRead(
+                        state, addr, sizeof(int32_t),
+                        PrPacketRole::Neighbor, state.nextRead,
+                        reinterpret_cast<uint8_t *>(
+                            &state.neighbors[state.nextRead]))) {
+                    return state.pendingPackets == 0;
+                }
+                ++state.nextRead;
+            }
+            if (state.pendingPackets != 0)
+                return false;
+            for (int32_t neighbor : state.neighbors) {
+                panic_if(neighbor < 0 ||
+                         static_cast<uint64_t>(neighbor) >=
+                            state.desc.node_count,
+                         "ASMC PR neighbor %d is outside node count %llu",
+                         neighbor, static_cast<unsigned long long>(
+                             state.desc.node_count));
+            }
+            state.nextRead = 0;
+            state.stage = PrStage::PullContributions;
+            continue;
+
+          case PrStage::PullContributions:
+            while (state.nextRead < state.contributions.size()) {
+                const uint64_t neighbor = static_cast<uint64_t>(
+                    state.neighbors[state.nextRead]);
+                const Addr addr = state.desc.contributions_addr +
+                    neighbor * sizeof(float);
+                if (!reservePrRead(
+                        state, addr, sizeof(float),
+                        PrPacketRole::Contribution, state.nextRead,
+                        reinterpret_cast<uint8_t *>(
+                            &state.contributions[state.nextRead]))) {
+                    return state.pendingPackets == 0;
+                }
+                ++state.nextRead;
+            }
+            if (state.pendingPackets != 0)
+                return false;
+            state.stage = PrStage::PullCompute;
+            schedulePrCompute(
+                state.id,
+                Cycles(static_cast<uint64_t>(prFpAddCycles) *
+                           state.contributions.size() +
+                       static_cast<uint64_t>(prFpMulCycles) +
+                       static_cast<uint64_t>(prFpAddCycles)));
+            return false;
+
+          case PrStage::ContribCompute:
+          case PrStage::PullCompute:
+            return false;
+
+          case PrStage::WriteResult:
+            if (state.nextRead == 0) {
+                const Addr base = state.desc.phase == PR_ROW_CONTRIB ?
+                    state.desc.contributions_addr : state.desc.scores_out_addr;
+                const Addr addr = base + state.row * sizeof(float);
+                if (!reservePrWrite(state, addr, &state.result,
+                                    sizeof(state.result))) {
+                    return state.pendingPackets == 0;
+                }
+                state.nextRead = 1;
+            }
+            if (state.pendingPackets != 0)
+                return false;
+            const uint64_t id = state.id;
+            advancePrRow(state);
+            return prOutstanding.count(id) != 0;
+        }
+    }
+}
+
+void
+ASMC::schedulePrCompute(uint64_t id, Cycles cycles)
+{
+    const Tick ticks = cyclesToTicks(cycles);
+    stats.prComputeTicks += ticks;
+    auto *event = new EventFunctionWrapper(
+        [this, id] { finishPrCompute(id); },
+        csprintf("%s.pr_compute_%llu", name(),
+                 static_cast<unsigned long long>(id)), true);
+    schedule(event, curTick() + ticks);
+}
+
+void
+ASMC::finishPrCompute(uint64_t id)
+{
+    const auto it = prOutstanding.find(id);
+    if (it == prOutstanding.end())
+        return;
+    PrDescriptorState &state = *it->second;
+    if (state.stage == PrStage::ContribCompute) {
+        float score = 0.0f;
+        int64_t degree = 0;
+        std::memcpy(&score, state.scoreData.data(), sizeof(score));
+        std::memcpy(&degree, state.degreeData.data(), sizeof(degree));
+        state.result = prF32Div(score, static_cast<float>(degree));
+    } else {
+        panic_if(state.stage != PrStage::PullCompute,
+                 "ASMC PR compute event observed an invalid stage");
+        float sum = 0.0f;
+        for (float contribution : state.contributions)
+            sum = prF32Add(sum, contribution);
+        float damping = 0.0f;
+        float base = 0.0f;
+        std::memcpy(&damping, &state.desc.damping_bits, sizeof(damping));
+        std::memcpy(&base, &state.desc.base_score_bits, sizeof(base));
+        state.result = prF32Add(base, prF32Mul(damping, sum));
+    }
+    state.stage = PrStage::WriteResult;
+    state.nextRead = 0;
+    schedulePrService(curTick());
+}
+
+void
+ASMC::advancePrRow(PrDescriptorState &state)
+{
+    ++stats.prRows;
+    ++state.row;
+    if (state.row == state.desc.row_begin + state.desc.row_count) {
+        completePrDescriptor(state.id);
+        return;
+    }
+    state.stage = PrStage::StartRow;
+    state.nextRead = 0;
+}
+
+uint64_t
+ASMC::totalOutstanding() const
+{
+    return outstanding.size() + prOutstanding.size();
+}
+
+void
+ASMC::completePrDescriptor(uint64_t id)
+{
+    const auto it = prOutstanding.find(id);
+    if (it == prOutstanding.end())
+        return;
+    PrDescriptorState &state = *it->second;
+    panic_if(state.pendingPackets != 0,
+             "ASMC completed PR descriptor with pending packets");
+    panic_if(state.reservedInitialPackets != 0,
+             "ASMC completed PR descriptor with reserved initial packets");
+    if (state.queueStalled)
+        stats.prQueueStallTicks += curTick() - state.stallStart;
+    ThreadContext *tc = state.tc;
+    finished[tc].push_back(id);
+    ++stats.completedPrDescriptors;
+    updateOccupancyIntegral();
+    auto count = outstandingPerThread.find(tc);
+    panic_if(count == outstandingPerThread.end() || count->second == 0,
+             "ASMC PR per-thread outstanding accounting underflow");
+    if (--count->second == 0)
+        outstandingPerThread.erase(count);
+    prOutstanding.erase(it);
+
+    const bool hasOutstanding = std::any_of(
+        outstanding.begin(), outstanding.end(),
+        [tc](const auto &entry) { return entry.second->tc == tc; }) ||
+        std::any_of(prOutstanding.begin(), prOutstanding.end(),
+        [tc](const auto &entry) { return entry.second->tc == tc; });
+    constexpr size_t completionWakeBatch = 4;
+    if (completionWaiters.count(tc) != 0 &&
+        (finished[tc].size() >= completionWakeBatch || !hasOutstanding)) {
+        completionWaiters.erase(tc);
+        tc->activate();
+    }
 }
 
 ASMC::ThreadConfig &
@@ -469,8 +1050,8 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     outstanding[id] = std::move(state);
     ++outstandingPerThread[tc];
     stats.maxObservedOutstanding = std::max(
-        outstanding.size(),
-        static_cast<size_t>(stats.maxObservedOutstanding.value()));
+        totalOutstanding(),
+        static_cast<uint64_t>(stats.maxObservedOutstanding.value()));
     reservedFarSendSlots += memory_packets;
     reservedSpmSendSlots[target_core] += reserved_spm_packets;
     metadataPending++;
@@ -746,10 +1327,16 @@ ASMC::tryFarSend()
             panic_if(!sender_state ||
                      sender_state->targetCore != InvalidPortID,
                      "ASMC far packet carried invalid sender state");
-            if (sender_state->read)
+            if (sender_state->prPacket) {
+                if (sender_state->read)
+                    ++stats.prReadPackets;
+                else
+                    ++stats.prWritePackets;
+            } else if (sender_state->read) {
                 ++stats.farReadPackets;
-            else
+            } else {
                 ++stats.farWritePackets;
+            }
             farRetryPkt = nullptr;
             farRetryReady = false;
         } else {
@@ -759,6 +1346,8 @@ ASMC::tryFarSend()
             break;
         }
     }
+    if (!prServiceQueue.empty())
+        schedulePrService(curTick());
 }
 
 void
@@ -802,6 +1391,9 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
 {
     auto *sender_state = dynamic_cast<PacketSenderState *>(pkt->senderState);
     panic_if(!sender_state, "ASMC response without ASMC sender state");
+
+    if (sender_state->prPacket)
+        return recvPrTimingResp(pkt, sender_state);
 
     DPRINTF(ASMC, "response id=%#llx addr=%#llx size=%u error=%d\n",
             static_cast<unsigned long long>(sender_state->id),
@@ -925,6 +1517,72 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
     return true;
 }
 
+bool
+ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
+{
+    panic_if(sender_state->targetCore != InvalidPortID,
+             "ASMC PR response returned on an SPM route");
+    const auto it = prOutstanding.find(sender_state->id);
+    panic_if(it == prOutstanding.end(),
+             "ASMC PR response has no active descriptor");
+    PrDescriptorState &state = *it->second;
+    panic_if(pkt->isError() || sender_state->size != pkt->getSize() ||
+             state.pendingPackets == 0,
+             "ASMC PR response failed its packet contract");
+
+    if (sender_state->read) {
+        uint8_t *target = nullptr;
+        uint64_t targetSize = 0;
+        switch (sender_state->prRole) {
+          case PrPacketRole::Score:
+            target = state.scoreData.data();
+            targetSize = state.scoreData.size();
+            break;
+          case PrPacketRole::Degree:
+            target = state.degreeData.data();
+            targetSize = state.degreeData.size();
+            break;
+          case PrPacketRole::Offsets:
+            target = state.offsetsData.data();
+            targetSize = state.offsetsData.size();
+            break;
+          case PrPacketRole::Neighbor:
+            panic_if(sender_state->prIndex >= state.neighbors.size(),
+                     "ASMC PR neighbor response index is invalid");
+            target = reinterpret_cast<uint8_t *>(
+                &state.neighbors[sender_state->prIndex]);
+            targetSize = sizeof(int32_t);
+            break;
+          case PrPacketRole::Contribution:
+            panic_if(sender_state->prIndex >= state.contributions.size(),
+                     "ASMC PR contribution response index is invalid");
+            target = reinterpret_cast<uint8_t *>(
+                &state.contributions[sender_state->prIndex]);
+            targetSize = sizeof(float);
+            break;
+          case PrPacketRole::Result:
+            panic("ASMC PR result write returned as a read");
+        }
+        panic_if(sender_state->byteOffset + sender_state->size > targetSize,
+                 "ASMC PR response payload exceeds its destination");
+        std::memcpy(target + sender_state->byteOffset,
+                    pkt->getConstPtr<uint8_t>(), sender_state->size);
+        panic_if(pendingPrReads == 0,
+                 "ASMC PR read-credit accounting underflow");
+        --pendingPrReads;
+    } else {
+        panic_if(sender_state->prRole != PrPacketRole::Result,
+                 "ASMC PR non-result write response");
+    }
+    --state.pendingPackets;
+
+    pkt->senderState = nullptr;
+    delete sender_state;
+    delete pkt;
+    schedulePrService(curTick());
+    return true;
+}
+
 void
 ASMC::recvReqRetry(PortID target_core)
 {
@@ -994,6 +1652,8 @@ ASMC::completeRequest(uint64_t id)
     constexpr size_t completionWakeBatch = 4;
     const bool has_outstanding = std::any_of(
         outstanding.begin(), outstanding.end(),
+        [tc](const auto &entry) { return entry.second->tc == tc; }) ||
+        std::any_of(prOutstanding.begin(), prOutstanding.end(),
         [tc](const auto &entry) { return entry.second->tc == tc; });
     if (completionWaiters.count(tc) != 0 &&
         (queue.size() >= completionWakeBatch || !has_outstanding)) {
@@ -1008,7 +1668,7 @@ ASMC::updateOccupancyIntegral()
     const Tick now = curTick();
     panic_if(now < lastOccupancyTick, "ASMC occupancy time moved backwards");
     const Tick elapsed = now - lastOccupancyTick;
-    stats.outstandingIntegral += elapsed * outstanding.size();
+    stats.outstandingIntegral += elapsed * totalOutstanding();
     stats.occupancyTicks += elapsed;
     lastOccupancyTick = now;
 }
@@ -1047,6 +1707,8 @@ ASMC::quiesceUntilCompletion(ThreadContext *tc)
 
     const bool has_outstanding = std::any_of(
         outstanding.begin(), outstanding.end(),
+        [tc](const auto &entry) { return entry.second->tc == tc; }) ||
+        std::any_of(prOutstanding.begin(), prOutstanding.end(),
         [tc](const auto &entry) { return entry.second->tc == tc; });
     if (!has_outstanding)
         return false;
@@ -1154,6 +1816,12 @@ ASMC::reset()
         state->spmWritebacks.clear();
     }
     outstanding.clear();
+    prOutstanding.clear();
+    prServiceQueue.clear();
+    pendingPrReads = 0;
+    reservedPrReadSlots = 0;
+    if (prServiceEvent.scheduled())
+        deschedule(prServiceEvent);
     outstandingPerThread.clear();
     finished.clear();
     for (ThreadContext *tc : completionWaiters)

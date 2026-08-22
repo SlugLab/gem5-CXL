@@ -626,6 +626,15 @@ amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
 }
 
 uint64_t
+amuPrRows(ThreadContext *tc, GuestAddr desc)
+{
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->issuePrRows(tc, desc.addr);
+
+    return 0;
+}
+
+uint64_t
 amuGetfin(ThreadContext *tc)
 {
     if (auto *asmc = ASMC::get(tc->getSystemPtr()))

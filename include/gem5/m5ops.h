@@ -69,6 +69,7 @@ uint64_t m5_amu_astore(const void *spm_addr, void *mem_addr);
 uint64_t m5_amu_getfin(void);
 uint64_t m5_amu_getfin_batch(void);
 void m5_amu_waitfin(void);
+uint64_t m5_amu_pr_rows(const void *desc);
 uint64_t m5_amu_cfgwr(uint64_t reg, uint64_t value);
 uint64_t m5_amu_cfgrd(uint64_t reg);
 uint64_t m5_cira_prefetch(const void *addr, uint64_t size);
