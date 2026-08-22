@@ -22,6 +22,9 @@ BUILDER = (
 MATCHED = (
     REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py"
 ).read_text(encoding="utf-8")
+PR_OFFLOAD = (
+    REPO / "util/pr_offload/gapbs_pr_spmv_offload.cc"
+).read_text(encoding="utf-8")
 M5OPS = (
     REPO / "include/gem5/asm/generic/m5ops.h"
 ).read_text(encoding="utf-8")
@@ -398,21 +401,17 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("amu_getfin", consume)
         self.assertIn("head_", consume)
 
-    def test_matched_pr_uses_ordered_line_batches(self):
-        loop = MATCHED[
-            MATCHED.index("_AMU_PULL_LOOP") : MATCHED.index("_CIRA_PULL_LOOP")
-        ]
-        self.assertIn("LineBatch<gapbs_amu::Gem5LineBackend> initial_batch", loop)
-        self.assertIn("LineBatch<gapbs_amu::Gem5LineBackend> current_batch", loop)
-        self.assertLess(loop.index("current_batch.issue_all()"),
-                        loop.index("current_batch.wait_all()"))
-        self.assertIn(
-            "incoming_total = incoming_total + current_batch.value<ScoreT>",
-            loop,
-        )
-        self.assertNotIn("AsyncWindow", loop)
-        self.assertNotIn("load_values", loop)
-        self.assertNotIn("load_value", loop)
+    def test_matched_pr_uses_ordered_row_descriptors(self):
+        self.assertIn("-DPR_OFFLOAD_AMU=1", MATCHED)
+        self.assertNotIn("_AMU_PULL_LOOP", MATCHED)
+        contribution = PR_OFFLOAD.index("PR_ROW_CONTRIB")
+        pull = PR_OFFLOAD.index("PR_ROW_PULL", contribution)
+        self.assertLess(contribution, pull)
+        self.assertIn("submitAndWait(contribution", PR_OFFLOAD)
+        self.assertIn("submitAndWait(pull", PR_OFFLOAD)
+        self.assertIn("scores.swap(nextScores)", PR_OFFLOAD)
+        self.assertNotIn("load_values", PR_OFFLOAD)
+        self.assertNotIn("load_value", PR_OFFLOAD)
 
 
 if __name__ == "__main__":

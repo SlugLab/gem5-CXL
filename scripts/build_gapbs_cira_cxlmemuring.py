@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CXLMEMURING = (REPO / ".." / "CXLMemUring").resolve()
 DEFAULT_OUTDIR = REPO / "m5out" / "gapbs_cira_bins"
 M5_LIB = REPO / "util" / "m5" / "build" / "x86" / "out" / "libm5.a"
+PR_ROW_OFFLOAD_SOURCE = REPO / "util" / "pr_offload" / "gapbs_pr_spmv_offload.cc"
 GAPBS_KERNELS = ["bc", "bfs", "pr", "pr_spmv", "sssp"]
 
 

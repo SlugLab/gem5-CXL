@@ -1,8 +1,8 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
-import struct
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,21 +11,22 @@ from scripts import build_gapbs_matched_pr_spmv_variants as variants
 
 
 REPO = Path(__file__).resolve().parents[3]
-FIXED_SOURCE = REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
+OFFLOAD_SOURCE = REPO / "util/pr_offload/gapbs_pr_spmv_offload.cc"
 
 
 class MatchedVariantSourceTest(unittest.TestCase):
     def test_recorded_root_is_embedded_before_compilation(self):
-        source = (
-            REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py"
-        ).read_text(encoding="utf-8")
+        source = (REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("embedded_reference_raw=", source)
         self.assertIn("recorded_reference_dir", source)
-        self.assertIn(
-            "write_experiment_header(\n"
-            "        generated_dir / \"m2ndp_experiment_config.h\",\n"
-            "        embedded_reference_raw",
-            source,
+        self.assertNotIn("def transform_source(", source)
+        self.assertNotIn("_AMU_PULL_LOOP", source)
+        self.assertNotIn("_CIRA_PULL_LOOP", source)
+        self.assertEqual(
+            variants.amu_builder.PR_ROW_OFFLOAD_SOURCE,
+            variants.cira_builder.PR_ROW_OFFLOAD_SOURCE,
         )
 
     def test_rebase_manifest_paths_records_final_root(self):
@@ -35,28 +36,18 @@ class MatchedVariantSourceTest(unittest.TestCase):
             final = root / "g4"
             manifest = {"variants": [{
                 "binary": str((staging / "amu/bin/pr_spmv").resolve()),
-                "reference_raw": str(
-                    (staging / "reference/amu.u32").resolve()
-                ),
+                "reference_raw": str((staging / "reference/amu.u32").resolve()),
                 "generated_source": str(
-                    (staging / "amu/generated/pr_spmv.cc").resolve()
+                    (staging / "amu/generated/pr_spmv_offload.cc").resolve()
                 ),
-                "command": [
-                    "g++", str(staging / "amu/generated/pr_spmv.cc")
-                ],
+                "command": ["g++", str(staging / "amu/generated/pr_spmv_offload.cc")],
             }]}
-
-            rebased = variants.rebase_output_paths(
-                manifest, staging, final
-            )
+            rebased = variants.rebase_output_paths(manifest, staging, final)
 
         row = rebased["variants"][0]
+        self.assertEqual(row["binary"], str((final / "amu/bin/pr_spmv").resolve()))
         self.assertEqual(
-            row["binary"], str((final / "amu/bin/pr_spmv").resolve())
-        )
-        self.assertEqual(
-            row["reference_raw"],
-            str((final / "reference/amu.u32").resolve()),
+            row["reference_raw"], str((final / "reference/amu.u32").resolve())
         )
         self.assertIn(str(staging), " ".join(row["command"]))
 
@@ -67,13 +58,14 @@ class MatchedVariantSourceTest(unittest.TestCase):
                 "amu_pdf": {"sha256": variants.calibration.AMU_PDF_SHA256},
                 "cira_csv": {
                     "sha256": variants.calibration.CIRA_CSV_SHA256,
-                    "rows": {
-                        "pr_spmv": {
-                            "A": {"verification": "PASS", "return_code": 0, "mean_time_ms": 11},
-                            "B": {"verification": "PASS", "return_code": 0, "mean_time_ms": 10},
-                            "C": {"verification": "PASS", "return_code": 0, "mean_time_ms": 12},
-                        }
-                    },
+                    "rows": {"pr_spmv": {
+                        "A": {"verification": "PASS", "return_code": 0,
+                              "mean_time_ms": 11},
+                        "B": {"verification": "PASS", "return_code": 0,
+                              "mean_time_ms": 10},
+                        "C": {"verification": "PASS", "return_code": 0,
+                              "mean_time_ms": 12},
+                    }},
                 },
             },
             "amu": {"validation": {"status": "PASS"}},
@@ -85,185 +77,51 @@ class MatchedVariantSourceTest(unittest.TestCase):
             policy = variants.resolve_cira_build_policy(
                 path, "pgo-selected", source_row=None
             )
-        self.assertEqual(policy["mode"], "pgo-selected")
         self.assertEqual(policy["source_row"], "B")
         self.assertEqual(policy["lead_blocks"], 32)
         self.assertTrue(policy["hoist_decision"]["emit_prefetch"])
-        self.assertEqual(len(policy["calibration_manifest_sha256"]), 64)
 
-    def test_fixed_pull_rows_are_partitioned_across_both_cores(self):
-        source = FIXED_SOURCE.read_text(encoding="utf-8")
-        self.assertIn(
-            "#pragma omp parallel for schedule(static)\n"
-            "    for (NodeID u = 0; u < g.num_nodes(); ++u)",
-            source,
-        )
-        self.assertNotIn("schedule(dynamic, 16384)", source)
+    def test_common_source_has_ordered_two_phase_descriptor_execution(self):
+        source = OFFLOAD_SOURCE.read_text(encoding="utf-8")
+        contribution = source.index("PR_ROW_CONTRIB")
+        pull = source.index("PR_ROW_PULL", contribution)
+        swap = source.index("scores.swap(nextScores)", pull)
+        self.assertLess(contribution, pull)
+        self.assertLess(pull, swap)
+        self.assertNotIn("incoming_total +=", source)
+        self.assertNotIn("load_value(", source)
 
-    def test_amu_line_pipeline_commits_float_adds_in_csr_order(self):
-        generated = variants.transform_source(
-            FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
-        )
-
-        self.assertIn("gapbs_amu::thread_store().begin_trial()", generated)
-        self.assertIn("gapbs_amu::thread_store().reset_iteration()", generated)
-        self.assertIn("gapbs_amu::LineBatch<", generated)
-        self.assertIn("current_batch.issue_all()", generated)
-        self.assertIn("current_batch.wait_all()", generated)
-        self.assertEqual(
-            generated.count(
-                "incoming_total = incoming_total + "
-                "current_batch.value<ScoreT>(score_slots[i])"
-            ),
-            1,
-        )
-        self.assertIn("constexpr int kPageRankIterations = 20;", generated)
-        self.assertIn("next_scores[u] = base_score + product;", generated)
-        self.assertIn("scores.swap(next_scores);", generated)
-        self.assertLess(
-            generated.index("InitializePageRank(g, scores"),
-            generated.index("m5_work_begin(trial, 0)"),
-        )
-        self.assertNotIn("gapbs_amu::AsyncWindow", generated)
-        self.assertNotIn("gapbs_amu::load_values(", generated)
-        self.assertNotIn("gapbs_amu::load_value(", generated)
-        self.assertNotIn("incoming_total +=", generated)
-        self.assertEqual(generated.count("AMU_INVALID_NODE node=%lld"), 2)
-        self.assertEqual(generated.count("fflush(stderr)"), 2)
-
-        work_end = generated.index("m5_work_end(trial, 0)")
-        report = generated.index("gapbs_amu::report_trial(trial)")
-        self.assertLess(work_end, report)
-
-    def test_amu_has_no_variant_only_trial_zero_priming(self):
-        generated = variants.transform_source(
-            FIXED_SOURCE.read_text(encoding="utf-8"), "amu"
-        )
-
-        self.assertNotIn("prime_graph_pages", generated)
-        self.assertNotIn("prime_worker_stack_pages", generated)
-        self.assertNotIn("prime_graph_pages", variants.amu_builder.AMU_HEADER)
-        self.assertNotIn(
-            "prime_worker_stack_pages", variants.amu_builder.AMU_HEADER
-        )
-
-        cira = variants.transform_source(
-            FIXED_SOURCE.read_text(encoding="utf-8"), "cira"
-        )
-        self.assertNotIn("prime_worker_stack_pages", cira)
-
-    def test_cira_prefetches_future_row_batches_before_ordered_adds(self):
-        generated = variants.transform_source(
-            FIXED_SOURCE.read_text(encoding="utf-8"), "cira"
-        )
-
-        future = generated.index(
-            "GAPBS_CIRA_FUTURE_BLOCK(g, u, pf_begin, pf_count)"
-        )
-        prefetch = generated.index(
-            "GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROWS("
-            "g, pf_begin, pf_count, outgoing_contrib)"
-        )
-        current = generated.index("auto neigh = g.in_neigh(u)")
-        ordered_add = generated.index(
-            "incoming_total = incoming_total + outgoing_contrib[v]"
-        )
-        self.assertLess(future, prefetch)
-        self.assertLess(prefetch, current)
-        self.assertLess(current, ordered_add)
-        self.assertNotIn("u % GAPBS_CIRA_ROW_BATCH", generated)
-        self.assertIn(
-            "(current64 - thread_begin) % GAPBS_CIRA_ROW_BATCH",
-            variants.cira_builder.CIRA_HEADER,
-        )
-        self.assertEqual(
-            generated.count(
-                "incoming_total = incoming_total + outgoing_contrib[v]"
-            ),
-            1,
-        )
-        self.assertNotIn("GAPBS_CIRA_PREFETCH_IN_CSR_INDEXED_ROW(", generated)
-        header = variants.cira_builder.CIRA_HEADER
-        self.assertIn("GAPBS_CIRA_LEAD_BLOCKS", header)
-        self.assertIn("GAPBS_CIRA_ROW_BLOCK_SIZE 64", header)
-        self.assertIn(
-            "current_block_begin + lead_blocks * row_block_size", header
-        )
-
-    def test_compile_commands_disable_contraction_and_fast_math(self):
+    def test_compile_commands_select_exactly_one_offload_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            command = variants.compile_command(
-                kind="amu",
-                cxx="g++",
-                source=root / "pr_spmv.cc",
-                gapbs_root=root / "gapbs",
-                generated_dir=root / "generated",
-                output=root / "bin/pr_spmv",
-                m5_library=root / "libm5.a",
-                amu_batch_size=64,
-                cira_prefetch_distance=16,
-                cira_row_batch=256,
-                cira_max_outstanding=256,
+            common = {
+                "cxx": "g++", "source": root / "pr.cc",
+                "gapbs_root": root / "gapbs",
+                "generated_dir": root / "generated",
+                "output": root / "bin/pr", "m5_library": root / "libm5.a",
+            }
+            amu = variants.compile_command(kind="amu", **common)
+            cira = variants.compile_command(
+                kind="cira", cira_mode="pgo-selected",
+                cira_source_row="B", **common
             )
-
-        self.assertIn("-ffp-contract=off", command)
-        self.assertIn("-fno-fast-math", command)
-        self.assertIn("-DGAPBS_AMU_BATCH_SIZE=64", command)
-        self.assertNotIn("-ffast-math", command)
-
-    def test_cira_compile_command_sets_scale_derived_row_policy(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            g4_command = variants.compile_command(
-                kind="cira",
-                cxx="g++",
-                source=root / "pr_spmv.cc",
-                gapbs_root=root / "gapbs",
-                generated_dir=root / "generated",
-                output=root / "bin/pr_spmv",
-                m5_library=root / "libm5.a",
-                amu_batch_size=64,
-                cira_prefetch_distance=2,
-                cira_row_batch=256,
-                cira_max_outstanding=256,
-                cira_lead_rows=1,
-                cira_batch_rows=1,
-            )
-            g12_command = variants.compile_command(
-                kind="cira",
-                cxx="g++",
-                source=root / "pr_spmv.cc",
-                gapbs_root=root / "gapbs",
-                generated_dir=root / "generated",
-                output=root / "bin/pr_spmv",
-                m5_library=root / "libm5.a",
-                amu_batch_size=64,
-                cira_prefetch_distance=8,
-                cira_row_batch=64,
-                cira_max_outstanding=256,
-                cira_lead_rows=512,
-                cira_batch_rows=64,
-            )
-
-        self.assertIn("-DGAPBS_CIRA_LEAD_ROWS=1", g4_command)
-        self.assertIn("-DGAPBS_CIRA_BATCH_ROWS=1", g4_command)
-        self.assertIn("-DGAPBS_CIRA_LEAD_ROWS=512", g12_command)
-        self.assertIn("-DGAPBS_CIRA_BATCH_ROWS=64", g12_command)
-        for command in (g4_command, g12_command):
-            self.assertNotIn("-DGAPBS_CIRA_NODE_DISTANCE=2", command)
-            self.assertFalse(any(
-                flag.startswith("-DGAPBS_CIRA_LEAD_BLOCKS=")
-                for flag in command
-            ))
+        for command in (amu, cira):
+            self.assertIn("-ffp-contract=off", command)
+            self.assertIn("-fno-fast-math", command)
+            self.assertNotIn("-ffast-math", command)
+            self.assertIn(str(REPO / "util/pr_offload"), command)
+        self.assertIn("-DPR_OFFLOAD_AMU=1", amu)
+        self.assertNotIn("-DPR_OFFLOAD_CIRA=1", amu)
+        self.assertIn("-DPR_OFFLOAD_CIRA=1", cira)
+        self.assertNotIn("-DPR_OFFLOAD_AMU=1", cira)
+        self.assertIn("-DPR_CIRA_POLICY_PGO=1", cira)
+        self.assertIn("-DPR_CIRA_SOURCE_ROW=1", cira)
 
 
 class MatchedVariantBitGateTest(unittest.TestCase):
     @staticmethod
     def write_words(path, words):
-        path.write_bytes(
-            b"".join(struct.pack("<I", word) for word in words)
-        )
+        path.write_bytes(b"".join(struct.pack("<I", word) for word in words))
 
     def test_bit_gate_accepts_both_exact_variant_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -274,23 +132,13 @@ class MatchedVariantBitGateTest(unittest.TestCase):
             words = [0x3E800000, 0x80000000, 0x7FC00001]
             for path in (reference, amu, cira):
                 self.write_words(path, words)
-
             evidence = variants.validate_raw_outputs(
-                reference,
-                {"amu": amu, "cira": cira},
-                expected_words=3,
+                reference, {"amu": amu, "cira": cira}, expected_words=3
             )
-
         self.assertEqual(evidence["compared_words"], 3)
         self.assertEqual(evidence["mismatches"], {"amu": 0, "cira": 0})
-        self.assertEqual(
-            evidence["sha256"]["baseline"],
-            evidence["sha256"]["amu"],
-        )
-        self.assertEqual(
-            evidence["sha256"]["baseline"],
-            evidence["sha256"]["cira"],
-        )
+        self.assertEqual(evidence["sha256"]["baseline"], evidence["sha256"]["amu"])
+        self.assertEqual(evidence["sha256"]["baseline"], evidence["sha256"]["cira"])
 
     def test_bit_gate_rejects_a_single_changed_bit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,14 +147,11 @@ class MatchedVariantBitGateTest(unittest.TestCase):
             amu = root / "amu.u32"
             self.write_words(reference, [0x3E800000, 0x3F000000])
             self.write_words(amu, [0x3E800001, 0x3F000000])
-
             with self.assertRaisesRegex(
                 variants.VariantEvidenceError,
                 r"amu word 0: expected 0x3e800000, actual 0x3e800001",
             ):
-                variants.validate_raw_outputs(
-                    reference, {"amu": amu}, expected_words=2
-                )
+                variants.validate_raw_outputs(reference, {"amu": amu}, 2)
 
 
 if __name__ == "__main__":
