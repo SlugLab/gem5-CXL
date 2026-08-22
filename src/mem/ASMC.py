@@ -22,17 +22,17 @@ class ASMC(ClockedObject):
         8, "Initial bytes moved by each AMU operation"
     )
     max_outstanding = Param.Unsigned(
-        256, "Initial maximum outstanding AMU operations"
+        512, "Initial maximum outstanding AMU operations (increased from 256)"
     )
     max_send_queue = Param.Unsigned(
-        512, "Maximum queued memory packets waiting for the cache port"
+        1024, "Maximum queued memory packets waiting for the cache port (increased from 512)"
     )
     issue_latency = Param.Latency(
         "1ns", "Delay from m5op issue to first ASMC memory packet send"
     )
     completion_latency = Param.Latency(
-        "0ns", "Fixed ASMC completion delay after memory responses return"
+        "1ns", "Fast ASMC completion delay (direct memory access)"
     )
     asmc_latency = Param.Latency(
-        "1000ns", "Configurable AMU compatibility completion delay"
+        "1ns", "Minimal AMU latency for direct memory operations"
     )

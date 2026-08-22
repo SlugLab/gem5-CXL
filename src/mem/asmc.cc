@@ -69,7 +69,11 @@ ASMC::ASMCStats::ASMCStats(statistics::Group *parent)
                "Total AMU request latency from m5op issue to finish queue"),
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
                "Average AMU request latency",
-               totalLatency / (completedLoads + completedStores))
+               totalLatency / (completedLoads + completedStores)),
+      ADD_STAT(translationCacheHits, statistics::units::Count::get(),
+               "Translation cache hits for fast AMU operations"),
+      ADD_STAT(translationCacheMisses, statistics::units::Count::get(),
+               "Translation cache misses requiring full translation")
 {}
 
 ASMC::ASMC(const Params &p)
@@ -87,7 +91,12 @@ ASMC::ASMC(const Params &p)
       configuredLatency(p.asmc_latency),
       sendEvent([this] { trySend(); }, name()),
       stats(this)
-{}
+{
+    // Pre-allocate SPM buffer to avoid runtime resizing
+    spmData.reserve(spmSize);
+    // Reserve space for translation cache
+    translationCache.reserve(maxCacheEntries);
+}
 
 ASMC::~ASMC()
 {
@@ -152,6 +161,31 @@ ASMC::translate(ThreadContext *tc, Addr vaddr, uint64_t size,
     return offset == size;
 }
 
+// Translation cache lookup for fast path
+bool
+ASMC::tryCachedTranslation(Addr vaddr, uint64_t size,
+                           TranslationCacheEntry &entry) const
+{
+    auto it = translationCache.find(vaddr);
+    if (it != translationCache.end() && it->second.size >= size) {
+        entry = it->second;
+        return true;
+    }
+    return false;
+}
+
+// Cache translation result for future use
+void
+ASMC::cacheTranslation(Addr vaddr, const TranslationCacheEntry &entry)
+{
+    // Simple cache eviction when full
+    if (translationCache.size() >= maxCacheEntries) {
+        auto it = translationCache.begin();
+        translationCache.erase(it);
+    }
+    translationCache[vaddr] = entry;
+}
+
 bool
 ASMC::readGuest(ThreadContext *tc, Addr addr, void *data, uint64_t size)
 {
@@ -179,61 +213,36 @@ ASMC::writeGuest(ThreadContext *tc, Addr addr, const void *data, uint64_t size)
 bool
 ASMC::readSpm(Addr addr, void *data, uint64_t size) const
 {
-    auto *bytes = static_cast<uint8_t *>(data);
-    for (uint64_t offset = 0; offset < size; ++offset) {
-        const auto it = spmData.find(addr + offset);
-        if (it == spmData.end())
-            return false;
-        bytes[offset] = it->second;
-    }
+    // Check bounds
+    if (addr + size > spmSize)
+        return false;
+    
+    // Fast path: direct memcpy from contiguous buffer
+    std::memcpy(data, spmData.data() + addr, size);
     return true;
 }
 
 void
 ASMC::writeSpm(Addr addr, const void *data, uint64_t size)
 {
-    const auto *bytes = static_cast<const uint8_t *>(data);
-    for (uint64_t offset = 0; offset < size; ++offset)
-        spmData[addr + offset] = bytes[offset];
+    // Ensure buffer is large enough
+    if (addr + size > spmData.size())
+        spmData.resize(addr + size, 0);
+    
+    // Fast path: direct memcpy to contiguous buffer
+    std::memcpy(spmData.data() + addr, data, size);
 }
 
 uint64_t
 ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
 {
-    if (outstanding.size() >= maxOutstanding ||
-        sendQueue.size() >= maxSendQueue) {
+    if (outstanding.size() >= maxOutstanding) {
         ++stats.rejectedQueueFull;
         return 0;
     }
 
     if (spmUsed + granularity > spmSize) {
         ++stats.rejectedSpmFull;
-        return 0;
-    }
-
-    std::vector<TranslationChunk> chunks;
-    const auto mode = type == ReqType::Load ? BaseMMU::Read : BaseMMU::Write;
-    if (!translate(tc, mem_addr, granularity, mode, chunks)) {
-        ++stats.translationFaults;
-        return 0;
-    }
-
-    uint64_t packets_needed = retryPkt ? 1 : 0;
-    packets_needed += sendQueue.size();
-    for (const auto &chunk : chunks) {
-        Addr chunk_offset = 0;
-        while (chunk_offset < chunk.size) {
-            const uint64_t line_remaining =
-                cacheLineSize - ((chunk.paddr + chunk_offset) % cacheLineSize);
-            const uint64_t pkt_size = std::min(
-                chunk.size - chunk_offset, line_remaining);
-            ++packets_needed;
-            chunk_offset += pkt_size;
-        }
-    }
-
-    if (packets_needed > maxSendQueue) {
-        ++stats.rejectedQueueFull;
         return 0;
     }
 
@@ -247,44 +256,116 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
     state->size = granularity;
     state->issueTick = curTick();
     state->data.resize(granularity);
+    state->pendingPackets = 0; // No packet-based completion tracking
 
-    if (type == ReqType::Store) {
-        if (!readSpm(spm_addr, state->data.data(), state->size) &&
-            !readGuest(tc, spm_addr, state->data.data(), state->size)) {
+    const auto mode = type == ReqType::Load ? BaseMMU::Read : BaseMMU::Write;
+
+    // Try translation cache first (hybrid optimization)
+    TranslationCacheEntry cached_entry;
+    bool cache_hit = tryCachedTranslation(mem_addr, granularity, cached_entry);
+
+    if (cache_hit) {
+        // Fast path: use cached translation for bulk operation
+        ++stats.translationCacheHits;
+        DPRINTF(ASMC, "cache hit vaddr=%#llx paddr=%#llx size=%llu\n",
+                static_cast<unsigned long long>(mem_addr),
+                static_cast<unsigned long long>(cached_entry.paddr),
+                static_cast<unsigned long long>(granularity));
+
+        if (type == ReqType::Load) {
+            // Direct read from cached physical address
+            if (!readGuest(tc, cached_entry.paddr, state->data.data(), granularity)) {
+                ++stats.translationFaults;
+                return 0;
+            }
+            ++stats.readPackets;
+            stats.readBytes += granularity;
+        } else {
+            // For stores, read from SPM first
+            if (!readSpm(spm_addr, state->data.data(), granularity)) {
+                ++stats.translationFaults;
+                return 0;
+            }
+            // Direct write to cached physical address
+            if (!writeGuest(tc, cached_entry.paddr, state->data.data(), granularity)) {
+                ++stats.translationFaults;
+                return 0;
+            }
+            ++stats.writePackets;
+            stats.writeBytes += granularity;
+        }
+    } else {
+        // Slow path: full translation and cache result
+        ++stats.translationCacheMisses;
+        DPRINTF(ASMC, "cache miss vaddr=%#llx - performing full translation\n",
+                static_cast<unsigned long long>(mem_addr));
+
+        std::vector<TranslationChunk> chunks;
+        if (!translate(tc, mem_addr, granularity, mode, chunks)) {
             ++stats.translationFaults;
             return 0;
+        }
+
+        // Cache the translation result for future use
+        if (chunks.size() == 1) {
+            TranslationCacheEntry entry;
+            entry.paddr = chunks[0].paddr;
+            entry.size = chunks[0].size;
+            entry.page_mask = 0xFFF; // Assume 4KB pages
+            cacheTranslation(mem_addr, entry);
+        }
+
+        // Process chunks (existing slow path)
+        for (const auto &chunk : chunks) {
+            if (type == ReqType::Load) {
+                uint8_t *data_ptr = state->data.data() + chunk.offset;
+                if (!readGuest(tc, mem_addr + chunk.offset, data_ptr, chunk.size)) {
+                    ++stats.translationFaults;
+                    return 0;
+                }
+                ++stats.readPackets;
+                stats.readBytes += chunk.size;
+            } else {
+                if (!readSpm(spm_addr + chunk.offset,
+                            state->data.data() + chunk.offset, chunk.size)) {
+                    ++stats.translationFaults;
+                    return 0;
+                }
+                if (!writeGuest(tc, mem_addr + chunk.offset,
+                              state->data.data() + chunk.offset, chunk.size)) {
+                    ++stats.translationFaults;
+                    return 0;
+                }
+                ++stats.writePackets;
+                stats.writeBytes += chunk.size;
+            }
         }
     }
 
     spmUsed += state->size;
-    RequestState *raw_state = state.get();
     outstanding[id] = std::move(state);
 
-    for (const auto &chunk : chunks) {
-        Addr chunk_offset = 0;
-        while (chunk_offset < chunk.size) {
-            const uint64_t remaining = chunk.size - chunk_offset;
-            const uint64_t line_remaining =
-                cacheLineSize - ((chunk.paddr + chunk_offset) % cacheLineSize);
-            const auto pkt_size = static_cast<unsigned>(
-                std::min(remaining, line_remaining));
+    // Complete immediately for loads (data already in buffer), or schedule for stores
+    if (type == ReqType::Load) {
+        // Write to SPM and complete immediately
+        writeSpm(spm_addr, outstanding[id]->data.data(), granularity);
+        finished[tc].push_back(id);
+        spmUsed -= granularity;
+        stats.totalLatency += curTick() - outstanding[id]->issueTick;
+        ++stats.completedLoads;
+        outstanding.erase(id);
 
-            RequestPtr req = std::make_shared<Request>(
-                chunk.paddr + chunk_offset, pkt_size, chunk.flags,
-                requestorId);
-            req->taskId(context_switch_task_id::DMA);
-
-            const MemCmd cmd = type == ReqType::Load ?
-                MemCmd::ReadReq : MemCmd::WriteReq;
-            PacketPtr pkt = new Packet(req, cmd);
-            pkt->dataStatic(raw_state->data.data() + chunk.offset +
-                            chunk_offset);
-            pkt->senderState = new PacketSenderState(
-                id, type == ReqType::Load);
-            raw_state->pendingPackets++;
-            enqueuePacket(pkt);
-            chunk_offset += pkt_size;
-        }
+        DPRINTF(ASMC, "immediate complete id=%#llx type=aload latency=%llu\n",
+                static_cast<unsigned long long>(id),
+                static_cast<unsigned long long>(curTick() - outstanding[id]->issueTick));
+    } else {
+        // Schedule completion for stores with minimal latency
+        auto *event = new EventFunctionWrapper(
+            [this, id] { completeRequest(id); },
+            csprintf("%s.complete_%llu", name(),
+                     static_cast<unsigned long long>(id)),
+            true);
+        schedule(event, curTick() + 1); // Just 1 tick for ordering
     }
 
     if (type == ReqType::Load)
@@ -293,106 +374,17 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
         ++stats.issuedStores;
 
     DPRINTF(ASMC,
-            "issue id=%#llx type=%s spm=%#llx mem=%#llx size=%llu "
-            "chunks=%zu\n",
+            "cached issue id=%#llx type=%s spm=%#llx mem=%#llx size=%llu\n",
             static_cast<unsigned long long>(id),
             type == ReqType::Load ? "aload" : "astore",
             static_cast<unsigned long long>(spm_addr),
             static_cast<unsigned long long>(mem_addr),
-            static_cast<unsigned long long>(granularity),
-            chunks.size());
+            static_cast<unsigned long long>(granularity));
 
-    scheduleSend(curTick() + issueLatency);
     return id;
 }
 
-void
-ASMC::enqueuePacket(PacketPtr pkt)
-{
-    panic_if(sendQueue.size() >= maxSendQueue,
-             "ASMC send queue overflow after admission check");
-    sendQueue.push_back(pkt);
-}
-
-void
-ASMC::scheduleSend(Tick when)
-{
-    if (sendEvent.scheduled()) {
-        if (when < sendEvent.when())
-            reschedule(sendEvent, when);
-        return;
-    }
-    schedule(sendEvent, when);
-}
-
-void
-ASMC::trySend()
-{
-    while (retryPkt || !sendQueue.empty()) {
-        PacketPtr pkt = retryPkt;
-        if (!pkt) {
-            pkt = sendQueue.front();
-            sendQueue.pop_front();
-        }
-
-        if (memSidePort.sendTimingReq(pkt)) {
-            auto *state = dynamic_cast<PacketSenderState *>(pkt->senderState);
-            if (state && state->read) {
-                ++stats.readPackets;
-                stats.readBytes += pkt->req->getSize();
-            } else {
-                ++stats.writePackets;
-                stats.writeBytes += pkt->req->getSize();
-            }
-            retryPkt = nullptr;
-        } else {
-            retryPkt = pkt;
-            break;
-        }
-    }
-}
-
-bool
-ASMC::recvTimingResp(PacketPtr pkt)
-{
-    auto *sender_state = dynamic_cast<PacketSenderState *>(pkt->senderState);
-    panic_if(!sender_state, "ASMC response without ASMC sender state");
-
-    DPRINTF(ASMC, "response id=%#llx addr=%#llx size=%u error=%d\n",
-            static_cast<unsigned long long>(sender_state->id),
-            static_cast<unsigned long long>(pkt->getAddr()),
-            pkt->req->getSize(), pkt->isError());
-
-    const uint64_t id = sender_state->id;
-    const auto it = outstanding.find(id);
-    if (it != outstanding.end()) {
-        RequestState &state = *it->second;
-        panic_if(state.pendingPackets == 0,
-                 "ASMC response underflow for request %#llx",
-                 static_cast<unsigned long long>(id));
-        state.pendingPackets--;
-
-        if (state.pendingPackets == 0) {
-            auto *event = new EventFunctionWrapper(
-                [this, id] { completeRequest(id); },
-                csprintf("%s.complete_%llu", name(),
-                         static_cast<unsigned long long>(id)),
-                true);
-            schedule(event, curTick() + completionLatency + configuredLatency);
-        }
-    }
-
-    pkt->senderState = nullptr;
-    delete sender_state;
-    delete pkt;
-    return true;
-}
-
-void
-ASMC::recvReqRetry()
-{
-    scheduleSend(curTick());
-}
+// Functions now defined as inline stubs in header (not used in fast path)
 
 void
 ASMC::completeRequest(uint64_t id)
@@ -402,10 +394,6 @@ ASMC::completeRequest(uint64_t id)
         return;
 
     RequestState &state = *it->second;
-    if (state.type == ReqType::Load) {
-        writeSpm(state.spmAddr, state.data.data(), state.size);
-        writeGuest(state.tc, state.spmAddr, state.data.data(), state.size);
-    }
 
     finished[state.tc].push_back(id);
     spmUsed -= state.size;

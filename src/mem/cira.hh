@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "arch/generic/mmu.hh"
@@ -168,6 +169,9 @@ class CIRA : public ClockedObject
     bool readIndex(ThreadContext *tc, Addr addr, uint64_t index_size,
                    uint64_t &index) const;
     bool hasPrefetchSlot() const;
+    bool isCacheLineOutstanding(Addr line_addr) const;
+    void markCacheLineOutstanding(Addr line_addr);
+    void clearCacheLineOutstanding(Addr line_addr);
     void scheduleCsrWalk(Tick when);
     void processCsrWalk();
     void enqueuePacket(PacketPtr pkt);
@@ -201,6 +205,9 @@ class CIRA : public ClockedObject
     EventFunctionWrapper sendEvent;
     std::deque<CsrWalkState> csrWalkQueue;
     EventFunctionWrapper csrWalkEvent;
+
+    // Request deduplication cache to prevent duplicate prefetches for same cache line
+    std::unordered_set<Addr> outstandingCacheLines;
 
     CIRAStats stats;
 };

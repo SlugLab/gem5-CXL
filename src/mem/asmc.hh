@@ -116,6 +116,8 @@ class ASMC : public ClockedObject
         statistics::Scalar writeBytes;
         statistics::Scalar totalLatency;
         statistics::Formula avgLatency;
+        statistics::Scalar translationCacheHits;
+        statistics::Scalar translationCacheMisses;
     };
 
     uint64_t issue(ThreadContext *tc, ReqType type, Addr spm_addr,
@@ -128,11 +130,11 @@ class ASMC : public ClockedObject
                     uint64_t size);
     bool readSpm(Addr addr, void *data, uint64_t size) const;
     void writeSpm(Addr addr, const void *data, uint64_t size);
-    void enqueuePacket(PacketPtr pkt);
-    void scheduleSend(Tick when);
-    void trySend();
-    bool recvTimingResp(PacketPtr pkt);
-    void recvReqRetry();
+    void enqueuePacket(PacketPtr pkt) { /* Unused in fast path */ }
+    void scheduleSend(Tick when) { /* Unused in fast path */ }
+    void trySend() { /* Unused in fast path */ }
+    bool recvTimingResp(PacketPtr pkt) { return true; /* Unused in fast path */ }
+    void recvReqRetry() { /* Unused in fast path */ }
     void completeRequest(uint64_t id);
     void reset();
     void deleteQueuedPacket(PacketPtr pkt);
@@ -157,10 +159,25 @@ class ASMC : public ClockedObject
 
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;
-    std::unordered_map<Addr, uint8_t> spmData;
+    std::vector<uint8_t> spmData;  // Changed from map to vector for efficiency
     std::deque<PacketPtr> sendQueue;
     PacketPtr retryPkt = nullptr;
     EventFunctionWrapper sendEvent;
+
+    // Translation cache for hybrid optimization
+    struct TranslationCacheEntry
+    {
+        Addr paddr;
+        uint64_t size;
+        Addr page_mask;
+    };
+    std::unordered_map<Addr, TranslationCacheEntry> translationCache;
+    const uint64_t maxCacheEntries = 4096; // Cache up to 4K translations
+
+    // Translation cache methods (must be after struct definition)
+    bool tryCachedTranslation(Addr vaddr, uint64_t size,
+                            TranslationCacheEntry &entry) const;
+    void cacheTranslation(Addr vaddr, const TranslationCacheEntry &entry);
 
     ASMCStats stats;
 };

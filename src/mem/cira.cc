@@ -197,6 +197,24 @@ CIRA::hasPrefetchSlot() const
            queuedPackets < maxSendQueue;
 }
 
+bool
+CIRA::isCacheLineOutstanding(Addr line_addr) const
+{
+    return outstandingCacheLines.count(line_addr) > 0;
+}
+
+void
+CIRA::markCacheLineOutstanding(Addr line_addr)
+{
+    outstandingCacheLines.insert(line_addr);
+}
+
+void
+CIRA::clearCacheLineOutstanding(Addr line_addr)
+{
+    outstandingCacheLines.erase(line_addr);
+}
+
 void
 CIRA::scheduleCsrWalk(Tick when)
 {
@@ -299,6 +317,15 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
 
     const uint64_t requestSize = size ? size : cacheLineSize;
     const Addr lineBase = addr & ~(cacheLineSize - 1);
+
+    // Request deduplication: check if this cache line is already being prefetched
+    if (isCacheLineOutstanding(lineBase)) {
+        DPRINTF(CIRA, "duplicate prefetch rejected vaddr=%#llx line=%#llx\n",
+                static_cast<unsigned long long>(addr),
+                static_cast<unsigned long long>(lineBase));
+        return 0;
+    }
+
     const Addr lineEnd = (addr + requestSize + cacheLineSize - 1) &
                          ~(cacheLineSize - 1);
     const uint64_t installSize = std::max<uint64_t>(cacheLineSize,
@@ -339,6 +366,9 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
     state->issueTick = curTick();
     RequestState *rawState = state.get();
     outstanding[id] = std::move(state);
+
+    // Mark this cache line as outstanding to prevent duplicate prefetches
+    markCacheLineOutstanding(lineBase);
 
     for (const auto &chunk : chunks) {
         Addr chunkOffset = 0;
@@ -758,6 +788,11 @@ CIRA::completeRequest(uint64_t id)
         return;
 
     RequestState &state = *it->second;
+
+    // Clear the cache line from outstanding set when request completes
+    const Addr lineBase = state.vaddr & ~(cacheLineSize - 1);
+    clearCacheLineOutstanding(lineBase);
+
     finished[state.tc].push_back(id);
     stats.totalLatency += curTick() - state.issueTick;
     ++stats.completedPrefetches;
@@ -849,6 +884,7 @@ CIRA::reset()
     csrWalkQueue.clear();
     outstanding.clear();
     finished.clear();
+    outstandingCacheLines.clear();
     nextId = 1;
 }
 
