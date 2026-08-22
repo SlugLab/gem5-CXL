@@ -601,3 +601,108 @@ AMU rows also preserve `amu_logical_values`, `amu_line_requests`,
 `amu_line_cache_hits`, and `amu_coalesced_misses`; formal paper scales require
 line requests to match ASMC issued loads, remain below logical values, and show
 nonzero cache hits and coalescing.
+
+## Asymmetric near-data PR publication (current contract)
+
+The current paper comparison supersedes the four-scale flow above. Its formal
+profile is `pr-offload-4thread-1us` and selects only g12, g14, and g20 from the
+accepted source-input manifest; g4 remains a correctness-only historical row
+and can never become a timed point. Every formal point uses four workers, all
+memory behind the 1 us CXL link, two trials with trial 1 measured, and 20
+synchronous float32 PageRank iterations. The shared row descriptor is exactly
+104 bytes. Both rank buffers are initialized before the measured iteration,
+iteration 0 reads A and writes B, and iteration 19 writes the final result to
+A. Every published vector must match the matched Vanilla vector bit for bit.
+
+The ROI starts immediately before iteration-0 formation/scheduling and ends
+only after iteration 19, the four-worker barrier, and the final device drain.
+CIRA Few-shot charges formation, all discarded A/B/C samples, selection,
+JIT/reconfiguration, execution, and drain. Those six additive fields must sum
+exactly to E2E ticks. Executor counters overlap and are published separately as
+non-additive mechanism evidence. M2NDP initializes and validates its four-way,
+double-buffered trace with FuncSim before NDPSim; its timed marker is
+`K2_CONTRIB_TRIAL1_PART0`.
+
+The schema-2 model must be regenerated from the approved sources. AMU uses
+`3663479.pdf` (SHA-256
+`cba178ece7593b3ede868417a031ded3efddd85d5f7c50672b0a93735187790f`),
+and CIRA uses
+`/root/ia780i_type2_delay_buffer_new/benchmark_gapbs_workloads_ci_long.csv`
+(SHA-256
+`4e0297da423cee0a742bc2e10656d022bb27776807f2d2ce4cca43e65c634184`).
+The manifest must say `formal_speedup_is_fit_target=false` and both validation
+sections must pass. Collection, independent gate, and fit are:
+
+```sh
+python3 scripts/run_amu_paper_calibration.py collect \
+  --gem5 build/X86/gem5.opt \
+  --config configs/example/gem5_library/x86-gapbs-amu-se.py \
+  --m5-library util/m5/build/x86/out/libm5.a \
+  --pdf /home/victoryang00/gem5-CXL/3663479.pdf \
+  --cira-csv /root/ia780i_type2_delay_buffer_new/benchmark_gapbs_workloads_ci_long.csv \
+  --outdir /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/collection \
+  --measurements /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/measurements.json \
+  --collection-manifest /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/collection-manifest.json \
+  --iterations 2 --jobs 12
+python3 scripts/run_amu_paper_calibration.py gate \
+  --gem5 build/X86/gem5.opt \
+  --config configs/example/gem5_library/x86-gapbs-amu-se.py \
+  --m5-library util/m5/build/x86/out/libm5.a \
+  --outdir /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/gate \
+  --proof /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/gate-proof.json \
+  --iterations 2
+python3 scripts/run_amu_paper_calibration.py fit \
+  --measurements /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/measurements.json \
+  --pdf /home/victoryang00/gem5-CXL/3663479.pdf \
+  --cira-csv /root/ia780i_type2_delay_buffer_new/benchmark_gapbs_workloads_ci_long.csv \
+  --holdout-workload stream --holdout-latency 2us \
+  --output /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/amu-cira.json
+```
+
+Freeze all policy builds first, then launch only g12 qualification from a new
+root. `--policy` is the immutable policy/build manifest and
+`--variants-build-root` contains the hash-bound AMU and CIRA policy binaries:
+
+```sh
+python3 scripts/run_pr_asymmetric_offload.py \
+  --inputs /mnt/disk0/gem5-CXL-eval/pr-scaling-120b389653d8/inputs.json \
+  --calibration /mnt/disk0/gem5-CXL-eval/pr-offload-calibration/amu-cira.json \
+  --policy /mnt/disk0/gem5-CXL-eval/pr-offload-builds/policy.json \
+  --variants-build-root /mnt/disk0/gem5-CXL-eval/pr-offload-builds \
+  --root /mnt/disk0/gem5-CXL-eval/pr-offload-formal \
+  --gem5 build/X86/gem5.opt --m5-library util/m5/build/x86/out/libm5.a \
+  --config configs/example/gem5_library/x86-gapbs-amu-se.py \
+  --cxlmemuring /home/victoryang00/CXLMemUring \
+  --m2ndp-root /mnt/disk0/M2NDP-public \
+  --stop-after qualification
+```
+
+Qualification first validates bits and mechanism evidence, then recomputes the
+AMU, CIRA Few-shot, and M2NDP speedups against the same g12 Vanilla result. All
+three must be inclusively within 1.4--1.6x. It then reruns all four g12 points
+and requires identical rank hashes and native timing counts, plus the same CIRA
+selected candidate. Only a passing `qualification.json` authorizes the same
+command with `--resume` and without `--stop-after`.
+
+Any correctness, queue, topology, phase, FuncSim, or replay failure writes
+`diagnostic-performance-hold.json`, removes `qualification.json` and
+`complete.json`, and launches no larger graph. A final nine-point speedup
+offender writes `performance-hold.json`; CIRA Static/PGO/A/B/C remain
+correctness-only ablations. Held results are raw diagnostic evidence and are
+never publishable.
+
+After a valid 27-point `complete.json`, generate the exact raw CSV/JSON, table,
+and PDF/SVG figures atomically:
+
+```sh
+python3 scripts/generate_pr_offload_artifacts.py \
+  --complete /mnt/disk0/gem5-CXL-eval/pr-offload-formal/complete.json \
+  --outdir /mnt/disk0/gem5-CXL-eval/pr-offload-formal/publication
+```
+
+The speedup and absolute-latency figures contain the nine formal accelerated
+points. CIRA policy scaling is separate; Oracle regret is annotation/raw data,
+not a formal bar. The phase chart contains only the six additive stages, while
+the normalized mechanism heatmap is explicitly labeled non-additive. The
+publisher stages all 14 required files, hashes them, and rolls back the whole
+tree on any validation, rendering, or promotion failure.

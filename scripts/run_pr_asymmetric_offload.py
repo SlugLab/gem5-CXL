@@ -524,6 +524,14 @@ def load_point(entry, options):
             for name in contract.CIRA_PHASES
         }
         point["selected_candidate"] = row.get("pr_cira_selected_candidate")
+        point["mechanism"] = {
+            "csr_reads": int(row.get("pr_read_packets", 0)),
+            "rank_reads": int(row.get("pr_coherent_read_packets", 0)),
+            "fp_compute": int(row.get("pr_compute_ticks", 0)),
+            "queue_stall": int(row.get("pr_queue_stall_ticks", 0)),
+            "coherence": int(row.get("pr_coherent_read_packets", 0)),
+            "writeback": int(row.get("pr_write_packets", 0)),
+        }
     return contract.validate_point(point)
 
 
