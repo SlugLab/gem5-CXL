@@ -49,6 +49,21 @@ class CIRA(ClockedObject):
     completion_latency = Param.Latency(
         "0ns", "Fixed CIRA completion delay after memory responses return"
     )
+    pr_descriptor_entries = Param.Unsigned(
+        16, "Maximum accepted PageRank descriptors per issuing core"
+    )
+    pr_csr_read_entries = Param.Unsigned(
+        256, "Maximum queued and in-flight PageRank CSR reads"
+    )
+    pr_coherent_entries = Param.Unsigned(
+        256, "Maximum queued and in-flight PageRank coherent packets per core"
+    )
+    pr_fp_add_cycles = Param.Cycles(1, "Cycles per ordered PageRank float add")
+    pr_fp_mul_cycles = Param.Cycles(1, "Cycles per PageRank float multiply")
+    pr_fp_div_cycles = Param.Cycles(4, "Cycles per PageRank float divide")
+    pr_reconfiguration_latency = Param.Latency(
+        "100ns", "Charged latency for a CIRA PageRank JIT reconfiguration"
+    )
     enabled = Param.Bool(True, "Enable CIRA timing prefetch requests")
     timing_csr_traversal = Param.Bool(
         True, "Use bounded device-side timing reads for CSR indices"

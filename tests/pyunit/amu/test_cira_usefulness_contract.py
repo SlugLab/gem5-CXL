@@ -13,6 +13,9 @@ REPO = Path(__file__).resolve().parents[3]
 CIRA_PY = REPO / "src" / "mem" / "CIRA.py"
 CIRA_HH = REPO / "src" / "mem" / "cira.hh"
 CIRA_CC = REPO / "src" / "mem" / "cira.cc"
+M5OPS = REPO / "include" / "gem5" / "asm" / "generic" / "m5ops.h"
+PSEUDO = REPO / "src" / "sim" / "pseudo_inst.cc"
+CIRA_HEADER = REPO / "util" / "cira" / "cira.h"
 TRANSLATING_PORT_PROXY_CC = REPO / "src" / "mem" / "translating_port_proxy.cc"
 PROCESS_CC = REPO / "src" / "sim" / "process.cc"
 SYSCALL_EMUL_HH = REPO / "src" / "sim" / "syscall_emul.hh"
@@ -26,17 +29,54 @@ CIRA_MULTICORE_WORKLOAD = (
 CIRA_MULTICORE_CONFIG = (
     REPO / "tests" / "gem5" / "cira" / "run_cira_multicore.py"
 )
+CIRA_PR_WORKLOAD = (
+    REPO / "tests" / "gem5" / "cira" / "cira_pr_rows_smoke.cc"
+)
 
 
 class CiraUsefulnessTrackerContractTest(unittest.TestCase):
+    def test_cira_pr_descriptor_uses_native_dispatch(self):
+        self.assertIn(
+            "M5OP_CIRA_PR_ROWS      0x66",
+            M5OPS.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "cira->issuePrRows(tc, desc.addr)",
+            PSEUDO.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "cira_pr_rows(const struct pr_row_offload_desc *desc)",
+            CIRA_HEADER.read_text(encoding="utf-8"),
+        )
+
+    def test_cira_pr_descriptor_uses_device_csr_and_coherent_value_ports(self):
+        source = CIRA_CC.read_text(encoding="utf-8")
+        self.assertIn("issuePrRows(ThreadContext *tc, Addr desc_addr)", source)
+        self.assertIn("PrPacketRole::CsrRead", source)
+        self.assertIn("PrPacketRole::CoherentRead", source)
+        self.assertIn("PrPacketRole::CoherentWrite", source)
+        self.assertIn("completedPrDescriptorsPerCore", source)
+        self.assertIn("csrMemoryPort->sendTimingReq", source)
+        self.assertIn("memSidePorts[targetCore]->sendTimingReq", source)
+
+    def test_cira_jit_reconfiguration_is_a_real_completion(self):
+        header = CIRA_HEADER.read_text(encoding="utf-8")
+        self.assertIn("CIRA_CFG_PR_RECONFIGURE", header)
+        self.assertIn("CIRA_CFG_PR_ROW_WINDOW", header)
+        self.assertIn("CIRA_CFG_PR_LEAD_BLOCKS", header)
+        source = CIRA_CC.read_text(encoding="utf-8")
+        self.assertIn("prReconfigurationLatency", source)
+        self.assertIn("completedPrReconfigurations", source)
+
     def test_csr_timing_walk_has_a_bounded_device_side_read_path(self):
         cira_py = CIRA_PY.read_text(encoding="utf-8")
         cira_hh = CIRA_HH.read_text(encoding="utf-8")
         cira_cc = CIRA_CC.read_text(encoding="utf-8")
-        process = cira_cc[
-            cira_cc.index("CIRA::processCsrWalk()"):
-            cira_cc.index("CIRA::issuePrefetch(")
-        ]
+        process_start = cira_cc.index("CIRA::processCsrWalk()")
+        process_end = cira_cc.index(
+            "CIRA::validatePrDescriptor(", process_start
+        )
+        process = cira_cc[process_start:process_end]
 
         self.assertNotIn("readIndex(", process)
         self.assertNotIn("readGuest(", process)
@@ -522,6 +562,90 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
             self.assertEqual(
                 int(stats["board.cira.droppedCsrDescriptors"]), 0
             )
+
+    def test_live_four_core_pr_rows_are_bit_exact_and_drained(self):
+        gem5 = REPO / "build" / "X86" / "gem5.opt"
+        if not gem5.is_file():
+            self.skipTest(f"{gem5} is not built")
+        self.assertTrue(CIRA_PR_WORKLOAD.is_file())
+        m5_library = (
+            REPO / "util" / "m5" / "build" / "x86" / "out" / "libm5.a"
+        )
+        self.assertTrue(m5_library.is_file())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            binary = tmp_path / "cira_pr_rows_smoke"
+            outdir = tmp_path / "m5out"
+            compile_result = subprocess.run(
+                [
+                    "g++", "-std=c++17", "-O2", "-Wall", "-Wextra",
+                    "-static", "-no-pie", "-ffp-contract=off",
+                    "-fno-fast-math", "-I", str(REPO / "include"),
+                    "-I", str(REPO / "util" / "cira"),
+                    str(CIRA_PR_WORKLOAD), str(m5_library),
+                    "-o", str(binary),
+                ],
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                compile_result.returncode,
+                0,
+                compile_result.stdout + compile_result.stderr,
+            )
+            run_result = subprocess.run(
+                [
+                    str(gem5), "--outdir", str(outdir),
+                    str(CIRA_MULTICORE_CONFIG), "--binary", str(binary),
+                ],
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(
+                run_result.returncode,
+                0,
+                run_result.stdout + run_result.stderr,
+            )
+            self.assertIn("Verification: PASS", run_result.stdout)
+
+            stats = {}
+            for line in (outdir / "stats.txt").read_text().splitlines():
+                fields = line.split()
+                if len(fields) >= 2:
+                    stats[fields[0]] = fields[1]
+            self.assertEqual(int(stats["board.cira.issuedPrDescriptors"]), 8)
+            self.assertEqual(
+                int(stats["board.cira.completedPrDescriptors"]), 8
+            )
+            self.assertEqual(int(stats["board.cira.rejectedPrDescriptors"]), 0)
+            self.assertEqual(int(stats["board.cira.prRows"]), 16)
+            self.assertGreater(int(stats["board.cira.prCsrReads"]), 0)
+            self.assertGreater(int(stats["board.cira.prCoherentReads"]), 0)
+            self.assertEqual(int(stats["board.cira.prCoherentWrites"]), 16)
+            self.assertEqual(
+                int(stats["board.cira.issuedPrReconfigurations"]), 4
+            )
+            self.assertEqual(
+                int(stats["board.cira.completedPrReconfigurations"]), 4
+            )
+            self.assertEqual(int(stats["board.cira.prOutstandingWork"]), 0)
+            for core in range(4):
+                self.assertEqual(
+                    int(stats[
+                        f"board.cira.issuedPrDescriptorsPerCore::{core}"
+                    ]),
+                    2,
+                )
+                self.assertEqual(
+                    int(stats[
+                        f"board.cira.completedPrDescriptorsPerCore::{core}"
+                    ]),
+                    2,
+                )
 
 
 if __name__ == "__main__":

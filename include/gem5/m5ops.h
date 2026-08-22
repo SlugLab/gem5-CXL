@@ -76,6 +76,7 @@ uint64_t m5_cira_prefetch(const void *addr, uint64_t size);
 uint64_t m5_cira_getfin(void);
 uint64_t m5_cira_cfgwr(uint64_t reg, uint64_t value);
 uint64_t m5_cira_cfgrd(uint64_t reg);
+uint64_t m5_cira_pr_rows(const void *desc);
 uint64_t m5_cira_prefetch_indexed(uint64_t base_addr, uint64_t records_addr,
                                   uint64_t count, uint64_t record_stride,
                                   uint64_t index_offset,

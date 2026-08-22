@@ -814,6 +814,15 @@ ciraGetfin(ThreadContext *tc)
 }
 
 uint64_t
+ciraPrRows(ThreadContext *tc, GuestAddr desc)
+{
+    if (auto *cira = CIRA::get(tc->getSystemPtr()))
+        return cira->issuePrRows(tc, desc.addr);
+
+    return 0;
+}
+
+uint64_t
 ciraCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value)
 {
     if (auto *cira = CIRA::get(tc->getSystemPtr()))

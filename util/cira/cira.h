@@ -10,6 +10,8 @@
 
 #include <gem5/m5ops.h>
 
+#include "../pr_offload/pr_row_offload.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -21,6 +23,9 @@ enum cira_cfg_reg
     CIRA_CFG_RESET = 2,
     CIRA_CFG_OUTSTANDING = 2,
     CIRA_CFG_FINISHED = 3,
+    CIRA_CFG_PR_ROW_WINDOW = 4,
+    CIRA_CFG_PR_LEAD_BLOCKS = 5,
+    CIRA_CFG_PR_RECONFIGURE = 6,
 };
 
 struct cira_indexed_prefetch_desc
@@ -86,6 +91,12 @@ cira_prefetch_csr(const struct cira_csr_prefetch_desc *desc)
     return m5_cira_prefetch_csr(desc->offsets_addr, desc->records_addr,
                                 desc->values_addr, desc->row_start,
                                 desc->row_count, packed);
+}
+
+static inline uint64_t
+cira_pr_rows(const struct pr_row_offload_desc *desc)
+{
+    return m5_cira_pr_rows(desc);
 }
 
 static inline uint64_t

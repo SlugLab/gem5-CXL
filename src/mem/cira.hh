@@ -26,6 +26,8 @@
 #include "sim/clocked_object.hh"
 #include "sim/probe/probe.hh"
 
+#include "../../util/pr_offload/pr_row_offload.h"
+
 namespace gem5
 {
 
@@ -60,6 +62,7 @@ class CIRA : public ClockedObject
                               Addr records_addr, Addr values_addr,
                               uint64_t row_start, uint64_t row_count,
                               uint64_t packed);
+    uint64_t issuePrRows(ThreadContext *tc, Addr desc_addr);
     uint64_t getFinished(ThreadContext *tc);
     uint64_t cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value);
     uint64_t cfgRead(ThreadContext *tc, uint64_t reg) const;
@@ -90,6 +93,66 @@ class CIRA : public ClockedObject
         CsrIndexRead
     };
 
+    enum class PrStage
+    {
+        StartRow,
+        ContribRead,
+        ContribCompute,
+        PullOffsets,
+        PullNeighbors,
+        PullContributions,
+        PullCompute,
+        WriteResult,
+    };
+
+    enum class PrPacketRole
+    {
+        CsrRead,
+        CoherentRead,
+        CoherentWrite,
+    };
+
+    enum class PrPayloadRole
+    {
+        Score,
+        Degree,
+        Offsets,
+        Neighbor,
+        Contribution,
+        Result,
+    };
+
+    struct PrDescriptorState
+    {
+        uint64_t id = 0;
+        PortID targetCore = InvalidPortID;
+        ThreadContext *tc = nullptr;
+        pr_row_offload_desc desc = {};
+        PrStage stage = PrStage::StartRow;
+        uint64_t row = 0;
+        uint64_t edgeBegin = 0;
+        uint64_t edgeEnd = 0;
+        uint64_t nextRead = 0;
+        uint32_t pendingPackets = 0;
+        uint32_t reservedInitialCsrPackets = 0;
+        uint32_t reservedInitialCoherentPackets = 0;
+        Tick issueTick = 0;
+        Tick stallStart = 0;
+        bool queueStalled = false;
+        std::array<uint8_t, 4> scoreData = {};
+        std::array<uint8_t, 8> degreeData = {};
+        std::array<uint8_t, 16> offsetsData = {};
+        std::vector<int32_t> neighbors;
+        std::vector<float> contributions;
+        float result = 0.0f;
+    };
+
+    struct PrThreadConfig
+    {
+        uint64_t rowWindow = 1;
+        uint64_t leadBlocks = 0;
+    };
+
     struct PacketSenderState : public Packet::SenderState
     {
         PacketSenderState(PacketRole packet_role, uint64_t request_id,
@@ -99,12 +162,26 @@ class CIRA : public ClockedObject
               walkId(walk_id), entry(entry_id), dataOffset(data_offset)
         {}
 
+        PacketSenderState(PrPacketRole pr_role,
+                          PrPayloadRole payload_role,
+                          uint64_t request_id, PortID target_core,
+                          uint64_t index, uint64_t data_offset)
+            : role(PacketRole::PrefetchLine), id(request_id),
+              targetCore(target_core), walkId(0), entry(0),
+              dataOffset(data_offset), prPacket(true), prRole(pr_role),
+              prPayload(payload_role), prIndex(index)
+        {}
+
         PacketRole role;
         uint64_t id;
         PortID targetCore;
         uint64_t walkId;
         uint64_t entry;
         uint64_t dataOffset;
+        bool prPacket = false;
+        PrPacketRole prRole = PrPacketRole::CsrRead;
+        PrPayloadRole prPayload = PrPayloadRole::Offsets;
+        uint64_t prIndex = 0;
     };
 
     struct PendingCsrIndexRead
@@ -252,11 +329,45 @@ class CIRA : public ClockedObject
         statistics::Scalar rejectedCsrIndexQueueFull;
         statistics::Scalar timingCsrTraversalEnabled;
         statistics::Scalar totalLatency;
+        statistics::Scalar issuedPrDescriptors;
+        statistics::Scalar completedPrDescriptors;
+        statistics::Scalar rejectedPrDescriptors;
+        statistics::Scalar prRows;
+        statistics::Scalar prCsrReads;
+        statistics::Scalar prCoherentReads;
+        statistics::Scalar prCoherentWrites;
+        statistics::Scalar prComputeTicks;
+        statistics::Scalar prQueueStallTicks;
+        statistics::Scalar issuedPrReconfigurations;
+        statistics::Scalar completedPrReconfigurations;
+        statistics::Scalar usefulHoists;
+        statistics::Scalar ineffectiveHoists;
+        statistics::Scalar prOutstandingWork;
+        statistics::Scalar prHighWatermark;
+        statistics::Vector issuedPrDescriptorsPerCore;
+        statistics::Vector completedPrDescriptorsPerCore;
+        statistics::Vector prRowsPerCore;
+        statistics::Vector prCsrReadsPerCore;
+        statistics::Vector prCoherentReadsPerCore;
+        statistics::Vector prCoherentWritesPerCore;
+        statistics::Vector prComputeTicksPerCore;
+        statistics::Vector prQueueStallTicksPerCore;
+        statistics::Vector issuedPrReconfigurationsPerCore;
+        statistics::Vector completedPrReconfigurationsPerCore;
+        statistics::Vector usefulHoistsPerCore;
+        statistics::Vector ineffectiveHoistsPerCore;
+        statistics::Vector prOutstandingWorkPerCore;
+        statistics::Vector prHighWatermarkPerCore;
         statistics::Formula avgLatency;
     };
 
     bool translate(ThreadContext *tc, Addr vaddr, uint64_t size,
                    std::vector<TranslationChunk> &chunks) const;
+    bool translatePr(ThreadContext *tc, Addr vaddr, uint64_t size,
+                     BaseMMU::Mode mode, bool csr,
+                     std::vector<TranslationChunk> &chunks) const;
+    uint32_t countPackets(
+        const std::vector<TranslationChunk> &chunks) const;
     bool readGuest(ThreadContext *tc, Addr addr, void *data,
                    uint64_t size) const;
     bool readIndex(ThreadContext *tc, Addr addr, uint64_t index_size,
@@ -280,6 +391,27 @@ class CIRA : public ClockedObject
     void trySend();
     bool recvTimingResp(PortID targetCore, PacketPtr pkt);
     void recvReqRetry(PortID targetCore);
+    bool validatePrDescriptor(ThreadContext *tc,
+                              const pr_row_offload_desc &desc) const;
+    bool reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+                       PrPacketRole route, PrPayloadRole payload,
+                       uint64_t index);
+    bool reservePrWrite(PrDescriptorState &state, Addr addr,
+                        const void *data, uint64_t size);
+    void schedulePr(PortID targetCore, Tick when);
+    void processPr(PortID targetCore);
+    bool processPrDescriptor(PrDescriptorState &state);
+    bool recvPrTimingResp(PortID targetCore, PacketPtr pkt,
+                          PacketSenderState *senderState);
+    bool recvPrCsrTimingResp(PacketPtr pkt,
+                             PacketSenderState *senderState);
+    void schedulePrCompute(uint64_t id, Cycles cycles);
+    void finishPrCompute(uint64_t id);
+    void advancePrRow(PrDescriptorState &state);
+    void completePrDescriptor(uint64_t id);
+    void completePrReconfiguration(uint64_t id);
+    void notePrStall(PrDescriptorState &state);
+    void clearPrStall(PrDescriptorState &state);
     void completeRequest(uint64_t id);
     void handleCacheProbe(PortID targetCore, CacheProbeEvent event,
                           const CacheAccessProbeArg &arg);
@@ -304,6 +436,13 @@ class CIRA : public ClockedObject
     const uint64_t csrLinesPerTurn;
     const Tick issueLatency;
     const Tick completionLatency;
+    const uint64_t prDescriptorEntries;
+    const uint64_t prCsrReadEntries;
+    const uint64_t prCoherentEntries;
+    const Cycles prFpAddCycles;
+    const Cycles prFpMulCycles;
+    const Cycles prFpDivCycles;
+    const Tick prReconfigurationLatency;
 
     uint64_t maxOutstanding;
     bool enabled;
@@ -328,6 +467,17 @@ class CIRA : public ClockedObject
     bool csrIndexRetryReady = false;
     EventFunctionWrapper csrIndexSendEvent;
     std::vector<std::unique_ptr<CacheProbeListener>> probeListeners;
+    std::unordered_map<uint64_t, std::unique_ptr<PrDescriptorState>>
+        prOutstanding;
+    std::vector<std::deque<uint64_t>> prDescriptors;
+    std::vector<std::unique_ptr<EventFunctionWrapper>> prEvents;
+    std::vector<uint64_t> reservedPrCoherentSlots;
+    std::vector<uint64_t> pendingPrCoherentPackets;
+    uint64_t reservedPrCsrSlots = 0;
+    uint64_t pendingPrCsrPackets = 0;
+    uint64_t prEpoch = 0;
+    std::unordered_map<ThreadContext *, PrThreadConfig> prThreadConfigs;
+    std::unordered_map<uint64_t, ThreadContext *> prReconfigurations;
 
     CIRAStats stats;
 };

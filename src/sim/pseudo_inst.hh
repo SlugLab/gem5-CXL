@@ -131,6 +131,7 @@ uint64_t ciraPrefetchCsr(ThreadContext *tc, uint64_t offsets_addr,
                          uint64_t row_start, uint64_t row_count,
                          uint64_t packed);
 uint64_t ciraGetfin(ThreadContext *tc);
+uint64_t ciraPrRows(ThreadContext *tc, GuestAddr desc);
 uint64_t ciraCfgwr(ThreadContext *tc, uint64_t reg, uint64_t value);
 uint64_t ciraCfgrd(ThreadContext *tc, uint64_t reg);
 
@@ -299,6 +300,10 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
 
       case M5OP_CIRA_GETFIN:
         result = invokeSimcall<ABI, store_ret>(tc, ciraGetfin);
+        return true;
+
+      case M5OP_CIRA_PR_ROWS:
+        result = invokeSimcall<ABI, store_ret>(tc, ciraPrRows);
         return true;
 
       case M5OP_CIRA_CFGWR:
