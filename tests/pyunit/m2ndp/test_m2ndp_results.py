@@ -152,6 +152,33 @@ class M2NDPResultTest(unittest.TestCase):
             evidence.core_period_seconds, Decimal("5e-10")
         )
 
+    def test_parse_ndpsim_starts_at_first_measured_contribution_partition(self):
+        log = "\n".join([
+            "CORE period: 5e-10",
+            "K0_INIT_TRIAL1_PART0 at cycle 100",
+            "K1_META_TRIAL1 at cycle 120",
+            "K2_CONTRIB_TRIAL1_PART0 at cycle 140",
+            "EXPR FINISHED 400",
+        ])
+        evidence = results.parse_ndpsim(log, returncode=0)
+        self.assertEqual(evidence.start_cycle, 140)
+        self.assertEqual(evidence.measured_cycles, 260)
+
+    def test_formal_result_rejects_legacy_profile_and_non_four_way_trace(self):
+        valid = {
+            "profile": "pr-offload-4thread-1us",
+            "logical_partitions": 4,
+        }
+        self.assertEqual(results.validate_formal_result(valid), valid)
+        for candidate in (
+            dict(valid, profile="g20-2thread-1us"),
+            dict(valid, logical_partitions=2),
+        ):
+            with self.subTest(candidate=candidate), self.assertRaises(
+                artifacts.EvidenceError
+            ):
+                results.validate_formal_result(candidate)
+
     def test_parse_ndpsim_rejects_duplicate_and_reordered_markers(self):
         duplicate = "\n".join(
             [

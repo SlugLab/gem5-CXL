@@ -38,6 +38,7 @@ class OrchestratorTest(unittest.TestCase):
             timeout=0,
             stop_after=None,
             m5_library=root / "frozen/libm5.a",
+            profile="g20-2thread-1us",
         )
         self.paths = runner.make_paths(self.options)
 
@@ -54,11 +55,32 @@ class OrchestratorTest(unittest.TestCase):
         state["stages"][stage]["outputs"] = outputs or {}
         return state
 
-    def test_publication_command_is_two_core_all_cxl_trial_one(self):
-        command = runner.gem5_command(self.options, self.paths)
+    def test_publication_command_is_four_core_all_cxl_trial_one(self):
+        root = self.outdir.parent
+        manifest = root / "g20.manifest.json"
+        manifest.write_text("{}\n")
+        options = dataclasses.replace(
+            self.options,
+            profile="pr-offload-4thread-1us",
+            profile_manifest=manifest,
+        )
+        with mock.patch.object(
+            profiles, "load_formal_offload_profile",
+            return_value=profiles.ExperimentProfile(
+                name="pr-offload-4thread-1us", graph_scale=20,
+                graph_sha256="a" * 64, num_nodes=1 << 20,
+                cores=4, threads=4, logical_partitions=4,
+                latencies=("1us",),
+            ),
+        ), mock.patch.object(
+            profiles,
+            "load_graph_manifest",
+            return_value=mock.Mock(graph=str(self.graph.resolve())),
+        ):
+            command = runner.gem5_command(options, self.paths)
         for option, value in (
             ("--benchmarks", "pr_spmv"),
-            ("--cores", "2"),
+            ("--cores", "4"),
             ("--cpu", "timing"),
             ("--cxl-link-delay", "1us"),
             ("--iterations", "2"),
@@ -69,6 +91,12 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIn("--checkpoint-root", command)
         self.assertIn("--roi-work-events", command)
         self.assertIn("--verify", command)
+
+    def test_default_profile_is_formal_four_way_contract(self):
+        self.assertEqual(
+            runner.Options.__dataclass_fields__["profile"].default,
+            "pr-offload-4thread-1us",
+        )
 
     def test_g4_commands_use_four_cores_and_selected_latency(self):
         options = dataclasses.replace(

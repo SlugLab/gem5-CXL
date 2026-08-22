@@ -20,7 +20,10 @@ except ImportError:
 IN_OFFSETS_ADDR = 0x8000_0000_0000
 IN_NEIGHBORS_ADDR = 0x8100_0000_0000
 OUT_DEGREE_ADDR = 0x8200_0000_0000
-SCORES_ADDR = 0x8300_0000_0000
+SCORES_A_ADDR = 0x8300_0000_0000
+SCORES_B_ADDR = 0x8500_0000_0000
+# Compatibility alias for diagnostic traces and existing strict dump tooling.
+SCORES_ADDR = SCORES_A_ADDR
 CONTRIB_ADDR = 0x8400_0000_0000
 SCRATCHPAD_ADDR = 0x1000_0000_0000_0000
 PACKET_SIZE = 32
@@ -332,6 +335,112 @@ def _kernels():
     }
 
 
+def _formal_kernels():
+    """Four-way kernels; row bounds change addressing, never FP order."""
+    spad = SCRATCHPAD_ADDR
+    return {
+        "K0_INIT": _kernel(
+            "K0_INIT", 0,
+            [
+                f"li x31, {spad}",
+                "ld x10, 0(x31)",
+                "ld x11, 8(x31)",
+                "ld x12, 16(x31)",
+                "flw f0, 32(x31)",
+                "srli x3, x2, 5",
+                "bge x3, x12, .SKIP0",
+                "add x3, x3, x11",
+                "slli x4, x3, 2",
+                "add x4, x10, x4",
+                "fsw f0, 0(x4)",
+                ".SKIP0",
+            ],
+        ),
+        "K1_META": _kernels()["K1_META"],
+        "K2_CONTRIB": _kernel(
+            "K2_CONTRIB", 2,
+            [
+                f"li x31, {spad}",
+                "ld x10, 0(x31)",
+                "ld x11, 8(x31)",
+                "ld x12, 16(x31)",
+                "ld x13, 24(x31)",
+                "ld x14, 32(x31)",
+                "srli x3, x2, 5",
+                "bge x3, x14, .SKIP0",
+                "add x3, x3, x13",
+                "slli x4, x3, 2",
+                "add x5, x10, x4",
+                "flw f0, 0(x5)",
+                "add x5, x11, x4",
+                "lw x6, 0(x5)",
+                "fmv.w.x f1, x6",
+                "fdiv f0, f0, f1",
+                "add x5, x12, x4",
+                "fsw f0, 0(x5)",
+                ".SKIP0",
+            ],
+        ),
+        "K3_PULL_DAMP": _kernel(
+            "K3_PULL_DAMP", 3,
+            [
+                f"li x31, {spad}",
+                "ld x10, 0(x31)",
+                "ld x11, 8(x31)",
+                "ld x12, 16(x31)",
+                "ld x13, 24(x31)",
+                "ld x14, 32(x31)",
+                "ld x15, 40(x31)",
+                "flw f2, 64(x31)",
+                "flw f3, 68(x31)",
+                "srli x3, x2, 5",
+                "bge x3, x15, .SKIP0",
+                "add x3, x3, x14",
+                "slli x4, x3, 3",
+                "add x4, x10, x4",
+                "ld x5, 0(x4)",
+                "ld x6, 8(x4)",
+                "li x7, 0",
+                "fmv.w.x f0, x7",
+                ".LOOP0",
+                "bge x5, x6, .SKIP1",
+                "slli x8, x5, 2",
+                "add x8, x11, x8",
+                "lw x9, 0(x8)",
+                "slli x9, x9, 2",
+                "add x9, x12, x9",
+                "flw f1, 0(x9)",
+                "fadd f0, f0, f1",
+                "addi x5, x5, 1",
+                "j .LOOP0",
+                ".SKIP1",
+                "fmul f0, f2, f0",
+                "fadd f0, f3, f0",
+                "slli x4, x3, 2",
+                "add x4, x13, x4",
+                "fsw f0, 0(x4)",
+                ".SKIP0",
+            ],
+        ),
+    }
+
+
+def pr_static_partitions(rows, workers=4):
+    if rows < 0 or workers <= 0:
+        raise artifacts.EvidenceError("invalid static partition shape")
+    quotient, remainder = divmod(rows, workers)
+    bounds = []
+    for worker in range(workers):
+        begin = worker * quotient + min(worker, remainder)
+        end = begin + quotient + (1 if worker < remainder else 0)
+        bounds.append((begin, end))
+    if bounds[0][0] != 0 or bounds[-1][1] != rows:
+        raise artifacts.EvidenceError("static partitions do not cover rows")
+    if any(bounds[i][1] != bounds[i + 1][0] for i in range(workers - 1)):
+        raise artifacts.EvidenceError("static partitions are not contiguous")
+    return tuple(bounds)
+
+
 def _launch(kernel_id, base, size, int_args, float_args=()):
     total_args = len(int_args) + len(float_args)
     smem_size = 96
@@ -358,6 +467,77 @@ def _trial_names(iterations, *, measured):
     return names
 
 
+def _formal_trial_records(
+    *, trial, iterations, bounds, node_count, edge_count, init_score,
+    damping, base_score,
+):
+    records = []
+    for partition, (begin, end) in enumerate(bounds):
+        count = end - begin
+        name = f"K0_INIT_TRIAL{trial}_PART{partition}"
+        records.append((
+            name,
+            "K0_INIT",
+            _launch(
+                0,
+                SCORES_A_ADDR + begin * PACKET_SIZE,
+                count * PACKET_SIZE,
+                (SCORES_A_ADDR, begin, count),
+                (init_score,),
+            ),
+        ))
+    records.append((
+        f"K1_META_TRIAL{trial}",
+        "K1_META",
+        _launch(
+            1, IN_OFFSETS_ADDR, PACKET_SIZE,
+            (IN_OFFSETS_ADDR, node_count, edge_count),
+        ),
+    ))
+    for iteration in range(iterations):
+        read_scores = SCORES_A_ADDR if iteration % 2 == 0 else SCORES_B_ADDR
+        write_scores = SCORES_B_ADDR if iteration % 2 == 0 else SCORES_A_ADDR
+        iteration_tag = "" if iteration == 0 else f"_ITER{iteration}"
+        for partition, (begin, end) in enumerate(bounds):
+            count = end - begin
+            name = (
+                f"K2_CONTRIB_TRIAL{trial}{iteration_tag}_PART{partition}"
+            )
+            records.append((
+                name,
+                "K2_CONTRIB",
+                _launch(
+                    2,
+                    CONTRIB_ADDR + begin * PACKET_SIZE,
+                    count * PACKET_SIZE,
+                    (
+                        read_scores, OUT_DEGREE_ADDR, CONTRIB_ADDR,
+                        begin, count,
+                    ),
+                ),
+            ))
+        for partition, (begin, end) in enumerate(bounds):
+            count = end - begin
+            name = (
+                f"K3_PULL_DAMP_TRIAL{trial}_ITER{iteration}_PART{partition}"
+            )
+            records.append((
+                name,
+                "K3_PULL_DAMP",
+                _launch(
+                    3,
+                    write_scores + begin * PACKET_SIZE,
+                    count * PACKET_SIZE,
+                    (
+                        IN_OFFSETS_ADDR, IN_NEIGHBORS_ADDR, CONTRIB_ADDR,
+                        write_scores, begin, count,
+                    ),
+                    (damping, base_score),
+                ),
+            ))
+    return records
+
+
 def read_trace_meta(path):
     return json.loads(Path(path).read_text())
 
@@ -378,8 +558,21 @@ def validate_trace_binding(
         "measured_trial": profile.measured_trial,
         "iterations": profile.page_rank_iterations,
         "stage_sequence": list(UNIQUE_KERNELS),
-        "measure_marker": "K0_INIT_TRIAL1",
+        "measure_marker": (
+            "K2_CONTRIB_TRIAL1_PART0"
+            if profile.name == "pr-offload-4thread-1us"
+            else "K0_INIT_TRIAL1"
+        ),
     }
+    if profile.name == "pr-offload-4thread-1us":
+        expected.update(
+            logical_partitions=4,
+            partition_bounds=[
+                list(bound)
+                for bound in pr_static_partitions(profile.num_nodes, 4)
+            ],
+            double_buffered=True,
+        )
     for field, value in expected.items():
         if meta.get(field) != value:
             raise artifacts.EvidenceError(
@@ -451,7 +644,16 @@ def generate_trace(
         f32_sub(f32(1.0), damping), f32(node_count)
     )
 
-    kernels = _kernels()
+    formal = (
+        profile is not None
+        and profile.name == "pr-offload-4thread-1us"
+    )
+    if formal and getattr(profile, "logical_partitions", None) != 4:
+        raise artifacts.EvidenceError(
+            "formal trace requires four logical partitions"
+        )
+
+    kernels = _formal_kernels() if formal else _kernels()
     launches = {
         "K0_INIT": _launch(
             0,
@@ -488,33 +690,72 @@ def generate_trace(
     }
     for name in UNIQUE_KERNELS:
         _atomic_write_text(trace_dir / f"{name}.traceg", kernels[name])
+        if not formal:
+            _atomic_write_text(
+                trace_dir / f"{name}_launch.txt", launches[name]
+            )
+    if not formal:
         _atomic_write_text(
-            trace_dir / f"{name}_launch.txt", launches[name]
+            trace_dir / "K0_INIT_TRIAL1.traceg", kernels["K0_INIT"]
         )
-    _atomic_write_text(
-        trace_dir / "K0_INIT_TRIAL1.traceg", kernels["K0_INIT"]
-    )
-    _atomic_write_text(
-        trace_dir / "K0_INIT_TRIAL1_launch.txt", launches["K0_INIT"]
-    )
+        _atomic_write_text(
+            trace_dir / "K0_INIT_TRIAL1_launch.txt", launches["K0_INIT"]
+        )
 
-    zero_words = (0 for _ in range(node_count))
+    memory_arrays = [
+        (IN_OFFSETS_ADDR, "int64", bundle.in_offsets),
+        (IN_NEIGHBORS_ADDR, "int32", bundle.in_neighbors),
+        (OUT_DEGREE_ADDR, "int32", bundle.out_degree),
+        (SCORES_A_ADDR, "float32", (0 for _ in range(node_count))),
+    ]
+    if formal:
+        memory_arrays.append(
+            (SCORES_B_ADDR, "float32", (0 for _ in range(node_count)))
+        )
+    memory_arrays.append(
+        (CONTRIB_ADDR, "float32", (0 for _ in range(node_count)))
+    )
     _write_memory_map(
         trace_dir / "K0_INIT_input.data",
-        (
-            (IN_OFFSETS_ADDR, "int64", bundle.in_offsets),
-            (IN_NEIGHBORS_ADDR, "int32", bundle.in_neighbors),
-            (OUT_DEGREE_ADDR, "int32", bundle.out_degree),
-            (SCORES_ADDR, "float32", zero_words),
-            (CONTRIB_ADDR, "float32", (0 for _ in range(node_count))),
-        ),
+        memory_arrays,
     )
     _write_memory_map(
         trace_dir / "K3_PULL_DAMP_output.data",
-        ((SCORES_ADDR, "float32", reference_words),),
+        ((SCORES_A_ADDR, "float32", reference_words),),
     )
 
-    functional_names = _trial_names(iterations, measured=False)
+    partition_bounds = pr_static_partitions(node_count, 4) if formal else ()
+    if formal:
+        trial_records = [
+            _formal_trial_records(
+                trial=trial,
+                iterations=iterations,
+                bounds=partition_bounds,
+                node_count=node_count,
+                edge_count=edge_count,
+                init_score=init_score,
+                damping=damping,
+                base_score=base_score,
+            )
+            for trial in range(trials)
+        ]
+        for records in trial_records:
+            for name, kernel_name, launch in records:
+                _atomic_write_text(
+                    trace_dir / f"{name}.traceg", kernels[kernel_name]
+                )
+                _atomic_write_text(
+                    trace_dir / f"{name}_launch.txt", launch
+                )
+        functional_names = [name for name, _, _ in trial_records[0]]
+        timing_names = [
+            name for records in trial_records for name, _, _ in records
+        ]
+    else:
+        functional_names = _trial_names(iterations, measured=False)
+        timing_names = functional_names + _trial_names(
+            iterations, measured=True
+        )
     sequence_lines = []
     for name in functional_names:
         sequence_lines.append(
@@ -525,9 +766,6 @@ def generate_trace(
     _atomic_write_text(
         outdir / "funcsim.sequence",
         "\n".join(sequence_lines) + "\n",
-    )
-    timing_names = functional_names + _trial_names(
-        iterations, measured=True
     )
     _atomic_write_text(
         trace_dir / "kernelslist.g", "\n".join(timing_names) + "\n"
@@ -554,7 +792,15 @@ def generate_trace(
         "stage_sequence": list(UNIQUE_KERNELS),
         "funcsim_launches": len(functional_names),
         "ndpsim_launches": len(timing_names),
-        "measure_marker": "K0_INIT_TRIAL1",
+        "measure_marker": (
+            "K2_CONTRIB_TRIAL1_PART0" if formal else "K0_INIT_TRIAL1"
+        ),
+        "logical_partitions": 4 if formal else 1,
+        "partition_bounds": (
+            [list(bound) for bound in partition_bounds]
+            if formal else [[0, node_count]]
+        ),
+        "double_buffered": formal,
         "max_kernel_launch": 128,
         "packet_size": PACKET_SIZE,
         "init_score_bits": f"0x{float32_bits(init_score):08x}",
@@ -591,6 +837,6 @@ def generate_trace(
         UNIQUE_KERNELS,
         len(functional_names),
         len(timing_names),
-        "K0_INIT_TRIAL1",
+        "K2_CONTRIB_TRIAL1_PART0" if formal else "K0_INIT_TRIAL1",
         meta_path,
     )

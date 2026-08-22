@@ -76,6 +76,26 @@ class ExperimentProfileTest(unittest.TestCase):
         self.assertEqual(profile.measured_trial, 1)
         self.assertEqual(profile.page_rank_iterations, 20)
 
+    def test_formal_offload_profile_is_four_way_g12_g14_g20(self):
+        profile = profiles.get_formal_offload_profile()
+        self.assertEqual(profile.name, "pr-offload-4thread-1us")
+        self.assertEqual(profile.scales, (12, 14, 20))
+        self.assertEqual(profile.cores, 4)
+        self.assertEqual(profile.threads, 4)
+        self.assertEqual(profile.logical_partitions, 4)
+        self.assertEqual(profile.latencies, ("1us",))
+        self.assertEqual(profile.trials, 2)
+        self.assertEqual(profile.measured_trial, 1)
+        self.assertEqual(profile.page_rank_iterations, 20)
+
+    def test_legacy_two_thread_profile_is_diagnostic_only(self):
+        self.assertNotIn("g20-2thread-1us", profiles.FORMAL_PROFILE_NAMES)
+        legacy = profiles.get_legacy_diagnostic_profile(
+            "g20-2thread-1us"
+        )
+        self.assertEqual(legacy.cores, 2)
+        self.assertEqual(legacy.logical_partitions, 2)
+
     def test_graph_hash_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             graph = Path(tmp) / "g4.sg"

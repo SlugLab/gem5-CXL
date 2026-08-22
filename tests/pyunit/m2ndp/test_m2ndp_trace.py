@@ -221,6 +221,53 @@ class PageRankTraceTest(unittest.TestCase):
                     directed_edges=12345,
                 )
 
+    def test_formal_trace_is_four_way_double_buffered_and_roi_starts_at_k2(self):
+        profile = SimpleNamespace(
+            name="pr-offload-4thread-1us",
+            graph_scale=12,
+            graph_sha256=self.bundle.meta.graph_sha256,
+            num_nodes=self.bundle.meta.num_nodes,
+            cores=4,
+            threads=4,
+            logical_partitions=4,
+            latencies=("1us",),
+            page_rank_iterations=20,
+            trials=2,
+            measured_trial=1,
+        )
+        result = trace.generate_trace(
+            bundle=self.bundle,
+            reference=self.reference,
+            outdir=self.root / "formal-trace",
+            trials=2,
+            iterations=20,
+            profile=profile,
+            profile_manifest_sha256="c" * 64,
+            cxl_link_delay="1us",
+            vanilla_raw_sha256="d" * 64,
+        )
+        meta = trace.read_trace_meta(result.meta_path)
+        self.assertEqual(meta["logical_partitions"], 4)
+        self.assertEqual(meta["partition_bounds"], [[0, 1], [1, 2], [2, 3], [3, 3]])
+        self.assertTrue(meta["double_buffered"])
+        self.assertEqual(result.measure_marker, "K2_CONTRIB_TRIAL1_PART0")
+        self.assertEqual(meta["measure_marker"], result.measure_marker)
+        self.assertEqual(result.funcsim_launches, 4 + 1 + 20 * 8)
+        self.assertEqual(result.ndpsim_launches, 2 * result.funcsim_launches)
+
+        names = (self.root / "formal-trace/0/kernelslist.g").read_text().splitlines()
+        marker_index = names.index("K2_CONTRIB_TRIAL1_PART0")
+        self.assertTrue(all("K0_INIT_TRIAL1_PART" in name for name in names[165:169]))
+        self.assertEqual(names[169], "K1_META_TRIAL1")
+        self.assertEqual(marker_index, 170)
+
+        first_k2 = (self.root / "formal-trace/0/K2_CONTRIB_TRIAL1_PART0_launch.txt").read_text().split()
+        final_k3 = (self.root / "formal-trace/0/K3_PULL_DAMP_TRIAL1_ITER19_PART3_launch.txt").read_text().split()
+        self.assertEqual(first_k2[6], f"0x{trace.SCORES_A_ADDR:x}")
+        self.assertEqual(final_k3[9], f"0x{trace.SCORES_A_ADDR:x}")
+        self.assertEqual(first_k2[9:11], ["0x0", "0x1"])
+        self.assertEqual(final_k3[10:12], ["0x3", "0x0"])
+
 
 if __name__ == "__main__":
     unittest.main()

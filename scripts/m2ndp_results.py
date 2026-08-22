@@ -74,6 +74,25 @@ REAL_CXL_FIELDS = (
     "mem_ctrl_bytes_read",
     "mem_ctrl_cpu_data_reads",
 )
+FORMAL_PROFILE = "pr-offload-4thread-1us"
+
+
+def validate_formal_result(result):
+    if result.get("profile") != FORMAL_PROFILE:
+        raise artifacts.EvidenceError(
+            "M2NDP result is not the formal PR profile"
+        )
+    try:
+        logical_partitions = int(result.get("logical_partitions"))
+    except (TypeError, ValueError) as error:
+        raise artifacts.EvidenceError(
+            "M2NDP trace is not four-way partitioned"
+        ) from error
+    if logical_partitions != 4:
+        raise artifacts.EvidenceError(
+            "M2NDP trace is not four-way partitioned"
+        )
+    return result
 
 
 def expected_gem5_contract(profile, latency):
@@ -203,12 +222,25 @@ def parse_ndpsim(log, *, returncode=0, output_text=None):
         raise artifacts.EvidenceError(
             f"NDPSim exit status {returncode}, expected 0"
         )
-    start = _single_match(
+    formal_marker = re.search(
+        r"K2_CONTRIB_TRIAL1_PART0[^\n]*?\b(?:at\s+)?cycle\s+(\d+)",
         log,
-        r"K0_INIT_TRIAL1[^\n]*?\b(?:at\s+)?cycle\s+(\d+)",
-        "K0_INIT_TRIAL1",
-        flags=re.IGNORECASE,
+        re.IGNORECASE,
     )
+    if formal_marker is not None:
+        start = _single_match(
+            log,
+            r"K2_CONTRIB_TRIAL1_PART0[^\n]*?\b(?:at\s+)?cycle\s+(\d+)",
+            "K2_CONTRIB_TRIAL1_PART0",
+            flags=re.IGNORECASE,
+        )
+    else:
+        start = _single_match(
+            log,
+            r"K0_INIT_TRIAL1[^\n]*?\b(?:at\s+)?cycle\s+(\d+)",
+            "legacy K0_INIT_TRIAL1",
+            flags=re.IGNORECASE,
+        )
     finish = _single_match(
         log,
         r"\bEXPR\s+FINISHED\s+(\d+)\b",
@@ -312,7 +344,9 @@ def parse_gem5_summary(
     smoke_test=False,
 ):
     if profile is None:
-        profile = profiles.get_profile("g20-2thread-1us")
+        profile = profiles.get_legacy_diagnostic_profile(
+            "g20-2thread-1us"
+        )
     path = Path(path)
     if not path.is_file():
         raise artifacts.EvidenceError(f"gem5 summary is missing: {path}")
@@ -348,7 +382,10 @@ def _require_decimal_positive(value, name, *, allow_zero=False):
 def validate_calibration_binding(
     calibration, *, profile, latency, profile_manifest_sha256
 ):
-    if profile.name not in profiles.FROZEN_PROFILE_CONTRACTS:
+    if (
+        profile.name not in profiles.FROZEN_PROFILE_CONTRACTS
+        and profile.name != FORMAL_PROFILE
+    ):
         return
     if calibration.profile != profile.name:
         raise artifacts.EvidenceError("calibration profile binding mismatch")
@@ -440,7 +477,9 @@ def build_summary(
     profile_manifest_sha256=None,
 ):
     if profile is None:
-        profile = profiles.get_profile("g20-2thread-1us")
+        profile = profiles.get_legacy_diagnostic_profile(
+            "g20-2thread-1us"
+        )
     sim_ticks = validate_gem5_row(
         gem5.row,
         profile=profile,
@@ -537,6 +576,9 @@ def build_summary(
         "trials": str(profile.trials),
         "measured_trial": str(profile.measured_trial),
         "cores": str(profile.cores),
+        "logical_partitions": str(
+            getattr(profile, "logical_partitions", 1)
+        ),
         "all_memory_cxl": "True",
         "cxl_link_delay": latency,
         "gem5_microprobe_ns": str(calibration.target_ns),

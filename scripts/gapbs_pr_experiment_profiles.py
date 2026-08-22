@@ -20,6 +20,8 @@ G4_SHA256 = (
 )
 SCALING_SCALES = (4, 12, 14, 20)
 SCALING_PROFILE_NAME = "pr-scaling-4thread-1us"
+FORMAL_PROFILE_NAME = "pr-offload-4thread-1us"
+FORMAL_SCALES = (12, 14, 20)
 SCALING_GRAPH_HASHES = {
     4: G4_SHA256,
     20: m2ndp_artifacts.EXPECTED_G20_SHA256,
@@ -45,6 +47,7 @@ class ExperimentProfile:
     cores: int
     threads: int
     latencies: tuple[str, ...]
+    logical_partitions: int = 4
     trials: int = 2
     measured_trial: int = 1
     page_rank_iterations: int = 20
@@ -56,6 +59,7 @@ class ScalingExperimentProfile:
     scales: tuple[int, ...] = SCALING_SCALES
     cores: int = 4
     threads: int = 4
+    logical_partitions: int = 4
     latencies: tuple[str, ...] = ("1us",)
     trials: int = 2
     measured_trial: int = 1
@@ -94,7 +98,7 @@ FROZEN_PROFILE_CONTRACTS = {
 }
 
 
-PROFILES = {
+LEGACY_DIAGNOSTIC_PROFILES = {
     "g20-2thread-1us": ExperimentProfile(
         name="g20-2thread-1us",
         graph_scale=20,
@@ -103,7 +107,12 @@ PROFILES = {
         cores=2,
         threads=2,
         latencies=("1us",),
+        logical_partitions=2,
     ),
+}
+
+PROFILES = {
+    **LEGACY_DIAGNOSTIC_PROFILES,
     "g4-4thread-sweep": ExperimentProfile(
         name="g4-4thread-sweep",
         graph_scale=4,
@@ -114,10 +123,30 @@ PROFILES = {
         latencies=("200ns", "500ns", "1us", "2us"),
     ),
 }
+FORMAL_PROFILE_NAMES = frozenset(
+    {FORMAL_PROFILE_NAME, SCALING_PROFILE_NAME}
+    | set(FROZEN_PROFILE_CONTRACTS)
+)
 
 
 def get_scaling_profile() -> ScalingExperimentProfile:
     return ScalingExperimentProfile()
+
+
+def get_formal_offload_profile() -> ScalingExperimentProfile:
+    return ScalingExperimentProfile(
+        name=FORMAL_PROFILE_NAME,
+        scales=FORMAL_SCALES,
+    )
+
+
+def get_legacy_diagnostic_profile(name: str) -> ExperimentProfile:
+    try:
+        return LEGACY_DIAGNOSTIC_PROFILES[name]
+    except KeyError as error:
+        raise ProfileError(
+            f"unknown legacy diagnostic profile: {name}"
+        ) from error
 
 
 def get_profile(name: str) -> ExperimentProfile:
@@ -312,6 +341,49 @@ def load_scaling_profile(manifest_path: Path) -> ExperimentProfile:
         threads=4,
         latencies=("1us",),
     )
+
+
+def load_formal_offload_profile(manifest_path: Path) -> ExperimentProfile:
+    manifest = load_any_frozen_graph(manifest_path)
+    if manifest.scale not in FORMAL_SCALES:
+        raise ProfileError(
+            f"formal offload profile requires g12/g14/g20, got g{manifest.scale}"
+        )
+    expected_hash = SCALING_GRAPH_HASHES.get(manifest.scale)
+    if expected_hash is not None and manifest.graph_sha256 != expected_hash:
+        raise ProfileError(
+            f"g{manifest.scale} graph SHA-256 does not match formal input"
+        )
+    return ExperimentProfile(
+        name=FORMAL_PROFILE_NAME,
+        graph_scale=manifest.scale,
+        graph_sha256=manifest.graph_sha256,
+        num_nodes=manifest.num_nodes,
+        cores=4,
+        threads=4,
+        logical_partitions=4,
+        latencies=("1us",),
+    )
+
+
+def validate_formal_offload_profile(
+    profile: ExperimentProfile,
+) -> ExperimentProfile:
+    actual = (
+        profile.name,
+        profile.graph_scale in FORMAL_SCALES,
+        profile.cores,
+        profile.threads,
+        profile.logical_partitions,
+        profile.latencies,
+        profile.trials,
+        profile.measured_trial,
+        profile.page_rank_iterations,
+    )
+    expected = (FORMAL_PROFILE_NAME, True, 4, 4, 4, ("1us",), 2, 1, 20)
+    if actual != expected:
+        raise ProfileError(f"formal offload profile differs: {actual}")
+    return profile
 
 
 def validate_scaling_profile(profile: ExperimentProfile) -> ExperimentProfile:

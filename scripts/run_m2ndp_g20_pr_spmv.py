@@ -84,7 +84,7 @@ class Options:
     resume: bool
     timeout: int
     stop_after: str | None
-    profile: str = "g20-2thread-1us"
+    profile: str = profiles.FORMAL_PROFILE_NAME
     cxl_link_delay: str = "1us"
     profile_manifest: Path | None = None
     m5_library: Path | None = None
@@ -161,7 +161,20 @@ def _stage_record():
 
 
 def _experiment_profile(options):
-    if options.profile == profiles.SCALING_PROFILE_NAME:
+    if options.profile == profiles.FORMAL_PROFILE_NAME:
+        if options.profile_manifest is None:
+            raise profiles.ProfileError(
+                f"profile {options.profile} requires --graph-manifest"
+            )
+        profile = profiles.validate_formal_offload_profile(
+            profiles.load_formal_offload_profile(options.profile_manifest)
+        )
+        manifest = profiles.load_graph_manifest(options.profile_manifest)
+        if Path(manifest.graph).resolve() != Path(options.graph).resolve():
+            raise profiles.ProfileError(
+                "graph path differs from frozen profile manifest"
+            )
+    elif options.profile == profiles.SCALING_PROFILE_NAME:
         if options.profile_manifest is None:
             raise profiles.ProfileError(
                 f"profile {options.profile} requires --graph-manifest"
@@ -187,6 +200,12 @@ def _experiment_profile(options):
             raise profiles.ProfileError(
                 "graph path differs from frozen profile manifest"
             )
+    elif options.profile in profiles.LEGACY_DIAGNOSTIC_PROFILES:
+        if options.profile_manifest is not None:
+            raise profiles.ProfileError(
+                "legacy diagnostic profile does not accept a graph manifest"
+            )
+        profile = profiles.get_legacy_diagnostic_profile(options.profile)
     else:
         if options.profile_manifest is not None:
             raise profiles.ProfileError(
@@ -225,6 +244,7 @@ def new_state(options):
             "cpu": "timing",
             "cores": profile.cores,
             "threads": profile.threads,
+            "logical_partitions": profile.logical_partitions,
             "all_memory_cxl": True,
             "cxl_link_delay": options.cxl_link_delay,
             "smoke_test": options.smoke_test,
@@ -712,14 +732,19 @@ def _validate_trace_binding(options, paths):
         return
     profile = _experiment_profile(options)
     graph_meta = _graph_meta(paths)
+    trace_meta = pagerank_trace.read_trace_meta(
+        paths.trace / "trace.meta.json"
+    )
     pagerank_trace.validate_trace_binding(
-        pagerank_trace.read_trace_meta(paths.trace / "trace.meta.json"),
+        trace_meta,
         profile=profile,
         profile_manifest_sha256=_profile_manifest_sha256(options),
         cxl_link_delay=options.cxl_link_delay,
         vanilla_raw_sha256=artifacts.sha256_file(paths.reference_raw),
         directed_edges=graph_meta.num_directed_edges,
     )
+    if options.profile == profiles.FORMAL_PROFILE_NAME:
+        results.validate_formal_result(trace_meta)
 
 
 def _parse_calibration(path):
@@ -761,7 +786,10 @@ def _parse_calibration(path):
 
 
 def _bind_calibration_artifact(options, path):
-    if options.profile not in profiles.FROZEN_PROFILE_CONTRACTS:
+    if (
+        options.profile not in profiles.FROZEN_PROFILE_CONTRACTS
+        and options.profile != profiles.FORMAL_PROFILE_NAME
+    ):
         return
     value = _load_json(path, "calibration artifact")
     value.update(
@@ -863,8 +891,14 @@ def _publish(options, paths):
     row.update(
         checkpoint_boundary="trial0_entry",
         warmup_execution="full_cxl_trial0",
-        measured_interval="trial1_init_through_final_drain",
+        measured_interval=(
+            "trial1_iteration0_contrib_through_final_drain"
+            if options.profile == profiles.FORMAL_PROFILE_NAME
+            else "trial1_init_through_final_drain"
+        ),
     )
+    if options.profile == profiles.FORMAL_PROFILE_NAME:
+        results.validate_formal_result(row)
     artifacts.atomic_write_csv(
         paths.summary,
         tuple(row),
@@ -1186,10 +1220,13 @@ def parse_args(argv=None):
     parser.add_argument(
         "--profile",
         choices=tuple(
-            sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
-            + [profiles.SCALING_PROFILE_NAME]
+            sorted(
+                (set(profiles.PROFILES) - set(profiles.LEGACY_DIAGNOSTIC_PROFILES))
+                | set(profiles.FROZEN_PROFILE_CONTRACTS)
+            )
+            + [profiles.SCALING_PROFILE_NAME, profiles.FORMAL_PROFILE_NAME]
         ),
-        default="g20-2thread-1us",
+        default=profiles.FORMAL_PROFILE_NAME,
     )
     parser.add_argument(
         "--profile-manifest", "--graph-manifest",
