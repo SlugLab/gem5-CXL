@@ -132,6 +132,20 @@ class GraphBundleTest(unittest.TestCase):
 
 
 class MatchedPageRankSourceTest(unittest.TestCase):
+    def test_fixed_source_initializes_outside_roi_and_double_buffers(self):
+        source = (
+            REPO / "util/m2ndp/gapbs_pr_spmv_fixed.cc"
+        ).read_text()
+        main = source[source.index("int main") :]
+        self.assertIn("pvector<ScoreT> next_scores", main)
+        self.assertLess(
+            main.index("InitializePageRank("),
+            main.index("m5_work_begin(trial, 0)"),
+        )
+        self.assertIn("next_scores[u] = base_score + product;", source)
+        self.assertIn("scores.swap(next_scores);", source)
+        self.assertNotIn("\n      scores[u] = base_score + product;", source)
+
     def test_copied_gapbs_builder_preserves_generated_scale_node_space(self):
         builder = importlib.import_module(
             "scripts.build_gapbs_m2ndp_pr_spmv"
@@ -184,7 +198,7 @@ class MatchedPageRankSourceTest(unittest.TestCase):
         self.assertNotIn("reduction(+ : error)", source)
         self.assertNotIn("if (error <", source)
         self.assertIn("const ScoreT product = kDamp * incoming_total;", source)
-        self.assertIn("scores[u] = base_score + product;", source)
+        self.assertIn("next_scores[u] = base_score + product;", source)
         self.assertIn("PRVerifier", source)
         self.assertIn("Verification: PASS", source)
 
@@ -212,6 +226,9 @@ class MatchedPageRankSourceTest(unittest.TestCase):
         self.assertTrue(manifest["fixed_iterations"])
         self.assertFalse(manifest["convergence_reduction"])
         self.assertFalse(manifest["fp_contract"])
+        self.assertIs(manifest.get("double_buffered"), True)
+        self.assertEqual(manifest.get("threads"), 4)
+        self.assertEqual(manifest.get("pr_row_descriptor_bytes"), 104)
         self.assertTrue(Path(manifest["reference_raw_path"]).is_absolute())
 
     def test_experiment_header_is_written_with_absolute_reference(self):

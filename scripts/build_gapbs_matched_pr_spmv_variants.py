@@ -116,8 +116,11 @@ _AMU_INIT_LOOP = (
     "  {\n"
     "    gapbs_amu::thread_store().begin_trial();\n"
     "#pragma omp for\n"
-    "    for (NodeID node = 0; node < g.num_nodes(); ++node)\n"
+    "    for (NodeID node = 0; node < g.num_nodes(); ++node) {\n"
     "      scores[node] = init_score;\n"
+    "      next_scores[node] = 0.0f;\n"
+    "      outgoing_contrib[node] = 0.0f;\n"
+    "    }\n"
     "  }"
 )
 
@@ -200,8 +203,11 @@ def transform_source(source, kind):
     if kind == "amu":
         init_loop = (
             "#pragma omp parallel for\n"
-            "  for (NodeID node = 0; node < g.num_nodes(); ++node)\n"
-            "    scores[node] = init_score;"
+            "  for (NodeID node = 0; node < g.num_nodes(); ++node) {\n"
+            "    scores[node] = init_score;\n"
+            "    next_scores[node] = 0.0f;\n"
+            "    outgoing_contrib[node] = 0.0f;\n"
+            "  }"
         )
         iteration_begin = (
             "  for (int iteration = 0; iteration < kPageRankIterations; "
@@ -212,8 +218,9 @@ def transform_source(source, kind):
             "#pragma omp parallel for schedule(static)"
         )
         iteration_end = (
-            "      scores[u] = base_score + product;\n"
+            "      next_scores[u] = base_score + product;\n"
             "    }\n"
+            "    scores.swap(next_scores);\n"
             "  }\n"
             "}"
         )
@@ -229,9 +236,10 @@ def transform_source(source, kind):
         )
         transformed = transformed.replace(
             iteration_end,
-            "      scores[u] = base_score + product;\n"
+            "      next_scores[u] = base_score + product;\n"
             "      }\n"
             "    }\n"
+            "    scores.swap(next_scores);\n"
             "  }\n"
             "}",
             1,

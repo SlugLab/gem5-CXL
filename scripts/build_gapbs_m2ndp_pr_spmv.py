@@ -14,8 +14,10 @@ from pathlib import Path
 
 try:
     from scripts import m2ndp_artifacts as artifacts
+    from scripts import pr_offload_contract as pr_contract
 except ImportError:
     import m2ndp_artifacts as artifacts
+    import pr_offload_contract as pr_contract
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -79,6 +81,9 @@ def build_manifest(*, reference_raw, compiler, flags):
         "fixed_iterations": True,
         "convergence_reduction": False,
         "fp_contract": False,
+        "double_buffered": True,
+        "threads": pr_contract.FORMAL_THREADS,
+        "pr_row_descriptor_bytes": pr_contract.PR_ROW_DESC_BYTES,
         "reference_raw_path": str(Path(reference_raw).resolve()),
         "compiler": compiler,
         "flags": [str(flag) for flag in flags],

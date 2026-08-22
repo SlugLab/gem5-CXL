@@ -31,13 +31,22 @@ using ScoreT = float;
 constexpr ScoreT kDamp = 0.85f;
 constexpr int kPageRankIterations = 20;
 
-void PageRankPullFixed(const Graph &g, pvector<ScoreT> &scores,
-                       pvector<ScoreT> &outgoing_contrib) {
+void InitializePageRank(const Graph &g, pvector<ScoreT> &scores,
+                        pvector<ScoreT> &next_scores,
+                        pvector<ScoreT> &outgoing_contrib) {
   const ScoreT init_score = 1.0f / g.num_nodes();
-  const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
 #pragma omp parallel for
-  for (NodeID node = 0; node < g.num_nodes(); ++node)
+  for (NodeID node = 0; node < g.num_nodes(); ++node) {
     scores[node] = init_score;
+    next_scores[node] = 0.0f;
+    outgoing_contrib[node] = 0.0f;
+  }
+}
+
+void PageRankPullFixed20(const Graph &g, pvector<ScoreT> &scores,
+                         pvector<ScoreT> &next_scores,
+                         pvector<ScoreT> &outgoing_contrib) {
+  const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
   for (int iteration = 0; iteration < kPageRankIterations; ++iteration) {
 #pragma omp parallel for
     for (NodeID node = 0; node < g.num_nodes(); ++node)
@@ -48,8 +57,9 @@ void PageRankPullFixed(const Graph &g, pvector<ScoreT> &scores,
       for (NodeID v : g.in_neigh(u))
         incoming_total = incoming_total + outgoing_contrib[v];
       const ScoreT product = kDamp * incoming_total;
-      scores[u] = base_score + product;
+      next_scores[u] = base_score + product;
     }
+    scores.swap(next_scores);
   }
 }
 
@@ -114,12 +124,12 @@ int main(int argc, char **argv) {
 
   for (int trial = 0; trial < cli.num_trials(); ++trial) {
     pvector<ScoreT> scores(g.num_nodes());
+    pvector<ScoreT> next_scores(g.num_nodes());
     pvector<ScoreT> outgoing_contrib(g.num_nodes());
-    std::fill(scores.begin(), scores.end(), 0.0f);
-    std::fill(outgoing_contrib.begin(), outgoing_contrib.end(), 0.0f);
+    InitializePageRank(g, scores, next_scores, outgoing_contrib);
 
     m5_work_begin(trial, 0);
-    PageRankPullFixed(g, scores, outgoing_contrib);
+    PageRankPullFixed20(g, scores, next_scores, outgoing_contrib);
     m5_work_end(trial, 0);
 
     if (trial == cli.num_trials() - 1) {

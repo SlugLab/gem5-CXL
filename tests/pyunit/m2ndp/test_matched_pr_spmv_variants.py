@@ -118,6 +118,12 @@ class MatchedVariantSourceTest(unittest.TestCase):
             1,
         )
         self.assertIn("constexpr int kPageRankIterations = 20;", generated)
+        self.assertIn("next_scores[u] = base_score + product;", generated)
+        self.assertIn("scores.swap(next_scores);", generated)
+        self.assertLess(
+            generated.index("InitializePageRank(g, scores"),
+            generated.index("m5_work_begin(trial, 0)"),
+        )
         self.assertNotIn("gapbs_amu::AsyncWindow", generated)
         self.assertNotIn("gapbs_amu::load_values(", generated)
         self.assertNotIn("gapbs_amu::load_value(", generated)
