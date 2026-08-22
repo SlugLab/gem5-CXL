@@ -99,6 +99,14 @@ def pr_calibration_fixture_for_test():
 def resolve_profile(options):
     name = getattr(options, "profile", "g20-2thread-1us")
     manifest = getattr(options, "graph_manifest", None)
+    if name == profiles.FORMAL_PROFILE_NAME:
+        if manifest is None:
+            raise VariantRunError(
+                f"profile {name} requires --graph-manifest"
+            )
+        return profiles.validate_formal_offload_profile(
+            profiles.load_formal_offload_profile(manifest)
+        )
     if name == profiles.SCALING_PROFILE_NAME:
         if manifest is None:
             raise VariantRunError(
@@ -375,6 +383,19 @@ def load_manifest(path):
     return manifest, by_kind
 
 
+def validate_cira_policy_binding(manifest, mode, source_row):
+    if mode not in {"static", "pgo-selected", "few-shot-online"}:
+        raise VariantRunError("requested CIRA mode is invalid")
+    if source_row not in {"A", "B", "C"}:
+        raise VariantRunError("requested CIRA source row is invalid")
+    if manifest.get("cira_mode") != mode:
+        raise VariantRunError("variant manifest CIRA mode differs")
+    policy = manifest.get("cira_policy")
+    if not isinstance(policy, dict) or policy.get("source_row") != source_row:
+        raise VariantRunError("variant manifest CIRA source row differs")
+    return policy
+
+
 def write_summary_atomic(path, rows):
     path = Path(path)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -409,9 +430,9 @@ def parse_args(argv=None):
         "--profile",
         choices=tuple(
             sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
-            + [profiles.SCALING_PROFILE_NAME]
+            + [profiles.SCALING_PROFILE_NAME, profiles.FORMAL_PROFILE_NAME]
         ),
-        default="g20-2thread-1us",
+        default=profiles.FORMAL_PROFILE_NAME,
     )
     parser.add_argument("--graph-manifest", type=Path)
     parser.add_argument("--cxl-link-delay", default="1us")
@@ -431,6 +452,11 @@ def parse_args(argv=None):
         default="legacy",
     )
     parser.add_argument("--asmc-calibration-manifest", type=Path)
+    parser.add_argument(
+        "--cira-mode",
+        choices=("static", "pgo-selected", "few-shot-online"),
+    )
+    parser.add_argument("--cira-source-row", choices=("A", "B", "C"))
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -466,6 +492,18 @@ def main(argv=None):
 
         manifest_path = options.variants_build / "manifest.json"
         manifest, variants = load_manifest(manifest_path)
+        if "cira" in options.kind and (
+            profile.name == profiles.FORMAL_PROFILE_NAME
+            or options.cira_mode is not None
+            or options.cira_source_row is not None
+        ):
+            if options.cira_mode is None or options.cira_source_row is None:
+                raise VariantRunError(
+                    "formal CIRA run requires mode and source row"
+                )
+            validate_cira_policy_binding(
+                manifest, options.cira_mode, options.cira_source_row
+            )
         compare_args = make_compare_args(options)
         result_rows = []
         run_evidence = {}

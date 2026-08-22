@@ -14,6 +14,23 @@ from scripts import run_gapbs_matched_pr_spmv_variants as runner
 
 
 class MatchedVariantRunnerTest(unittest.TestCase):
+    def test_formal_cira_policy_binding_rejects_mode_or_source_drift(self):
+        manifest = {
+            "cira_mode": "few-shot-online",
+            "cira_policy": {"source_row": "B"},
+        }
+        self.assertEqual(
+            runner.validate_cira_policy_binding(
+                manifest, "few-shot-online", "B"
+            )["source_row"],
+            "B",
+        )
+        for mode, source in (("static", "B"), ("few-shot-online", "A")):
+            with self.subTest(mode=mode, source=source), self.assertRaises(
+                runner.VariantRunError
+            ):
+                runner.validate_cira_policy_binding(manifest, mode, source)
+
     def test_formal_pr_calibration_rejects_schema_hash_and_speedup_target_drift(self):
         manifest = runner.pr_calibration_fixture_for_test()
         validated = runner.validate_pr_calibration(manifest)
