@@ -6,6 +6,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,6 +115,104 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         artifact.write_text("changed\n")
         with self.assertRaisesRegex(runner.OffloadError, "artifact"):
             runner.validate_resume(state, identity)
+
+    def qualification_points(self, amu="1.4", cira="1.5", m2ndp="1.6"):
+        vanilla_ticks = 1_600_000
+        points = {
+            "g12:vanilla": {
+                "scale": 12, "system": "vanilla",
+                "sim_ticks": vanilla_ticks,
+            },
+            "g12:amu": {
+                "scale": 12, "system": "amu",
+                "sim_ticks": int(Decimal(vanilla_ticks) / Decimal(amu)),
+            },
+            "g12:cira-few-shot": {
+                "scale": 12, "system": "cira-few-shot",
+                "sim_ticks": int(Decimal(vanilla_ticks) / Decimal(cira)),
+                "selected_candidate": "B",
+            },
+            "g12:m2ndp": {
+                "scale": 12, "system": "m2ndp",
+                "ndpsim_cycles": int(Decimal(vanilla_ticks) / Decimal(m2ndp)),
+                "ndpsim_core_period_seconds": "1e-12",
+            },
+        }
+        common = {
+            "profile": "pr-offload-4thread-1us",
+            "cxl_link_delay": "1us", "workers": 4, "iterations": 20,
+            "all_memory_cxl": True, "verification": "pass",
+            "raw_sha256": "a" * 64,
+            "worker_completions": [40, 40, 40, 40],
+            "pending": {"all": 0},
+        }
+        for point in points.values():
+            point.update({key: value for key, value in common.items()
+                          if key not in point})
+        cira_ticks = points["g12:cira-few-shot"]["sim_ticks"]
+        points["g12:cira-few-shot"]["phases"] = {
+            "formation": 1, "sampling": 1, "selection": 1, "jit": 1,
+            "execution": cira_ticks - 5, "drain": 1,
+        }
+        m2ndp_point = points["g12:m2ndp"]
+        m2ndp_point["funcsim"] = {
+            "status": "pass", "compared": 1 << 12,
+            "mismatched": 0, "completed_at_seq": 1,
+        }
+        m2ndp_point["ndpsim_started_at_seq"] = 2
+        return points
+
+    def test_qualification_gate_is_inclusive_and_checks_three_points(self):
+        points = self.qualification_points()
+        gate = runner.qualification_gate(points)
+        self.assertEqual(gate["checked_points"], 3)
+        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(set(gate["speedups"]), {"amu", "cira-few-shot", "m2ndp"})
+
+    def test_qualification_rejects_1399_bits_and_zero_jit(self):
+        offender = self.qualification_points(amu="1.399")
+        self.assertEqual(runner.qualification_gate(offender)["status"], "failed")
+        bit = self.qualification_points(); bit["g12:amu"]["verification"] = "fail"
+        zero_jit = self.qualification_points(); zero_jit["g12:cira-few-shot"]["phases"]["jit"] = 0
+        zero_jit["g12:cira-few-shot"]["phases"]["execution"] += 1
+        for points in (bit, zero_jit):
+            with self.assertRaises(runner.OffloadError):
+                runner.qualification_gate(points)
+
+    def test_replay_requires_rank_native_timing_and_cira_policy(self):
+        primary = self.qualification_points()
+        replay = copy.deepcopy(primary)
+        runner.validate_replay(primary, replay)
+        mutations = (
+            ("g12:amu", "raw_sha256", "b" * 64),
+            ("g12:m2ndp", "ndpsim_cycles", replay["g12:m2ndp"]["ndpsim_cycles"] + 1),
+            ("g12:cira-few-shot", "selected_candidate", "A"),
+        )
+        for key, field, value in mutations:
+            candidate = copy.deepcopy(replay)
+            candidate[key][field] = value
+            with self.subTest(key=key, field=field), self.assertRaises(
+                runner.OffloadError
+            ):
+                runner.validate_replay(primary, candidate)
+
+    def test_g12_gate_failure_writes_hold_before_larger_scale(self):
+        launched = []
+        points = self.qualification_points(amu="1.399")
+
+        def run_point(entry):
+            launched.append(entry)
+            return copy.deepcopy(points[entry.key])
+
+        with self.assertRaisesRegex(runner.OffloadError, "qualification"):
+            runner.run_qualification_state_machine(
+                self.options.root, run_point
+            )
+        self.assertFalse(any(entry.scale > 12 for entry in launched))
+        hold = json.loads((
+            self.options.root / "diagnostic-performance-hold.json"
+        ).read_text())
+        self.assertFalse(hold["official_qualification"])
 
 
 if __name__ == "__main__":

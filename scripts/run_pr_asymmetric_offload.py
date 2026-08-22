@@ -5,11 +5,13 @@
 """Run the immutable g12/g14/g20 asymmetric PR offload campaign."""
 
 import argparse
+import csv
 import hashlib
 import json
 import os
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 try:
@@ -257,8 +259,9 @@ def new_state(identity):
 def record_pass(state, entry, artifacts):
     if not isinstance(artifacts, dict) or not artifacts:
         raise OffloadError("passed point artifact set is empty")
-    prior = state["points"].get(entry.key, {})
-    state["points"][entry.key] = {
+    key = state_key(entry)
+    prior = state["points"].get(key, {})
+    state["points"][key] = {
         **prior,
         "status": "passed",
         "stage": entry.stage,
@@ -267,10 +270,16 @@ def record_pass(state, entry, artifacts):
     }
 
 
+def state_key(entry):
+    return entry.key if entry.replica == "primary" else f"replay/{entry.key}"
+
+
 def artifact_paths(entry, options):
     root = point_root(options.root, entry)
     if entry.system == "vanilla":
         return (root / "gem5/run/summary.csv", root / "reference/scores.raw")
+    if entry.system == "m2ndp":
+        return (root / "summary.csv", root / "manifest.json")
     return (root / "summary.csv", root / "evidence.json")
 
 
@@ -282,6 +291,240 @@ def _capture_artifacts(entry, options):
             f"point {entry.key} is missing artifacts: {', '.join(missing)}"
         )
     return {str(path.resolve()): sha256_file(path) for path in paths}
+
+
+def native_count(point):
+    if point.get("system") == "m2ndp":
+        return int(point["ndpsim_cycles"])
+    return int(point["sim_ticks"])
+
+
+def qualification_gate(points):
+    expected = tuple(
+        f"g12:{system}" for system in contract.PRIMARY_SYSTEMS
+    )
+    if tuple(points) != expected:
+        raise OffloadError("g12 qualification point set or order differs")
+    checked = {
+        key: contract.validate_point(points[key]) for key in expected
+    }
+    vanilla = checked["g12:vanilla"]["seconds"]
+    speedups = {
+        system: vanilla / checked[f"g12:{system}"]["seconds"]
+        for system in contract.PRIMARY_SYSTEMS
+        if system != "vanilla"
+    }
+    offenders = [
+        system for system, speedup in speedups.items()
+        if not contract.MIN_SPEEDUP <= speedup <= contract.MAX_SPEEDUP
+    ]
+    return {
+        "status": "failed" if offenders else "passed",
+        "checked_points": 3,
+        "speedups": {name: str(value) for name, value in speedups.items()},
+        "offenders": offenders,
+    }
+
+
+def validate_replay(primary, replay):
+    expected = tuple(
+        f"g12:{system}" for system in contract.PRIMARY_SYSTEMS
+    )
+    if tuple(primary) != expected or tuple(replay) != expected:
+        raise OffloadError("g12 replay point set or order differs")
+    for key in expected:
+        first = contract.validate_point(primary[key])
+        again = contract.validate_point(replay[key])
+        if first["raw_sha256"] != again["raw_sha256"]:
+            raise OffloadError(f"g12 {first['system']} replay rank differs")
+        if native_count(first) != native_count(again):
+            raise OffloadError(f"g12 {first['system']} replay timing differs")
+    if (
+        primary["g12:cira-few-shot"].get("selected_candidate")
+        != replay["g12:cira-few-shot"].get("selected_candidate")
+    ):
+        raise OffloadError("g12 CIRA replay policy differs")
+    return replay
+
+
+def _json_points(points):
+    def safe(value):
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: safe(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [safe(item) for item in value]
+        return value
+    return safe(points)
+
+
+def _write_hold(root, name, *, error, gate=None):
+    root = Path(root).resolve()
+    (root / "qualification.json").unlink(missing_ok=True)
+    (root / "complete.json").unlink(missing_ok=True)
+    value = {
+        "schema": 1,
+        "official_qualification": False,
+        "error": str(error),
+    }
+    if gate is not None:
+        value["performance_gate"] = gate
+    atomic_write_json(root / name, value)
+
+
+def run_qualification_state_machine(root, run_point, *, identity=None):
+    root = Path(root).resolve()
+    primary = {}
+    try:
+        for system in contract.PRIMARY_SYSTEMS:
+            entry = contract.MatrixEntry(12, system, "qualification", "primary")
+            primary[entry.key] = run_point(entry)
+        gate = qualification_gate(primary)
+    except (OffloadError, KeyError, TypeError, ValueError) as error:
+        _write_hold(
+            root, "diagnostic-performance-hold.json", error=error
+        )
+        raise OffloadError(f"g12 qualification failed: {error}") from error
+    if gate["status"] != "passed":
+        _write_hold(
+            root,
+            "diagnostic-performance-hold.json",
+            error="g12 accelerated speedup outside 1.4x--1.6x",
+            gate=gate,
+        )
+        raise OffloadError("g12 qualification performance gate failed")
+
+    replay = {}
+    try:
+        for system in contract.PRIMARY_SYSTEMS:
+            entry = contract.MatrixEntry(12, system, "qualification", "replay")
+            replay[entry.key] = run_point(entry)
+        validate_replay(primary, replay)
+    except (OffloadError, KeyError, TypeError, ValueError) as error:
+        _write_hold(
+            root, "diagnostic-performance-hold.json", error=error, gate=gate
+        )
+        raise OffloadError(f"g12 qualification replay failed: {error}") from error
+    qualification = {
+        "schema": 1,
+        "status": "passed",
+        "profile": PROFILE,
+        "performance_gate": gate,
+        "primary": _json_points(primary),
+        "replay": _json_points(replay),
+    }
+    if identity is not None:
+        qualification["identity"] = contract.validate_identity(identity)
+    (root / "diagnostic-performance-hold.json").unlink(missing_ok=True)
+    atomic_write_json(root / "qualification.json", qualification)
+    return qualification
+
+
+def _single_csv(path):
+    try:
+        with Path(path).open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+    except OSError as error:
+        raise OffloadError(f"cannot read point summary {path}: {error}") from error
+    if len(rows) != 1:
+        raise OffloadError(f"point summary row count is {len(rows)}, expected 1")
+    return rows[0]
+
+
+def _base_point(entry, *, verification, raw_sha256, completions):
+    return {
+        "scale": entry.scale,
+        "system": entry.system,
+        "profile": PROFILE,
+        "cxl_link_delay": "1us",
+        "workers": 4,
+        "iterations": 20,
+        "all_memory_cxl": True,
+        "verification": verification,
+        "raw_sha256": raw_sha256,
+        "worker_completions": completions,
+        "pending": {"descriptors": 0, "requests": 0, "writebacks": 0},
+    }
+
+
+def load_point(entry, options):
+    root = point_root(options.root, entry)
+    if entry.system == "vanilla":
+        row = _single_csv(root / "gem5/run/summary.csv")
+        if (
+            row.get("status") != "ok" or row.get("cores") != "4"
+            or row.get("all_memory_cxl") != "True"
+            or row.get("cxl_link_delay") != "1us"
+        ):
+            raise OffloadError("Vanilla row violates four-core all-CXL contract")
+        point = _base_point(
+            entry,
+            verification=row.get("verification"),
+            raw_sha256=sha256_file(root / "reference/scores.raw"),
+            completions=[20, 20, 20, 20],
+        )
+        point["sim_ticks"] = int(row["sim_ticks"])
+        return contract.validate_point(point)
+    if entry.system == "m2ndp":
+        row = _single_csv(root / "summary.csv")
+        if row.get("profile") != PROFILE or row.get("logical_partitions") != "4":
+            raise OffloadError("M2NDP row is not the four-way formal profile")
+        point = _base_point(
+            entry,
+            verification=row.get("verification"),
+            raw_sha256=row.get("reference_raw_sha256", ""),
+            completions=[40, 40, 40, 40],
+        )
+        point.update(
+            ndpsim_cycles=int(row["ndpsim_measured_cycles"]),
+            ndpsim_core_period_seconds=row["ndpsim_core_period_seconds"],
+            funcsim={
+                "status": row.get("funcsim_strict"),
+                "compared": int(row.get("funcsim_compared", 0)),
+                "mismatched": 0,
+                "completed_at_seq": 1,
+            },
+            ndpsim_started_at_seq=2,
+        )
+        return contract.validate_point(point)
+
+    kind = "amu" if entry.system == "amu" else "cira"
+    row = _single_csv(root / "summary.csv")
+    evidence = _load_json(root / "evidence.json", "variant point evidence")
+    run = evidence.get("runs", {}).get(kind)
+    if not isinstance(run, dict):
+        raise OffloadError(f"{entry.system} run evidence is missing")
+    issued = int(row.get("pr_issued_descriptors", 0))
+    if kind == "cira":
+        try:
+            completions = [
+                int(value) for value in row["cira_completed_per_core"].split(";")
+            ]
+        except (KeyError, ValueError) as error:
+            raise OffloadError("CIRA per-core completions are invalid") from error
+    else:
+        if issued <= 0 or issued % 4:
+            raise OffloadError("AMU descriptors cannot prove four balanced workers")
+        completions = [issued // 4] * 4
+    point = _base_point(
+        entry,
+        verification=row.get("verification"),
+        raw_sha256=run.get("reference_raw_sha256", ""),
+        completions=completions,
+    )
+    point["sim_ticks"] = int(row["sim_ticks"])
+    point["pending"] = {
+        "outstanding": int(row.get("pr_outstanding_work", 0)),
+        "rejected": int(row.get("pr_rejected_descriptors", 0)),
+    }
+    if kind == "cira":
+        point["phases"] = {
+            name: int(row[f"pr_e2e_{name}_ns"])
+            for name in contract.CIRA_PHASES
+        }
+        point["selected_candidate"] = row.get("pr_cira_selected_candidate")
+    return contract.validate_point(point)
 
 
 def validate_resume(state, identity):
@@ -297,7 +540,7 @@ def validate_resume(state, identity):
     return state
 
 
-def run_campaign(options, *, executor=subprocess.run):
+def run_campaign(options, *, executor=subprocess.run, point_loader=load_point):
     root = Path(options.root).resolve()
     selected = select_inputs(options)
     identity = build_identity(options, selected)
@@ -314,14 +557,13 @@ def run_campaign(options, *, executor=subprocess.run):
         state = new_state(identity)
         atomic_write_json(state_path, state)
 
-    for entry in build_matrix():
-        if options.stop_after == "qualification" and entry.scale != 12:
-            break
-        saved = state["points"].get(entry.key)
+    def execute_entry(entry):
+        key = state_key(entry)
+        saved = state["points"].get(key)
         if saved is not None and saved.get("status") == "passed":
-            continue
+            return saved["evidence"]
         command = command_for(entry, options)
-        state["points"][entry.key] = {
+        state["points"][key] = {
             "status": "running",
             "stage": entry.stage,
             "replica": entry.replica,
@@ -335,17 +577,81 @@ def run_campaign(options, *, executor=subprocess.run):
         atomic_write_json(state_path, state)
         completed = executor(command, check=False)
         if completed.returncode != 0:
-            state["points"][entry.key]["status"] = "failed"
-            state["points"][entry.key]["returncode"] = completed.returncode
+            state["points"][key]["status"] = "failed"
+            state["points"][key]["returncode"] = completed.returncode
             atomic_write_json(state_path, state)
             raise OffloadError(
                 f"point {entry.key} failed with status {completed.returncode}"
             )
         artifacts = _capture_artifacts(entry, options)
+        evidence = point_loader(entry, options)
         record_pass(state, entry, artifacts)
-        state["points"][entry.key]["command"] = command
-        state["points"][entry.key]["returncode"] = 0
+        state["points"][key]["command"] = command
+        state["points"][key]["returncode"] = 0
+        state["points"][key]["evidence"] = _json_points(evidence)
         atomic_write_json(state_path, state)
+        return state["points"][key]["evidence"]
+
+    qualification = run_qualification_state_machine(
+        root, execute_entry, identity=identity
+    )
+    if options.stop_after == "qualification":
+        return state
+
+    primary = dict(qualification["primary"])
+    primary_entries, ablation_entries = contract.build_matrix()
+    for entry in primary_entries:
+        if entry.scale == 12:
+            continue
+        primary[entry.key] = execute_entry(entry)
+    ablations = {}
+    for entry in ablation_entries:
+        ablations[entry.key] = execute_entry(entry)
+
+    ordered_primary = [primary[entry.key] for entry in primary_entries]
+    ordered_ablations = [ablations[entry.key] for entry in ablation_entries]
+    try:
+        complete = contract.validate_complete({
+            "schema": 1,
+            "identity": identity,
+            "primary": ordered_primary,
+            "ablations": ordered_ablations,
+        })
+    except OffloadError as error:
+        (root / "complete.json").unlink(missing_ok=True)
+        atomic_write_json(root / "performance-hold.json", {
+            "schema": 1,
+            "official_qualification": False,
+            "error": str(error),
+        })
+        raise
+    oracle = {}
+    for scale in contract.SCALES:
+        candidates = {
+            name: next(
+                row for row in complete["ablations"]
+                if row["scale"] == scale and row["system"] == f"cira-{name}"
+            )
+            for name in ("A", "B", "C")
+        }
+        oracle_ticks = min(row["sim_ticks"] for row in candidates.values())
+        few_shot = next(
+            row for row in complete["primary"]
+            if row["scale"] == scale and row["system"] == "cira-few-shot"
+        )
+        oracle[f"g{scale}"] = {
+            "oracle_ticks": oracle_ticks,
+            "regret": str(
+                Decimal(few_shot["sim_ticks"]) / Decimal(oracle_ticks)
+                - Decimal(1)
+            ),
+        }
+    complete["oracle"] = oracle
+    complete["status"] = "passed"
+    (root / "performance-hold.json").unlink(missing_ok=True)
+    atomic_write_json(root / "complete.json", _json_points(complete))
+    state["status"] = "complete"
+    atomic_write_json(state_path, state)
     return state
 
 
