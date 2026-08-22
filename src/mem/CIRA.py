@@ -64,6 +64,18 @@ class CIRA(ClockedObject):
     pr_reconfiguration_latency = Param.Latency(
         "100ns", "Charged latency for a CIRA PageRank JIT reconfiguration"
     )
+    pr_policy_base_cycles = Param.Cycles(
+        1000, "Base descriptor-formation cost for a CIRA PageRank policy"
+    )
+    pr_policy_a_cost_ppm = Param.Unsigned(
+        1003978, "Hardware-ranked relative formation cost for policy A"
+    )
+    pr_policy_b_cost_ppm = Param.Unsigned(
+        1000000, "Hardware-ranked relative formation cost for policy B"
+    )
+    pr_policy_c_cost_ppm = Param.Unsigned(
+        1038586, "Hardware-ranked relative formation cost for policy C"
+    )
     enabled = Param.Bool(True, "Enable CIRA timing prefetch requests")
     timing_csr_traversal = Param.Bool(
         True, "Use bounded device-side timing reads for CSR indices"

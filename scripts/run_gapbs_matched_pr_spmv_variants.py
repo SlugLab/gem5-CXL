@@ -12,10 +12,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 try:
+    from scripts import amu_cira_calibration as calibration
     from scripts import compare_gapbs_cxl_amu_cira as comparison
     from scripts import gapbs_pr_experiment_profiles as profiles
     from scripts import m2ndp_artifacts as artifacts
 except ImportError:
+    import amu_cira_calibration as calibration
     import compare_gapbs_cxl_amu_cira as comparison
     import gapbs_pr_experiment_profiles as profiles
     import m2ndp_artifacts as artifacts
@@ -23,6 +25,75 @@ except ImportError:
 
 class VariantRunError(RuntimeError):
     pass
+
+
+def validate_pr_calibration(manifest):
+    try:
+        if manifest.get("schema") != 2:
+            raise VariantRunError(
+                "formal PR offload requires calibration schema 2"
+            )
+        if manifest["sources"]["amu_pdf"]["sha256"] != calibration.AMU_PDF_SHA256:
+            raise VariantRunError("AMU source hash differs")
+        if manifest["sources"]["cira_csv"]["sha256"] != calibration.CIRA_CSV_SHA256:
+            raise VariantRunError("CIRA source hash differs")
+        near_data = manifest["near_data_pr"]
+        if near_data.get("formal_speedup_is_fit_target") is not False:
+            raise VariantRunError("formal speedup cannot be a calibration target")
+        for owner in ("amu", "cira"):
+            parameters = near_data[owner]["parameters"]
+            if not isinstance(parameters, dict) or not parameters:
+                raise VariantRunError(f"{owner} PR parameters are missing")
+            for name, value in parameters.items():
+                if "speedup" in name.lower():
+                    raise VariantRunError(
+                        "formal speedup cannot be stored as a model parameter"
+                    )
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise VariantRunError(
+                        f"{owner} PR parameter {name} must be a positive integer"
+                    )
+        if near_data["cira"]["selected_source_row"] not in {"A", "B", "C"}:
+            raise VariantRunError("CIRA selected source row is invalid")
+        candidates = near_data["cira"].get("candidates")
+        if candidates is not None:
+            for name in ("A", "B", "C"):
+                ppm = candidates[name]["relative_cost_ppm"]
+                if not isinstance(ppm, int) or isinstance(ppm, bool) or ppm <= 0:
+                    raise VariantRunError(
+                        f"CIRA policy {name} relative cost is invalid"
+                    )
+    except (KeyError, TypeError) as error:
+        raise VariantRunError("formal PR calibration is incomplete") from error
+    return manifest
+
+
+def load_pr_calibration(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VariantRunError("cannot read formal PR calibration") from error
+    return validate_pr_calibration(value)
+
+
+def pr_calibration_fixture_for_test():
+    return {
+        "schema": 2,
+        "sources": {
+            "amu_pdf": {"sha256": calibration.AMU_PDF_SHA256},
+            "cira_csv": {"sha256": calibration.CIRA_CSV_SHA256},
+        },
+        "near_data_pr": {
+            "formal_speedup_is_fit_target": False,
+            "amu": {
+                "parameters": dict(calibration.NEAR_DATA_PR_AMU_ASSUMPTIONS)
+            },
+            "cira": {
+                "parameters": dict(calibration.NEAR_DATA_PR_CIRA_ASSUMPTIONS),
+                "selected_source_row": "B",
+            },
+        },
+    }
 
 
 def resolve_profile(options):
@@ -59,6 +130,19 @@ def make_compare_args(options):
     asmc_calibration_manifest = getattr(
         options, "asmc_calibration_manifest", None
     )
+    pr_parameters = pr_calibration_fixture_for_test()["near_data_pr"]
+    if asmc_calibration_manifest is not None:
+        pr_parameters = load_pr_calibration(
+            asmc_calibration_manifest
+        )["near_data_pr"]
+    amu_pr = pr_parameters["amu"]["parameters"]
+    cira_pr = pr_parameters["cira"]["parameters"]
+    candidate_costs = pr_parameters["cira"].get("candidates", {})
+    policy_cost_ppm = {
+        name: candidate_costs.get(name, {}).get("relative_cost_ppm", default)
+        for name, default in (("A", 1003978), ("B", 1000000),
+                              ("C", 1038586))
+    }
     return SimpleNamespace(
         gem5=Path(options.gem5).resolve(),
         config=Path(options.config).resolve(),
@@ -97,6 +181,11 @@ def make_compare_args(options):
         asmc_issue_latency="1ns",
         asmc_completion_latency="0ns",
         asmc_latency="0ns",
+        asmc_pr_descriptor_entries=amu_pr["descriptor_entries"],
+        asmc_pr_read_entries=amu_pr["read_entries"],
+        asmc_pr_fp_add_cycles=amu_pr["fp_add_cycles"],
+        asmc_pr_fp_mul_cycles=amu_pr["fp_mul_cycles"],
+        asmc_pr_fp_div_cycles=amu_pr["fp_div_cycles"],
         cira_max_outstanding=256,
         cira_max_send_queue=1024,
         cira_max_csr_walk_queue=4096,
@@ -105,6 +194,19 @@ def make_compare_args(options):
         cira_max_completed_lines=65536,
         cira_issue_latency="1ns",
         cira_completion_latency="0ns",
+        cira_pr_descriptor_entries=cira_pr["descriptor_entries"],
+        cira_pr_csr_read_entries=cira_pr["csr_read_entries"],
+        cira_pr_coherent_entries=cira_pr["coherent_entries"],
+        cira_pr_fp_add_cycles=cira_pr["fp_add_cycles"],
+        cira_pr_fp_mul_cycles=cira_pr["fp_mul_cycles"],
+        cira_pr_fp_div_cycles=cira_pr["fp_div_cycles"],
+        cira_pr_reconfiguration_latency=(
+            f"{cira_pr['reconfiguration_latency_ns']}ns"
+        ),
+        cira_pr_policy_base_cycles=cira_pr["policy_base_cycles"],
+        cira_pr_policy_a_cost_ppm=policy_cost_ppm["A"],
+        cira_pr_policy_b_cost_ppm=policy_cost_ppm["B"],
+        cira_pr_policy_c_cost_ppm=policy_cost_ppm["C"],
         roi_work_events=True,
         verify=True,
         env=[f"OMP_NUM_THREADS={profile.threads}"],

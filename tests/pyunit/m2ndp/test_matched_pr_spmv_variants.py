@@ -53,7 +53,7 @@ class MatchedVariantSourceTest(unittest.TestCase):
 
     def test_calibrated_build_policy_binds_mode_source_and_hoist(self):
         calibration = {
-            "schema": 1,
+            "schema": 2,
             "sources": {
                 "amu_pdf": {"sha256": variants.calibration.AMU_PDF_SHA256},
                 "cira_csv": {
@@ -70,6 +70,7 @@ class MatchedVariantSourceTest(unittest.TestCase):
             },
             "amu": {"validation": {"status": "PASS"}},
             "cira": {"primary": {"selected_source_mode": "B"}},
+            "near_data_pr": {"formal_speedup_is_fit_target": False},
         }
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "calibration.json"

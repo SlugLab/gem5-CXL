@@ -1310,7 +1310,7 @@ class CalibrationRunnerTest(unittest.TestCase):
             self.assertEqual(runner.main([*common, "--output", str(output_b)]), 0)
             self.assertEqual(output_a.read_bytes(), output_b.read_bytes())
             manifest = runner.load_json(output_a)
-            self.assertEqual(manifest["schema"], 1)
+            self.assertEqual(manifest["schema"], 2)
             self.assertEqual(
                 manifest["sources"]["amu_pdf"]["sha256"],
                 calibration.AMU_PDF_SHA256,
@@ -1330,6 +1330,26 @@ class CalibrationRunnerTest(unittest.TestCase):
             self.assertEqual(manifest["amu"]["validation"]["status"], "PASS")
             self.assertEqual(manifest["amu"]["proxy_isa"], "x86")
             self.assertEqual(manifest["amu"]["paper_isa"], "RISC-V")
+            near_data = manifest["near_data_pr"]
+            self.assertEqual(
+                near_data["amu"]["fit_role"],
+                "architecture_and_cross_workload_validation",
+            )
+            self.assertEqual(
+                near_data["cira"]["fit_role"],
+                "pr_spmv_policy_ranking",
+            )
+            self.assertFalse(near_data["formal_speedup_is_fit_target"])
+            self.assertEqual(
+                near_data["cira"]["selected_source_row"], "B"
+            )
+            self.assertEqual(
+                len(near_data["cira"]["candidates"]["B"]["raw_times_ms"]),
+                10,
+            )
+            for owner in (near_data["amu"], near_data["cira"]):
+                self.assertIn("parameters", owner)
+                self.assertIn("parameter_sources", owner)
 
     def test_infeasible_proxy_uses_architecture_defaults_not_fake_fit(self):
         rows = calibration.paper_measurements_for_test()

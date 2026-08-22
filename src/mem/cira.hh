@@ -137,6 +137,7 @@ class CIRA : public ClockedObject
         uint32_t reservedInitialCsrPackets = 0;
         uint32_t reservedInitialCoherentPackets = 0;
         Tick issueTick = 0;
+        Tick policyReadyTick = 0;
         Tick stallStart = 0;
         bool queueStalled = false;
         std::array<uint8_t, 4> scoreData = {};
@@ -338,6 +339,7 @@ class CIRA : public ClockedObject
         statistics::Scalar prCoherentWrites;
         statistics::Scalar prComputeTicks;
         statistics::Scalar prQueueStallTicks;
+        statistics::Scalar prPolicyFormationTicks;
         statistics::Scalar issuedPrReconfigurations;
         statistics::Scalar completedPrReconfigurations;
         statistics::Scalar usefulHoists;
@@ -352,6 +354,7 @@ class CIRA : public ClockedObject
         statistics::Vector prCoherentWritesPerCore;
         statistics::Vector prComputeTicksPerCore;
         statistics::Vector prQueueStallTicksPerCore;
+        statistics::Vector prPolicyFormationTicksPerCore;
         statistics::Vector issuedPrReconfigurationsPerCore;
         statistics::Vector completedPrReconfigurationsPerCore;
         statistics::Vector usefulHoistsPerCore;
@@ -393,6 +396,8 @@ class CIRA : public ClockedObject
     void recvReqRetry(PortID targetCore);
     bool validatePrDescriptor(ThreadContext *tc,
                               const pr_row_offload_desc &desc) const;
+    uint64_t prPolicyCostPpm(uint64_t rowWindow,
+                             uint64_t leadBlocks) const;
     bool reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
                        PrPacketRole route, PrPayloadRole payload,
                        uint64_t index);
@@ -443,6 +448,10 @@ class CIRA : public ClockedObject
     const Cycles prFpMulCycles;
     const Cycles prFpDivCycles;
     const Tick prReconfigurationLatency;
+    const Cycles prPolicyBaseCycles;
+    const uint64_t prPolicyACostPpm;
+    const uint64_t prPolicyBCostPpm;
+    const uint64_t prPolicyCCostPpm;
 
     uint64_t maxOutstanding;
     bool enabled;

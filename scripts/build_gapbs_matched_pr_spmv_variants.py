@@ -56,14 +56,16 @@ def resolve_cira_build_policy(calibration_manifest, mode, *, source_row=None):
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise VariantEvidenceError(f"invalid calibration manifest: {path}") from error
     try:
-        if value["schema"] != 1:
-            raise VariantEvidenceError("calibration schema must be 1")
+        if value["schema"] != 2:
+            raise VariantEvidenceError("calibration schema must be 2")
         if value["sources"]["amu_pdf"]["sha256"] != calibration.AMU_PDF_SHA256:
             raise VariantEvidenceError("calibration AMU PDF hash differs")
         if value["sources"]["cira_csv"]["sha256"] != calibration.CIRA_CSV_SHA256:
             raise VariantEvidenceError("calibration CIRA CSV hash differs")
         if value["amu"]["validation"]["status"] != "PASS":
             raise VariantEvidenceError("AMU calibration validation did not pass")
+        if value["near_data_pr"]["formal_speedup_is_fit_target"] is not False:
+            raise VariantEvidenceError("formal speedup cannot be a calibration target")
         policy = cira_lead_policy.resolve_mode(value, mode, source_row=source_row)
     except (KeyError, TypeError, cira_lead_policy.LeadPolicyError) as error:
         raise VariantEvidenceError(str(error)) from error

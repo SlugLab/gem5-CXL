@@ -6,6 +6,7 @@ import unittest
 import json
 import os
 import struct
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,27 @@ from scripts import run_gapbs_matched_pr_spmv_variants as runner
 
 
 class MatchedVariantRunnerTest(unittest.TestCase):
+    def test_formal_pr_calibration_rejects_schema_hash_and_speedup_target_drift(self):
+        manifest = runner.pr_calibration_fixture_for_test()
+        validated = runner.validate_pr_calibration(manifest)
+        self.assertEqual(validated["near_data_pr"]["cira"]["selected_source_row"], "B")
+        mutations = (
+            ("schema", 1, "schema 2"),
+            ("amu_hash", "0" * 64, "AMU source hash"),
+            ("speedup_target", True, "speedup cannot"),
+        )
+        for name, value, message in mutations:
+            with self.subTest(name=name):
+                candidate = deepcopy(manifest)
+                if name == "schema":
+                    candidate["schema"] = value
+                elif name == "amu_hash":
+                    candidate["sources"]["amu_pdf"]["sha256"] = value
+                else:
+                    candidate["near_data_pr"]["formal_speedup_is_fit_target"] = value
+                with self.assertRaisesRegex(runner.VariantRunError, message):
+                    runner.validate_pr_calibration(candidate)
+
     def test_compare_args_fix_publication_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

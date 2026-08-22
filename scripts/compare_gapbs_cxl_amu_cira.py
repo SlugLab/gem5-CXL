@@ -187,6 +187,38 @@ AMU_LINE_CACHE_RE = re.compile(
     r"cache_hits=(?P<cache_hits>[0-9]+) "
     r"coalesced_misses=(?P<coalesced_misses>[0-9]+)$"
 )
+PR_E2E_PHASES_RE = re.compile(
+    r"^PR_E2E_PHASES formation=(?P<formation>[0-9]+) "
+    r"sampling=(?P<sampling>[0-9]+) selection=(?P<selection>[0-9]+) "
+    r"jit=(?P<jit>[0-9]+) execution=(?P<execution>[0-9]+) "
+    r"drain=(?P<drain>[0-9]+) total=(?P<total>[0-9]+)$"
+)
+PR_EVIDENCE_STATS = {
+    "amu": {
+        "pr_issued_descriptors": "board.asmc.issuedPrDescriptors",
+        "pr_completed_descriptors": "board.asmc.completedPrDescriptors",
+        "pr_rows": "board.asmc.prRows",
+        "pr_read_packets": "board.asmc.prReadPackets",
+        "pr_write_packets": "board.asmc.prWritePackets",
+        "pr_compute_ticks": "board.asmc.prComputeTicks",
+        "pr_queue_stall_ticks": "board.asmc.prQueueStallTicks",
+    },
+    "cira": {
+        "pr_issued_descriptors": "board.cira.issuedPrDescriptors",
+        "pr_completed_descriptors": "board.cira.completedPrDescriptors",
+        "pr_rows": "board.cira.prRows",
+        "pr_read_packets": "board.cira.prCsrReads",
+        "pr_coherent_read_packets": "board.cira.prCoherentReads",
+        "pr_write_packets": "board.cira.prCoherentWrites",
+        "pr_compute_ticks": "board.cira.prComputeTicks",
+        "pr_queue_stall_ticks": "board.cira.prQueueStallTicks",
+        "pr_outstanding_work": "board.cira.prOutstandingWork",
+        "pr_rejected_descriptors": "board.cira.rejectedPrDescriptors",
+        "pr_issued_reconfigurations": "board.cira.issuedPrReconfigurations",
+        "pr_completed_reconfigurations": "board.cira.completedPrReconfigurations",
+        "pr_policy_formation_ticks": "board.cira.prPolicyFormationTicks",
+    },
+}
 SUMMARY_FIELDS = (
     "benchmark",
     "label",
@@ -247,6 +279,26 @@ SUMMARY_FIELDS = (
     "cira_completed_csr_index_reads",
     "cira_rejected_csr_index_queue_full",
     "cira_timing_csr_traversal",
+    "pr_issued_descriptors",
+    "pr_completed_descriptors",
+    "pr_rows",
+    "pr_read_packets",
+    "pr_coherent_read_packets",
+    "pr_write_packets",
+    "pr_compute_ticks",
+    "pr_queue_stall_ticks",
+    "pr_outstanding_work",
+    "pr_rejected_descriptors",
+    "pr_issued_reconfigurations",
+    "pr_completed_reconfigurations",
+    "pr_policy_formation_ticks",
+    "pr_e2e_formation_ns",
+    "pr_e2e_sampling_ns",
+    "pr_e2e_selection_ns",
+    "pr_e2e_jit_ns",
+    "pr_e2e_execution_ns",
+    "pr_e2e_drain_ns",
+    "pr_e2e_total_ns",
     "cxl_packets",
     "cxl_bytes",
     *REAL_CXL_FIELDS,
@@ -327,6 +379,86 @@ def parse_verification(path):
         elif "Verification: FAIL" in line:
             return "fail"
     return verification
+
+
+def parse_pr_e2e_phases(path, measured_trial=0):
+    if not Path(path).is_file():
+        raise StatsError(f"missing PageRank phase log: {path}")
+    records = []
+    for line in Path(path).read_text(errors="replace").splitlines():
+        if not line.startswith("PR_E2E_PHASES"):
+            continue
+        match = PR_E2E_PHASES_RE.fullmatch(line)
+        if match is None:
+            raise StatsError(f"malformed PageRank phase marker: {line}")
+        record = {name: int(value) for name, value in match.groupdict().items()}
+        if sum(record[name] for name in (
+            "formation", "sampling", "selection", "jit", "execution", "drain"
+        )) != record["total"]:
+            raise StatsError("PageRank phase sum differs from total")
+        records.append(record)
+    if measured_trial < 0 or measured_trial >= len(records):
+        raise StatsError(
+            f"PageRank measured trial {measured_trial} marker is missing"
+        )
+    record = records[measured_trial]
+    return {f"pr_e2e_{name}_ns": value for name, value in record.items()}
+
+
+def extract_pr_evidence(stats, kind):
+    fields = (
+        "pr_issued_descriptors", "pr_completed_descriptors", "pr_rows",
+        "pr_read_packets", "pr_coherent_read_packets", "pr_write_packets",
+        "pr_compute_ticks", "pr_queue_stall_ticks", "pr_outstanding_work",
+        "pr_rejected_descriptors", "pr_issued_reconfigurations",
+        "pr_completed_reconfigurations", "pr_policy_formation_ticks",
+    )
+    if kind not in PR_EVIDENCE_STATS:
+        return {field: 0 for field in fields}
+    evidence = {field: 0 for field in fields}
+    first_stat = next(iter(PR_EVIDENCE_STATS[kind].values()))
+    if first_stat not in stats:
+        return evidence
+    for field, stat_name in PR_EVIDENCE_STATS[kind].items():
+        if stat_name not in stats:
+            raise StatsError(f"missing required ROI statistic: {stat_name}")
+        evidence[field] = _counter(stats, stat_name)
+    if kind == "amu" and pr_evidence.get("pr_issued_descriptors", 0) == 0:
+        evidence["pr_outstanding_work"] = (
+            evidence["pr_issued_descriptors"] -
+            evidence["pr_completed_descriptors"]
+        )
+    return evidence
+
+
+def pr_evidence_failure(evidence, kind):
+    if evidence["pr_issued_descriptors"] <= 0:
+        return "no-pr-descriptors"
+    if evidence["pr_issued_descriptors"] != evidence["pr_completed_descriptors"]:
+        return "pr-incomplete-descriptors"
+    if evidence["pr_outstanding_work"] != 0:
+        return "pr-outstanding-work"
+    if evidence["pr_rows"] <= 0 or evidence["pr_read_packets"] <= 0 or \
+            evidence["pr_write_packets"] <= 0:
+        return "pr-inactive-data-path"
+    if evidence["pr_rejected_descriptors"] != 0:
+        return "pr-rejected-descriptors"
+    if evidence["pr_issued_reconfigurations"] != \
+            evidence["pr_completed_reconfigurations"]:
+        return "pr-incomplete-reconfiguration"
+    if kind == "cira" and evidence["pr_policy_formation_ticks"] <= 0:
+        return "pr-missing-policy-charge"
+    return None
+
+
+def empty_pr_phase_evidence():
+    return {
+        f"pr_e2e_{name}_ns": ""
+        for name in (
+            "formation", "sampling", "selection", "jit", "execution",
+            "drain", "total",
+        )
+    }
 
 
 def parse_amu_line_cache(path, *, measured_trial):
@@ -798,6 +930,28 @@ def extract_cira_evidence(stats, kind, num_cores):
             **{field: 0 for field in CIRA_EVIDENCE_STATS},
         }
 
+    pr_evidence = extract_pr_evidence(stats, kind)
+    if pr_evidence["pr_issued_descriptors"] > 0:
+        evidence = {
+            **{field: "" for field in CIRA_PER_CORE_STATS},
+            **{field: 0 for field in CIRA_EVIDENCE_STATS},
+            **pr_evidence,
+        }
+        issued = []
+        completed = []
+        for core in range(num_cores):
+            for values, root in (
+                (issued, "board.cira.issuedPrDescriptorsPerCore"),
+                (completed, "board.cira.completedPrDescriptorsPerCore"),
+            ):
+                name = f"{root}::{core}"
+                if name not in stats:
+                    raise StatsError(f"missing required ROI statistic: {name}")
+                values.append(str(_counter(stats, name)))
+        evidence["cira_issued_per_core"] = ";".join(issued)
+        evidence["cira_completed_per_core"] = ";".join(completed)
+        return evidence
+
     evidence = {}
     for field, stat_name in CIRA_EVIDENCE_STATS.items():
         if stat_name not in stats:
@@ -818,6 +972,26 @@ def extract_cira_evidence(stats, kind, num_cores):
 
 
 def cira_evidence_failure(evidence, num_cores):
+    if evidence.get("pr_issued_descriptors", 0) > 0:
+        failure = pr_evidence_failure(evidence, "cira")
+        if failure:
+            return failure
+        issued = [
+            Decimal(value)
+            for value in evidence["cira_issued_per_core"].split(";")
+        ]
+        completed = [
+            Decimal(value)
+            for value in evidence["cira_completed_per_core"].split(";")
+        ]
+        if len(issued) != num_cores or len(completed) != num_cores:
+            raise StatsError("CIRA PR per-core evidence width does not match cores")
+        if any(value <= 0 for value in issued):
+            return "inactive-cira-core"
+        if issued != completed:
+            return "pr-incomplete-descriptors"
+        return None
+
     if (
         evidence["cira_rejected_queue_full"] != 0
         or evidence["cira_dropped_csr_descriptors"] != 0
@@ -928,6 +1102,16 @@ def append_kind_args(cmd, args, kind):
             args.asmc_completion_latency,
             "--asmc-latency",
             args.asmc_latency,
+            "--asmc-pr-descriptor-entries",
+            str(getattr(args, "asmc_pr_descriptor_entries", 32)),
+            "--asmc-pr-read-entries",
+            str(getattr(args, "asmc_pr_read_entries", 1024)),
+            "--asmc-pr-fp-add-cycles",
+            str(getattr(args, "asmc_pr_fp_add_cycles", 1)),
+            "--asmc-pr-fp-mul-cycles",
+            str(getattr(args, "asmc_pr_fp_mul_cycles", 1)),
+            "--asmc-pr-fp-div-cycles",
+            str(getattr(args, "asmc_pr_fp_div_cycles", 4)),
         ]
         if args.asmc_calibration_manifest is not None:
             cmd += [
@@ -955,6 +1139,28 @@ def append_kind_args(cmd, args, kind):
             args.cira_issue_latency,
             "--cira-completion-latency",
             args.cira_completion_latency,
+            "--cira-pr-descriptor-entries",
+            str(getattr(args, "cira_pr_descriptor_entries", 16)),
+            "--cira-pr-csr-read-entries",
+            str(getattr(args, "cira_pr_csr_read_entries", 256)),
+            "--cira-pr-coherent-entries",
+            str(getattr(args, "cira_pr_coherent_entries", 256)),
+            "--cira-pr-fp-add-cycles",
+            str(getattr(args, "cira_pr_fp_add_cycles", 1)),
+            "--cira-pr-fp-mul-cycles",
+            str(getattr(args, "cira_pr_fp_mul_cycles", 1)),
+            "--cira-pr-fp-div-cycles",
+            str(getattr(args, "cira_pr_fp_div_cycles", 4)),
+            "--cira-pr-reconfiguration-latency",
+            getattr(args, "cira_pr_reconfiguration_latency", "100ns"),
+            "--cira-pr-policy-base-cycles",
+            str(getattr(args, "cira_pr_policy_base_cycles", 1000)),
+            "--cira-pr-policy-a-cost-ppm",
+            str(getattr(args, "cira_pr_policy_a_cost_ppm", 1003978)),
+            "--cira-pr-policy-b-cost-ppm",
+            str(getattr(args, "cira_pr_policy_b_cost_ppm", 1000000)),
+            "--cira-pr-policy-c-cost-ppm",
+            str(getattr(args, "cira_pr_policy_c_cost_ppm", 1038586)),
         ]
         if (
             not has_env(args.env, "CIRA_GEM5_M5OPS")
@@ -974,7 +1180,7 @@ def checkpoint_model_parameters(args, kind):
         "env": "\0".join(args.env),
         "checkpoint_save_contract": CHECKPOINT_SAVE_CONTRACT,
     }
-    if kind == "amu":
+    if kind == "amu" and pr_evidence["pr_issued_descriptors"] == 0:
         parameters.update(
             {
                 "asmc_spm_size": args.asmc_spm_size,
@@ -995,6 +1201,11 @@ def checkpoint_model_parameters(args, kind):
                 "asmc_issue_latency": args.asmc_issue_latency,
                 "asmc_completion_latency": args.asmc_completion_latency,
                 "asmc_latency": args.asmc_latency,
+                "asmc_pr_descriptor_entries": getattr(args, "asmc_pr_descriptor_entries", 32),
+                "asmc_pr_read_entries": getattr(args, "asmc_pr_read_entries", 1024),
+                "asmc_pr_fp_add_cycles": getattr(args, "asmc_pr_fp_add_cycles", 1),
+                "asmc_pr_fp_mul_cycles": getattr(args, "asmc_pr_fp_mul_cycles", 1),
+                "asmc_pr_fp_div_cycles": getattr(args, "asmc_pr_fp_div_cycles", 4),
             }
         )
     elif kind == "cira":
@@ -1008,6 +1219,17 @@ def checkpoint_model_parameters(args, kind):
                 "cira_max_completed_lines": args.cira_max_completed_lines,
                 "cira_issue_latency": args.cira_issue_latency,
                 "cira_completion_latency": args.cira_completion_latency,
+                "cira_pr_descriptor_entries": getattr(args, "cira_pr_descriptor_entries", 16),
+                "cira_pr_csr_read_entries": getattr(args, "cira_pr_csr_read_entries", 256),
+                "cira_pr_coherent_entries": getattr(args, "cira_pr_coherent_entries", 256),
+                "cira_pr_fp_add_cycles": getattr(args, "cira_pr_fp_add_cycles", 1),
+                "cira_pr_fp_mul_cycles": getattr(args, "cira_pr_fp_mul_cycles", 1),
+                "cira_pr_fp_div_cycles": getattr(args, "cira_pr_fp_div_cycles", 4),
+                "cira_pr_reconfiguration_latency": getattr(args, "cira_pr_reconfiguration_latency", "100ns"),
+                "cira_pr_policy_base_cycles": getattr(args, "cira_pr_policy_base_cycles", 1000),
+                "cira_pr_policy_a_cost_ppm": getattr(args, "cira_pr_policy_a_cost_ppm", 1003978),
+                "cira_pr_policy_b_cost_ppm": getattr(args, "cira_pr_policy_b_cost_ppm", 1000000),
+                "cira_pr_policy_c_cost_ppm": getattr(args, "cira_pr_policy_c_cost_ppm", 1038586),
             }
         )
     return parameters
@@ -1336,6 +1558,12 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
     try:
         stats = parse_stats(run_dir / "stats.txt")
         owned_metrics = extract_owned_metrics(stats, kind)
+        pr_evidence = extract_pr_evidence(stats, kind)
+        phase_evidence = (
+            parse_pr_e2e_phases(log_path, args.measure_trial)
+            if pr_evidence["pr_issued_descriptors"] > 0
+            else empty_pr_phase_evidence()
+        )
         cira_evidence = extract_cira_evidence(stats, kind, args.cores)
         diagnostic_metrics = extract_diagnostic_metrics(
             stats, kind, fast_forward=False, num_cores=args.cores
@@ -1343,6 +1571,8 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
     except StatsError:
         stats = {}
         owned_metrics = {}
+        pr_evidence = {}
+        phase_evidence = {}
         cira_evidence = {}
         diagnostic_metrics = {}
         if status == "ok":
@@ -1363,6 +1593,9 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         evidence_failure = cira_evidence_failure(cira_evidence, args.cores)
         if evidence_failure != "inactive-cira-core" or not args.allow_zero_cira:
             status = evidence_failure or status
+    if kind == "amu" and status == "ok" and \
+            pr_evidence.get("pr_issued_descriptors", 0) > 0:
+        status = pr_evidence_failure(pr_evidence, kind) or status
 
     line_cache_evidence = {}
     if kind == "amu":
@@ -1387,6 +1620,8 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         **provenance,
         **owned_metrics,
         **line_cache_evidence,
+        **pr_evidence,
+        **phase_evidence,
         **cira_evidence,
         **diagnostic_metrics,
         "run_dir": str(run_dir),
@@ -1487,6 +1722,12 @@ def run_one(args, benchmark, label, binary_dir, kind):
         elif verification == "missing":
             status = "verification-missing"
     owned_metrics = extract_owned_metrics(stats, kind)
+    pr_evidence = extract_pr_evidence(stats, kind)
+    phase_evidence = (
+        parse_pr_e2e_phases(log_path, args.measure_trial)
+        if pr_evidence["pr_issued_descriptors"] > 0
+        else empty_pr_phase_evidence()
+    )
     cira_evidence = extract_cira_evidence(stats, kind, args.cores)
     diagnostic_metrics = extract_diagnostic_metrics(
         stats,
@@ -1512,6 +1753,9 @@ def run_one(args, benchmark, label, binary_dir, kind):
         evidence_failure = cira_evidence_failure(cira_evidence, args.cores)
         if evidence_failure != "inactive-cira-core" or not args.allow_zero_cira:
             status = evidence_failure or status
+    if kind == "amu" and status == "ok" and \
+            pr_evidence["pr_issued_descriptors"] > 0:
+        status = pr_evidence_failure(pr_evidence, kind) or status
 
     line_cache_evidence = {}
     if kind == "amu":
@@ -1542,6 +1786,8 @@ def run_one(args, benchmark, label, binary_dir, kind):
         "sim_insts": stats.get("simInsts", ""),
         **owned_metrics,
         **line_cache_evidence,
+        **pr_evidence,
+        **phase_evidence,
         **cira_evidence,
         **diagnostic_metrics,
         **real_cxl_metrics,
@@ -1707,6 +1953,11 @@ def main():
     parser.add_argument("--asmc-issue-latency", default="1ns")
     parser.add_argument("--asmc-completion-latency", default="0ns")
     parser.add_argument("--asmc-latency", default="0ns")
+    parser.add_argument("--asmc-pr-descriptor-entries", type=int, default=32)
+    parser.add_argument("--asmc-pr-read-entries", type=int, default=1024)
+    parser.add_argument("--asmc-pr-fp-add-cycles", type=int, default=1)
+    parser.add_argument("--asmc-pr-fp-mul-cycles", type=int, default=1)
+    parser.add_argument("--asmc-pr-fp-div-cycles", type=int, default=4)
     parser.add_argument("--cira-max-outstanding", type=int, default=256)
     parser.add_argument("--cira-max-send-queue", type=int, default=1024)
     parser.add_argument("--cira-max-csr-walk-queue", type=int, default=4096)
@@ -1715,6 +1966,17 @@ def main():
     parser.add_argument("--cira-max-completed-lines", type=int, default=65536)
     parser.add_argument("--cira-issue-latency", default="1ns")
     parser.add_argument("--cira-completion-latency", default="0ns")
+    parser.add_argument("--cira-pr-descriptor-entries", type=int, default=16)
+    parser.add_argument("--cira-pr-csr-read-entries", type=int, default=256)
+    parser.add_argument("--cira-pr-coherent-entries", type=int, default=256)
+    parser.add_argument("--cira-pr-fp-add-cycles", type=int, default=1)
+    parser.add_argument("--cira-pr-fp-mul-cycles", type=int, default=1)
+    parser.add_argument("--cira-pr-fp-div-cycles", type=int, default=4)
+    parser.add_argument("--cira-pr-reconfiguration-latency", default="100ns")
+    parser.add_argument("--cira-pr-policy-base-cycles", type=int, default=1000)
+    parser.add_argument("--cira-pr-policy-a-cost-ppm", type=int, default=1003978)
+    parser.add_argument("--cira-pr-policy-b-cost-ppm", type=int, default=1000000)
+    parser.add_argument("--cira-pr-policy-c-cost-ppm", type=int, default=1038586)
     parser.add_argument(
         "--roi-work-events",
         action="store_true",

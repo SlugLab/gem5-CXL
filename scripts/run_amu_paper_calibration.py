@@ -328,7 +328,7 @@ def build_manifest(options):
     amu_source = calibration.load_amu_source(options.pdf)
     cira_source = calibration.load_cira_source(options.cira_csv)
     return {
-        "schema": 1,
+        "schema": 2,
         "sources": {
             "amu_pdf": amu_source,
             "cira_csv": cira_source,
@@ -365,6 +365,9 @@ def build_manifest(options):
             "geomean": cira_source["geomean"],
             "mode_mapping": cira_source["classification"],
         },
+        "near_data_pr": calibration.build_near_data_pr_section(
+            amu_source, cira_source
+        ),
     }
 
 

@@ -64,6 +64,24 @@ AMU_ARCHITECTURE_DEFAULTS = {
     "completion_cycles": 0,
 }
 
+NEAR_DATA_PR_AMU_ASSUMPTIONS = {
+    "descriptor_entries": 32,
+    "read_entries": 1024,
+    "fp_add_cycles": 1,
+    "fp_mul_cycles": 1,
+    "fp_div_cycles": 4,
+}
+NEAR_DATA_PR_CIRA_ASSUMPTIONS = {
+    "descriptor_entries": 16,
+    "csr_read_entries": 256,
+    "coherent_entries": 256,
+    "fp_add_cycles": 1,
+    "fp_mul_cycles": 1,
+    "fp_div_cycles": 4,
+    "reconfiguration_latency_ns": 100,
+    "policy_base_cycles": 1000,
+}
+
 
 class CalibrationError(RuntimeError):
     """The selected calibration evidence is missing or inconsistent."""
@@ -295,6 +313,82 @@ def load_cira_source(path):
             "Rows failing Verification are excluded from fitting and plots.",
             "Original fallback and confidence-interval fields are preserved.",
         ],
+    }
+
+
+def build_near_data_pr_section(amu_source, cira_source):
+    """Freeze executor resources and hardware-backed CIRA policy ranking."""
+    direct = amu_source["direct"]
+    amu_parameters = {
+        "spm_bytes": direct["spm_bytes"],
+        "pending_entries_per_state_machine": direct["pending_entries"],
+        "id_batch_entries": direct["id_batch_entries"],
+        **NEAR_DATA_PR_AMU_ASSUMPTIONS,
+    }
+    amu_sources = {
+        "spm_bytes": "AMU paper direct",
+        "pending_entries_per_state_machine": "AMU paper direct",
+        "id_batch_entries": "AMU paper direct",
+        "descriptor_entries": "derived from paper pending entries",
+        "read_entries": "pending entries times ID batch entries",
+        "fp_add_cycles": "explicit architecture assumption",
+        "fp_mul_cycles": "explicit architecture assumption",
+        "fp_div_cycles": "explicit architecture assumption",
+    }
+    if amu_parameters["read_entries"] != (
+        direct["pending_entries"] * direct["id_batch_entries"]
+    ):
+        raise CalibrationError("AMU PR read entries are not paper-derived")
+
+    rows = cira_source["rows"]["pr_spmv"]
+    selected = cira_source["primary"]["selected_source_mode"]
+    if selected not in {"A", "B", "C"}:
+        raise CalibrationError("CIRA PR selected source row is invalid")
+    selected_mean = rows[selected]["mean_time_ms"]
+    candidates = {}
+    for name in ("A", "B", "C"):
+        row = rows[name]
+        if row["verification"] != "PASS" or row["return_code"] != 0:
+            raise CalibrationError(f"CIRA PR candidate {name} is not verified")
+        candidates[name] = {
+            "mean_time_ms": row["mean_time_ms"],
+            "stddev_time_ms": row["stddev_time_ms"],
+            "ci95_time_ms": row["ci95_time_ms"],
+            "ci95_time_low_ms": row["ci95_time_low_ms"],
+            "ci95_time_high_ms": row["ci95_time_high_ms"],
+            "raw_times_ms": row["raw_times_ms"],
+            "relative_cost_ppm": round(
+                row["mean_time_ms"] / selected_mean * 1_000_000
+            ),
+        }
+    if min(candidates, key=lambda name: candidates[name]["mean_time_ms"]) != selected:
+        raise CalibrationError("CIRA selected source row differs from raw ranking")
+
+    cira_sources = {
+        name: "explicit architecture assumption"
+        for name in NEAR_DATA_PR_CIRA_ASSUMPTIONS
+    }
+    cira_sources["policy_base_cycles"] = (
+        "architecture charge scaled only by hardware policy ranking"
+    )
+    return {
+        "formal_speedup_is_fit_target": False,
+        "amu": {
+            "fit_role": "architecture_and_cross_workload_validation",
+            "parameters": amu_parameters,
+            "parameter_sources": amu_sources,
+            "limitations": list(amu_source["limitations"]),
+        },
+        "cira": {
+            "fit_role": "pr_spmv_policy_ranking",
+            "parameters": dict(NEAR_DATA_PR_CIRA_ASSUMPTIONS),
+            "parameter_sources": cira_sources,
+            "selected_source_row": selected,
+            "candidates": candidates,
+            "policy_multiplier_role": (
+                "relative descriptor formation charge, not E2E replacement"
+            ),
+        },
     }
 
 

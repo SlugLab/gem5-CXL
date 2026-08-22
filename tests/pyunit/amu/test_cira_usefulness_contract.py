@@ -68,6 +68,23 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("prReconfigurationLatency", source)
         self.assertIn("completedPrReconfigurations", source)
 
+    def test_cira_pr_policy_has_hardware_ranked_formation_charge(self):
+        cira_py = CIRA_PY.read_text(encoding="utf-8")
+        cira_hh = CIRA_HH.read_text(encoding="utf-8")
+        source = CIRA_CC.read_text(encoding="utf-8")
+        for token in (
+            "pr_policy_base_cycles = Param.Cycles(",
+            "pr_policy_a_cost_ppm = Param.Unsigned(",
+            "pr_policy_b_cost_ppm = Param.Unsigned(",
+            "pr_policy_c_cost_ppm = Param.Unsigned(",
+        ):
+            self.assertIn(token, cira_py)
+        self.assertIn("policyReadyTick", cira_hh)
+        self.assertIn("prPolicyCostPpm(desc.row_window, desc.lead_blocks)", source)
+        self.assertIn("state->policyReadyTick", source)
+        self.assertIn("const Tick policyReadyTick = state->policyReadyTick", source)
+        self.assertIn("schedulePr(targetCore, policyReadyTick)", source)
+
     def test_csr_timing_walk_has_a_bounded_device_side_read_path(self):
         cira_py = CIRA_PY.read_text(encoding="utf-8")
         cira_hh = CIRA_HH.read_text(encoding="utf-8")

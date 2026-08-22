@@ -83,8 +83,8 @@ def load_amu_calibration(path):
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"cannot read AMU calibration manifest: {path}") from error
     try:
-        if calibration["schema"] != 1:
-            raise ValueError("AMU calibration manifest schema must be 1")
+        if calibration["schema"] != 2:
+            raise ValueError("AMU calibration manifest schema must be 2")
         if calibration["sources"]["amu_pdf"]["sha256"] != AMU_PDF_SHA256:
             raise ValueError("AMU calibration PDF hash is not approved")
         if calibration["sources"]["cira_csv"]["sha256"] != CIRA_CSV_SHA256:
@@ -94,6 +94,16 @@ def load_amu_calibration(path):
         profile = calibration["amu"]["formal_profile"]
         fit_parameters = calibration["amu"]["fit"]["parameters"]
         selection = calibration["amu"]["formal_profile_selection"]
+        near_data = calibration["near_data_pr"]
+        if near_data["formal_speedup_is_fit_target"] is not False:
+            raise ValueError("formal speedup cannot be a calibration target")
+        for owner in ("amu", "cira"):
+            parameters = near_data[owner]["parameters"]
+            if not parameters or any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in parameters.values()
+            ):
+                raise ValueError(f"{owner} near-data parameters are invalid")
     except (KeyError, TypeError) as error:
         raise ValueError("AMU calibration manifest is incomplete") from error
 
@@ -383,6 +393,11 @@ parser.add_argument("--asmc-max-send-queue", type=int, default=512)
 parser.add_argument("--asmc-issue-latency", default="1ns")
 parser.add_argument("--asmc-completion-latency", default="0ns")
 parser.add_argument("--asmc-latency", default="0ns")
+parser.add_argument("--asmc-pr-descriptor-entries", type=int, default=32)
+parser.add_argument("--asmc-pr-read-entries", type=int, default=1024)
+parser.add_argument("--asmc-pr-fp-add-cycles", type=int, default=1)
+parser.add_argument("--asmc-pr-fp-mul-cycles", type=int, default=1)
+parser.add_argument("--asmc-pr-fp-div-cycles", type=int, default=4)
 parser.add_argument(
     "--cxl-memory",
     action="store_true",
@@ -412,6 +427,17 @@ parser.add_argument("--cira-csr-lines-per-turn", type=int, default=64)
 parser.add_argument("--cira-max-completed-lines", type=int, default=65536)
 parser.add_argument("--cira-issue-latency", default="1ns")
 parser.add_argument("--cira-completion-latency", default="0ns")
+parser.add_argument("--cira-pr-descriptor-entries", type=int, default=16)
+parser.add_argument("--cira-pr-csr-read-entries", type=int, default=256)
+parser.add_argument("--cira-pr-coherent-entries", type=int, default=256)
+parser.add_argument("--cira-pr-fp-add-cycles", type=int, default=1)
+parser.add_argument("--cira-pr-fp-mul-cycles", type=int, default=1)
+parser.add_argument("--cira-pr-fp-div-cycles", type=int, default=4)
+parser.add_argument("--cira-pr-reconfiguration-latency", default="100ns")
+parser.add_argument("--cira-pr-policy-base-cycles", type=int, default=1000)
+parser.add_argument("--cira-pr-policy-a-cost-ppm", type=int, default=1003978)
+parser.add_argument("--cira-pr-policy-b-cost-ppm", type=int, default=1000000)
+parser.add_argument("--cira-pr-policy-c-cost-ppm", type=int, default=1038586)
 parser.add_argument(
     "--roi-work-events",
     action="store_true",
@@ -607,6 +633,11 @@ if not args.no_asmc:
         issue_latency=args.asmc_issue_latency,
         completion_latency=args.asmc_completion_latency,
         asmc_latency=args.asmc_latency,
+        pr_descriptor_entries=args.asmc_pr_descriptor_entries,
+        pr_read_entries=args.asmc_pr_read_entries,
+        pr_fp_add_cycles=args.asmc_pr_fp_add_cycles,
+        pr_fp_mul_cycles=args.asmc_pr_fp_mul_cycles,
+        pr_fp_div_cycles=args.asmc_pr_fp_div_cycles,
     )
     board.asmc_io_cache = Cache(
         assoc=8,
@@ -642,6 +673,17 @@ if args.cira:
         max_completed_lines=args.cira_max_completed_lines,
         issue_latency=args.cira_issue_latency,
         completion_latency=args.cira_completion_latency,
+        pr_descriptor_entries=args.cira_pr_descriptor_entries,
+        pr_csr_read_entries=args.cira_pr_csr_read_entries,
+        pr_coherent_entries=args.cira_pr_coherent_entries,
+        pr_fp_add_cycles=args.cira_pr_fp_add_cycles,
+        pr_fp_mul_cycles=args.cira_pr_fp_mul_cycles,
+        pr_fp_div_cycles=args.cira_pr_fp_div_cycles,
+        pr_reconfiguration_latency=args.cira_pr_reconfiguration_latency,
+        pr_policy_base_cycles=args.cira_pr_policy_base_cycles,
+        pr_policy_a_cost_ppm=args.cira_pr_policy_a_cost_ppm,
+        pr_policy_b_cost_ppm=args.cira_pr_policy_b_cost_ppm,
+        pr_policy_c_cost_ppm=args.cira_pr_policy_c_cost_ppm,
     )
 
 checkpoint = (

@@ -29,6 +29,72 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
     def setUpClass(cls):
         cls.runner = load_runner()
 
+    def test_pr_offload_parameters_are_forwarded_to_config(self):
+        config = (
+            REPO / "configs/example/gem5_library/x86-gapbs-amu-se.py"
+        ).read_text(encoding="utf-8")
+        comparison = RUNNER_PATH.read_text(encoding="utf-8")
+        for option in (
+            "--asmc-pr-descriptor-entries",
+            "--asmc-pr-read-entries",
+            "--asmc-pr-fp-add-cycles",
+            "--asmc-pr-fp-mul-cycles",
+            "--asmc-pr-fp-div-cycles",
+            "--cira-pr-descriptor-entries",
+            "--cira-pr-csr-read-entries",
+            "--cira-pr-coherent-entries",
+            "--cira-pr-fp-add-cycles",
+            "--cira-pr-fp-mul-cycles",
+            "--cira-pr-fp-div-cycles",
+            "--cira-pr-reconfiguration-latency",
+            "--cira-pr-policy-base-cycles",
+            "--cira-pr-policy-a-cost-ppm",
+            "--cira-pr-policy-b-cost-ppm",
+            "--cira-pr-policy-c-cost-ppm",
+        ):
+            self.assertIn(option, config)
+            self.assertIn(option, comparison)
+
+    def test_pr_phase_marker_is_complete_and_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "gem5.log"
+            log.write_text(
+                "PR_E2E_PHASES formation=10 sampling=20 selection=3 "
+                "jit=4 execution=50 drain=5 total=92\n",
+                encoding="utf-8",
+            )
+            phases = self.runner.parse_pr_e2e_phases(log)
+            self.assertEqual(phases["pr_e2e_total_ns"], 92)
+            self.assertEqual(phases["pr_e2e_execution_ns"], 50)
+            log.write_text(
+                "PR_E2E_PHASES formation=10 sampling=20 selection=3 "
+                "jit=4 execution=50 drain=5 total=91\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(self.runner.StatsError, "sum"):
+                self.runner.parse_pr_e2e_phases(log)
+
+    def test_pr_descriptor_evidence_replaces_legacy_prefetch_gate(self):
+        evidence = {
+            "pr_issued_descriptors": Decimal(8),
+            "pr_completed_descriptors": Decimal(8),
+            "pr_rows": Decimal(4096),
+            "pr_read_packets": Decimal(100),
+            "pr_write_packets": Decimal(20),
+            "pr_outstanding_work": Decimal(0),
+            "pr_rejected_descriptors": Decimal(0),
+            "pr_issued_reconfigurations": Decimal(1),
+            "pr_completed_reconfigurations": Decimal(1),
+            "pr_policy_formation_ticks": Decimal(1000),
+        }
+        self.assertIsNone(self.runner.pr_evidence_failure(evidence, "cira"))
+        candidate = dict(evidence)
+        candidate["pr_completed_descriptors"] -= 1
+        self.assertEqual(
+            self.runner.pr_evidence_failure(candidate, "cira"),
+            "pr-incomplete-descriptors",
+        )
+
     def stats(self):
         return {
             "board.memory.mem_ctrl.readReqs": Decimal(31),

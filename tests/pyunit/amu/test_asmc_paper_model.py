@@ -284,7 +284,7 @@ class AsmcPaperModelTest(unittest.TestCase):
             "completion_cycles": 2,
         }
         manifest = {
-            "schema": 1,
+            "schema": 2,
             "sources": {
                 "amu_pdf": {"sha256": loader["AMU_PDF_SHA256"]},
                 "cira_csv": {"sha256": loader["CIRA_CSV_SHA256"]},
@@ -303,6 +303,11 @@ class AsmcPaperModelTest(unittest.TestCase):
                     }
                 },
                 "formal_profile": profile,
+            },
+            "near_data_pr": {
+                "formal_speedup_is_fit_target": False,
+                "amu": {"parameters": {"descriptor_entries": 32}},
+                "cira": {"parameters": {"descriptor_entries": 16}},
             },
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -334,7 +339,7 @@ class AsmcPaperModelTest(unittest.TestCase):
     def test_manifest_loader_accepts_only_proven_infeasible_defaults(self):
         loader = self.calibration_loader()
         manifest = {
-            "schema": 1,
+            "schema": 2,
             "sources": {
                 "amu_pdf": {"sha256": loader["AMU_PDF_SHA256"]},
                 "cira_csv": {"sha256": loader["CIRA_CSV_SHA256"]},
@@ -365,6 +370,11 @@ class AsmcPaperModelTest(unittest.TestCase):
                     "id_refill_cycles": 0,
                     "completion_cycles": 0,
                 },
+            },
+            "near_data_pr": {
+                "formal_speedup_is_fit_target": False,
+                "amu": {"parameters": {"descriptor_entries": 32}},
+                "cira": {"parameters": {"descriptor_entries": 16}},
             },
         }
         with tempfile.TemporaryDirectory() as temporary:

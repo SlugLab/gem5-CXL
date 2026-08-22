@@ -145,6 +145,8 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "CIRA PageRank modeled compute ticks"),
       ADD_STAT(prQueueStallTicks, statistics::units::Tick::get(),
                "CIRA PageRank descriptor queue stall ticks"),
+      ADD_STAT(prPolicyFormationTicks, statistics::units::Tick::get(),
+               "CIRA PageRank hardware-ranked policy formation ticks"),
       ADD_STAT(issuedPrReconfigurations, statistics::units::Count::get(),
                "CIRA PageRank JIT reconfigurations issued"),
       ADD_STAT(completedPrReconfigurations, statistics::units::Count::get(),
@@ -174,6 +176,9 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "CIRA PageRank compute ticks per core"),
       ADD_STAT(prQueueStallTicksPerCore, statistics::units::Tick::get(),
                "CIRA PageRank queue stall ticks per core"),
+      ADD_STAT(prPolicyFormationTicksPerCore,
+               statistics::units::Tick::get(),
+               "CIRA PageRank policy formation ticks per core"),
       ADD_STAT(issuedPrReconfigurationsPerCore,
                statistics::units::Count::get(),
                "CIRA PageRank reconfigurations issued per core"),
@@ -206,6 +211,7 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
     prCoherentWritesPerCore.init(num_cores);
     prComputeTicksPerCore.init(num_cores);
     prQueueStallTicksPerCore.init(num_cores);
+    prPolicyFormationTicksPerCore.init(num_cores);
     issuedPrReconfigurationsPerCore.init(num_cores);
     completedPrReconfigurationsPerCore.init(num_cores);
     usefulHoistsPerCore.init(num_cores);
@@ -228,6 +234,7 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
         prCoherentWritesPerCore.subname(core, label);
         prComputeTicksPerCore.subname(core, label);
         prQueueStallTicksPerCore.subname(core, label);
+        prPolicyFormationTicksPerCore.subname(core, label);
         issuedPrReconfigurationsPerCore.subname(core, label);
         completedPrReconfigurationsPerCore.subname(core, label);
         usefulHoistsPerCore.subname(core, label);
@@ -258,6 +265,10 @@ CIRA::CIRA(const Params &p)
       prFpMulCycles(p.pr_fp_mul_cycles),
       prFpDivCycles(p.pr_fp_div_cycles),
       prReconfigurationLatency(p.pr_reconfiguration_latency),
+      prPolicyBaseCycles(p.pr_policy_base_cycles),
+      prPolicyACostPpm(p.pr_policy_a_cost_ppm),
+      prPolicyBCostPpm(p.pr_policy_b_cost_ppm),
+      prPolicyCCostPpm(p.pr_policy_c_cost_ppm),
       maxOutstanding(p.max_outstanding),
       enabled(p.enabled),
       timingCsrTraversal(p.timing_csr_traversal),
@@ -278,6 +289,10 @@ CIRA::CIRA(const Params &p)
     panic_if(prDescriptorEntries == 0 || prCsrReadEntries == 0 ||
              prCoherentEntries == 0,
              "CIRA %s requires nonzero PageRank queue limits", name());
+    panic_if(static_cast<uint64_t>(prPolicyBaseCycles) == 0 ||
+             prPolicyACostPpm == 0 ||
+             prPolicyBCostPpm == 0 || prPolicyCCostPpm == 0,
+             "CIRA %s requires nonzero PageRank policy costs", name());
     stats.timingCsrTraversalEnabled = timingCsrTraversal ? 1 : 0;
 
     memSidePorts.reserve(numCores);
@@ -861,6 +876,20 @@ CIRA::validatePrDescriptor(
 }
 
 uint64_t
+CIRA::prPolicyCostPpm(uint64_t rowWindow, uint64_t leadBlocks) const
+{
+    if (rowWindow == 64 && leadBlocks == 1)
+        return prPolicyACostPpm;
+    if (rowWindow == 2048 && leadBlocks == 32)
+        return prPolicyBCostPpm;
+    if (rowWindow == 1024 && leadBlocks == 16)
+        return prPolicyCCostPpm;
+    // Legacy smoke descriptors carry no policy metadata. Charge the selected
+    // hardware row rather than creating an uncalibrated fourth policy.
+    return prPolicyBCostPpm;
+}
+
+uint64_t
 CIRA::issuePrRows(ThreadContext *tc, Addr desc_addr)
 {
     if (!enabled || !tc || desc_addr == 0) {
@@ -942,6 +971,16 @@ CIRA::issuePrRows(ThreadContext *tc, Addr desc_addr)
     state->desc = desc;
     state->row = desc.row_begin;
     state->issueTick = curTick();
+    const uint64_t policyPpm =
+        prPolicyCostPpm(desc.row_window, desc.lead_blocks);
+    const uint64_t policyCycles =
+        (static_cast<uint64_t>(prPolicyBaseCycles) * policyPpm + 999999) /
+        1000000;
+    const Tick policyTicks = cyclesToTicks(Cycles(policyCycles));
+    state->policyReadyTick = curTick() + issueLatency + policyTicks;
+    const Tick policyReadyTick = state->policyReadyTick;
+    stats.prPolicyFormationTicks += policyTicks;
+    stats.prPolicyFormationTicksPerCore[targetCore] += policyTicks;
     state->reservedInitialCsrPackets = initialCsrPackets;
     state->reservedInitialCoherentPackets = initialCoherentPackets;
     prOutstanding.emplace(id, std::move(state));
@@ -961,7 +1000,7 @@ CIRA::issuePrRows(ThreadContext *tc, Addr desc_addr)
             stats.prOutstandingWorkPerCore[targetCore].value()),
         static_cast<uint64_t>(
             stats.prHighWatermarkPerCore[targetCore].value()));
-    schedulePr(targetCore, curTick() + issueLatency);
+    schedulePr(targetCore, policyReadyTick);
     return id;
 }
 
@@ -1154,6 +1193,10 @@ CIRA::processPr(PortID targetCore)
 bool
 CIRA::processPrDescriptor(PrDescriptorState &state)
 {
+    if (curTick() < state.policyReadyTick) {
+        schedulePr(state.targetCore, state.policyReadyTick);
+        return false;
+    }
     while (true) {
         switch (state.stage) {
           case PrStage::StartRow:
