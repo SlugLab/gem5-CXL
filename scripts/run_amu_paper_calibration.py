@@ -5,6 +5,7 @@
 """Collect AMU paper-profile proxies and emit a calibrated manifest."""
 
 import argparse
+import concurrent.futures
 import csv
 import datetime
 import json
@@ -1019,6 +1020,7 @@ def _collection_manifest(
             "runs": runs,
             "expected_simulations": len(WORKLOADS) * len(LATENCIES) * 2,
             "expected_measurement_rows": len(WORKLOADS) * len(LATENCIES),
+            "parallel_jobs": getattr(options, "jobs", 1),
         },
         "host": _host_information(),
         "timestamps": {"started_utc": _utc_now()},
@@ -1573,7 +1575,7 @@ def run_collect(options):
         immutable_path = manifest_path
         immutable_sha256 = calibration.sha256_file(manifest_path)
 
-        for record in plan["runs"]:
+        def execute_record(record):
             _verify_collection_inputs(inputs)
             _verify_collection_manifest(
                 manifest_path, immutable_sha256
@@ -1594,7 +1596,26 @@ def run_collect(options):
             _verify_collection_manifest(
                 manifest_path, immutable_sha256
             )
-            completed_runs += 1
+            return record
+
+        jobs = getattr(options, "jobs", 1)
+        if jobs <= 0:
+            raise calibration.CalibrationError("collection jobs must be positive")
+        if jobs == 1:
+            for record in plan["runs"]:
+                execute_record(record)
+                completed_runs += 1
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=jobs
+            ) as executor:
+                futures = [
+                    executor.submit(execute_record, record)
+                    for record in plan["runs"]
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+                    completed_runs += 1
         rows = _measurement_rows(plan)
         if len(rows) != manifest["plan"]["expected_measurement_rows"]:
             raise calibration.CalibrationError(
@@ -1664,6 +1685,10 @@ def parse_args(argv=None):
     collect.add_argument("--measurements", type=Path, required=True)
     collect.add_argument("--collection-manifest", type=Path, required=True)
     collect.add_argument("--iterations", type=int, default=1)
+    collect.add_argument(
+        "--jobs", type=int, default=1,
+        help="Independent gem5 simulations to run concurrently.",
+    )
     collect.add_argument("--dry-run", action="store_true")
     gate = subparsers.add_parser("gate")
     gate.add_argument("--gem5", type=Path, required=True)

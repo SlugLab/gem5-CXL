@@ -361,6 +361,7 @@ class CalibrationRunnerTest(unittest.TestCase):
             measurements=root / "measurements.csv",
             collection_manifest=root / "collection.json",
             iterations=1,
+            jobs=1,
             dry_run=False,
         )
 
@@ -1202,8 +1203,11 @@ class CalibrationRunnerTest(unittest.TestCase):
                     "--collection-manifest",
                     str(root / "collection.json"),
                     "--dry-run",
+                    "--jobs",
+                    "12",
                 ]
             )
+            self.assertEqual(options.jobs, 12)
             plan = runner.collect_plan(options)
             self.assertEqual(len(plan["runs"]), 3 * 6 * 2)
             self.assertIn("-ffp-contract=off", plan["build"])
