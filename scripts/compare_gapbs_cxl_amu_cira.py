@@ -33,15 +33,18 @@ from gapbs_checkpoint import (  # noqa: E402
 )
 from gapbs_pr_experiment_profiles import (  # noqa: E402
     FROZEN_PROFILE_CONTRACTS,
+    FORMAL_PROFILE_NAME,
     PROFILES as EXPERIMENT_PROFILES,
     SCALING_PROFILE_NAME,
     ProfileError,
     get_profile,
     load_frozen_profile,
+    load_formal_offload_profile,
     load_graph_manifest,
     load_scaling_profile,
     require_latency,
     validate_scaling_profile,
+    validate_formal_offload_profile,
 )
 
 
@@ -193,6 +196,11 @@ PR_E2E_PHASES_RE = re.compile(
     r"jit=(?P<jit>[0-9]+) execution=(?P<execution>[0-9]+) "
     r"drain=(?P<drain>[0-9]+) total=(?P<total>[0-9]+)$"
 )
+PR_CIRA_POLICY_RE = re.compile(
+    r"^PR_CIRA_POLICY selected=(?P<selected>[ABC]) "
+    r"sample_a=(?P<sample_a>[0-9]+) sample_b=(?P<sample_b>[0-9]+) "
+    r"sample_c=(?P<sample_c>[0-9]+)$"
+)
 PR_EVIDENCE_STATS = {
     "amu": {
         "pr_issued_descriptors": "board.asmc.issuedPrDescriptors",
@@ -299,6 +307,10 @@ SUMMARY_FIELDS = (
     "pr_e2e_execution_ns",
     "pr_e2e_drain_ns",
     "pr_e2e_total_ns",
+    "pr_cira_selected_candidate",
+    "pr_cira_sample_a_ticks",
+    "pr_cira_sample_b_ticks",
+    "pr_cira_sample_c_ticks",
     "cxl_packets",
     "cxl_bytes",
     *REAL_CXL_FIELDS,
@@ -403,6 +415,29 @@ def parse_pr_e2e_phases(path, measured_trial=0):
         )
     record = records[measured_trial]
     return {f"pr_e2e_{name}_ns": value for name, value in record.items()}
+
+
+def parse_pr_cira_policy(path, measured_trial=0):
+    records = []
+    for line in Path(path).read_text(errors="replace").splitlines():
+        if not line.startswith("PR_CIRA_POLICY"):
+            continue
+        match = PR_CIRA_POLICY_RE.fullmatch(line)
+        if match is None:
+            raise StatsError(f"malformed PageRank CIRA policy marker: {line}")
+        records.append(match.groupdict())
+    if measured_trial < 0 or measured_trial >= len(records):
+        raise StatsError(
+            f"PageRank measured trial {measured_trial} CIRA policy is missing"
+        )
+    record = records[measured_trial]
+    return {
+        "pr_cira_selected_candidate": record["selected"],
+        **{
+            f"pr_cira_sample_{name}_ticks": int(record[f"sample_{name}"])
+            for name in ("a", "b", "c")
+        },
+    }
 
 
 def extract_pr_evidence(stats, kind):
@@ -1564,6 +1599,11 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
             if pr_evidence["pr_issued_descriptors"] > 0
             else empty_pr_phase_evidence()
         )
+        policy_evidence = (
+            parse_pr_cira_policy(log_path, args.measure_trial)
+            if kind == "cira" and pr_evidence["pr_issued_descriptors"] > 0
+            else {}
+        )
         cira_evidence = extract_cira_evidence(stats, kind, args.cores)
         diagnostic_metrics = extract_diagnostic_metrics(
             stats, kind, fast_forward=False, num_cores=args.cores
@@ -1573,6 +1613,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         owned_metrics = {}
         pr_evidence = {}
         phase_evidence = {}
+        policy_evidence = {}
         cira_evidence = {}
         diagnostic_metrics = {}
         if status == "ok":
@@ -1622,6 +1663,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         **line_cache_evidence,
         **pr_evidence,
         **phase_evidence,
+        **policy_evidence,
         **cira_evidence,
         **diagnostic_metrics,
         "run_dir": str(run_dir),
@@ -1728,6 +1770,11 @@ def run_one(args, benchmark, label, binary_dir, kind):
         if pr_evidence["pr_issued_descriptors"] > 0
         else empty_pr_phase_evidence()
     )
+    policy_evidence = (
+        parse_pr_cira_policy(log_path, args.measure_trial)
+        if kind == "cira" and pr_evidence["pr_issued_descriptors"] > 0
+        else {}
+    )
     cira_evidence = extract_cira_evidence(stats, kind, args.cores)
     diagnostic_metrics = extract_diagnostic_metrics(
         stats,
@@ -1788,6 +1835,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         **line_cache_evidence,
         **pr_evidence,
         **phase_evidence,
+        **policy_evidence,
         **cira_evidence,
         **diagnostic_metrics,
         **real_cxl_metrics,
@@ -1820,6 +1868,16 @@ def write_summary(path, rows):
 def resolve_checkpoint_profile(args):
     name = getattr(args, "profile", "g20-2thread-1us")
     manifest_path = getattr(args, "graph_manifest", None)
+    if name == FORMAL_PROFILE_NAME:
+        if manifest_path is None:
+            raise ProfileError(f"profile {name} requires --graph-manifest")
+        profile = validate_formal_offload_profile(
+            load_formal_offload_profile(manifest_path)
+        )
+        manifest = load_graph_manifest(manifest_path)
+        if Path(manifest.graph).resolve() != Path(args.graph).resolve():
+            raise ProfileError("graph path differs from frozen manifest")
+        return profile
     if name == SCALING_PROFILE_NAME:
         if manifest_path is None:
             raise ProfileError(f"profile {name} requires --graph-manifest")

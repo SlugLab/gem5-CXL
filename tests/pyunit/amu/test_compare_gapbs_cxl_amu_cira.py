@@ -74,6 +74,18 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             with self.assertRaisesRegex(self.runner.StatsError, "sum"):
                 self.runner.parse_pr_e2e_phases(log)
 
+    def test_pr_cira_policy_marker_selects_measured_trial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "gem5.log"
+            log.write_text(
+                "PR_CIRA_POLICY selected=A sample_a=1 sample_b=2 sample_c=3\n"
+                "PR_CIRA_POLICY selected=B sample_a=4 sample_b=5 sample_c=6\n",
+                encoding="utf-8",
+            )
+            evidence = self.runner.parse_pr_cira_policy(log, measured_trial=1)
+            self.assertEqual(evidence["pr_cira_selected_candidate"], "B")
+            self.assertEqual(evidence["pr_cira_sample_c_ticks"], 6)
+
     def test_pr_descriptor_evidence_replaces_legacy_prefetch_gate(self):
         evidence = {
             "pr_issued_descriptors": Decimal(8),
