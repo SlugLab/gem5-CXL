@@ -1626,6 +1626,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
     if (
         kind == "cira"
         and status == "ok"
+        and pr_evidence.get("pr_issued_descriptors", 0) == 0
         and owned_metrics["cira_prefetches"] == 0
         and owned_metrics["cira_indexed_prefetches"] == 0
         and owned_metrics["cira_csr_prefetches"] == 0
@@ -1792,6 +1793,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
     if (
         kind == "cira"
         and proc.returncode == 0
+        and pr_evidence["pr_issued_descriptors"] == 0
         and owned_metrics["cira_prefetches"] == 0
         and owned_metrics["cira_indexed_prefetches"] == 0
         and owned_metrics["cira_csr_prefetches"] == 0

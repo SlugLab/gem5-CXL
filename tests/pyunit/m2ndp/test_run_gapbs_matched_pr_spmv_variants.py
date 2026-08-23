@@ -345,6 +345,41 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         ):
             runner.validate_row(row, "cira", smoke_test=False)
 
+    def test_cira_row_descriptors_replace_legacy_prefetch_evidence(self):
+        row = self.valid_row("cira")
+        row.update(
+            cira_prefetches=0,
+            cira_completed=0,
+            cira_indexed_prefetches=0,
+            cira_csr_prefetches=0,
+            pr_issued_descriptors=160,
+            pr_completed_descriptors=160,
+            pr_rows=163840,
+            pr_read_packets=2063440,
+            pr_coherent_read_packets=2063440,
+            pr_write_packets=163840,
+            pr_outstanding_work=0,
+            pr_rejected_descriptors=0,
+            pr_issued_reconfigurations=20,
+            pr_completed_reconfigurations=20,
+            pr_policy_formation_ticks=160000,
+            cira_issued_per_core="80;80",
+            cira_completed_per_core="80;80",
+        )
+        self.assertIs(
+            runner.validate_row(row, "cira", smoke_test=False), row
+        )
+
+    def test_cira_pr_descriptor_path_does_not_require_legacy_events(self):
+        source = Path(runner.comparison.__file__).read_text(encoding="utf-8")
+        legacy_gate = source[source.index("if (\n        kind == \"cira\""):]
+        legacy_gate = legacy_gate[
+            :legacy_gate.index('if kind == "cira" and status')
+        ]
+        self.assertIn(
+            'pr_evidence.get("pr_issued_descriptors", 0) == 0', legacy_gate
+        )
+
     def test_variant_manifest_rejects_baseline_manifest_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

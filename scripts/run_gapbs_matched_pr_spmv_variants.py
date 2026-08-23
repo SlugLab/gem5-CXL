@@ -339,14 +339,21 @@ def validate_row(
                         "AMU coalesced misses must be nonzero"
                     )
     elif kind == "cira":
-        descriptors = (
-            _integer(row, "cira_prefetches")
-            + _integer(row, "cira_indexed_prefetches")
-            + _integer(row, "cira_csr_prefetches")
-        )
-        completed = _integer(row, "cira_completed")
-        if descriptors <= 0 or completed <= 0:
-            raise VariantRunError("no CIRA events completed")
+        if _integer(row, "pr_issued_descriptors") > 0:
+            failure = comparison.cira_evidence_failure(row, profile.cores)
+            if failure:
+                raise VariantRunError(
+                    f"CIRA PR descriptor evidence failed: {failure}"
+                )
+        else:
+            descriptors = (
+                _integer(row, "cira_prefetches")
+                + _integer(row, "cira_indexed_prefetches")
+                + _integer(row, "cira_csr_prefetches")
+            )
+            completed = _integer(row, "cira_completed")
+            if descriptors <= 0 or completed <= 0:
+                raise VariantRunError("no CIRA events completed")
     else:
         raise VariantRunError(f"unsupported variant kind: {kind}")
     return row
