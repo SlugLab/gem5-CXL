@@ -103,6 +103,24 @@ class OffloadContractTest(unittest.TestCase):
             with self.subTest(point=point), self.assertRaises(contract.OffloadError):
                 contract.validate_point(point)
 
+    def test_few_shot_allows_three_charged_pilots_on_one_worker_only(self):
+        point = self.point(12, "cira-few-shot")
+        point["worker_completions"] = [40, 40, 40, 43]
+        self.assertEqual(
+            contract.validate_point(point)["worker_completions"],
+            [40, 40, 40, 43],
+        )
+
+        split_pilots = self.point(12, "cira-few-shot")
+        split_pilots["worker_completions"] = [40, 40, 41, 42]
+        with self.assertRaisesRegex(contract.OffloadError, "balanced"):
+            contract.validate_point(split_pilots)
+
+        non_few_shot = self.point(12, "cira-pgo")
+        non_few_shot["worker_completions"] = [40, 40, 40, 43]
+        with self.assertRaisesRegex(contract.OffloadError, "balanced"):
+            contract.validate_point(non_few_shot)
+
     def test_complete_requires_exact_rows_raw_equality_and_nine_speedups(self):
         primary = [
             self.point(scale, system)

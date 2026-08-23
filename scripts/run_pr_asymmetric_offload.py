@@ -434,6 +434,21 @@ def _single_csv(path):
     return rows[0]
 
 
+def cira_worker_completions(row):
+    try:
+        issued = [
+            int(value) for value in row["cira_issued_per_core"].split(";")
+        ]
+        completed = [
+            int(value) for value in row["cira_completed_per_core"].split(";")
+        ]
+    except (KeyError, ValueError) as error:
+        raise OffloadError("CIRA per-core completions are invalid") from error
+    if issued != completed:
+        raise OffloadError("CIRA per-core issued and completed counts differ")
+    return completed
+
+
 def _base_point(entry, *, verification, raw_sha256, completions):
     return {
         "scale": entry.scale,
@@ -499,12 +514,7 @@ def load_point(entry, options):
         raise OffloadError(f"{entry.system} run evidence is missing")
     issued = int(row.get("pr_issued_descriptors", 0))
     if kind == "cira":
-        try:
-            completions = [
-                int(value) for value in row["cira_completed_per_core"].split(";")
-            ]
-        except (KeyError, ValueError) as error:
-            raise OffloadError("CIRA per-core completions are invalid") from error
+        completions = cira_worker_completions(row)
     else:
         if issued <= 0 or issued % 4:
             raise OffloadError("AMU descriptors cannot prove four balanced workers")

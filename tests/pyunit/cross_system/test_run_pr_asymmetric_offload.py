@@ -113,6 +113,18 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         resumed = runner.command_for(g12, self.options)
         self.assertIn("--resume", resumed)
 
+    def test_cira_worker_completions_require_matching_issues(self):
+        row = {
+            "cira_issued_per_core": "40;40;40;43",
+            "cira_completed_per_core": "40;40;40;43",
+        }
+        self.assertEqual(
+            runner.cira_worker_completions(row), [40, 40, 40, 43]
+        )
+        row["cira_completed_per_core"] = "40;40;40;42"
+        with self.assertRaisesRegex(runner.OffloadError, "differ"):
+            runner.cira_worker_completions(row)
+
     def test_resume_rehashes_every_passed_artifact(self):
         selected = runner.select_inputs(self.options)
         identity = runner.build_identity(self.options, selected)
