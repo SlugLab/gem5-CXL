@@ -59,7 +59,8 @@ def write_stats(path, *, amu, average=200, peak=256, requests=65536,
 
 
 def write_config(path, binary, *, kind, delay=5000000, extra_core=False,
-                 workload="gups", amu_token="--amu", connected=True):
+                 workload="gups", amu_token="--amu", connected=True,
+                 switchable=False):
     sections = [
         "[board.cxl_mem_link0]",
         f"delay={delay}",
@@ -71,14 +72,25 @@ def write_config(path, binary, *, kind, delay=5000000, extra_core=False,
                 "mem_side_port=board.cxl_device_xbar0.cpu_side_ports[0]",
             ]
         )
+    core = "board.processor.start.core" if switchable else \
+        "board.processor.cores.core"
     sections.extend([
-        "[board.processor.cores.core]",
-        "type=BaseO3CPU",
-        "[board.processor.cores.core.workload]",
+        f"[{core}]",
+        "type=BaseAtomicSimpleCPU" if switchable else "type=BaseO3CPU",
+        "cpu_id=0",
+        f"workload={core}.workload",
+        f"[{core}.workload]",
         f"executable={binary}",
         f"cmd={binary} --workload {workload} --iterations 1 --raw-output out"
         + (f" {amu_token}" if kind == "amu" else ""),
     ])
+    if switchable:
+        sections.extend([
+            "[board.processor.switch.core]",
+            "type=BaseO3CPU",
+            "cpu_id=0",
+            f"workload={core}.workload",
+        ])
     if extra_core:
         sections.extend(
             ["[board.processor.cores1.core]", "type=BaseO3CPU"]
@@ -183,6 +195,26 @@ class AmuGupsGateTest(unittest.TestCase):
             )
             for evidence in proof["evidence"].values():
                 self.assertIn("command_sha256", evidence)
+
+    def test_valid_gate_accepts_one_logical_fast_forward_core(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "proxy"
+            binary.write_bytes(b"same proxy")
+            baseline = make_record(root, binary.resolve(), "baseline")
+            amu = make_record(root, binary.resolve(), "amu")
+            for record in (baseline, amu):
+                write_config(
+                    Path(record["run_dir"], "config.ini"),
+                    binary.resolve(), kind=record["kind"], switchable=True,
+                )
+            proof = runner.validate_gups_gate(
+                baseline,
+                amu,
+                binary,
+                execution_inputs=make_execution_inputs(root),
+            )
+            self.assertEqual(proof["status"], "PASS")
 
     def test_gate_rejects_every_hard_boundary(self):
         mutations = (

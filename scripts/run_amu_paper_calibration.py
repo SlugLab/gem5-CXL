@@ -568,6 +568,65 @@ def _ini_sections(path):
     return sections
 
 
+def _gate_logical_core_workloads(sections, config_path):
+    direct = {
+        match.group(1): name
+        for name in sections
+        if (match := re.fullmatch(
+            r"board\.processor\.cores(\d*)\.core", name
+        ))
+    }
+    starts = {
+        match.group(1): name
+        for name in sections
+        if (match := re.fullmatch(
+            r"board\.processor\.start(\d*)\.core", name
+        ))
+    }
+    switches = {
+        match.group(1): name
+        for name in sections
+        if (match := re.fullmatch(
+            r"board\.processor\.switch(\d*)\.core", name
+        ))
+    }
+    if direct and (starts or switches):
+        raise calibration.CalibrationError(
+            f"GUPS gate has mixed direct/switchable CPU topology: {config_path}"
+        )
+    if starts or switches:
+        if set(starts) != set(switches) or len(starts) != 1:
+            raise calibration.CalibrationError(
+                "GUPS gate requires exactly one paired fast-forward/ROI CPU "
+                f"core: {config_path}"
+            )
+        key = next(iter(starts))
+        start = sections[starts[key]]
+        switch = sections[switches[key]]
+        if (
+            start.get("type") != "BaseAtomicSimpleCPU"
+            or switch.get("type") != "BaseO3CPU"
+            or start.get("cpu_id") != switch.get("cpu_id")
+        ):
+            raise calibration.CalibrationError(
+                f"GUPS gate fast-forward/ROI CPU pair mismatch: {config_path}"
+            )
+        logical_cores = [start]
+    else:
+        if len(direct) != 1:
+            raise calibration.CalibrationError(
+                f"GUPS gate requires exactly one CPU core: {config_path}"
+            )
+        logical_cores = [sections[next(iter(direct.values()))]]
+
+    workload_names = [core.get("workload") for core in logical_cores]
+    if any(not name or name not in sections for name in workload_names):
+        raise calibration.CalibrationError(
+            f"GUPS gate CPU workload topology mismatch: {config_path}"
+        )
+    return [sections[name] for name in workload_names]
+
+
 def _gate_config(record, binary):
     config_path = Path(record["run_dir"]) / "config.ini"
     sections = _ini_sections(_require_file(config_path, "gate config"))
@@ -581,22 +640,7 @@ def _gate_config(record, binary):
             f"GUPS gate requires exactly one 5us CXL link: {config_path}"
         )
     link_name, link = links[0]
-    cores = [
-        name
-        for name in sections
-        if re.fullmatch(r"board\.processor\.cores\d*\.core", name)
-    ]
-    if len(cores) != 1:
-        raise calibration.CalibrationError(
-            f"GUPS gate requires exactly one CPU core: {config_path}"
-        )
-    workloads = [
-        values
-        for name, values in sections.items()
-        if re.fullmatch(
-            r"board\.processor\.cores\d*\.core\.workload", name
-        )
-    ]
+    workloads = _gate_logical_core_workloads(sections, config_path)
     executables = {values.get("executable") for values in workloads}
     expected_binary = str(Path(binary).resolve())
     if executables != {expected_binary}:
