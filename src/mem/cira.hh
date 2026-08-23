@@ -140,6 +140,21 @@ class CIRA : public ClockedObject
         float result = 0.0f;
     };
 
+    struct PrReadWaiter
+    {
+        uint64_t row = 0;
+        PrPayloadRole payload = PrPayloadRole::Score;
+        uint64_t index = 0;
+        uint64_t dataOffset = 0;
+        uint64_t lineOffset = 0;
+        uint64_t size = 0;
+    };
+
+    struct PrLineReadState
+    {
+        std::vector<PrReadWaiter> waiters;
+    };
+
     struct PrDescriptorState
     {
         uint64_t id = 0;
@@ -156,6 +171,10 @@ class CIRA : public ClockedObject
         Tick stallStart = 0;
         bool queueStalled = false;
         std::map<uint64_t, PrRowState> rows;
+        std::map<Addr, std::vector<uint8_t>> cachedCsrReadLines;
+        std::map<Addr, PrLineReadState> pendingCsrReadLines;
+        std::map<Addr, std::vector<uint8_t>> cachedCoherentReadLines;
+        std::map<Addr, PrLineReadState> pendingCoherentReadLines;
     };
 
     struct PrThreadConfig
@@ -176,12 +195,13 @@ class CIRA : public ClockedObject
         PacketSenderState(PrPacketRole pr_role,
                           PrPayloadRole payload_role,
                           uint64_t request_id, PortID target_core,
-                          uint64_t pr_row, uint64_t index,
+                          uint64_t pr_row, Addr pr_line, uint64_t index,
                           uint64_t data_offset)
             : role(PacketRole::PrefetchLine), id(request_id),
               targetCore(target_core), walkId(0), entry(0),
               dataOffset(data_offset), prPacket(true), prRole(pr_role),
-              prPayload(payload_role), prRow(pr_row), prIndex(index)
+              prPayload(payload_role), prRow(pr_row), prLine(pr_line),
+              prIndex(index)
         {}
 
         PacketRole role;
@@ -194,6 +214,7 @@ class CIRA : public ClockedObject
         PrPacketRole prRole = PrPacketRole::CsrRead;
         PrPayloadRole prPayload = PrPayloadRole::Offsets;
         uint64_t prRow = 0;
+        Addr prLine = 0;
         uint64_t prIndex = 0;
     };
 
@@ -416,6 +437,9 @@ class CIRA : public ClockedObject
                        uint64_t index);
     bool reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                         const void *data, uint64_t size);
+    void copyPrReadFragment(PrDescriptorState &state,
+                            const PrReadWaiter &waiter,
+                            const std::vector<uint8_t> &line);
     void schedulePr(PortID targetCore, Tick when);
     void scheduleAllPr(Tick when);
     void processPr(PortID targetCore);

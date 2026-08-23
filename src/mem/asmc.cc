@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <utility>
 
 #include "arch/generic/mmu.hh"
@@ -410,11 +411,38 @@ ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
                     PrPacketRole role, uint64_t index, uint8_t *target)
 {
     (void)target;
+    struct Fragment
+    {
+        Addr line;
+        uint64_t lineOffset;
+        uint64_t dataOffset;
+        uint64_t size;
+        Request::Flags flags;
+    };
     std::vector<TranslationChunk> chunks;
     if (!translate(state.tc, addr, size, BaseMMU::Read, chunks))
         panic("ASMC accepted PR descriptor encountered a read translation "
               "fault at %#llx", static_cast<unsigned long long>(addr));
-    const uint32_t packets = countPackets(chunks);
+    std::vector<Fragment> fragments;
+    std::set<Addr> newLines;
+    for (const auto &chunk : chunks) {
+        Addr chunkOffset = 0;
+        while (chunkOffset < chunk.size) {
+            const Addr paddr = chunk.paddr + chunkOffset;
+            const Addr line = paddr & ~(cacheLineSize - 1);
+            const uint64_t fragmentSize = std::min<uint64_t>(
+                chunk.size - chunkOffset, cacheLineSize - (paddr - line));
+            fragments.push_back({line, paddr - line,
+                                 chunk.offset + chunkOffset,
+                                 fragmentSize, chunk.flags});
+            if (!state.cachedReadLines.count(line) &&
+                !state.pendingReadLines.count(line)) {
+                newLines.insert(line);
+            }
+            chunkOffset += fragmentSize;
+        }
+    }
+    const uint32_t packets = newLines.size();
     if (state.reservedInitialPackets != 0) {
         panic_if(packets > state.reservedInitialPackets ||
                  packets > reservedFarSendSlots ||
@@ -440,29 +468,36 @@ ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
         state.queueStalled = false;
     }
 
-    for (const auto &chunk : chunks) {
-        Addr chunkOffset = 0;
-        while (chunkOffset < chunk.size) {
-            const uint64_t lineRemaining = cacheLineSize -
-                ((chunk.paddr + chunkOffset) % cacheLineSize);
-            const auto packetSize = static_cast<unsigned>(std::min<uint64_t>(
-                chunk.size - chunkOffset, lineRemaining));
-            Request::Flags flags = chunk.flags;
-            flags.set(Request::UNCACHEABLE);
-            RequestPtr req = std::make_shared<Request>(
-                chunk.paddr + chunkOffset, packetSize, flags, requestorId);
-            req->taskId(context_switch_task_id::DMA);
-            PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
-            pkt->allocate();
-            pkt->senderState = new PacketSenderState(
-                state.id, role, row.row, index, chunk.offset + chunkOffset,
-                packetSize, true);
-            ++row.pendingPackets;
-            ++state.pendingPackets;
-            ++pendingPrReads;
-            enqueueFarPacket(pkt);
-            chunkOffset += packetSize;
+    for (const auto &fragment : fragments) {
+        const auto cached = state.cachedReadLines.find(fragment.line);
+        const PrReadWaiter waiter = {
+            row.row, role, index, fragment.dataOffset,
+            fragment.lineOffset, fragment.size,
+        };
+        if (cached != state.cachedReadLines.end()) {
+            copyPrReadFragment(state, waiter, cached->second);
+            continue;
         }
+        auto [pending, inserted] = state.pendingReadLines.try_emplace(
+            fragment.line);
+        pending->second.waiters.push_back(waiter);
+        ++row.pendingPackets;
+        ++state.pendingPackets;
+        if (!inserted)
+            continue;
+
+        Request::Flags flags = fragment.flags;
+        flags.set(Request::UNCACHEABLE);
+        RequestPtr req = std::make_shared<Request>(
+            fragment.line, cacheLineSize, flags, requestorId);
+        req->taskId(context_switch_task_id::DMA);
+        PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+        pkt->allocate();
+        pkt->senderState = new PacketSenderState(
+            state.id, role, row.row, fragment.line, 0, 0,
+            cacheLineSize, true);
+        ++pendingPrReads;
+        enqueueFarPacket(pkt);
     }
     scheduleFarSend(curTick());
     return true;
@@ -508,7 +543,7 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
             std::memcpy(pkt->getPtr<uint8_t>(),
                         bytes + chunk.offset + chunkOffset, packetSize);
             pkt->senderState = new PacketSenderState(
-                state.id, PrPacketRole::Result, row.row, 0,
+                state.id, PrPacketRole::Result, row.row, 0, 0,
                 chunk.offset + chunkOffset, packetSize, false);
             ++row.pendingPackets;
             ++state.pendingPackets;
@@ -802,6 +837,7 @@ ASMC::completePrDescriptor(uint64_t id)
         return;
     PrDescriptorState &state = *it->second;
     panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
+             !state.pendingReadLines.empty() ||
              state.completedRows != state.desc.row_count,
              "ASMC completed PR descriptor with pending packets");
     panic_if(state.reservedInitialPackets != 0,
@@ -1548,6 +1584,53 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
     return true;
 }
 
+void
+ASMC::copyPrReadFragment(PrDescriptorState &state,
+                         const PrReadWaiter &waiter,
+                         const std::vector<uint8_t> &line)
+{
+    const auto rowIt = state.rows.find(waiter.row);
+    panic_if(rowIt == state.rows.end(),
+             "ASMC PR line waiter has no active row");
+    PrRowState &row = rowIt->second;
+    uint8_t *target = nullptr;
+    uint64_t targetSize = 0;
+    switch (waiter.role) {
+      case PrPacketRole::Score:
+        target = row.scoreData.data();
+        targetSize = row.scoreData.size();
+        break;
+      case PrPacketRole::Degree:
+        target = row.degreeData.data();
+        targetSize = row.degreeData.size();
+        break;
+      case PrPacketRole::Offsets:
+        target = row.offsetsData.data();
+        targetSize = row.offsetsData.size();
+        break;
+      case PrPacketRole::Neighbor:
+        panic_if(waiter.index >= row.neighbors.size(),
+                 "ASMC PR neighbor waiter index is invalid");
+        target = reinterpret_cast<uint8_t *>(&row.neighbors[waiter.index]);
+        targetSize = sizeof(int32_t);
+        break;
+      case PrPacketRole::Contribution:
+        panic_if(waiter.index >= row.contributions.size(),
+                 "ASMC PR contribution waiter index is invalid");
+        target = reinterpret_cast<uint8_t *>(
+            &row.contributions[waiter.index]);
+        targetSize = sizeof(float);
+        break;
+      case PrPacketRole::Result:
+        panic("ASMC PR result write registered as a line waiter");
+    }
+    panic_if(waiter.dataOffset + waiter.size > targetSize ||
+             waiter.lineOffset + waiter.size > line.size(),
+             "ASMC PR line waiter exceeds its source or destination");
+    std::memcpy(target + waiter.dataOffset,
+                line.data() + waiter.lineOffset, waiter.size);
+}
+
 bool
 ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
 {
@@ -1557,60 +1640,42 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
     panic_if(it == prOutstanding.end(),
              "ASMC PR response has no active descriptor");
     PrDescriptorState &state = *it->second;
-    const auto rowIt = state.rows.find(sender_state->prRow);
-    panic_if(rowIt == state.rows.end(),
-             "ASMC PR response has no active row");
-    PrRowState &row = rowIt->second;
-    panic_if(pkt->isError() || sender_state->size != pkt->getSize() ||
-             state.pendingPackets == 0 || row.pendingPackets == 0,
+    panic_if(pkt->isError() || sender_state->size != pkt->getSize(),
              "ASMC PR response failed its packet contract");
 
     if (sender_state->read) {
-        uint8_t *target = nullptr;
-        uint64_t targetSize = 0;
-        switch (sender_state->prRole) {
-          case PrPacketRole::Score:
-            target = row.scoreData.data();
-            targetSize = row.scoreData.size();
-            break;
-          case PrPacketRole::Degree:
-            target = row.degreeData.data();
-            targetSize = row.degreeData.size();
-            break;
-          case PrPacketRole::Offsets:
-            target = row.offsetsData.data();
-            targetSize = row.offsetsData.size();
-            break;
-          case PrPacketRole::Neighbor:
-            panic_if(sender_state->prIndex >= row.neighbors.size(),
-                     "ASMC PR neighbor response index is invalid");
-            target = reinterpret_cast<uint8_t *>(
-                &row.neighbors[sender_state->prIndex]);
-            targetSize = sizeof(int32_t);
-            break;
-          case PrPacketRole::Contribution:
-            panic_if(sender_state->prIndex >= row.contributions.size(),
-                     "ASMC PR contribution response index is invalid");
-            target = reinterpret_cast<uint8_t *>(
-                &row.contributions[sender_state->prIndex]);
-            targetSize = sizeof(float);
-            break;
-          case PrPacketRole::Result:
-            panic("ASMC PR result write returned as a read");
+        const auto pending = state.pendingReadLines.find(sender_state->prLine);
+        panic_if(pending == state.pendingReadLines.end() ||
+                 pkt->getSize() != cacheLineSize,
+                 "ASMC PR line response has no pending coalescer entry");
+        std::vector<uint8_t> line(cacheLineSize);
+        std::memcpy(line.data(), pkt->getConstPtr<uint8_t>(), cacheLineSize);
+        for (const PrReadWaiter &waiter : pending->second.waiters) {
+            copyPrReadFragment(state, waiter, line);
+            auto rowIt = state.rows.find(waiter.row);
+            panic_if(rowIt == state.rows.end() ||
+                     rowIt->second.pendingPackets == 0 ||
+                     state.pendingPackets == 0,
+                     "ASMC PR line waiter accounting underflow");
+            --rowIt->second.pendingPackets;
+            --state.pendingPackets;
         }
-        panic_if(sender_state->byteOffset + sender_state->size > targetSize,
-                 "ASMC PR response payload exceeds its destination");
-        std::memcpy(target + sender_state->byteOffset,
-                    pkt->getConstPtr<uint8_t>(), sender_state->size);
+        state.cachedReadLines.emplace(sender_state->prLine, std::move(line));
+        state.pendingReadLines.erase(pending);
         panic_if(pendingPrReads == 0,
                  "ASMC PR read-credit accounting underflow");
         --pendingPrReads;
     } else {
+        const auto rowIt = state.rows.find(sender_state->prRow);
+        panic_if(rowIt == state.rows.end() ||
+                 rowIt->second.pendingPackets == 0 ||
+                 state.pendingPackets == 0,
+                 "ASMC PR write response has no active row");
         panic_if(sender_state->prRole != PrPacketRole::Result,
                  "ASMC PR non-result write response");
+        --rowIt->second.pendingPackets;
+        --state.pendingPackets;
     }
-    --row.pendingPackets;
-    --state.pendingPackets;
 
     pkt->senderState = nullptr;
     delete sender_state;

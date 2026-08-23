@@ -119,6 +119,9 @@ def run_case(gem5, binary, root, mode, *, queue_entries=32):
 
 
 def validate_mechanism(stats, mode):
+    # The frozen fixture issues 192 logical scalar reads across three rounds:
+    # 6 score + 6 degree + 6 offset-pair + 23 neighbor + 23 contribution.
+    logical_scalar_reads = 3 * (6 + 6 + 6 + 23 + 23)
     if mode == "amu":
         prefix = "board.asmc"
         issued = stats[f"{prefix}.issuedPrDescriptors"]
@@ -128,6 +131,8 @@ def validate_mechanism(stats, mode):
         if stats[f"{prefix}.prReadPackets"] <= 0 or \
                 stats[f"{prefix}.prWritePackets"] <= 0:
             raise SmokeError("AMU data path is inactive")
+        if stats[f"{prefix}.prReadPackets"] >= logical_scalar_reads:
+            raise SmokeError("AMU reads were not coalesced by cache line")
     elif mode == "cira":
         prefix = "board.cira"
         issued = stats[f"{prefix}.issuedPrDescriptors"]
@@ -140,6 +145,10 @@ def validate_mechanism(stats, mode):
                 raise SmokeError("CIRA core is inactive")
             if stats[f"{prefix}.completedPrDescriptorsPerCore::{core}"] != 6:
                 raise SmokeError("CIRA core completion differs")
+        physical_reads = stats[f"{prefix}.prCsrReads"] + \
+            stats[f"{prefix}.prCoherentReads"]
+        if physical_reads >= logical_scalar_reads:
+            raise SmokeError("CIRA reads were not coalesced by cache line")
 
 
 def run_smoke(*, gem5, m5_library):
@@ -160,10 +169,15 @@ def run_smoke(*, gem5, m5_library):
             config = (outdir / "config.ini").read_text(errors="replace")
             if "delay=1000000" not in config:
                 raise SmokeError("CXL delay is not exactly 1000000 ticks")
-            mode_proofs[mode] = {"issued": stats.get(
-                f"board.{ 'asmc' if mode == 'amu' else 'cira' }.issuedPrDescriptors",
-                0,
-            )}
+            prefix = f"board.{ 'asmc' if mode == 'amu' else 'cira' }"
+            read_packets = stats.get(f"{prefix}.prReadPackets", 0)
+            if mode == "cira":
+                read_packets = stats.get(f"{prefix}.prCsrReads", 0) + \
+                    stats.get(f"{prefix}.prCoherentReads", 0)
+            mode_proofs[mode] = {
+                "issued": stats.get(f"{prefix}.issuedPrDescriptors", 0),
+                "read_packets": read_packets,
+            }
         validate_word_rows(rows)
 
         failed = []

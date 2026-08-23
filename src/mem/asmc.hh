@@ -145,6 +145,21 @@ class ASMC : public ClockedObject
         float result = 0.0f;
     };
 
+    struct PrReadWaiter
+    {
+        uint64_t row = 0;
+        PrPacketRole role = PrPacketRole::Score;
+        uint64_t index = 0;
+        uint64_t dataOffset = 0;
+        uint64_t lineOffset = 0;
+        uint64_t size = 0;
+    };
+
+    struct PrLineReadState
+    {
+        std::vector<PrReadWaiter> waiters;
+    };
+
     struct PrDescriptorState
     {
         uint64_t id = 0;
@@ -158,6 +173,8 @@ class ASMC : public ClockedObject
         Tick stallStart = 0;
         bool queueStalled = false;
         std::map<uint64_t, PrRowState> rows;
+        std::map<Addr, std::vector<uint8_t>> cachedReadLines;
+        std::map<Addr, PrLineReadState> pendingReadLines;
     };
 
     struct PacketSenderState : public Packet::SenderState
@@ -175,13 +192,14 @@ class ASMC : public ClockedObject
         {}
 
         PacketSenderState(uint64_t request_id, PrPacketRole role,
-                          uint64_t pr_row, uint64_t index, Addr byte_offset,
+                          uint64_t pr_row, Addr pr_line, uint64_t index,
+                          Addr byte_offset,
                           unsigned packet_size, bool is_read)
             : id(request_id), phase(RequestPhase::MemoryAccess),
               targetCore(InvalidPortID), byteOffset(byte_offset),
               size(packet_size), read(is_read), fragmentOffset(0),
               fragmentSize(packet_size), prPacket(true), prRole(role),
-              prRow(pr_row), prIndex(index)
+              prRow(pr_row), prLine(pr_line), prIndex(index)
         {}
 
         uint64_t id;
@@ -195,6 +213,7 @@ class ASMC : public ClockedObject
         bool prPacket;
         PrPacketRole prRole;
         uint64_t prRow = 0;
+        Addr prLine = 0;
         uint64_t prIndex;
     };
 
@@ -268,6 +287,9 @@ class ASMC : public ClockedObject
                        PrPacketRole role, uint64_t index, uint8_t *target);
     bool reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                         const void *data, uint64_t size);
+    void copyPrReadFragment(PrDescriptorState &state,
+                            const PrReadWaiter &waiter,
+                            const std::vector<uint8_t> &line);
     void processPrDescriptors();
     bool processPrDescriptor(PrDescriptorState &state);
     bool processPrRow(PrDescriptorState &state, PrRowState &row);

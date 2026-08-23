@@ -1030,13 +1030,42 @@ CIRA::reservePrRead(PrDescriptorState &state, PrRowState &row,
                     PrPacketRole route, PrPayloadRole payload,
                     uint64_t index)
 {
+    struct Fragment
+    {
+        Addr line;
+        uint64_t lineOffset;
+        uint64_t dataOffset;
+        uint64_t size;
+        Request::Flags flags;
+    };
     const bool csr = route == PrPacketRole::CsrRead;
     panic_if(route == PrPacketRole::CoherentWrite,
              "CIRA PR read requested a write route");
     std::vector<TranslationChunk> chunks;
     if (!translatePr(state.tc, addr, size, BaseMMU::Read, csr, chunks))
         panic("CIRA accepted PR descriptor encountered a read fault");
-    const uint32_t packets = countPackets(chunks);
+    auto &cachedLines = csr ? state.cachedCsrReadLines :
+                              state.cachedCoherentReadLines;
+    auto &pendingLines = csr ? state.pendingCsrReadLines :
+                               state.pendingCoherentReadLines;
+    std::vector<Fragment> fragments;
+    std::set<Addr> newLines;
+    for (const auto &chunk : chunks) {
+        Addr chunkOffset = 0;
+        while (chunkOffset < chunk.size) {
+            const Addr paddr = chunk.paddr + chunkOffset;
+            const Addr line = paddr & ~(cacheLineSize - 1);
+            const uint64_t fragmentSize = std::min<uint64_t>(
+                chunk.size - chunkOffset, cacheLineSize - (paddr - line));
+            fragments.push_back({line, paddr - line,
+                                 chunk.offset + chunkOffset,
+                                 fragmentSize, chunk.flags});
+            if (!cachedLines.count(line) && !pendingLines.count(line))
+                newLines.insert(line);
+            chunkOffset += fragmentSize;
+        }
+    }
+    const uint32_t packets = newLines.size();
 
     if (csr && state.reservedInitialCsrPackets != 0) {
         panic_if(packets > state.reservedInitialCsrPackets ||
@@ -1073,32 +1102,37 @@ CIRA::reservePrRead(PrDescriptorState &state, PrRowState &row,
     }
     clearPrStall(state);
 
-    for (const auto &chunk : chunks) {
-        Addr chunkOffset = 0;
-        while (chunkOffset < chunk.size) {
-            const uint64_t lineRemaining = cacheLineSize -
-                ((chunk.paddr + chunkOffset) % cacheLineSize);
-            const auto packetSize = static_cast<unsigned>(std::min<uint64_t>(
-                chunk.size - chunkOffset, lineRemaining));
-            RequestPtr req = std::make_shared<Request>(
-                chunk.paddr + chunkOffset, packetSize, chunk.flags,
-                requestorId);
-            req->taskId(context_switch_task_id::DMA);
-            PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
-            pkt->allocate();
-            pkt->senderState = new PacketSenderState(
-                route, payload, state.id, state.targetCore, row.row, index,
-                chunk.offset + chunkOffset);
-            ++row.pendingPackets;
-            ++state.pendingPackets;
-            if (csr) {
-                ++pendingPrCsrPackets;
-                enqueueCsrIndexPacket(pkt);
-            } else {
-                ++pendingPrCoherentPackets[state.targetCore];
-                enqueuePacket(state.targetCore, pkt);
-            }
-            chunkOffset += packetSize;
+    for (const auto &fragment : fragments) {
+        const PrReadWaiter waiter = {
+            row.row, payload, index, fragment.dataOffset,
+            fragment.lineOffset, fragment.size,
+        };
+        const auto cached = cachedLines.find(fragment.line);
+        if (cached != cachedLines.end()) {
+            copyPrReadFragment(state, waiter, cached->second);
+            continue;
+        }
+        auto [pending, inserted] = pendingLines.try_emplace(fragment.line);
+        pending->second.waiters.push_back(waiter);
+        ++row.pendingPackets;
+        ++state.pendingPackets;
+        if (!inserted)
+            continue;
+
+        RequestPtr req = std::make_shared<Request>(
+            fragment.line, cacheLineSize, fragment.flags, requestorId);
+        req->taskId(context_switch_task_id::DMA);
+        PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+        pkt->allocate();
+        pkt->senderState = new PacketSenderState(
+            route, payload, state.id, state.targetCore, row.row,
+            fragment.line, 0, 0);
+        if (csr) {
+            ++pendingPrCsrPackets;
+            enqueueCsrIndexPacket(pkt);
+        } else {
+            ++pendingPrCoherentPackets[state.targetCore];
+            enqueuePacket(state.targetCore, pkt);
         }
     }
     if (csr)
@@ -1154,7 +1188,7 @@ CIRA::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                         bytes + chunk.offset + chunkOffset, packetSize);
             pkt->senderState = new PacketSenderState(
                 PrPacketRole::CoherentWrite, PrPayloadRole::Result,
-                state.id, state.targetCore, row.row, 0,
+                state.id, state.targetCore, row.row, 0, 0,
                 chunk.offset + chunkOffset);
             ++row.pendingPackets;
             ++state.pendingPackets;
@@ -1466,6 +1500,8 @@ CIRA::completePrDescriptor(uint64_t id)
         return;
     PrDescriptorState &state = *it->second;
     panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
+             !state.pendingCsrReadLines.empty() ||
+             !state.pendingCoherentReadLines.empty() ||
              state.completedRows != state.desc.row_count ||
              state.reservedInitialCsrPackets != 0 ||
              state.reservedInitialCoherentPackets != 0,
@@ -2032,6 +2068,53 @@ CIRA::recvTimingResp(PortID targetCore, PacketPtr pkt)
     return true;
 }
 
+void
+CIRA::copyPrReadFragment(PrDescriptorState &state,
+                         const PrReadWaiter &waiter,
+                         const std::vector<uint8_t> &line)
+{
+    const auto rowIt = state.rows.find(waiter.row);
+    panic_if(rowIt == state.rows.end(),
+             "CIRA PR line waiter has no active row");
+    PrRowState &row = rowIt->second;
+    uint8_t *target = nullptr;
+    uint64_t targetSize = 0;
+    switch (waiter.payload) {
+      case PrPayloadRole::Score:
+        target = row.scoreData.data();
+        targetSize = row.scoreData.size();
+        break;
+      case PrPayloadRole::Degree:
+        target = row.degreeData.data();
+        targetSize = row.degreeData.size();
+        break;
+      case PrPayloadRole::Offsets:
+        target = row.offsetsData.data();
+        targetSize = row.offsetsData.size();
+        break;
+      case PrPayloadRole::Neighbor:
+        panic_if(waiter.index >= row.neighbors.size(),
+                 "CIRA PR neighbor waiter index is invalid");
+        target = reinterpret_cast<uint8_t *>(&row.neighbors[waiter.index]);
+        targetSize = sizeof(int32_t);
+        break;
+      case PrPayloadRole::Contribution:
+        panic_if(waiter.index >= row.contributions.size(),
+                 "CIRA PR contribution waiter index is invalid");
+        target = reinterpret_cast<uint8_t *>(
+            &row.contributions[waiter.index]);
+        targetSize = sizeof(float);
+        break;
+      case PrPayloadRole::Result:
+        panic("CIRA PR result write registered as a line waiter");
+    }
+    panic_if(waiter.dataOffset + waiter.size > targetSize ||
+             waiter.lineOffset + waiter.size > line.size(),
+             "CIRA PR line waiter exceeds its source or destination");
+    std::memcpy(target + waiter.dataOffset,
+                line.data() + waiter.lineOffset, waiter.size);
+}
+
 bool
 CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
                        PacketSenderState *senderState)
@@ -2044,47 +2127,50 @@ CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
     panic_if(it == prOutstanding.end(),
              "CIRA PR coherent response has no descriptor");
     PrDescriptorState &state = *it->second;
-    const auto rowIt = state.rows.find(senderState->prRow);
-    panic_if(rowIt == state.rows.end(),
-             "CIRA PR coherent response has no active row");
-    PrRowState &row = rowIt->second;
-    panic_if(pkt->isError() || state.pendingPackets == 0 ||
-             row.pendingPackets == 0 ||
+    panic_if(pkt->isError() ||
              pendingPrCoherentPackets[targetCore] == 0,
              "CIRA PR coherent response failed its packet contract");
 
     if (senderState->prRole == PrPacketRole::CoherentRead) {
-        uint8_t *target = nullptr;
-        uint64_t targetSize = 0;
-        switch (senderState->prPayload) {
-          case PrPayloadRole::Score:
-            target = row.scoreData.data();
-            targetSize = row.scoreData.size();
-            break;
-          case PrPayloadRole::Contribution:
-            panic_if(senderState->prIndex >= row.contributions.size(),
-                     "CIRA PR contribution response index is invalid");
-            target = reinterpret_cast<uint8_t *>(
-                &row.contributions[senderState->prIndex]);
-            targetSize = sizeof(float);
-            break;
-          default:
-            panic("CIRA PR coherent read has an invalid payload role");
+        const auto pending = state.pendingCoherentReadLines.find(
+            senderState->prLine);
+        panic_if(pending == state.pendingCoherentReadLines.end() ||
+                 pkt->getSize() != cacheLineSize,
+                 "CIRA PR coherent line has no coalescer entry");
+        std::vector<uint8_t> line(cacheLineSize);
+        std::memcpy(line.data(), pkt->getConstPtr<uint8_t>(), cacheLineSize);
+        for (const PrReadWaiter &waiter : pending->second.waiters) {
+            copyPrReadFragment(state, waiter, line);
+            auto rowIt = state.rows.find(waiter.row);
+            panic_if(rowIt == state.rows.end() ||
+                     rowIt->second.pendingPackets == 0 ||
+                     state.pendingPackets == 0,
+                     "CIRA PR coherent waiter accounting underflow");
+            --rowIt->second.pendingPackets;
+            --state.pendingPackets;
         }
-        panic_if(senderState->dataOffset + pkt->getSize() > targetSize,
-                 "CIRA PR coherent response exceeds destination");
-        std::memcpy(target + senderState->dataOffset,
-                    pkt->getConstPtr<uint8_t>(), pkt->getSize());
+        state.cachedCoherentReadLines.emplace(
+            senderState->prLine, std::move(line));
+        state.pendingCoherentReadLines.erase(pending);
+        if (!targetCaches.empty()) {
+            targetCaches.at(targetCore)->discardCleanBlock(
+                senderState->prLine, pkt->req->isSecure());
+        }
     } else {
+        const auto rowIt = state.rows.find(senderState->prRow);
+        panic_if(rowIt == state.rows.end() ||
+                 rowIt->second.pendingPackets == 0 ||
+                 state.pendingPackets == 0,
+                 "CIRA PR coherent write has no active row");
         panic_if(senderState->prPayload != PrPayloadRole::Result,
                  "CIRA PR coherent write has an invalid payload role");
         const Addr writeLine = pkt->getAddr() & ~(cacheLineSize - 1);
         panic_if(pendingPrWriteLines.erase(writeLine) != 1,
                  "CIRA PR coherent write line was not reserved");
+        --rowIt->second.pendingPackets;
+        --state.pendingPackets;
     }
     --pendingPrCoherentPackets[targetCore];
-    --row.pendingPackets;
-    --state.pendingPackets;
     const bool releasedWriteLine =
         senderState->prRole == PrPacketRole::CoherentWrite;
     pkt->senderState = nullptr;
@@ -2107,44 +2193,28 @@ CIRA::recvPrCsrTimingResp(PacketPtr pkt,
     panic_if(it == prOutstanding.end(),
              "CIRA PR CSR response has no descriptor");
     PrDescriptorState &state = *it->second;
-    const auto rowIt = state.rows.find(senderState->prRow);
-    panic_if(rowIt == state.rows.end(),
-             "CIRA PR CSR response has no active row");
-    PrRowState &row = rowIt->second;
-    panic_if(pkt->isError() || state.pendingPackets == 0 ||
-             row.pendingPackets == 0 ||
-             pendingPrCsrPackets == 0 ||
+    panic_if(pkt->isError() || pendingPrCsrPackets == 0 ||
              state.targetCore != senderState->targetCore,
              "CIRA PR CSR response failed its packet contract");
-
-    uint8_t *target = nullptr;
-    uint64_t targetSize = 0;
-    switch (senderState->prPayload) {
-      case PrPayloadRole::Degree:
-        target = row.degreeData.data();
-        targetSize = row.degreeData.size();
-        break;
-      case PrPayloadRole::Offsets:
-        target = row.offsetsData.data();
-        targetSize = row.offsetsData.size();
-        break;
-      case PrPayloadRole::Neighbor:
-        panic_if(senderState->prIndex >= row.neighbors.size(),
-                 "CIRA PR neighbor response index is invalid");
-        target = reinterpret_cast<uint8_t *>(
-            &row.neighbors[senderState->prIndex]);
-        targetSize = sizeof(int32_t);
-        break;
-      default:
-        panic("CIRA PR CSR read has an invalid payload role");
+    const auto pending = state.pendingCsrReadLines.find(senderState->prLine);
+    panic_if(pending == state.pendingCsrReadLines.end() ||
+             pkt->getSize() != cacheLineSize,
+             "CIRA PR CSR line has no coalescer entry");
+    std::vector<uint8_t> line(cacheLineSize);
+    std::memcpy(line.data(), pkt->getConstPtr<uint8_t>(), cacheLineSize);
+    for (const PrReadWaiter &waiter : pending->second.waiters) {
+        copyPrReadFragment(state, waiter, line);
+        auto rowIt = state.rows.find(waiter.row);
+        panic_if(rowIt == state.rows.end() ||
+                 rowIt->second.pendingPackets == 0 ||
+                 state.pendingPackets == 0,
+                 "CIRA PR CSR waiter accounting underflow");
+        --rowIt->second.pendingPackets;
+        --state.pendingPackets;
     }
-    panic_if(senderState->dataOffset + pkt->getSize() > targetSize,
-             "CIRA PR CSR response exceeds destination");
-    std::memcpy(target + senderState->dataOffset,
-                pkt->getConstPtr<uint8_t>(), pkt->getSize());
+    state.cachedCsrReadLines.emplace(senderState->prLine, std::move(line));
+    state.pendingCsrReadLines.erase(pending);
     --pendingPrCsrPackets;
-    --row.pendingPackets;
-    --state.pendingPackets;
     pkt->senderState = nullptr;
     delete senderState;
     delete pkt;

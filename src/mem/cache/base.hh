@@ -1286,6 +1286,22 @@ class BaseCache : public ClockedObject
         return tags->findBlock({addr, is_secure});
     }
 
+    /**
+     * Discard a clean line installed by a one-shot coherent engine read.
+     * Dirty CPU data is never discarded; false tells the caller that the
+     * line must remain resident.
+     */
+    bool discardCleanBlock(Addr addr, bool is_secure)
+    {
+        CacheBlk *block = tags->findBlock({addr, is_secure});
+        if (!block)
+            return true;
+        if (block->isSet(CacheBlk::DirtyBit))
+            return false;
+        invalidateBlock(block);
+        return true;
+    }
+
     bool hasBeenPrefetched(Addr addr, bool is_secure) const {
         CacheBlk *block = tags->findBlock({addr, is_secure});
         return block && block->wasPrefetched();

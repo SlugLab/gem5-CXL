@@ -97,6 +97,17 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
             "schedulePr(targetCore, clockEdge(Cycles(1)))", source
         )
         self.assertIn("scheduleAllPr(curTick())", source)
+        self.assertIn("struct PrLineReadState", header)
+        self.assertIn("cachedCsrReadLines", header)
+        self.assertIn("pendingCoherentReadLines", header)
+        self.assertIn("std::vector<PrReadWaiter> waiters", header)
+        self.assertIn("copyPrReadFragment", source)
+        self.assertIn("discardCleanBlock", source)
+        cache_header = (REPO / "src/mem/cache/base.hh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("bool discardCleanBlock", cache_header)
+        self.assertIn("CacheBlk::DirtyBit", cache_header)
 
     def test_cira_serializes_partial_result_writes_per_cache_line(self):
         source = CIRA_CC.read_text(encoding="utf-8")

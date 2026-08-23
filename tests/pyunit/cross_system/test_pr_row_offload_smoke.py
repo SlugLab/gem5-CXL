@@ -54,6 +54,8 @@ class PrRowOffloadSmokeTest(unittest.TestCase):
         self.assertEqual(proof["status"], "PASS")
         self.assertEqual(proof["delay_ticks"], 1_000_000)
         self.assertEqual(set(proof["modes"]), {"vanilla", "amu", "cira"})
+        self.assertEqual(proof["modes"]["amu"]["read_packets"], 63)
+        self.assertEqual(proof["modes"]["cira"]["read_packets"], 63)
         self.assertEqual(
             set(proof["failed_injections"]),
             {"changed-bit", "queue-capacity", "unfinished-write"},

@@ -103,7 +103,7 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn(
             "reservedPrReadSlots += initialPacketCount", SOURCE
         )
-        self.assertIn("row.neighbors[sender_state->prIndex]", SOURCE)
+        self.assertIn("row.neighbors[waiter.index]", SOURCE)
         completion = SOURCE[
             SOURCE.index("ASMC::completePrDescriptor"):
             SOURCE.index("ASMC::configFor", SOURCE.index(
@@ -131,6 +131,11 @@ class AsmcPaperModelTest(unittest.TestCase):
             SOURCE.index("ASMC::totalOutstanding")
         ]
         self.assertIn("schedulePrService(curTick())", advance)
+        self.assertIn("struct PrLineReadState", HEADER)
+        self.assertIn("cachedReadLines", HEADER)
+        self.assertIn("pendingReadLines", HEADER)
+        self.assertIn("std::vector<PrReadWaiter> waiters", HEADER)
+        self.assertIn("copyPrReadFragment", SOURCE)
         self.assertIn("PR_ROW_CONTRIB", PR_SMOKE)
         self.assertIn("PR_ROW_PULL", PR_SMOKE)
         self.assertIn("bits(next_scores[row]) != bits(expected)", PR_SMOKE)
