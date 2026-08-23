@@ -265,6 +265,19 @@ class PersistentScheduler
     size_t capacity() const { return activeSlots; }
     size_t live() const { return liveRequests; }
 
+    void bindToCurrentThread()
+    {
+        if (liveRequests != 0)
+            throw std::runtime_error(
+                "cannot rebind AMU configuration with live requests");
+        configure(granularity);
+        if (amu_cfgrd(AMU_CFG_GRANULARITY) != granularity ||
+            amu_cfgrd(AMU_CFG_MAX_OUTSTANDING) != kWindowSlots) {
+            throw std::runtime_error(
+                "AMU configuration did not bind to the ROI CPU");
+        }
+    }
+
     Slot &slot(size_t index)
     {
         if (index >= activeSlots)
@@ -709,9 +722,32 @@ runHashJoinAmu(size_t iteration, BenchmarkState &state,
             }
             const size_t query = slot.op;
             const uint8_t next_stage = slot.stage + 1;
+            const int32_t loaded_index = state.hashCurrent[query];
             HashNode node{};
             std::memcpy(&node, scheduler.payload<HashNode>(slot_index),
                         sizeof(node));
+            if (loaded_index < 0 ||
+                static_cast<uint64_t>(loaded_index) != node.key) {
+                std::fprintf(
+                    stderr,
+                    "HJ_AMU_PAYLOAD_MISMATCH query=%zu stage=%u "
+                    "expected=%d key=%llu next=%d\n",
+                    query, static_cast<unsigned>(slot.stage), loaded_index,
+                    static_cast<unsigned long long>(node.key), node.next);
+                throw std::runtime_error(
+                    "hash-join payload identity mismatch");
+            }
+            if (slot.stage >= kHashDepth) {
+                std::fprintf(
+                    stderr,
+                    "HJ_AMU_DEPTH_OVERFLOW query=%zu stage=%u "
+                    "loaded=%d target=%llu result=%llu next=%d\n",
+                    query, static_cast<unsigned>(slot.stage), loaded_index,
+                    static_cast<unsigned long long>(state.hashKeys[query]),
+                    static_cast<unsigned long long>(state.hashResults[query]),
+                    node.next);
+                throw std::runtime_error("hash-join depth overflow");
+            }
             if (node.key == state.hashKeys[query])
                 state.hashResults[query] = node.value;
             state.hashCurrent[query] = node.next;
@@ -888,8 +924,10 @@ main(int argc, char **argv)
                 workloadGranularity(options));
         }
         for (size_t iteration = 0; iteration < options.iterations;
-             ++iteration) {
+            ++iteration) {
             m5_work_begin(iteration, 0);
+            if (options.amu && iteration == 0)
+                scheduler->bindToCurrentThread();
             runKernelIteration(options, state, scheduler.get(), iteration);
             m5_work_end(iteration, 0);
         }

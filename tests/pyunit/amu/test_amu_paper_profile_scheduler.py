@@ -173,6 +173,32 @@ class AmuPaperProfileSchedulerTest(unittest.TestCase):
         self.assertIn("alignas(64) std::array<uint8_t, kSpmBytes>", SOURCE)
         self.assertIn("std::array<Slot, kWindowSlots>", SOURCE)
 
+    def test_trial_zero_rebinds_configuration_on_the_roi_cpu(self):
+        scheduler = SOURCE[
+            SOURCE.index("class PersistentScheduler"):
+            SOURCE.index("void\nprimeSpm")
+        ]
+        self.assertIn("void bindToCurrentThread()", scheduler)
+        self.assertIn("configure(granularity)", scheduler)
+        self.assertIn("AMU_CFG_GRANULARITY", scheduler)
+        self.assertIn("AMU_CFG_MAX_OUTSTANDING", scheduler)
+        main = SOURCE[SOURCE.index("main(int argc") :]
+        begin = main.index("m5_work_begin")
+        bind = main.index("scheduler->bindToCurrentThread()")
+        kernel = main.index("runKernelIteration")
+        end = main.index("m5_work_end")
+        self.assertLess(begin, bind)
+        self.assertLess(bind, kernel)
+        self.assertLess(kernel, end)
+
+        hash_join = SOURCE[
+            SOURCE.index("runHashJoinAmu"):
+            SOURCE.index("runStreamBaseline")
+        ]
+        self.assertIn("hash-join payload identity mismatch", hash_join)
+        self.assertIn("slot.stage >= kHashDepth", hash_join)
+        self.assertIn("hash-join depth overflow", hash_join)
+
     def test_id_dispatch_is_constant_time_and_phase_checked(self):
         self.assertIn("enum class SlotPhase", SOURCE)
         self.assertIn("LoadPending", SOURCE)
