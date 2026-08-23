@@ -819,6 +819,22 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         manifest = cmd.index("--asmc-calibration-manifest")
         self.assertEqual(cmd[profile + 1], "paper-calibrated")
         self.assertEqual(cmd[manifest + 1], "/tmp/amu-calibration.json")
+        with mock.patch.object(
+            self.runner, "sha256_file", return_value="a" * 64
+        ):
+            parameters = self.runner.checkpoint_model_parameters(args, "amu")
+        self.assertEqual(parameters["asmc_profile"], "paper-calibrated")
+        self.assertEqual(parameters["asmc_max_outstanding"], 256)
+
+    def test_amu_pr_evidence_derives_outstanding_from_completion_delta(self):
+        stats = {
+            stat: Decimal(8 if "Descriptors" in stat else 64)
+            for stat in self.runner.PR_EVIDENCE_STATS["amu"].values()
+        }
+        evidence = self.runner.extract_pr_evidence(stats, "amu")
+        self.assertEqual(evidence["pr_issued_descriptors"], Decimal(8))
+        self.assertEqual(evidence["pr_completed_descriptors"], Decimal(8))
+        self.assertEqual(evidence["pr_outstanding_work"], Decimal(0))
 
     def test_counts_exact_cpu_switch_markers(self):
         with tempfile.TemporaryDirectory() as tmp:

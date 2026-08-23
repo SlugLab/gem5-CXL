@@ -458,7 +458,7 @@ def extract_pr_evidence(stats, kind):
         if stat_name not in stats:
             raise StatsError(f"missing required ROI statistic: {stat_name}")
         evidence[field] = _counter(stats, stat_name)
-    if kind == "amu" and pr_evidence.get("pr_issued_descriptors", 0) == 0:
+    if kind == "amu":
         evidence["pr_outstanding_work"] = (
             evidence["pr_issued_descriptors"] -
             evidence["pr_completed_descriptors"]
@@ -1215,7 +1215,7 @@ def checkpoint_model_parameters(args, kind):
         "env": "\0".join(args.env),
         "checkpoint_save_contract": CHECKPOINT_SAVE_CONTRACT,
     }
-    if kind == "amu" and pr_evidence["pr_issued_descriptors"] == 0:
+    if kind == "amu":
         parameters.update(
             {
                 "asmc_spm_size": args.asmc_spm_size,
