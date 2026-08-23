@@ -197,9 +197,9 @@ def _cira_mode(system):
         "cira-few-shot": ("few-shot-online", "B"),
         "cira-static": ("static", "A"),
         "cira-pgo": ("pgo-selected", "B"),
-        "cira-A": ("pgo-selected", "A"),
-        "cira-B": ("pgo-selected", "B"),
-        "cira-C": ("pgo-selected", "C"),
+        "cira-A": ("candidate", "A"),
+        "cira-B": ("candidate", "B"),
+        "cira-C": ("candidate", "C"),
     }[system]
 
 

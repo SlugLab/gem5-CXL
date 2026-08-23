@@ -66,6 +66,20 @@ class CiraLeadPolicyTest(unittest.TestCase):
                 selected["lead_blocks"], selected["row_window_rows"] // 64
             )
 
+    def test_standalone_candidate_requires_and_preserves_named_row(self):
+        calibration = self.calibration()
+        for source_row in ("A", "B", "C"):
+            with self.subTest(source_row=source_row):
+                selected = policy.resolve_mode(
+                    calibration, "candidate", source_row=source_row
+                )
+                self.assertEqual(selected["mode"], "candidate")
+                self.assertEqual(selected["source_row"], source_row)
+        with self.assertRaisesRegex(
+            policy.LeadPolicyError, "candidate requires source row"
+        ):
+            policy.resolve_mode(calibration, "candidate")
+
     def test_pgo_rejects_abc_or_unverified_or_drifted_selection(self):
         calibration = self.calibration()
         calibration["cira"]["primary"]["selected_source_mode"] = "C"

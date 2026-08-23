@@ -93,7 +93,9 @@ def resolve_mode(
 ):
     """Resolve one mode from approved hardware rows and gate its hoist."""
 
-    if mode not in {"static", "pgo-selected", "few-shot-online"}:
+    if mode not in {
+        "static", "pgo-selected", "few-shot-online", "candidate"
+    }:
         raise LeadPolicyError(f"unknown CIRA mode {mode}")
     if not isinstance(cxl_latency_ns, int) or cxl_latency_ns <= 0:
         raise LeadPolicyError("CXL latency must be a positive integer")
@@ -121,10 +123,16 @@ def resolve_mode(
             raise LeadPolicyError(
                 f"PGO selected source {selected_row} differs from manifest {declared}"
             )
-    else:
+    elif mode == "few-shot-online":
         if source_row not in SOURCE_CANDIDATES:
             raise LeadPolicyError(
                 "few-shot-online requires source row A, B, or C"
+            )
+        selected_row = source_row
+    else:
+        if source_row not in SOURCE_CANDIDATES:
+            raise LeadPolicyError(
+                "candidate requires source row A, B, or C"
             )
         selected_row = source_row
 

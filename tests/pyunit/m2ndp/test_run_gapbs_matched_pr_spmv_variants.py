@@ -17,7 +17,9 @@ class MatchedVariantRunnerTest(unittest.TestCase):
     def test_formal_cira_policy_binding_rejects_mode_or_source_drift(self):
         manifest = {
             "cira_mode": "few-shot-online",
-            "cira_policy": {"source_row": "B"},
+            "cira_policy": {
+                "mode": "few-shot-online", "source_row": "B"
+            },
         }
         self.assertEqual(
             runner.validate_cira_policy_binding(
@@ -30,6 +32,19 @@ class MatchedVariantRunnerTest(unittest.TestCase):
                 runner.VariantRunError
             ):
                 runner.validate_cira_policy_binding(manifest, mode, source)
+
+    def test_standalone_candidate_binding_is_explicit(self):
+        manifest = {
+            "cira_mode": "candidate",
+            "cira_policy": {"mode": "candidate", "source_row": "A"},
+        }
+        policy = runner.validate_cira_policy_binding(
+            manifest, "candidate", "A"
+        )
+        self.assertEqual(policy["source_row"], "A")
+        manifest["cira_policy"]["mode"] = "pgo-selected"
+        with self.assertRaises(runner.VariantRunError):
+            runner.validate_cira_policy_binding(manifest, "candidate", "A")
 
     def test_formal_pr_calibration_rejects_schema_hash_and_speedup_target_drift(self):
         manifest = runner.pr_calibration_fixture_for_test()

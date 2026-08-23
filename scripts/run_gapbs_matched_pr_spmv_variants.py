@@ -384,14 +384,20 @@ def load_manifest(path):
 
 
 def validate_cira_policy_binding(manifest, mode, source_row):
-    if mode not in {"static", "pgo-selected", "few-shot-online"}:
+    if mode not in {
+        "static", "pgo-selected", "few-shot-online", "candidate"
+    }:
         raise VariantRunError("requested CIRA mode is invalid")
     if source_row not in {"A", "B", "C"}:
         raise VariantRunError("requested CIRA source row is invalid")
     if manifest.get("cira_mode") != mode:
         raise VariantRunError("variant manifest CIRA mode differs")
     policy = manifest.get("cira_policy")
-    if not isinstance(policy, dict) or policy.get("source_row") != source_row:
+    if (
+        not isinstance(policy, dict)
+        or policy.get("mode") != mode
+        or policy.get("source_row") != source_row
+    ):
         raise VariantRunError("variant manifest CIRA source row differs")
     return policy
 
@@ -454,7 +460,7 @@ def parse_args(argv=None):
     parser.add_argument("--asmc-calibration-manifest", type=Path)
     parser.add_argument(
         "--cira-mode",
-        choices=("static", "pgo-selected", "few-shot-online"),
+        choices=("static", "pgo-selected", "few-shot-online", "candidate"),
     )
     parser.add_argument("--cira-source-row", choices=("A", "B", "C"))
     parser.add_argument("--smoke-test", action="store_true")

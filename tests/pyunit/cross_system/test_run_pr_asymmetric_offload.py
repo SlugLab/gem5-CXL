@@ -102,6 +102,12 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         self.assertNotIn("--timeout", command)
         self.assertIn("pgo-selected", command)
         self.assertIn("--asmc-calibration-manifest", command)
+        candidate = next(
+            e for e in entries if e.scale == 14 and e.system == "cira-A"
+        )
+        candidate_command = runner.command_for(candidate, self.options)
+        self.assertIn("candidate", candidate_command)
+        self.assertIn("A", candidate_command)
 
     def test_resume_rehashes_every_passed_artifact(self):
         selected = runner.select_inputs(self.options)

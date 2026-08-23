@@ -82,9 +82,11 @@ def policy_compile_definitions(mode, source_row):
         if source_row not in {None, "A"}:
             raise VariantEvidenceError("static CIRA is fixed to source row A")
         return ["-DPR_CIRA_POLICY_STATIC=1", "-DPR_CIRA_SOURCE_ROW=0"]
-    if mode == "pgo-selected":
+    if mode in {"pgo-selected", "candidate"}:
         if source_row not in CANDIDATES:
-            raise VariantEvidenceError("PGO CIRA requires a selected source row")
+            raise VariantEvidenceError(
+                f"{mode} CIRA requires a selected source row"
+            )
         return [
             "-DPR_CIRA_POLICY_PGO=1",
             f"-DPR_CIRA_SOURCE_ROW={tuple(CANDIDATES).index(source_row)}",
@@ -241,7 +243,10 @@ def main(argv=None):
     parser.add_argument("--cira-max-outstanding", type=int, default=256)
     parser.add_argument(
         "--cira-mode",
-        choices=("legacy", "static", "pgo-selected", "few-shot-online"),
+        choices=(
+            "legacy", "static", "pgo-selected", "few-shot-online",
+            "candidate",
+        ),
         default="legacy",
     )
     parser.add_argument("--calibration-manifest", type=Path)
@@ -274,8 +279,13 @@ def main(argv=None):
             parser.error(
                 "calibrated CIRA mode requires --graph-scale 4, 12, 14, or 20"
             )
-        if args.cira_mode != "few-shot-online" and args.cira_source_row is not None:
-            parser.error("only few-shot-online accepts --cira-source-row")
+        if (
+            args.cira_mode not in {"few-shot-online", "candidate"}
+            and args.cira_source_row is not None
+        ):
+            parser.error(
+                "only few-shot-online/candidate accepts --cira-source-row"
+            )
         policy_source = args.cira_source_row
         if args.cira_mode == "few-shot-online" and policy_source is None:
             policy_source = "A"

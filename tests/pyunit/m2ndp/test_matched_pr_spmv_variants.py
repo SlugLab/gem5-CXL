@@ -82,6 +82,38 @@ class MatchedVariantSourceTest(unittest.TestCase):
         self.assertEqual(policy["lead_blocks"], 32)
         self.assertTrue(policy["hoist_decision"]["emit_prefetch"])
 
+    def test_standalone_candidate_build_policy_is_not_pgo(self):
+        calibration = {
+            "schema": 2,
+            "sources": {
+                "amu_pdf": {"sha256": variants.calibration.AMU_PDF_SHA256},
+                "cira_csv": {
+                    "sha256": variants.calibration.CIRA_CSV_SHA256,
+                    "rows": {"pr_spmv": {
+                        name: {
+                            "verification": "PASS", "return_code": 0,
+                            "mean_time_ms": 10,
+                        }
+                        for name in ("A", "B", "C")
+                    }},
+                },
+            },
+            "amu": {"validation": {"status": "PASS"}},
+            "cira": {"primary": {"selected_source_mode": "B"}},
+            "near_data_pr": {"formal_speedup_is_fit_target": False},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "calibration.json"
+            path.write_text(json.dumps(calibration), encoding="utf-8")
+            selected = variants.resolve_cira_build_policy(
+                path, "candidate", source_row="C"
+            )
+        self.assertEqual(selected["mode"], "candidate")
+        self.assertEqual(selected["source_row"], "C")
+        definitions = variants.policy_compile_definitions("candidate", "C")
+        self.assertIn("-DPR_CIRA_POLICY_PGO=1", definitions)
+        self.assertIn("-DPR_CIRA_SOURCE_ROW=2", definitions)
+
     def test_common_source_has_ordered_two_phase_descriptor_execution(self):
         source = OFFLOAD_SOURCE.read_text(encoding="utf-8")
         contribution = source.index("PR_ROW_CONTRIB")
