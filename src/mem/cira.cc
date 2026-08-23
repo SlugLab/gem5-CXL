@@ -1149,6 +1149,75 @@ CIRA::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
     std::vector<TranslationChunk> chunks;
     if (!translatePr(state.tc, addr, size, BaseMMU::Write, false, chunks))
         panic("CIRA accepted PR descriptor encountered a write fault");
+
+    const Addr outputBase = state.desc.phase == PR_ROW_CONTRIB ?
+        state.desc.contributions_addr : state.desc.scores_out_addr;
+    const Addr descriptorBegin = outputBase +
+        state.desc.row_begin * sizeof(float);
+    const Addr descriptorEnd = descriptorBegin +
+        state.desc.row_count * sizeof(float);
+    const Addr virtualLine = addr & ~(cacheLineSize - 1);
+    const bool ownsFullLine = size == sizeof(float) && chunks.size() == 1 &&
+        chunks.front().size == sizeof(float) &&
+        virtualLine >= descriptorBegin &&
+        virtualLine + cacheLineSize <= descriptorEnd;
+    if (ownsFullLine) {
+        panic_if(cacheLineSize % sizeof(float) != 0,
+                 "CIRA PR write combining requires float-aligned lines");
+        const Addr physicalLine = chunks.front().paddr &
+            ~(cacheLineSize - 1);
+        auto [entry, inserted] = state.pendingWriteLines.try_emplace(
+            physicalLine);
+        if (inserted)
+            entry->second.data.resize(cacheLineSize);
+        PrLineWriteState &write = entry->second;
+        panic_if(std::find(write.rows.begin(), write.rows.end(), row.row) !=
+                     write.rows.end(),
+                 "CIRA PR row registered twice with a combined write");
+        const uint64_t rowsPerLine = cacheLineSize / sizeof(float);
+        panic_if(write.rows.size() >= rowsPerLine,
+                 "CIRA PR combined write exceeded one cache line");
+        const bool completesLine = write.rows.size() + 1 == rowsPerLine;
+        if (completesLine) {
+            const uint64_t queued = sendQueues[state.targetCore].size() +
+                (retryPkts[state.targetCore] ? 1 : 0) +
+                reservedPrCoherentSlots[state.targetCore];
+            if (pendingPrWriteLines.count(physicalLine) ||
+                queued + 1 > maxSendQueue ||
+                pendingPrCoherentPackets[state.targetCore] +
+                        reservedPrCoherentSlots[state.targetCore] + 1 >
+                    prCoherentEntries) {
+                notePrStall(state);
+                return false;
+            }
+        }
+        clearPrStall(state);
+        std::memcpy(write.data.data() +
+                        (chunks.front().paddr - physicalLine),
+                    data, sizeof(float));
+        write.rows.push_back(row.row);
+        ++row.pendingPackets;
+        ++state.pendingPackets;
+        if (completesLine) {
+            pendingPrWriteLines.insert(physicalLine);
+            RequestPtr req = std::make_shared<Request>(
+                physicalLine, cacheLineSize, chunks.front().flags,
+                requestorId);
+            req->taskId(context_switch_task_id::DMA);
+            PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+            pkt->allocate();
+            std::memcpy(pkt->getPtr<uint8_t>(), write.data.data(),
+                        cacheLineSize);
+            pkt->senderState = new PacketSenderState(
+                PrPacketRole::CoherentWrite, PrPayloadRole::Result,
+                state.id, state.targetCore, 0, physicalLine, 0, 0);
+            ++pendingPrCoherentPackets[state.targetCore];
+            enqueuePacket(state.targetCore, pkt);
+            scheduleSend(curTick());
+        }
+        return true;
+    }
+
     const uint32_t packets = countPackets(chunks);
     panic_if(packets != 1,
              "CIRA PR scalar result write crossed a cache line");
@@ -1502,6 +1571,7 @@ CIRA::completePrDescriptor(uint64_t id)
     panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
              !state.pendingCsrReadLines.empty() ||
              !state.pendingCoherentReadLines.empty() ||
+             !state.pendingWriteLines.empty() ||
              state.completedRows != state.desc.row_count ||
              state.reservedInitialCsrPackets != 0 ||
              state.reservedInitialCoherentPackets != 0,
@@ -2157,18 +2227,35 @@ CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
                 senderState->prLine, pkt->req->isSecure());
         }
     } else {
-        const auto rowIt = state.rows.find(senderState->prRow);
-        panic_if(rowIt == state.rows.end() ||
-                 rowIt->second.pendingPackets == 0 ||
-                 state.pendingPackets == 0,
-                 "CIRA PR coherent write has no active row");
         panic_if(senderState->prPayload != PrPayloadRole::Result,
                  "CIRA PR coherent write has an invalid payload role");
         const Addr writeLine = pkt->getAddr() & ~(cacheLineSize - 1);
         panic_if(pendingPrWriteLines.erase(writeLine) != 1,
                  "CIRA PR coherent write line was not reserved");
-        --rowIt->second.pendingPackets;
-        --state.pendingPackets;
+        const auto combined = state.pendingWriteLines.find(
+            senderState->prLine);
+        if (combined != state.pendingWriteLines.end()) {
+            panic_if(pkt->getSize() != cacheLineSize,
+                     "CIRA PR combined write response is not one line");
+            for (uint64_t rowId : combined->second.rows) {
+                const auto rowIt = state.rows.find(rowId);
+                panic_if(rowIt == state.rows.end() ||
+                         rowIt->second.pendingPackets == 0 ||
+                         state.pendingPackets == 0,
+                         "CIRA PR combined write accounting underflow");
+                --rowIt->second.pendingPackets;
+                --state.pendingPackets;
+            }
+            state.pendingWriteLines.erase(combined);
+        } else {
+            const auto rowIt = state.rows.find(senderState->prRow);
+            panic_if(rowIt == state.rows.end() ||
+                     rowIt->second.pendingPackets == 0 ||
+                     state.pendingPackets == 0,
+                     "CIRA PR coherent write has no active row");
+            --rowIt->second.pendingPackets;
+            --state.pendingPackets;
+        }
     }
     --pendingPrCoherentPackets[targetCore];
     const bool releasedWriteLine =

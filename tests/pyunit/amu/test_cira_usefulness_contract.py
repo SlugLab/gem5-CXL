@@ -100,6 +100,8 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("struct PrLineReadState", header)
         self.assertIn("cachedCsrReadLines", header)
         self.assertIn("pendingCoherentReadLines", header)
+        self.assertIn("struct PrLineWriteState", header)
+        self.assertIn("pendingWriteLines", header)
         self.assertIn("std::vector<PrReadWaiter> waiters", header)
         self.assertIn("copyPrReadFragment", source)
         self.assertIn("discardCleanBlock", source)

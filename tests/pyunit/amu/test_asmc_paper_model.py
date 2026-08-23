@@ -134,6 +134,8 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("struct PrLineReadState", HEADER)
         self.assertIn("cachedReadLines", HEADER)
         self.assertIn("pendingReadLines", HEADER)
+        self.assertIn("struct PrLineWriteState", HEADER)
+        self.assertIn("pendingWriteLines", HEADER)
         self.assertIn("std::vector<PrReadWaiter> waiters", HEADER)
         self.assertIn("copyPrReadFragment", SOURCE)
         self.assertIn("PR_ROW_CONTRIB", PR_SMOKE)

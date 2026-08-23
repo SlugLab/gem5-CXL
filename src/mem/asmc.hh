@@ -160,6 +160,12 @@ class ASMC : public ClockedObject
         std::vector<PrReadWaiter> waiters;
     };
 
+    struct PrLineWriteState
+    {
+        std::vector<uint8_t> data;
+        std::vector<uint64_t> rows;
+    };
+
     struct PrDescriptorState
     {
         uint64_t id = 0;
@@ -175,6 +181,7 @@ class ASMC : public ClockedObject
         std::map<uint64_t, PrRowState> rows;
         std::map<Addr, std::vector<uint8_t>> cachedReadLines;
         std::map<Addr, PrLineReadState> pendingReadLines;
+        std::map<Addr, PrLineWriteState> pendingWriteLines;
     };
 
     struct PacketSenderState : public Packet::SenderState

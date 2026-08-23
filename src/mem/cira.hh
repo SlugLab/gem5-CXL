@@ -155,6 +155,12 @@ class CIRA : public ClockedObject
         std::vector<PrReadWaiter> waiters;
     };
 
+    struct PrLineWriteState
+    {
+        std::vector<uint8_t> data;
+        std::vector<uint64_t> rows;
+    };
+
     struct PrDescriptorState
     {
         uint64_t id = 0;
@@ -175,6 +181,7 @@ class CIRA : public ClockedObject
         std::map<Addr, PrLineReadState> pendingCsrReadLines;
         std::map<Addr, std::vector<uint8_t>> cachedCoherentReadLines;
         std::map<Addr, PrLineReadState> pendingCoherentReadLines;
+        std::map<Addr, PrLineWriteState> pendingWriteLines;
     };
 
     struct PrThreadConfig

@@ -511,6 +511,74 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
     if (!translate(state.tc, addr, size, BaseMMU::Write, chunks))
         panic("ASMC accepted PR descriptor encountered a write translation "
               "fault at %#llx", static_cast<unsigned long long>(addr));
+
+    const Addr outputBase = state.desc.phase == PR_ROW_CONTRIB ?
+        state.desc.contributions_addr : state.desc.scores_out_addr;
+    const Addr descriptorBegin = outputBase +
+        state.desc.row_begin * sizeof(float);
+    const Addr descriptorEnd = descriptorBegin +
+        state.desc.row_count * sizeof(float);
+    const Addr virtualLine = addr & ~(cacheLineSize - 1);
+    const bool ownsFullLine = size == sizeof(float) && chunks.size() == 1 &&
+        chunks.front().size == sizeof(float) &&
+        virtualLine >= descriptorBegin &&
+        virtualLine + cacheLineSize <= descriptorEnd;
+    if (ownsFullLine) {
+        panic_if(cacheLineSize % sizeof(float) != 0,
+                 "ASMC PR write combining requires float-aligned lines");
+        const Addr physicalLine = chunks.front().paddr &
+            ~(cacheLineSize - 1);
+        auto [entry, inserted] = state.pendingWriteLines.try_emplace(
+            physicalLine);
+        if (inserted)
+            entry->second.data.resize(cacheLineSize);
+        PrLineWriteState &write = entry->second;
+        panic_if(std::find(write.rows.begin(), write.rows.end(), row.row) !=
+                     write.rows.end(),
+                 "ASMC PR row registered twice with a combined write");
+        const uint64_t rowsPerLine = cacheLineSize / sizeof(float);
+        panic_if(write.rows.size() >= rowsPerLine,
+                 "ASMC PR combined write exceeded one cache line");
+        const bool completesLine = write.rows.size() + 1 == rowsPerLine;
+        if (completesLine) {
+            const uint64_t farOccupied = farSendQueue.size() +
+                (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
+            if (farOccupied + 1 > maxSendQueue) {
+                if (!state.queueStalled) {
+                    state.queueStalled = true;
+                    state.stallStart = curTick();
+                }
+                return false;
+            }
+        }
+        if (state.queueStalled) {
+            stats.prQueueStallTicks += curTick() - state.stallStart;
+            state.queueStalled = false;
+        }
+        std::memcpy(write.data.data() +
+                        (chunks.front().paddr - physicalLine),
+                    data, sizeof(float));
+        write.rows.push_back(row.row);
+        ++row.pendingPackets;
+        ++state.pendingPackets;
+        if (completesLine) {
+            RequestPtr req = std::make_shared<Request>(
+                physicalLine, cacheLineSize, chunks.front().flags,
+                requestorId);
+            req->taskId(context_switch_task_id::DMA);
+            PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+            pkt->allocate();
+            std::memcpy(pkt->getPtr<uint8_t>(), write.data.data(),
+                        cacheLineSize);
+            pkt->senderState = new PacketSenderState(
+                state.id, PrPacketRole::Result, 0, physicalLine, 0, 0,
+                cacheLineSize, false);
+            enqueueFarPacket(pkt);
+            scheduleFarSend(curTick());
+        }
+        return true;
+    }
+
     const uint32_t packets = countPackets(chunks);
     const uint64_t farOccupied = farSendQueue.size() +
         (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
@@ -838,6 +906,7 @@ ASMC::completePrDescriptor(uint64_t id)
     PrDescriptorState &state = *it->second;
     panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
              !state.pendingReadLines.empty() ||
+             !state.pendingWriteLines.empty() ||
              state.completedRows != state.desc.row_count,
              "ASMC completed PR descriptor with pending packets");
     panic_if(state.reservedInitialPackets != 0,
@@ -1666,15 +1735,32 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
                  "ASMC PR read-credit accounting underflow");
         --pendingPrReads;
     } else {
-        const auto rowIt = state.rows.find(sender_state->prRow);
-        panic_if(rowIt == state.rows.end() ||
-                 rowIt->second.pendingPackets == 0 ||
-                 state.pendingPackets == 0,
-                 "ASMC PR write response has no active row");
         panic_if(sender_state->prRole != PrPacketRole::Result,
                  "ASMC PR non-result write response");
-        --rowIt->second.pendingPackets;
-        --state.pendingPackets;
+        const auto combined = state.pendingWriteLines.find(
+            sender_state->prLine);
+        if (combined != state.pendingWriteLines.end()) {
+            panic_if(pkt->getSize() != cacheLineSize,
+                     "ASMC PR combined write response is not one line");
+            for (uint64_t rowId : combined->second.rows) {
+                const auto rowIt = state.rows.find(rowId);
+                panic_if(rowIt == state.rows.end() ||
+                         rowIt->second.pendingPackets == 0 ||
+                         state.pendingPackets == 0,
+                         "ASMC PR combined write accounting underflow");
+                --rowIt->second.pendingPackets;
+                --state.pendingPackets;
+            }
+            state.pendingWriteLines.erase(combined);
+        } else {
+            const auto rowIt = state.rows.find(sender_state->prRow);
+            panic_if(rowIt == state.rows.end() ||
+                     rowIt->second.pendingPackets == 0 ||
+                     state.pendingPackets == 0,
+                     "ASMC PR write response has no active row");
+            --rowIt->second.pendingPackets;
+            --state.pendingPackets;
+        }
     }
 
     pkt->senderState = nullptr;
