@@ -268,6 +268,19 @@ class PageRankTraceTest(unittest.TestCase):
         self.assertEqual(first_k2[9:11], ["0x0", "0x1"])
         self.assertEqual(final_k3[10:12], ["0x3", "0x0"])
 
+        trace_dir = self.root / "formal-trace/0"
+        self.assertEqual(
+            (trace_dir / "K0_INIT_TRIAL0_PART0_input.data").read_bytes(),
+            (trace_dir / "K0_INIT_input.data").read_bytes(),
+        )
+        self.assertEqual(
+            (
+                trace_dir
+                / "K3_PULL_DAMP_TRIAL1_ITER19_PART3_output.data"
+            ).read_bytes(),
+            (trace_dir / "K3_PULL_DAMP_output.data").read_bytes(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

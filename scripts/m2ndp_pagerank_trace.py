@@ -756,6 +756,13 @@ def generate_trace(
         timing_names = functional_names + _trial_names(
             iterations, measured=True
         )
+    if formal:
+        timing_input = trace_dir / f"{timing_names[0]}_input.data"
+        timing_output = trace_dir / f"{timing_names[-1]}_output.data"
+        timing_input.unlink(missing_ok=True)
+        timing_output.unlink(missing_ok=True)
+        os.link(trace_dir / "K0_INIT_input.data", timing_input)
+        os.link(trace_dir / "K3_PULL_DAMP_output.data", timing_output)
     sequence_lines = []
     for name in functional_names:
         sequence_lines.append(
