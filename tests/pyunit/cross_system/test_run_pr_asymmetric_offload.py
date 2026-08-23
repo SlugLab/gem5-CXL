@@ -109,6 +109,10 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         self.assertIn("candidate", candidate_command)
         self.assertIn("A", candidate_command)
 
+        self.options.resume = True
+        resumed = runner.command_for(g12, self.options)
+        self.assertIn("--resume", resumed)
+
     def test_resume_rehashes_every_passed_artifact(self):
         selected = runner.select_inputs(self.options)
         identity = runner.build_identity(self.options, selected)

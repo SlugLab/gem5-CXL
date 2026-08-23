@@ -226,6 +226,8 @@ def command_for(entry, options):
         ]
         if entry.system == "vanilla":
             command.extend(("--stop-after", "gem5_baseline"))
+        if options.resume:
+            command.append("--resume")
         return command
     kind = "amu" if entry.system == "amu" else "cira"
     build_root = Path(options.variants_build_root).resolve() / f"g{entry.scale}" / entry.system
