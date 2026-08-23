@@ -132,7 +132,7 @@ class AsmcPaperModelTest(unittest.TestCase):
         ]
         self.assertIn("schedulePrService(curTick())", advance)
         self.assertIn("struct PrLineReadState", HEADER)
-        self.assertIn("cachedReadLines", HEADER)
+        self.assertIn("prSpmLines", HEADER)
         self.assertIn("pendingReadLines", HEADER)
         self.assertIn("struct PrLineWriteState", HEADER)
         self.assertIn("pendingWriteLines", HEADER)
@@ -141,6 +141,66 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("PR_ROW_CONTRIB", PR_SMOKE)
         self.assertIn("PR_ROW_PULL", PR_SMOKE)
         self.assertIn("bits(next_scores[row]) != bits(expected)", PR_SMOKE)
+
+    def test_amu_pr_uses_one_bounded_persistent_spm_line_store(self):
+        for token in (
+            "static constexpr uint64_t PrSpmBytes = 64 * 1024",
+            "static constexpr uint64_t PrSpmLines = PrSpmBytes / 64",
+            "std::array<PrSpmLine, PrSpmLines> prSpmLines",
+            "lookupPrSpmLine",
+            "installPrSpmLine",
+            "invalidatePrSpmLine",
+            "beginPrSpmIteration",
+        ):
+            self.assertIn(token, HEADER + SOURCE)
+        self.assertNotIn(
+            "std::map<Addr, std::vector<uint8_t>> cachedReadLines", HEADER
+        )
+        reserve = SOURCE[
+            SOURCE.index("ASMC::reservePrRead"):
+            SOURCE.index("ASMC::reservePrWrite")
+        ]
+        self.assertIn("lookupPrSpmLine(fragment.line, role)", reserve)
+        self.assertIn("pendingPrReadOwners.count(key)", reserve)
+        response = SOURCE[
+            SOURCE.index("ASMC::recvPrTimingResp"):
+            SOURCE.index("ASMC::recvReqRetry", SOURCE.index(
+                "ASMC::recvPrTimingResp"
+            ))
+        ]
+        self.assertIn("installPrSpmLine(sender_state->prLine", response)
+        write = SOURCE[
+            SOURCE.index("ASMC::reservePrWrite"):
+            SOURCE.index("ASMC::schedulePrService")
+        ]
+        self.assertIn("invalidatePrSpmLine(physicalLine)", write)
+        self.assertIn("invalidatePrSpmLine(line)", write)
+
+    def test_amu_pr_payload_reads_bypass_io_cache(self):
+        reserve_read = SOURCE[
+            SOURCE.index("ASMC::reservePrRead"):
+            SOURCE.index("ASMC::reservePrWrite")
+        ]
+        self.assertIn("flags.set(Request::UNCACHEABLE)", reserve_read)
+
+    def test_amu_pr_coalesces_inflight_lines_across_descriptors(self):
+        self.assertIn("uint64_t descriptor = 0", HEADER)
+        self.assertIn("pendingPrReadOwners", HEADER)
+        self.assertIn("prGlobalReadCoalesces", HEADER)
+        reserve_read = SOURCE[
+            SOURCE.index("ASMC::reservePrRead"):
+            SOURCE.index("ASMC::reservePrWrite")
+        ]
+        self.assertIn("pendingPrReadOwners.find", reserve_read)
+        self.assertIn("ownerPending->second.waiters.push_back", reserve_read)
+        response = SOURCE[
+            SOURCE.index("ASMC::recvPrTimingResp"):
+            SOURCE.index("ASMC::recvReqRetry", SOURCE.index(
+                "ASMC::recvPrTimingResp"
+            ))
+        ]
+        self.assertIn("waiter.descriptor", response)
+        self.assertIn("pendingPrReadOwners.erase", response)
 
     @staticmethod
     def calibration_loader():

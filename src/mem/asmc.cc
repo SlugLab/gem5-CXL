@@ -109,6 +109,14 @@ ASMC::ASMCStats::ASMCStats(ASMC &owner, size_t num_cores)
                "Modeled PageRank float32 compute ticks"),
       ADD_STAT(prQueueStallTicks, statistics::units::Tick::get(),
                "PageRank descriptor ticks stalled on bounded queues"),
+      ADD_STAT(prSpmHits, statistics::units::Count::get(),
+               "PageRank reads served by the bounded AMU SPM line store"),
+      ADD_STAT(prSpmMisses, statistics::units::Count::get(),
+               "PageRank lines missing from the bounded AMU SPM line store"),
+      ADD_STAT(prSpmInvalidations, statistics::units::Count::get(),
+               "Valid PageRank SPM lines invalidated by writes or epochs"),
+      ADD_STAT(prGlobalReadCoalesces, statistics::units::Count::get(),
+               "PageRank line reads coalesced across descriptors"),
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
                "Average AMU request latency",
                totalLatency / (completedLoads + completedStores)),
@@ -169,6 +177,8 @@ ASMC::ASMC(const Params &p)
              "ASMC pr_descriptor_entries must be non-zero");
     panic_if(prReadEntries < 2,
              "ASMC pr_read_entries must provide at least two credits");
+    panic_if(cacheLineSize != 64 || spmSize < PrSpmBytes,
+             "ASMC PR requires a 64-byte line and at least 64 KiB of SPM");
     spmSidePorts.reserve(num_cores);
     spmSendEvents.reserve(num_cores);
     for (PortID core = 0; core < num_cores; ++core) {
@@ -308,6 +318,78 @@ ASMC::validatePrDescriptor(
 }
 
 uint64_t
+ASMC::prSpmSlot(Addr line, PrPacketRole role) const
+{
+    panic_if(line % cacheLineSize != 0,
+             "ASMC PR SPM address is not line aligned");
+    const uint64_t partition =
+        role == PrPacketRole::Contribution ? 0 : PrSpmRoleLines;
+    return partition + (line / cacheLineSize) % PrSpmRoleLines;
+}
+
+const ASMC::PrSpmLine *
+ASMC::findPrSpmLine(Addr line, PrPacketRole role) const
+{
+    const PrSpmLine &slot = prSpmLines[prSpmSlot(line, role)];
+    return slot.valid && slot.tag == line ? &slot : nullptr;
+}
+
+const ASMC::PrSpmLine *
+ASMC::lookupPrSpmLine(Addr line, PrPacketRole role)
+{
+    const PrSpmLine *slot = findPrSpmLine(line, role);
+    if (slot)
+        ++stats.prSpmHits;
+    else
+        ++stats.prSpmMisses;
+    return slot;
+}
+
+void
+ASMC::installPrSpmLine(
+    Addr line, PrPacketRole role, const uint8_t *data)
+{
+    panic_if(!data || line % cacheLineSize != 0,
+             "ASMC PR SPM install violates its line contract");
+    PrSpmLine &slot = prSpmLines[prSpmSlot(line, role)];
+    std::memcpy(slot.data.data(), data, cacheLineSize);
+    slot.tag = line;
+    slot.valid = true;
+}
+
+void
+ASMC::invalidatePrSpmLine(Addr line)
+{
+    panic_if(line % cacheLineSize != 0,
+             "ASMC PR SPM invalidation address is not line aligned");
+    for (uint64_t partition : {uint64_t{0}, PrSpmRoleLines}) {
+        PrSpmLine &slot = prSpmLines[
+            partition + (line / cacheLineSize) % PrSpmRoleLines];
+        if (slot.valid && slot.tag == line) {
+            slot.valid = false;
+            ++stats.prSpmInvalidations;
+        }
+    }
+}
+
+void
+ASMC::beginPrSpmIteration(uint64_t iteration)
+{
+    if (prSpmIterationValid && prSpmIteration == iteration)
+        return;
+    panic_if(!prOutstanding.empty(),
+             "ASMC PR SPM iteration changed with active descriptors");
+    for (PrSpmLine &slot : prSpmLines) {
+        if (slot.valid) {
+            slot.valid = false;
+            ++stats.prSpmInvalidations;
+        }
+    }
+    prSpmIteration = iteration;
+    prSpmIterationValid = true;
+}
+
+uint64_t
 ASMC::issuePrRows(ThreadContext *tc, Addr desc_addr)
 {
     if (!tc || desc_addr == 0 ||
@@ -342,6 +424,7 @@ ASMC::issuePrRows(ThreadContext *tc, Addr desc_addr)
         ++stats.translationFaults;
         return 0;
     }
+    beginPrSpmIteration(desc.iteration);
 
     auto initialPackets = [this, tc](Addr addr, uint64_t size) {
         std::vector<TranslationChunk> chunks;
@@ -425,6 +508,7 @@ ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
               "fault at %#llx", static_cast<unsigned long long>(addr));
     std::vector<Fragment> fragments;
     std::set<Addr> newLines;
+    std::set<Addr> reservationLines;
     for (const auto &chunk : chunks) {
         Addr chunkOffset = 0;
         while (chunkOffset < chunk.size) {
@@ -435,8 +519,10 @@ ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
             fragments.push_back({line, paddr - line,
                                  chunk.offset + chunkOffset,
                                  fragmentSize, chunk.flags});
-            if (!state.cachedReadLines.count(line) &&
-                !state.pendingReadLines.count(line)) {
+            reservationLines.insert(line);
+            const auto key = std::make_pair(line, role);
+            if (!findPrSpmLine(line, role) &&
+                !pendingPrReadOwners.count(key)) {
                 newLines.insert(line);
             }
             chunkOffset += fragmentSize;
@@ -444,13 +530,14 @@ ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
     }
     const uint32_t packets = newLines.size();
     if (state.reservedInitialPackets != 0) {
-        panic_if(packets > state.reservedInitialPackets ||
-                 packets > reservedFarSendSlots ||
-                 packets > reservedPrReadSlots,
+        const uint32_t released = std::min<uint32_t>(
+            state.reservedInitialPackets, reservationLines.size());
+        panic_if(packets > released || released > reservedFarSendSlots ||
+                 released > reservedPrReadSlots,
                  "ASMC PR initial packet reservation underflow");
-        state.reservedInitialPackets -= packets;
-        reservedFarSendSlots -= packets;
-        reservedPrReadSlots -= packets;
+        state.reservedInitialPackets -= released;
+        reservedFarSendSlots -= released;
+        reservedPrReadSlots -= released;
     } else {
         const uint64_t farOccupied = farSendQueue.size() +
             (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
@@ -469,22 +556,44 @@ ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
     }
 
     for (const auto &fragment : fragments) {
-        const auto cached = state.cachedReadLines.find(fragment.line);
         const PrReadWaiter waiter = {
-            row.row, role, index, fragment.dataOffset,
+            state.id, row.row, role, index, fragment.dataOffset,
             fragment.lineOffset, fragment.size,
         };
-        if (cached != state.cachedReadLines.end()) {
-            copyPrReadFragment(state, waiter, cached->second);
+        const auto key = std::make_pair(fragment.line, role);
+        const auto owner = pendingPrReadOwners.find(key);
+        if (owner != pendingPrReadOwners.end()) {
+            const auto ownerState = prOutstanding.find(owner->second);
+            panic_if(ownerState == prOutstanding.end(),
+                     "ASMC PR global read owner is not active");
+            auto ownerPending = ownerState->second->pendingReadLines.find(
+                fragment.line);
+            panic_if(ownerPending ==
+                         ownerState->second->pendingReadLines.end(),
+                     "ASMC PR global read owner has no pending line");
+            ownerPending->second.waiters.push_back(waiter);
+            ++row.pendingPackets;
+            ++state.pendingPackets;
+            if (owner->second != state.id)
+                ++stats.prGlobalReadCoalesces;
             continue;
         }
-        auto [pending, inserted] = state.pendingReadLines.try_emplace(
+        if (const PrSpmLine *cached =
+                lookupPrSpmLine(fragment.line, role)) {
+            copyPrReadFragment(state, waiter, cached->data.data());
+            continue;
+        }
+        auto [newPending, inserted] = state.pendingReadLines.try_emplace(
             fragment.line);
-        pending->second.waiters.push_back(waiter);
+        panic_if(!inserted,
+                 "ASMC PR line became pending during one reservation");
+        const auto [globalOwner, ownerInserted] =
+            pendingPrReadOwners.emplace(key, state.id);
+        panic_if(!ownerInserted || globalOwner->second != state.id,
+                 "ASMC PR line acquired multiple global owners");
+        newPending->second.waiters.push_back(waiter);
         ++row.pendingPackets;
         ++state.pendingPackets;
-        if (!inserted)
-            continue;
 
         Request::Flags flags = fragment.flags;
         flags.set(Request::UNCACHEABLE);
@@ -528,6 +637,7 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                  "ASMC PR write combining requires float-aligned lines");
         const Addr physicalLine = chunks.front().paddr &
             ~(cacheLineSize - 1);
+        invalidatePrSpmLine(physicalLine);
         auto [entry, inserted] = state.pendingWriteLines.try_emplace(
             physicalLine);
         if (inserted)
@@ -598,6 +708,9 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
     for (const auto &chunk : chunks) {
         Addr chunkOffset = 0;
         while (chunkOffset < chunk.size) {
+            const Addr line = (chunk.paddr + chunkOffset) &
+                ~(cacheLineSize - 1);
+            invalidatePrSpmLine(line);
             const uint64_t lineRemaining = cacheLineSize -
                 ((chunk.paddr + chunkOffset) % cacheLineSize);
             const auto packetSize = static_cast<unsigned>(std::min<uint64_t>(
@@ -1656,7 +1769,7 @@ ASMC::recvTimingResp(PortID target_core, PacketPtr pkt)
 void
 ASMC::copyPrReadFragment(PrDescriptorState &state,
                          const PrReadWaiter &waiter,
-                         const std::vector<uint8_t> &line)
+                         const uint8_t *line)
 {
     const auto rowIt = state.rows.find(waiter.row);
     panic_if(rowIt == state.rows.end(),
@@ -1693,11 +1806,11 @@ ASMC::copyPrReadFragment(PrDescriptorState &state,
       case PrPacketRole::Result:
         panic("ASMC PR result write registered as a line waiter");
     }
-    panic_if(waiter.dataOffset + waiter.size > targetSize ||
-             waiter.lineOffset + waiter.size > line.size(),
+    panic_if(!line || waiter.dataOffset + waiter.size > targetSize ||
+             waiter.lineOffset + waiter.size > cacheLineSize,
              "ASMC PR line waiter exceeds its source or destination");
     std::memcpy(target + waiter.dataOffset,
-                line.data() + waiter.lineOffset, waiter.size);
+                line + waiter.lineOffset, waiter.size);
 }
 
 bool
@@ -1717,19 +1830,29 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
         panic_if(pending == state.pendingReadLines.end() ||
                  pkt->getSize() != cacheLineSize,
                  "ASMC PR line response has no pending coalescer entry");
-        std::vector<uint8_t> line(cacheLineSize);
-        std::memcpy(line.data(), pkt->getConstPtr<uint8_t>(), cacheLineSize);
+        installPrSpmLine(sender_state->prLine, sender_state->prRole,
+                         pkt->getConstPtr<uint8_t>());
+        const PrSpmLine *line = findPrSpmLine(
+            sender_state->prLine, sender_state->prRole);
+        panic_if(!line, "ASMC PR completed line was not installed in SPM");
         for (const PrReadWaiter &waiter : pending->second.waiters) {
-            copyPrReadFragment(state, waiter, line);
-            auto rowIt = state.rows.find(waiter.row);
-            panic_if(rowIt == state.rows.end() ||
+            const auto waiterState = prOutstanding.find(waiter.descriptor);
+            panic_if(waiterState == prOutstanding.end(),
+                     "ASMC PR line waiter descriptor is not active");
+            PrDescriptorState &targetState = *waiterState->second;
+            copyPrReadFragment(targetState, waiter, line->data.data());
+            auto rowIt = targetState.rows.find(waiter.row);
+            panic_if(rowIt == targetState.rows.end() ||
                      rowIt->second.pendingPackets == 0 ||
-                     state.pendingPackets == 0,
+                     targetState.pendingPackets == 0,
                      "ASMC PR line waiter accounting underflow");
             --rowIt->second.pendingPackets;
-            --state.pendingPackets;
+            --targetState.pendingPackets;
         }
-        state.cachedReadLines.emplace(sender_state->prLine, std::move(line));
+        const auto erased = pendingPrReadOwners.erase(
+            std::make_pair(sender_state->prLine, sender_state->prRole));
+        panic_if(erased != 1,
+                 "ASMC PR response has no global coalescer owner");
         state.pendingReadLines.erase(pending);
         panic_if(pendingPrReads == 0,
                  "ASMC PR read-credit accounting underflow");
@@ -2005,6 +2128,11 @@ ASMC::reset()
     outstanding.clear();
     prOutstanding.clear();
     prServiceQueue.clear();
+    pendingPrReadOwners.clear();
+    for (PrSpmLine &slot : prSpmLines)
+        slot.valid = false;
+    prSpmIteration = 0;
+    prSpmIterationValid = false;
     pendingPrReads = 0;
     reservedPrReadSlots = 0;
     if (prServiceEvent.scheduled())

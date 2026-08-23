@@ -101,6 +101,17 @@ class ASMC : public ClockedObject
         Result,
     };
 
+    static constexpr uint64_t PrSpmBytes = 64 * 1024;
+    static constexpr uint64_t PrSpmLines = PrSpmBytes / 64;
+    static constexpr uint64_t PrSpmRoleLines = PrSpmLines / 2;
+
+    struct PrSpmLine
+    {
+        Addr tag = 0;
+        std::array<uint8_t, 64> data = {};
+        bool valid = false;
+    };
+
     struct ThreadConfig
     {
         uint64_t granularity;
@@ -147,6 +158,7 @@ class ASMC : public ClockedObject
 
     struct PrReadWaiter
     {
+        uint64_t descriptor = 0;
         uint64_t row = 0;
         PrPacketRole role = PrPacketRole::Score;
         uint64_t index = 0;
@@ -179,7 +191,6 @@ class ASMC : public ClockedObject
         Tick stallStart = 0;
         bool queueStalled = false;
         std::map<uint64_t, PrRowState> rows;
-        std::map<Addr, std::vector<uint8_t>> cachedReadLines;
         std::map<Addr, PrLineReadState> pendingReadLines;
         std::map<Addr, PrLineWriteState> pendingWriteLines;
     };
@@ -279,6 +290,10 @@ class ASMC : public ClockedObject
         statistics::Scalar prWritePackets;
         statistics::Scalar prComputeTicks;
         statistics::Scalar prQueueStallTicks;
+        statistics::Scalar prSpmHits;
+        statistics::Scalar prSpmMisses;
+        statistics::Scalar prSpmInvalidations;
+        statistics::Scalar prGlobalReadCoalesces;
         statistics::Formula avgLatency;
         statistics::Formula avgOutstanding;
     };
@@ -296,7 +311,15 @@ class ASMC : public ClockedObject
                         const void *data, uint64_t size);
     void copyPrReadFragment(PrDescriptorState &state,
                             const PrReadWaiter &waiter,
-                            const std::vector<uint8_t> &line);
+                            const uint8_t *line);
+    uint64_t prSpmSlot(Addr line, PrPacketRole role) const;
+    const PrSpmLine *findPrSpmLine(
+        Addr line, PrPacketRole role) const;
+    const PrSpmLine *lookupPrSpmLine(Addr line, PrPacketRole role);
+    void installPrSpmLine(
+        Addr line, PrPacketRole role, const uint8_t *data);
+    void invalidatePrSpmLine(Addr line);
+    void beginPrSpmIteration(uint64_t iteration);
     void processPrDescriptors();
     bool processPrDescriptor(PrDescriptorState &state);
     bool processPrRow(PrDescriptorState &state, PrRowState &row);
@@ -394,6 +417,11 @@ class ASMC : public ClockedObject
     std::unordered_map<uint64_t, std::unique_ptr<PrDescriptorState>>
         prOutstanding;
     std::deque<uint64_t> prServiceQueue;
+    std::map<std::pair<Addr, PrPacketRole>, uint64_t>
+        pendingPrReadOwners;
+    std::array<PrSpmLine, PrSpmLines> prSpmLines = {};
+    uint64_t prSpmIteration = 0;
+    bool prSpmIterationValid = false;
 
     ASMCStats stats;
 };
