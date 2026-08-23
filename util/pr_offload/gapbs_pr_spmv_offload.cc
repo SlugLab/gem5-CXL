@@ -32,6 +32,12 @@
 
 #if defined(PR_OFFLOAD_AMU)
 #include "amu.h"
+#ifndef PR_AMU_ROW_WINDOW
+#define PR_AMU_ROW_WINDOW 64
+#endif
+#if PR_AMU_ROW_WINDOW <= 0
+#error "PR_AMU_ROW_WINDOW must be positive"
+#endif
 #else
 #include "cira.h"
 #if (defined(PR_CIRA_POLICY_STATIC) + defined(PR_CIRA_POLICY_PGO) + \
@@ -217,7 +223,6 @@ makeDescriptor(const pvector<uint64_t> &inOffsets,
                uint64_t begin, uint64_t end, uint64_t iteration,
                uint32_t phase, Candidate candidate)
 {
-  const CandidateConfig &config = candidateConfig(candidate);
   pr_row_offload_desc desc = {};
   desc.in_offsets_addr = reinterpret_cast<uint64_t>(inOffsets.data());
   desc.in_neighbors_addr = reinterpret_cast<uint64_t>(inNeighbors);
@@ -231,8 +236,15 @@ makeDescriptor(const pvector<uint64_t> &inOffsets,
   desc.node_count = scores.size();
   desc.iteration = iteration;
   desc.phase = phase;
+#if defined(PR_OFFLOAD_AMU)
+  (void)candidate;
+  desc.row_window = PR_AMU_ROW_WINDOW;
+  desc.lead_blocks = 0;
+#else
+  const CandidateConfig &config = candidateConfig(candidate);
   desc.row_window = config.rowWindow;
   desc.lead_blocks = config.leadBlocks;
+#endif
   const ScoreT baseScore = (1.0f - kDamp) / scores.size();
   std::memcpy(&desc.damping_bits, &kDamp, sizeof(kDamp));
   std::memcpy(&desc.base_score_bits, &baseScore, sizeof(baseScore));
@@ -508,7 +520,6 @@ main(int argc, char **argv)
         }
 #endif
 
-#pragma omp barrier
 #pragma omp single
         ledger.transition(Phase::Formation, m5_rpns());
         configureCandidate(selectedCandidate);
@@ -528,7 +539,6 @@ main(int argc, char **argv)
 #pragma omp barrier
 #pragma omp single
         scores.swap(nextScores);
-#pragma omp barrier
       }
 
 #pragma omp barrier

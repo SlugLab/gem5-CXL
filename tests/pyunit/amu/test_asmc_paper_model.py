@@ -183,6 +183,40 @@ class AsmcPaperModelTest(unittest.TestCase):
         ]
         self.assertIn("flags.set(Request::UNCACHEABLE)", reserve_read)
 
+    def test_amu_pr_drains_resident_adapter_lines_with_timing_cleans(self):
+        for token in (
+            "AdapterFlush",
+            "PrIoCacheWays = 8",
+            "PrIoCacheSets = 2",
+            "prAdapterDirtyLines",
+            "adapterFlushStarted",
+            "prAdapterFlushPackets",
+        ):
+            self.assertIn(token, HEADER)
+        for token in (
+            "notePrAdapterWrite",
+            "startPrAdapterFlush",
+            "MemCmd::CleanInvalidReq",
+            "Request::CLEAN | Request::INVALIDATE |",
+            "Request::DST_POC",
+            "state.adapterFlushStarted && state.pendingPackets != 0",
+        ):
+            self.assertIn(token, SOURCE)
+        self.assertIn(
+            "#if defined(PR_OFFLOAD_CIRA)\n"
+            "        flushRange(contributions.data() + begin,",
+            PR_OFFLOAD,
+        )
+        self.assertIn(
+            "#if defined(PR_OFFLOAD_CIRA)\n"
+            "        flushRange(nextScores.data() + begin,",
+            PR_OFFLOAD,
+        )
+        self.assertNotIn(
+            "#if defined(PR_OFFLOAD_AMU) || defined(PR_OFFLOAD_CIRA)",
+            PR_OFFLOAD,
+        )
+
     def test_amu_pr_coalesces_inflight_lines_across_descriptors(self):
         self.assertIn("uint64_t descriptor = 0", HEADER)
         self.assertIn("pendingPrReadOwners", HEADER)
@@ -201,6 +235,26 @@ class AsmcPaperModelTest(unittest.TestCase):
         ]
         self.assertIn("waiter.descriptor", response)
         self.assertIn("pendingPrReadOwners.erase", response)
+
+    def test_amu_pr_combines_output_lines_across_descriptors(self):
+        self.assertIn("struct PrWriteWaiter", HEADER)
+        self.assertIn("pendingPrWriteOwners", HEADER)
+        self.assertIn("prGlobalWriteCoalesces", HEADER)
+        reserve_write = SOURCE[
+            SOURCE.index("ASMC::reservePrWrite"):
+            SOURCE.index("ASMC::schedulePrService")
+        ]
+        self.assertIn("outputEnd", reserve_write)
+        self.assertIn("pendingPrWriteOwners.find", reserve_write)
+        self.assertIn("write = &ownerPending->second", reserve_write)
+        response = SOURCE[
+            SOURCE.index("ASMC::recvPrTimingResp"):
+            SOURCE.index("ASMC::recvReqRetry", SOURCE.index(
+                "ASMC::recvPrTimingResp"
+            ))
+        ]
+        self.assertIn("waiter.descriptor", response)
+        self.assertIn("pendingPrWriteOwners.erase", response)
 
     @staticmethod
     def calibration_loader():
@@ -505,6 +559,26 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("scores.swap(nextScores)", PR_OFFLOAD)
         self.assertNotIn("load_values", PR_OFFLOAD)
         self.assertNotIn("load_value", PR_OFFLOAD)
+
+    def test_matched_amu_row_window_is_derived_from_read_credits(self):
+        self.assertIn("PR_AMU_ROW_WINDOW", PR_OFFLOAD)
+        self.assertIn("desc.row_window = PR_AMU_ROW_WINDOW", PR_OFFLOAD)
+        self.assertIn("resolve_amu_row_window", MATCHED)
+        self.assertIn("return read_entries", MATCHED)
+        self.assertNotIn("return read_entries // workers", MATCHED)
+        self.assertIn("-DPR_AMU_ROW_WINDOW=", MATCHED)
+        self.assertIn('"amu_row_window": amu_row_window', MATCHED)
+
+    def test_matched_driver_has_no_redundant_phase_barriers(self):
+        self.assertNotIn(
+            "#endif\n\n#pragma omp barrier\n#pragma omp single\n"
+            "        ledger.transition(Phase::Formation",
+            PR_OFFLOAD,
+        )
+        self.assertNotIn(
+            "scores.swap(nextScores);\n#pragma omp barrier",
+            PR_OFFLOAD,
+        )
 
 
 if __name__ == "__main__":

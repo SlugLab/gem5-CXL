@@ -208,6 +208,7 @@ PR_EVIDENCE_STATS = {
         "pr_rows": "board.asmc.prRows",
         "pr_read_packets": "board.asmc.prReadPackets",
         "pr_write_packets": "board.asmc.prWritePackets",
+        "pr_adapter_flush_packets": "board.asmc.prAdapterFlushPackets",
         "pr_compute_ticks": "board.asmc.prComputeTicks",
         "pr_queue_stall_ticks": "board.asmc.prQueueStallTicks",
     },
@@ -293,6 +294,7 @@ SUMMARY_FIELDS = (
     "pr_read_packets",
     "pr_coherent_read_packets",
     "pr_write_packets",
+    "pr_adapter_flush_packets",
     "pr_compute_ticks",
     "pr_queue_stall_ticks",
     "pr_outstanding_work",
@@ -444,6 +446,7 @@ def extract_pr_evidence(stats, kind):
     fields = (
         "pr_issued_descriptors", "pr_completed_descriptors", "pr_rows",
         "pr_read_packets", "pr_coherent_read_packets", "pr_write_packets",
+        "pr_adapter_flush_packets",
         "pr_compute_ticks", "pr_queue_stall_ticks", "pr_outstanding_work",
         "pr_rejected_descriptors", "pr_issued_reconfigurations",
         "pr_completed_reconfigurations", "pr_policy_formation_ticks",
@@ -483,6 +486,8 @@ def pr_evidence_failure(evidence, kind):
         return "pr-incomplete-reconfiguration"
     if kind == "cira" and evidence["pr_policy_formation_ticks"] <= 0:
         return "pr-missing-policy-charge"
+    if kind == "amu" and evidence["pr_adapter_flush_packets"] <= 0:
+        return "pr-missing-adapter-drain"
     return None
 
 

@@ -835,6 +835,13 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(evidence["pr_issued_descriptors"], Decimal(8))
         self.assertEqual(evidence["pr_completed_descriptors"], Decimal(8))
         self.assertEqual(evidence["pr_outstanding_work"], Decimal(0))
+        self.assertEqual(evidence["pr_adapter_flush_packets"], Decimal(64))
+        self.assertIsNone(self.runner.pr_evidence_failure(evidence, "amu"))
+        missing_drain = dict(evidence, pr_adapter_flush_packets=0)
+        self.assertEqual(
+            self.runner.pr_evidence_failure(missing_drain, "amu"),
+            "pr-missing-adapter-drain",
+        )
         self.assertFalse(self.runner.needs_amu_line_cache(evidence))
         self.assertTrue(self.runner.needs_amu_line_cache({
             "pr_issued_descriptors": 0

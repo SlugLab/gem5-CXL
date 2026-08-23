@@ -49,6 +49,32 @@ class VariantEvidenceError(RuntimeError):
     pass
 
 
+def resolve_amu_row_window(calibration_manifest):
+    path = Path(calibration_manifest).resolve()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if value["schema"] != 2:
+            raise VariantEvidenceError("calibration schema must be 2")
+        if value["sources"]["amu_pdf"]["sha256"] != calibration.AMU_PDF_SHA256:
+            raise VariantEvidenceError("calibration AMU PDF hash differs")
+        if value["amu"]["validation"]["status"] != "PASS":
+            raise VariantEvidenceError("AMU calibration validation did not pass")
+        read_entries = value["near_data_pr"]["amu"]["parameters"][
+            "read_entries"
+        ]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError,
+            TypeError) as error:
+        raise VariantEvidenceError(
+            f"invalid AMU calibration manifest: {path}"
+        ) from error
+    if (
+        not isinstance(read_entries, int) or isinstance(read_entries, bool)
+        or read_entries <= 0
+    ):
+        raise VariantEvidenceError("AMU read entries must be positive")
+    return read_entries
+
+
 def resolve_cira_build_policy(calibration_manifest, mode, *, source_row=None):
     path = Path(calibration_manifest).resolve()
     try:
@@ -98,11 +124,16 @@ def policy_compile_definitions(mode, source_row):
 
 def compile_command(
     *, kind, cxx, source, gapbs_root, generated_dir, output, m5_library,
-    cira_mode="legacy", cira_source_row=None, **_legacy_options,
+    amu_row_window=64, cira_mode="legacy", cira_source_row=None,
+    **_legacy_options,
 ):
     command = [cxx, *COMMON_FLAGS]
     if kind == "amu":
-        command += ["-DPR_OFFLOAD_AMU=1", "-I", str(REPO / "util/amu")]
+        command += [
+            "-DPR_OFFLOAD_AMU=1",
+            f"-DPR_AMU_ROW_WINDOW={amu_row_window}",
+            "-I", str(REPO / "util/amu"),
+        ]
     elif kind == "cira":
         command += [
             "-DPR_OFFLOAD_CIRA=1",
@@ -269,6 +300,9 @@ def main(argv=None):
 
     cira_policy = None
     cira_distance = args.cira_prefetch_distance
+    amu_row_window = calibration.NEAR_DATA_PR_AMU_ASSUMPTIONS[
+        "read_entries"
+    ]
     if args.cira_mode == "legacy":
         if args.calibration_manifest is not None or args.cira_source_row is not None:
             parser.error("legacy CIRA rejects calibration/source-row options")
@@ -290,6 +324,9 @@ def main(argv=None):
         if args.cira_mode == "few-shot-online" and policy_source is None:
             policy_source = "A"
         try:
+            amu_row_window = resolve_amu_row_window(
+                args.calibration_manifest
+            )
             cira_policy = resolve_cira_build_policy(
                 args.calibration_manifest, args.cira_mode,
                 source_row=policy_source,
@@ -336,6 +373,7 @@ def main(argv=None):
             cira_row_batch=args.cira_row_batch,
             cira_max_outstanding=args.cira_max_outstanding,
             cira_policy=cira_policy, cira_mode=args.cira_mode,
+            amu_row_window=amu_row_window,
         ))
 
     manifest = {
@@ -357,6 +395,7 @@ def main(argv=None):
         "descriptor_header_sha256": artifacts.sha256_file(DESCRIPTOR_HEADER),
         "compiler": baseline_builder.compiler_version(args.cxx),
         "amu_batch_size": args.amu_batch_size,
+        "amu_row_window": amu_row_window,
         "cira_prefetch_distance": cira_distance,
         "cira_lead_blocks": cira_distance,
         "cira_row_batch": 64,

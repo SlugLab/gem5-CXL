@@ -117,6 +117,10 @@ ASMC::ASMCStats::ASMCStats(ASMC &owner, size_t num_cores)
                "Valid PageRank SPM lines invalidated by writes or epochs"),
       ADD_STAT(prGlobalReadCoalesces, statistics::units::Count::get(),
                "PageRank line reads coalesced across descriptors"),
+      ADD_STAT(prGlobalWriteCoalesces, statistics::units::Count::get(),
+               "PageRank result writes combined across descriptors"),
+      ADD_STAT(prAdapterFlushPackets, statistics::units::Count::get(),
+               "Timing clean-invalidates used to drain the AMU I/O cache"),
       ADD_STAT(avgLatency, statistics::units::Tick::get(),
                "Average AMU request latency",
                totalLatency / (completedLoads + completedStores)),
@@ -389,6 +393,48 @@ ASMC::beginPrSpmIteration(uint64_t iteration)
     prSpmIterationValid = true;
 }
 
+void
+ASMC::notePrAdapterWrite(Addr line)
+{
+    panic_if(line % cacheLineSize != 0,
+             "ASMC PR adapter write is not line aligned");
+    const uint64_t set = (line / cacheLineSize) % PrIoCacheSets;
+    auto &lines = prAdapterDirtyLines[set];
+    const auto existing = std::find(lines.begin(), lines.end(), line);
+    if (existing != lines.end())
+        lines.erase(existing);
+    lines.push_back(line);
+    if (lines.size() > PrIoCacheWays)
+        lines.pop_front();
+}
+
+bool
+ASMC::startPrAdapterFlush(PrDescriptorState &state)
+{
+    uint64_t packets = 0;
+    for (auto &lines : prAdapterDirtyLines) {
+        for (Addr line : lines) {
+            Request::Flags flags = Request::CLEAN | Request::INVALIDATE |
+                Request::DST_POC;
+            RequestPtr req = std::make_shared<Request>(
+                line, cacheLineSize, flags, requestorId);
+            req->taskId(context_switch_task_id::DMA);
+            PacketPtr pkt = new Packet(req, MemCmd::CleanInvalidReq);
+            pkt->senderState = new PacketSenderState(
+                state.id, PrPacketRole::AdapterFlush, 0, line, 0, 0,
+                cacheLineSize, false);
+            ++state.pendingPackets;
+            ++stats.prAdapterFlushPackets;
+            ++packets;
+            enqueueFarPacket(pkt);
+        }
+        lines.clear();
+    }
+    if (packets != 0)
+        scheduleFarSend(curTick());
+    return packets != 0;
+}
+
 uint64_t
 ASMC::issuePrRows(ThreadContext *tc, Addr desc_addr)
 {
@@ -623,33 +669,62 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
 
     const Addr outputBase = state.desc.phase == PR_ROW_CONTRIB ?
         state.desc.contributions_addr : state.desc.scores_out_addr;
-    const Addr descriptorBegin = outputBase +
-        state.desc.row_begin * sizeof(float);
-    const Addr descriptorEnd = descriptorBegin +
-        state.desc.row_count * sizeof(float);
+    panic_if(state.desc.node_count >
+                 std::numeric_limits<Addr>::max() / sizeof(float) ||
+             outputBase > std::numeric_limits<Addr>::max() -
+                 state.desc.node_count * sizeof(float),
+             "ASMC PR output range overflows the address space");
+    const Addr outputEnd = outputBase +
+        state.desc.node_count * sizeof(float);
     const Addr virtualLine = addr & ~(cacheLineSize - 1);
     const bool ownsFullLine = size == sizeof(float) && chunks.size() == 1 &&
         chunks.front().size == sizeof(float) &&
-        virtualLine >= descriptorBegin &&
-        virtualLine + cacheLineSize <= descriptorEnd;
+        virtualLine >= outputBase &&
+        virtualLine + cacheLineSize <= outputEnd;
     if (ownsFullLine) {
         panic_if(cacheLineSize % sizeof(float) != 0,
                  "ASMC PR write combining requires float-aligned lines");
         const Addr physicalLine = chunks.front().paddr &
             ~(cacheLineSize - 1);
         invalidatePrSpmLine(physicalLine);
-        auto [entry, inserted] = state.pendingWriteLines.try_emplace(
-            physicalLine);
-        if (inserted)
+        auto owner = pendingPrWriteOwners.find(physicalLine);
+        PrLineWriteState *write = nullptr;
+        if (owner != pendingPrWriteOwners.end()) {
+            const auto ownerState = prOutstanding.find(owner->second);
+            panic_if(ownerState == prOutstanding.end(),
+                     "ASMC PR global write owner is not active");
+            auto ownerPending = ownerState->second->pendingWriteLines.find(
+                physicalLine);
+            panic_if(ownerPending ==
+                         ownerState->second->pendingWriteLines.end(),
+                     "ASMC PR global write owner has no pending line");
+            write = &ownerPending->second;
+            if (owner->second != state.id)
+                ++stats.prGlobalWriteCoalesces;
+        } else {
+            auto [entry, inserted] = state.pendingWriteLines.try_emplace(
+                physicalLine);
+            panic_if(!inserted,
+                     "ASMC PR write line exists without a global owner");
             entry->second.data.resize(cacheLineSize);
-        PrLineWriteState &write = entry->second;
-        panic_if(std::find(write.rows.begin(), write.rows.end(), row.row) !=
-                     write.rows.end(),
+            write = &entry->second;
+            const auto [globalOwner, ownerInserted] =
+                pendingPrWriteOwners.emplace(physicalLine, state.id);
+            panic_if(!ownerInserted || globalOwner->second != state.id,
+                     "ASMC PR write line acquired multiple global owners");
+        }
+        panic_if(std::find_if(
+                     write->waiters.begin(), write->waiters.end(),
+                     [&state, &row](const PrWriteWaiter &waiter) {
+                         return waiter.descriptor == state.id &&
+                                waiter.row == row.row;
+                     }) != write->waiters.end(),
                  "ASMC PR row registered twice with a combined write");
         const uint64_t rowsPerLine = cacheLineSize / sizeof(float);
-        panic_if(write.rows.size() >= rowsPerLine,
+        panic_if(write->waiters.size() >= rowsPerLine,
                  "ASMC PR combined write exceeded one cache line");
-        const bool completesLine = write.rows.size() + 1 == rowsPerLine;
+        const bool completesLine =
+            write->waiters.size() + 1 == rowsPerLine;
         if (completesLine) {
             const uint64_t farOccupied = farSendQueue.size() +
                 (farRetryPkt ? 1 : 0) + reservedFarSendSlots;
@@ -665,10 +740,10 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
             stats.prQueueStallTicks += curTick() - state.stallStart;
             state.queueStalled = false;
         }
-        std::memcpy(write.data.data() +
+        std::memcpy(write->data.data() +
                         (chunks.front().paddr - physicalLine),
                     data, sizeof(float));
-        write.rows.push_back(row.row);
+        write->waiters.push_back({state.id, row.row});
         ++row.pendingPackets;
         ++state.pendingPackets;
         if (completesLine) {
@@ -678,11 +753,13 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
             req->taskId(context_switch_task_id::DMA);
             PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
             pkt->allocate();
-            std::memcpy(pkt->getPtr<uint8_t>(), write.data.data(),
+            std::memcpy(pkt->getPtr<uint8_t>(), write->data.data(),
                         cacheLineSize);
             pkt->senderState = new PacketSenderState(
-                state.id, PrPacketRole::Result, 0, physicalLine, 0, 0,
+                pendingPrWriteOwners.at(physicalLine),
+                PrPacketRole::Result, 0, physicalLine, 0, 0,
                 cacheLineSize, false);
+            notePrAdapterWrite(physicalLine);
             enqueueFarPacket(pkt);
             scheduleFarSend(curTick());
         }
@@ -726,6 +803,7 @@ ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
             pkt->senderState = new PacketSenderState(
                 state.id, PrPacketRole::Result, row.row, 0, 0,
                 chunk.offset + chunkOffset, packetSize, false);
+            notePrAdapterWrite(line);
             ++row.pendingPackets;
             ++state.pendingPackets;
             enqueueFarPacket(pkt);
@@ -1017,6 +1095,13 @@ ASMC::completePrDescriptor(uint64_t id)
     if (it == prOutstanding.end())
         return;
     PrDescriptorState &state = *it->second;
+    if (!state.adapterFlushStarted && prOutstanding.size() == 1) {
+        state.adapterFlushStarted = true;
+        if (startPrAdapterFlush(state))
+            return;
+    }
+    if (state.adapterFlushStarted && state.pendingPackets != 0)
+        return;
     panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
              !state.pendingReadLines.empty() ||
              !state.pendingWriteLines.empty() ||
@@ -1805,6 +1890,8 @@ ASMC::copyPrReadFragment(PrDescriptorState &state,
         break;
       case PrPacketRole::Result:
         panic("ASMC PR result write registered as a line waiter");
+      case PrPacketRole::AdapterFlush:
+        panic("ASMC PR adapter flush registered as a line waiter");
     }
     panic_if(!line || waiter.dataOffset + waiter.size > targetSize ||
              waiter.lineOffset + waiter.size > cacheLineSize,
@@ -1857,6 +1944,10 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
         panic_if(pendingPrReads == 0,
                  "ASMC PR read-credit accounting underflow");
         --pendingPrReads;
+    } else if (sender_state->prRole == PrPacketRole::AdapterFlush) {
+        panic_if(state.pendingPackets == 0,
+                 "ASMC PR adapter flush accounting underflow");
+        --state.pendingPackets;
     } else {
         panic_if(sender_state->prRole != PrPacketRole::Result,
                  "ASMC PR non-result write response");
@@ -1865,15 +1956,25 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
         if (combined != state.pendingWriteLines.end()) {
             panic_if(pkt->getSize() != cacheLineSize,
                      "ASMC PR combined write response is not one line");
-            for (uint64_t rowId : combined->second.rows) {
-                const auto rowIt = state.rows.find(rowId);
-                panic_if(rowIt == state.rows.end() ||
+            for (const PrWriteWaiter &waiter :
+                    combined->second.waiters) {
+                const auto waiterState = prOutstanding.find(
+                    waiter.descriptor);
+                panic_if(waiterState == prOutstanding.end(),
+                         "ASMC PR write waiter descriptor is not active");
+                PrDescriptorState &targetState = *waiterState->second;
+                const auto rowIt = targetState.rows.find(waiter.row);
+                panic_if(rowIt == targetState.rows.end() ||
                          rowIt->second.pendingPackets == 0 ||
-                         state.pendingPackets == 0,
+                         targetState.pendingPackets == 0,
                          "ASMC PR combined write accounting underflow");
                 --rowIt->second.pendingPackets;
-                --state.pendingPackets;
+                --targetState.pendingPackets;
             }
+            const auto erased = pendingPrWriteOwners.erase(
+                sender_state->prLine);
+            panic_if(erased != 1,
+                     "ASMC PR response has no global write owner");
             state.pendingWriteLines.erase(combined);
         } else {
             const auto rowIt = state.rows.find(sender_state->prRow);
@@ -2129,6 +2230,9 @@ ASMC::reset()
     prOutstanding.clear();
     prServiceQueue.clear();
     pendingPrReadOwners.clear();
+    pendingPrWriteOwners.clear();
+    for (auto &lines : prAdapterDirtyLines)
+        lines.clear();
     for (PrSpmLine &slot : prSpmLines)
         slot.valid = false;
     prSpmIteration = 0;

@@ -99,11 +99,14 @@ class ASMC : public ClockedObject
         Neighbor,
         Contribution,
         Result,
+        AdapterFlush,
     };
 
     static constexpr uint64_t PrSpmBytes = 64 * 1024;
     static constexpr uint64_t PrSpmLines = PrSpmBytes / 64;
     static constexpr uint64_t PrSpmRoleLines = PrSpmLines / 2;
+    static constexpr uint64_t PrIoCacheWays = 8;
+    static constexpr uint64_t PrIoCacheSets = 2;
 
     struct PrSpmLine
     {
@@ -172,10 +175,16 @@ class ASMC : public ClockedObject
         std::vector<PrReadWaiter> waiters;
     };
 
+    struct PrWriteWaiter
+    {
+        uint64_t descriptor = 0;
+        uint64_t row = 0;
+    };
+
     struct PrLineWriteState
     {
         std::vector<uint8_t> data;
-        std::vector<uint64_t> rows;
+        std::vector<PrWriteWaiter> waiters;
     };
 
     struct PrDescriptorState
@@ -190,6 +199,7 @@ class ASMC : public ClockedObject
         Tick issueTick = 0;
         Tick stallStart = 0;
         bool queueStalled = false;
+        bool adapterFlushStarted = false;
         std::map<uint64_t, PrRowState> rows;
         std::map<Addr, PrLineReadState> pendingReadLines;
         std::map<Addr, PrLineWriteState> pendingWriteLines;
@@ -294,6 +304,8 @@ class ASMC : public ClockedObject
         statistics::Scalar prSpmMisses;
         statistics::Scalar prSpmInvalidations;
         statistics::Scalar prGlobalReadCoalesces;
+        statistics::Scalar prGlobalWriteCoalesces;
+        statistics::Scalar prAdapterFlushPackets;
         statistics::Formula avgLatency;
         statistics::Formula avgOutstanding;
     };
@@ -320,6 +332,8 @@ class ASMC : public ClockedObject
         Addr line, PrPacketRole role, const uint8_t *data);
     void invalidatePrSpmLine(Addr line);
     void beginPrSpmIteration(uint64_t iteration);
+    void notePrAdapterWrite(Addr line);
+    bool startPrAdapterFlush(PrDescriptorState &state);
     void processPrDescriptors();
     bool processPrDescriptor(PrDescriptorState &state);
     bool processPrRow(PrDescriptorState &state, PrRowState &row);
@@ -419,6 +433,8 @@ class ASMC : public ClockedObject
     std::deque<uint64_t> prServiceQueue;
     std::map<std::pair<Addr, PrPacketRole>, uint64_t>
         pendingPrReadOwners;
+    std::map<Addr, uint64_t> pendingPrWriteOwners;
+    std::array<std::deque<Addr>, PrIoCacheSets> prAdapterDirtyLines;
     std::array<PrSpmLine, PrSpmLines> prSpmLines = {};
     uint64_t prSpmIteration = 0;
     bool prSpmIterationValid = false;
