@@ -1972,7 +1972,7 @@ def main():
         "--profile",
         choices=tuple(
             sorted(set(EXPERIMENT_PROFILES) | set(FROZEN_PROFILE_CONTRACTS))
-            + [SCALING_PROFILE_NAME]
+            + [SCALING_PROFILE_NAME, FORMAL_PROFILE_NAME]
         ),
         default="g20-2thread-1us",
     )

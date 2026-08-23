@@ -5,6 +5,7 @@ import csv
 import importlib.util
 import inspect
 import subprocess
+import sys
 import tempfile
 import unittest
 from decimal import Decimal
@@ -1167,6 +1168,17 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         profile = self.runner.validate_checkpoint_profile(args)
 
         self.assertEqual(profile.name, "g4-4thread-sweep")
+
+    def test_cli_accepts_formal_offload_profile(self):
+        help_text = subprocess.check_output(
+            [
+                sys.executable,
+                str(REPO / "scripts/compare_gapbs_cxl_amu_cira.py"),
+                "--help",
+            ],
+            text=True,
+        )
+        self.assertIn("pr-offload-4thread-1us", help_text)
 
     def test_checkpoint_restore_timeout_returns_failure_row(self):
         with tempfile.TemporaryDirectory() as tmp:
