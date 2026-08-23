@@ -252,10 +252,6 @@ static uint64_t
 sampleCandidate(Candidate candidate, const pr_row_offload_desc &full,
                 pvector<ScoreT> &discardedOutput)
 {
-  flushRange(
-      reinterpret_cast<const void *>(full.contributions_addr),
-      full.node_count * sizeof(ScoreT));
-  _mm_mfence();
   configureCandidate(candidate);
   pr_row_offload_desc sample = full;
   sample.row_begin = 0;
@@ -490,6 +486,10 @@ main(int argc, char **argv)
                 inOffsets, inNeighbors, outDegrees, scores, contributions,
                 discardedSampleOutputs.a, 0, g.num_nodes(), iteration,
                 PR_ROW_PULL, Candidate::A);
+            flushRange(
+                reinterpret_cast<const void *>(pilot.contributions_addr),
+                pilot.node_count * sizeof(ScoreT));
+            _mm_mfence();
             sampleDurations[0] = sampleCandidate(Candidate::A, pilot,
                                                  discardedSampleOutputs.a);
             sampleDurations[1] = sampleCandidate(Candidate::B, pilot,

@@ -52,8 +52,17 @@ class CiraPrRuntimePolicyTest(unittest.TestCase):
             source.index("sampleCandidate(Candidate candidate"):
             source.index("selectMinimumPositive")
         ]
-        self.assertIn("flushRange(", sample)
-        self.assertLess(sample.index("flushRange("), sample.index("m5_rpns()"))
+        self.assertNotIn("flushRange(", sample)
+
+        sampling_batch = source[
+            source.index("ledger.transition(Phase::Sampling"):
+            source.index("ledger.transition(Phase::Selection")
+        ]
+        self.assertEqual(sampling_batch.count("flushRange("), 1)
+        self.assertLess(
+            sampling_batch.index("flushRange("),
+            sampling_batch.index("sampleCandidate(Candidate::A"),
+        )
 
     def test_cira_writes_back_each_owned_partition_before_phase_barriers(self):
         source = WORKLOAD.read_text(encoding="utf-8")
