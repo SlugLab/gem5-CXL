@@ -53,6 +53,7 @@ class OffloadContractTest(unittest.TestCase):
                 "formation": 100, "sampling": 100, "selection": 100,
                 "jit": 100, "execution": 500, "drain": 100,
             }
+            point["phase_total_ns"] = 1000
             point["selected_candidate"] = "B"
         return point
 
@@ -93,6 +94,7 @@ class OffloadContractTest(unittest.TestCase):
         cases = []
         bit = self.point(12, "amu"); bit["verification"] = "fail"; cases.append(bit)
         phase = self.point(12, "cira-few-shot"); phase["phases"]["drain"] = 99; cases.append(phase)
+        missing_total = self.point(12, "cira-few-shot"); missing_total.pop("phase_total_ns"); cases.append(missing_total)
         queue = self.point(12, "amu"); queue["pending"]["requests"] = 1; cases.append(queue)
         topology = self.point(12, "amu"); topology["all_memory_cxl"] = False; cases.append(topology)
         funcsim = self.point(12, "m2ndp"); funcsim["funcsim"]["completed_at_seq"] = 9; cases.append(funcsim)

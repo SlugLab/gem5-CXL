@@ -617,9 +617,11 @@ A. Every published vector must match the matched Vanilla vector bit for bit.
 The ROI starts immediately before iteration-0 formation/scheduling and ends
 only after iteration 19, the four-worker barrier, and the final device drain.
 CIRA Few-shot charges formation, all discarded A/B/C samples, selection,
-JIT/reconfiguration, execution, and drain. Those six additive fields must sum
-exactly to E2E ticks. Executor counters overlap and are published separately as
-non-additive mechanism evidence. M2NDP initializes and validates its four-way,
+JIT/reconfiguration, execution, and drain. Those six additive nanosecond fields
+must sum exactly to the emitted `phase_total_ns`; native gem5 `simTicks` remains
+the independent picosecond performance clock. Executor counters overlap and are
+published separately as non-additive mechanism evidence. M2NDP initializes and
+validates its four-way,
 double-buffered trace with FuncSim before NDPSim; its timed marker is
 `K2_CONTRIB_TRIAL1_PART0`.
 

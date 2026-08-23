@@ -523,6 +523,7 @@ def load_point(entry, options):
             name: int(row[f"pr_e2e_{name}_ns"])
             for name in contract.CIRA_PHASES
         }
+        point["phase_total_ns"] = int(row["pr_e2e_total_ns"])
         point["selected_candidate"] = row.get("pr_cira_selected_candidate")
         point["mechanism"] = {
             "csr_reads": int(row.get("pr_read_packets", 0)),

@@ -71,8 +71,12 @@ class PublisherTest(unittest.TestCase):
             if system != "cira-few-shot":
                 point["phases"].update(sampling=0, selection=0, jit=0,
                                        execution=800_000)
+            point["phase_total_ns"] = 1_000_000
             point["selected_candidate"] = "B"
         return point
+
+    def test_phase_values_are_converted_from_nanoseconds_to_milliseconds(self):
+        self.assertEqual(publisher.phase_milliseconds(1_000_000), 1.0)
 
     def fixture(self):
         identity = {

@@ -154,6 +154,7 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
             "formation": 1, "sampling": 1, "selection": 1, "jit": 1,
             "execution": cira_ticks - 5, "drain": 1,
         }
+        points["g12:cira-few-shot"]["phase_total_ns"] = cira_ticks
         m2ndp_point = points["g12:m2ndp"]
         m2ndp_point["funcsim"] = {
             "status": "pass", "compared": 1 << 12,

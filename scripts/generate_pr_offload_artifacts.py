@@ -171,6 +171,7 @@ def _rows(data):
                 "native_count": str(
                     row.get("sim_ticks", row.get("ndpsim_cycles"))
                 ),
+                "phase_total_ns": row.get("phase_total_ns", ""),
                 **{
                     f"phase_{name}": row.get("phases", {}).get(name, "")
                     for name in contract.CIRA_PHASES
@@ -197,6 +198,10 @@ def _save_figure(figure, base):
                   "Date": "2026-08-22"},
     )
     plt.close(figure)
+
+
+def phase_milliseconds(nanoseconds):
+    return float(nanoseconds) / 1e6
 
 
 def _grouped_bar(rows, systems, value, title, ylabel, output):
@@ -255,7 +260,7 @@ def _phase_figure(data, output):
     bottoms = [0.0] * len(rows)
     phase_colors = ("#3978B5", "#D9902F", "#7A8E3A", "#C95F75", "#7A6699", "#9AA1AA")
     for index, name in enumerate(contract.CIRA_PHASES):
-        values = [float(row["phases"][name]) / 1e9 for row in rows]
+        values = [phase_milliseconds(row["phases"][name]) for row in rows]
         axis.bar(range(len(rows)), values, bottom=bottoms, label=name,
                  color=phase_colors[index], edgecolor="#30343B", linewidth=0.35,
                  hatch=HATCHES[index])

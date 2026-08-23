@@ -195,11 +195,15 @@ def validate_point(point):
         if not isinstance(phases, dict) or set(phases) != set(CIRA_PHASES):
             raise OffloadError("CIRA additive phase set differs")
         values = {
-            name: _integer(phases[name], f"CIRA {name} ticks")
+            name: _integer(phases[name], f"CIRA {name} nanoseconds")
             for name in CIRA_PHASES
         }
-        if sum(values.values()) != point["sim_ticks"]:
-            raise OffloadError("CIRA phase sum differs from sim_ticks")
+        phase_total_ns = _integer(
+            point.get("phase_total_ns"), "CIRA phase total nanoseconds",
+            positive=True,
+        )
+        if sum(values.values()) != phase_total_ns:
+            raise OffloadError("CIRA phase sum differs from phase_total_ns")
         if system == "cira-few-shot" and any(
             values[name] <= 0 for name in ("sampling", "selection", "jit")
         ):
