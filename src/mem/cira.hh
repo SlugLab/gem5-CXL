@@ -9,7 +9,9 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -122,17 +124,30 @@ class CIRA : public ClockedObject
         Result,
     };
 
+    struct PrRowState
+    {
+        PrStage stage = PrStage::StartRow;
+        uint64_t row = 0;
+        uint64_t edgeBegin = 0;
+        uint64_t edgeEnd = 0;
+        uint64_t nextRead = 0;
+        uint32_t pendingPackets = 0;
+        std::array<uint8_t, 4> scoreData = {};
+        std::array<uint8_t, 8> degreeData = {};
+        std::array<uint8_t, 16> offsetsData = {};
+        std::vector<int32_t> neighbors;
+        std::vector<float> contributions;
+        float result = 0.0f;
+    };
+
     struct PrDescriptorState
     {
         uint64_t id = 0;
         PortID targetCore = InvalidPortID;
         ThreadContext *tc = nullptr;
         pr_row_offload_desc desc = {};
-        PrStage stage = PrStage::StartRow;
-        uint64_t row = 0;
-        uint64_t edgeBegin = 0;
-        uint64_t edgeEnd = 0;
-        uint64_t nextRead = 0;
+        uint64_t nextRow = 0;
+        uint64_t completedRows = 0;
         uint32_t pendingPackets = 0;
         uint32_t reservedInitialCsrPackets = 0;
         uint32_t reservedInitialCoherentPackets = 0;
@@ -140,12 +155,7 @@ class CIRA : public ClockedObject
         Tick policyReadyTick = 0;
         Tick stallStart = 0;
         bool queueStalled = false;
-        std::array<uint8_t, 4> scoreData = {};
-        std::array<uint8_t, 8> degreeData = {};
-        std::array<uint8_t, 16> offsetsData = {};
-        std::vector<int32_t> neighbors;
-        std::vector<float> contributions;
-        float result = 0.0f;
+        std::map<uint64_t, PrRowState> rows;
     };
 
     struct PrThreadConfig
@@ -166,11 +176,12 @@ class CIRA : public ClockedObject
         PacketSenderState(PrPacketRole pr_role,
                           PrPayloadRole payload_role,
                           uint64_t request_id, PortID target_core,
-                          uint64_t index, uint64_t data_offset)
+                          uint64_t pr_row, uint64_t index,
+                          uint64_t data_offset)
             : role(PacketRole::PrefetchLine), id(request_id),
               targetCore(target_core), walkId(0), entry(0),
               dataOffset(data_offset), prPacket(true), prRole(pr_role),
-              prPayload(payload_role), prIndex(index)
+              prPayload(payload_role), prRow(pr_row), prIndex(index)
         {}
 
         PacketRole role;
@@ -182,6 +193,7 @@ class CIRA : public ClockedObject
         bool prPacket = false;
         PrPacketRole prRole = PrPacketRole::CsrRead;
         PrPayloadRole prPayload = PrPayloadRole::Offsets;
+        uint64_t prRow = 0;
         uint64_t prIndex = 0;
     };
 
@@ -398,21 +410,23 @@ class CIRA : public ClockedObject
                               const pr_row_offload_desc &desc) const;
     uint64_t prPolicyCostPpm(uint64_t rowWindow,
                              uint64_t leadBlocks) const;
-    bool reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+    bool reservePrRead(PrDescriptorState &state, PrRowState &row,
+                       Addr addr, uint64_t size,
                        PrPacketRole route, PrPayloadRole payload,
                        uint64_t index);
-    bool reservePrWrite(PrDescriptorState &state, Addr addr,
+    bool reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                         const void *data, uint64_t size);
     void schedulePr(PortID targetCore, Tick when);
     void processPr(PortID targetCore);
     bool processPrDescriptor(PrDescriptorState &state);
+    bool processPrRow(PrDescriptorState &state, PrRowState &row);
     bool recvPrTimingResp(PortID targetCore, PacketPtr pkt,
                           PacketSenderState *senderState);
     bool recvPrCsrTimingResp(PacketPtr pkt,
                              PacketSenderState *senderState);
-    void schedulePrCompute(uint64_t id, Cycles cycles);
-    void finishPrCompute(uint64_t id);
-    void advancePrRow(PrDescriptorState &state);
+    void schedulePrCompute(uint64_t id, uint64_t row, Cycles cycles);
+    void finishPrCompute(uint64_t id, uint64_t row);
+    void advancePrRow(PrDescriptorState &state, uint64_t row);
     void completePrDescriptor(uint64_t id);
     void completePrReconfiguration(uint64_t id);
     void notePrStall(PrDescriptorState &state);
@@ -484,6 +498,7 @@ class CIRA : public ClockedObject
     std::vector<uint64_t> pendingPrCoherentPackets;
     uint64_t reservedPrCsrSlots = 0;
     uint64_t pendingPrCsrPackets = 0;
+    std::set<Addr> pendingPrWriteLines;
     uint64_t prEpoch = 0;
     std::unordered_map<ThreadContext *, PrThreadConfig> prThreadConfigs;
     std::unordered_map<uint64_t, ThreadContext *> prReconfigurations;

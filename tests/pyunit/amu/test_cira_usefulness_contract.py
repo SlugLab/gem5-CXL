@@ -85,6 +85,26 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("const Tick policyReadyTick = state->policyReadyTick", source)
         self.assertIn("schedulePr(targetCore, policyReadyTick)", source)
 
+    def test_cira_pr_descriptor_uses_policy_row_window_for_execution(self):
+        source = CIRA_CC.read_text(encoding="utf-8")
+        header = CIRA_HH.read_text(encoding="utf-8")
+        self.assertIn("struct PrRowState", header)
+        self.assertIn("std::map<uint64_t, PrRowState> rows", header)
+        self.assertIn("uint64_t prRow", header)
+        self.assertIn("state.desc.row_window", source)
+        self.assertIn("processPrRow(state, it->second)", source)
+
+    def test_cira_serializes_partial_result_writes_per_cache_line(self):
+        source = CIRA_CC.read_text(encoding="utf-8")
+        header = CIRA_HH.read_text(encoding="utf-8")
+        self.assertIn("std::set<Addr> pendingPrWriteLines", header)
+        self.assertIn(
+            "if (pendingPrWriteLines.count(writeLine))", source
+        )
+        self.assertIn("pendingPrWriteLines.insert(writeLine)", source)
+        self.assertIn("pendingPrWriteLines.erase(writeLine)", source)
+        self.assertIn("pendingPrWriteLines.clear()", source)
+
     def test_csr_timing_walk_has_a_bounded_device_side_read_path(self):
         cira_py = CIRA_PY.read_text(encoding="utf-8")
         cira_hh = CIRA_HH.read_text(encoding="utf-8")

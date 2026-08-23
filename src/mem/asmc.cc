@@ -386,7 +386,7 @@ ASMC::issuePrRows(ThreadContext *tc, Addr desc_addr)
     state->id = id;
     state->tc = tc;
     state->desc = desc;
-    state->row = desc.row_begin;
+    state->nextRow = desc.row_begin;
     state->issueTick = curTick();
     state->reservedInitialPackets = initialPacketCount;
 
@@ -405,7 +405,8 @@ ASMC::issuePrRows(ThreadContext *tc, Addr desc_addr)
 }
 
 bool
-ASMC::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+ASMC::reservePrRead(PrDescriptorState &state, PrRowState &row,
+                    Addr addr, uint64_t size,
                     PrPacketRole role, uint64_t index, uint8_t *target)
 {
     (void)target;
@@ -454,8 +455,9 @@ ASMC::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
             PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
             pkt->allocate();
             pkt->senderState = new PacketSenderState(
-                state.id, role, index, chunk.offset + chunkOffset,
+                state.id, role, row.row, index, chunk.offset + chunkOffset,
                 packetSize, true);
+            ++row.pendingPackets;
             ++state.pendingPackets;
             ++pendingPrReads;
             enqueueFarPacket(pkt);
@@ -467,7 +469,7 @@ ASMC::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
 }
 
 bool
-ASMC::reservePrWrite(PrDescriptorState &state, Addr addr,
+ASMC::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                      const void *data, uint64_t size)
 {
     std::vector<TranslationChunk> chunks;
@@ -506,8 +508,9 @@ ASMC::reservePrWrite(PrDescriptorState &state, Addr addr,
             std::memcpy(pkt->getPtr<uint8_t>(),
                         bytes + chunk.offset + chunkOffset, packetSize);
             pkt->senderState = new PacketSenderState(
-                state.id, PrPacketRole::Result, 0,
+                state.id, PrPacketRole::Result, row.row, 0,
                 chunk.offset + chunkOffset, packetSize, false);
+            ++row.pendingPackets;
             ++state.pendingPackets;
             enqueueFarPacket(pkt);
             chunkOffset += packetSize;
@@ -552,76 +555,109 @@ ASMC::processPrDescriptors()
 bool
 ASMC::processPrDescriptor(PrDescriptorState &state)
 {
+    const uint64_t window = std::max<uint64_t>(
+        1, std::min<uint64_t>(state.desc.row_window,
+                              state.desc.row_count));
+    const uint64_t rowEnd = state.desc.row_begin + state.desc.row_count;
+    while (state.rows.size() < window && state.nextRow < rowEnd) {
+        PrRowState row;
+        row.row = state.nextRow++;
+        state.rows.emplace(row.row, std::move(row));
+    }
+
+    std::vector<uint64_t> activeRows;
+    activeRows.reserve(state.rows.size());
+    for (const auto &[row, unused] : state.rows)
+        activeRows.push_back(row);
+
+    bool retryWithoutResponse = false;
+    for (uint64_t rowId : activeRows) {
+        const auto it = state.rows.find(rowId);
+        if (it != state.rows.end())
+            retryWithoutResponse |= processPrRow(state, it->second);
+    }
+    if (state.completedRows == state.desc.row_count) {
+        completePrDescriptor(state.id);
+        return false;
+    }
+    if (state.rows.size() < window && state.nextRow < rowEnd)
+        retryWithoutResponse = true;
+    return retryWithoutResponse;
+}
+
+bool
+ASMC::processPrRow(PrDescriptorState &state, PrRowState &row)
+{
     while (true) {
-        switch (state.stage) {
+        switch (row.stage) {
           case PrStage::StartRow:
-            panic_if(state.pendingPackets != 0,
+            panic_if(row.pendingPackets != 0,
                      "ASMC PR row started with pending packets");
-            state.nextRead = 0;
-            state.neighbors.clear();
-            state.contributions.clear();
-            state.scoreData.fill(0);
-            state.degreeData.fill(0);
-            state.offsetsData.fill(0);
-            state.stage = state.desc.phase == PR_ROW_CONTRIB ?
+            row.nextRead = 0;
+            row.neighbors.clear();
+            row.contributions.clear();
+            row.scoreData.fill(0);
+            row.degreeData.fill(0);
+            row.offsetsData.fill(0);
+            row.stage = state.desc.phase == PR_ROW_CONTRIB ?
                 PrStage::ContribRead : PrStage::PullOffsets;
             continue;
 
           case PrStage::ContribRead:
-            while (state.nextRead < 2) {
-                const bool score = state.nextRead == 0;
+            while (row.nextRead < 2) {
+                const bool score = row.nextRead == 0;
                 const Addr base = score ? state.desc.scores_in_addr :
                                           state.desc.out_degree_addr;
                 const uint64_t width = score ? sizeof(float) :
                                                sizeof(int64_t);
-                const Addr addr = base + state.row * width;
+                const Addr addr = base + row.row * width;
                 if (!reservePrRead(
-                        state, addr, width,
+                        state, row, addr, width,
                         score ? PrPacketRole::Score : PrPacketRole::Degree,
-                        0, score ? state.scoreData.data() :
-                                   state.degreeData.data())) {
-                    return state.pendingPackets == 0;
+                        0, score ? row.scoreData.data() :
+                                   row.degreeData.data())) {
+                    return row.pendingPackets == 0;
                 }
-                ++state.nextRead;
+                ++row.nextRead;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            state.stage = PrStage::ContribCompute;
-            schedulePrCompute(state.id, prFpDivCycles);
+            row.stage = PrStage::ContribCompute;
+            schedulePrCompute(state.id, row.row, prFpDivCycles);
             return false;
 
           case PrStage::PullOffsets:
-            if (state.nextRead == 0) {
+            if (row.nextRead == 0) {
                 const Addr addr = state.desc.in_offsets_addr +
-                    state.row * sizeof(uint64_t);
-                if (!reservePrRead(state, addr, state.offsetsData.size(),
+                    row.row * sizeof(uint64_t);
+                if (!reservePrRead(state, row, addr, row.offsetsData.size(),
                                    PrPacketRole::Offsets, 0,
-                                   state.offsetsData.data())) {
-                    return state.pendingPackets == 0;
+                                   row.offsetsData.data())) {
+                    return row.pendingPackets == 0;
                 }
-                state.nextRead = 1;
+                row.nextRead = 1;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            std::memcpy(&state.edgeBegin, state.offsetsData.data(),
-                        sizeof(state.edgeBegin));
-            std::memcpy(&state.edgeEnd,
-                        state.offsetsData.data() + sizeof(state.edgeBegin),
-                        sizeof(state.edgeEnd));
-            panic_if(state.edgeEnd < state.edgeBegin ||
-                     state.edgeEnd - state.edgeBegin >
+            std::memcpy(&row.edgeBegin, row.offsetsData.data(),
+                        sizeof(row.edgeBegin));
+            std::memcpy(&row.edgeEnd,
+                        row.offsetsData.data() + sizeof(row.edgeBegin),
+                        sizeof(row.edgeEnd));
+            panic_if(row.edgeEnd < row.edgeBegin ||
+                     row.edgeEnd - row.edgeBegin >
                         std::numeric_limits<uint32_t>::max(),
                      "ASMC PR row has an invalid CSR edge interval");
-            state.neighbors.assign(state.edgeEnd - state.edgeBegin, 0);
-            state.contributions.assign(state.edgeEnd - state.edgeBegin,
+            row.neighbors.assign(row.edgeEnd - row.edgeBegin, 0);
+            row.contributions.assign(row.edgeEnd - row.edgeBegin,
                                        0.0f);
-            state.nextRead = 0;
-            state.stage = PrStage::PullNeighbors;
+            row.nextRead = 0;
+            row.stage = PrStage::PullNeighbors;
             continue;
 
           case PrStage::PullNeighbors:
-            while (state.nextRead < state.neighbors.size()) {
-                const uint64_t edge = state.edgeBegin + state.nextRead;
+            while (row.nextRead < row.neighbors.size()) {
+                const uint64_t edge = row.edgeBegin + row.nextRead;
                 panic_if(edge > std::numeric_limits<Addr>::max() /
                                     sizeof(int32_t) ||
                          state.desc.in_neighbors_addr >
@@ -631,17 +667,17 @@ ASMC::processPrDescriptor(PrDescriptorState &state)
                 const Addr addr = state.desc.in_neighbors_addr +
                     edge * sizeof(int32_t);
                 if (!reservePrRead(
-                        state, addr, sizeof(int32_t),
-                        PrPacketRole::Neighbor, state.nextRead,
+                        state, row, addr, sizeof(int32_t),
+                        PrPacketRole::Neighbor, row.nextRead,
                         reinterpret_cast<uint8_t *>(
-                            &state.neighbors[state.nextRead]))) {
-                    return state.pendingPackets == 0;
+                            &row.neighbors[row.nextRead]))) {
+                    return row.pendingPackets == 0;
                 }
-                ++state.nextRead;
+                ++row.nextRead;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            for (int32_t neighbor : state.neighbors) {
+            for (int32_t neighbor : row.neighbors) {
                 panic_if(neighbor < 0 ||
                          static_cast<uint64_t>(neighbor) >=
                             state.desc.node_count,
@@ -649,32 +685,32 @@ ASMC::processPrDescriptor(PrDescriptorState &state)
                          neighbor, static_cast<unsigned long long>(
                              state.desc.node_count));
             }
-            state.nextRead = 0;
-            state.stage = PrStage::PullContributions;
+            row.nextRead = 0;
+            row.stage = PrStage::PullContributions;
             continue;
 
           case PrStage::PullContributions:
-            while (state.nextRead < state.contributions.size()) {
+            while (row.nextRead < row.contributions.size()) {
                 const uint64_t neighbor = static_cast<uint64_t>(
-                    state.neighbors[state.nextRead]);
+                    row.neighbors[row.nextRead]);
                 const Addr addr = state.desc.contributions_addr +
                     neighbor * sizeof(float);
                 if (!reservePrRead(
-                        state, addr, sizeof(float),
-                        PrPacketRole::Contribution, state.nextRead,
+                        state, row, addr, sizeof(float),
+                        PrPacketRole::Contribution, row.nextRead,
                         reinterpret_cast<uint8_t *>(
-                            &state.contributions[state.nextRead]))) {
-                    return state.pendingPackets == 0;
+                            &row.contributions[row.nextRead]))) {
+                    return row.pendingPackets == 0;
                 }
-                ++state.nextRead;
+                ++row.nextRead;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            state.stage = PrStage::PullCompute;
+            row.stage = PrStage::PullCompute;
             schedulePrCompute(
-                state.id,
+                state.id, row.row,
                 Cycles(static_cast<uint64_t>(prFpAddCycles) *
-                           state.contributions.size() +
+                           row.contributions.size() +
                        static_cast<uint64_t>(prFpMulCycles) +
                        static_cast<uint64_t>(prFpAddCycles)));
             return false;
@@ -684,78 +720,77 @@ ASMC::processPrDescriptor(PrDescriptorState &state)
             return false;
 
           case PrStage::WriteResult:
-            if (state.nextRead == 0) {
+            if (row.nextRead == 0) {
                 const Addr base = state.desc.phase == PR_ROW_CONTRIB ?
                     state.desc.contributions_addr : state.desc.scores_out_addr;
-                const Addr addr = base + state.row * sizeof(float);
-                if (!reservePrWrite(state, addr, &state.result,
-                                    sizeof(state.result))) {
-                    return state.pendingPackets == 0;
+                const Addr addr = base + row.row * sizeof(float);
+                if (!reservePrWrite(state, row, addr, &row.result,
+                                    sizeof(row.result))) {
+                    return row.pendingPackets == 0;
                 }
-                state.nextRead = 1;
+                row.nextRead = 1;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            const uint64_t id = state.id;
-            advancePrRow(state);
-            return prOutstanding.count(id) != 0;
+            advancePrRow(state, row.row);
+            return false;
         }
     }
 }
 
 void
-ASMC::schedulePrCompute(uint64_t id, Cycles cycles)
+ASMC::schedulePrCompute(uint64_t id, uint64_t row, Cycles cycles)
 {
     const Tick ticks = cyclesToTicks(cycles);
     stats.prComputeTicks += ticks;
     auto *event = new EventFunctionWrapper(
-        [this, id] { finishPrCompute(id); },
-        csprintf("%s.pr_compute_%llu", name(),
-                 static_cast<unsigned long long>(id)), true);
+        [this, id, row] { finishPrCompute(id, row); },
+        csprintf("%s.pr_compute_%llu_%llu", name(),
+                 static_cast<unsigned long long>(id),
+                 static_cast<unsigned long long>(row)), true);
     schedule(event, curTick() + ticks);
 }
 
 void
-ASMC::finishPrCompute(uint64_t id)
+ASMC::finishPrCompute(uint64_t id, uint64_t rowId)
 {
     const auto it = prOutstanding.find(id);
     if (it == prOutstanding.end())
         return;
     PrDescriptorState &state = *it->second;
-    if (state.stage == PrStage::ContribCompute) {
+    const auto rowIt = state.rows.find(rowId);
+    if (rowIt == state.rows.end())
+        return;
+    PrRowState &row = rowIt->second;
+    if (row.stage == PrStage::ContribCompute) {
         float score = 0.0f;
         int64_t degree = 0;
-        std::memcpy(&score, state.scoreData.data(), sizeof(score));
-        std::memcpy(&degree, state.degreeData.data(), sizeof(degree));
-        state.result = prF32Div(score, static_cast<float>(degree));
+        std::memcpy(&score, row.scoreData.data(), sizeof(score));
+        std::memcpy(&degree, row.degreeData.data(), sizeof(degree));
+        row.result = prF32Div(score, static_cast<float>(degree));
     } else {
-        panic_if(state.stage != PrStage::PullCompute,
+        panic_if(row.stage != PrStage::PullCompute,
                  "ASMC PR compute event observed an invalid stage");
         float sum = 0.0f;
-        for (float contribution : state.contributions)
+        for (float contribution : row.contributions)
             sum = prF32Add(sum, contribution);
         float damping = 0.0f;
         float base = 0.0f;
         std::memcpy(&damping, &state.desc.damping_bits, sizeof(damping));
         std::memcpy(&base, &state.desc.base_score_bits, sizeof(base));
-        state.result = prF32Add(base, prF32Mul(damping, sum));
+        row.result = prF32Add(base, prF32Mul(damping, sum));
     }
-    state.stage = PrStage::WriteResult;
-    state.nextRead = 0;
+    row.stage = PrStage::WriteResult;
+    row.nextRead = 0;
     schedulePrService(curTick());
 }
 
 void
-ASMC::advancePrRow(PrDescriptorState &state)
+ASMC::advancePrRow(PrDescriptorState &state, uint64_t row)
 {
     ++stats.prRows;
-    ++state.row;
-    if (state.row == state.desc.row_begin + state.desc.row_count) {
-        completePrDescriptor(state.id);
-        return;
-    }
-    state.stage = PrStage::StartRow;
-    state.nextRead = 0;
+    ++state.completedRows;
+    state.rows.erase(row);
 }
 
 uint64_t
@@ -771,7 +806,8 @@ ASMC::completePrDescriptor(uint64_t id)
     if (it == prOutstanding.end())
         return;
     PrDescriptorState &state = *it->second;
-    panic_if(state.pendingPackets != 0,
+    panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
+             state.completedRows != state.desc.row_count,
              "ASMC completed PR descriptor with pending packets");
     panic_if(state.reservedInitialPackets != 0,
              "ASMC completed PR descriptor with reserved initial packets");
@@ -1526,8 +1562,12 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
     panic_if(it == prOutstanding.end(),
              "ASMC PR response has no active descriptor");
     PrDescriptorState &state = *it->second;
+    const auto rowIt = state.rows.find(sender_state->prRow);
+    panic_if(rowIt == state.rows.end(),
+             "ASMC PR response has no active row");
+    PrRowState &row = rowIt->second;
     panic_if(pkt->isError() || sender_state->size != pkt->getSize() ||
-             state.pendingPackets == 0,
+             state.pendingPackets == 0 || row.pendingPackets == 0,
              "ASMC PR response failed its packet contract");
 
     if (sender_state->read) {
@@ -1535,29 +1575,29 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
         uint64_t targetSize = 0;
         switch (sender_state->prRole) {
           case PrPacketRole::Score:
-            target = state.scoreData.data();
-            targetSize = state.scoreData.size();
+            target = row.scoreData.data();
+            targetSize = row.scoreData.size();
             break;
           case PrPacketRole::Degree:
-            target = state.degreeData.data();
-            targetSize = state.degreeData.size();
+            target = row.degreeData.data();
+            targetSize = row.degreeData.size();
             break;
           case PrPacketRole::Offsets:
-            target = state.offsetsData.data();
-            targetSize = state.offsetsData.size();
+            target = row.offsetsData.data();
+            targetSize = row.offsetsData.size();
             break;
           case PrPacketRole::Neighbor:
-            panic_if(sender_state->prIndex >= state.neighbors.size(),
+            panic_if(sender_state->prIndex >= row.neighbors.size(),
                      "ASMC PR neighbor response index is invalid");
             target = reinterpret_cast<uint8_t *>(
-                &state.neighbors[sender_state->prIndex]);
+                &row.neighbors[sender_state->prIndex]);
             targetSize = sizeof(int32_t);
             break;
           case PrPacketRole::Contribution:
-            panic_if(sender_state->prIndex >= state.contributions.size(),
+            panic_if(sender_state->prIndex >= row.contributions.size(),
                      "ASMC PR contribution response index is invalid");
             target = reinterpret_cast<uint8_t *>(
-                &state.contributions[sender_state->prIndex]);
+                &row.contributions[sender_state->prIndex]);
             targetSize = sizeof(float);
             break;
           case PrPacketRole::Result:
@@ -1574,6 +1614,7 @@ ASMC::recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state)
         panic_if(sender_state->prRole != PrPacketRole::Result,
                  "ASMC PR non-result write response");
     }
+    --row.pendingPackets;
     --state.pendingPackets;
 
     pkt->senderState = nullptr;

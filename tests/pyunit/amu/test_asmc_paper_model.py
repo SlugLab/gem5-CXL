@@ -83,10 +83,11 @@ class AsmcPaperModelTest(unittest.TestCase):
 
     def test_amu_pr_reschedules_each_row_and_reduces_in_csr_order(self):
         self.assertIn(
-            "return prOutstanding.count(id) != 0;", SOURCE
+            "state.completedRows == state.desc.row_count", SOURCE
         )
+        self.assertIn("state.rows.erase(row);", SOURCE)
         self.assertIn(
-            "for (float contribution : state.contributions)", SOURCE
+            "for (float contribution : row.contributions)", SOURCE
         )
         self.assertIn("sum = prF32Add(sum, contribution);", SOURCE)
         self.assertIn(
@@ -102,7 +103,7 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn(
             "reservedPrReadSlots += initialPacketCount", SOURCE
         )
-        self.assertIn("state.neighbors[sender_state->prIndex]", SOURCE)
+        self.assertIn("row.neighbors[sender_state->prIndex]", SOURCE)
         completion = SOURCE[
             SOURCE.index("ASMC::completePrDescriptor"):
             SOURCE.index("ASMC::configFor", SOURCE.index(
@@ -115,6 +116,13 @@ class AsmcPaperModelTest(unittest.TestCase):
             completion.index("!hasOutstanding"),
             completion.index("completionWaiters.erase(tc)"),
         )
+
+    def test_amu_pr_descriptor_uses_bounded_multi_row_window(self):
+        self.assertIn("struct PrRowState", HEADER)
+        self.assertIn("std::map<uint64_t, PrRowState> rows", HEADER)
+        self.assertIn("uint64_t prRow", HEADER)
+        self.assertIn("state.desc.row_window", SOURCE)
+        self.assertIn("processPrRow(state, it->second)", SOURCE)
         self.assertIn("PR_ROW_CONTRIB", PR_SMOKE)
         self.assertIn("PR_ROW_PULL", PR_SMOKE)
         self.assertIn("bits(next_scores[row]) != bits(expected)", PR_SMOKE)

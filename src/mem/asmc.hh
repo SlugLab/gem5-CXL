@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -128,27 +129,35 @@ class ASMC : public ClockedObject
         uint32_t reservedSpmPackets = 0;
     };
 
-    struct PrDescriptorState
+    struct PrRowState
     {
-        uint64_t id = 0;
-        ThreadContext *tc = nullptr;
-        pr_row_offload_desc desc = {};
         PrStage stage = PrStage::StartRow;
         uint64_t row = 0;
         uint64_t edgeBegin = 0;
         uint64_t edgeEnd = 0;
         uint64_t nextRead = 0;
         uint32_t pendingPackets = 0;
-        uint32_t reservedInitialPackets = 0;
-        Tick issueTick = 0;
-        Tick stallStart = 0;
-        bool queueStalled = false;
         std::array<uint8_t, 4> scoreData = {};
         std::array<uint8_t, 8> degreeData = {};
         std::array<uint8_t, 16> offsetsData = {};
         std::vector<int32_t> neighbors;
         std::vector<float> contributions;
         float result = 0.0f;
+    };
+
+    struct PrDescriptorState
+    {
+        uint64_t id = 0;
+        ThreadContext *tc = nullptr;
+        pr_row_offload_desc desc = {};
+        uint64_t nextRow = 0;
+        uint64_t completedRows = 0;
+        uint32_t pendingPackets = 0;
+        uint32_t reservedInitialPackets = 0;
+        Tick issueTick = 0;
+        Tick stallStart = 0;
+        bool queueStalled = false;
+        std::map<uint64_t, PrRowState> rows;
     };
 
     struct PacketSenderState : public Packet::SenderState
@@ -166,13 +175,13 @@ class ASMC : public ClockedObject
         {}
 
         PacketSenderState(uint64_t request_id, PrPacketRole role,
-                          uint64_t index, Addr byte_offset,
+                          uint64_t pr_row, uint64_t index, Addr byte_offset,
                           unsigned packet_size, bool is_read)
             : id(request_id), phase(RequestPhase::MemoryAccess),
               targetCore(InvalidPortID), byteOffset(byte_offset),
               size(packet_size), read(is_read), fragmentOffset(0),
               fragmentSize(packet_size), prPacket(true), prRole(role),
-              prIndex(index)
+              prRow(pr_row), prIndex(index)
         {}
 
         uint64_t id;
@@ -185,6 +194,7 @@ class ASMC : public ClockedObject
         unsigned fragmentSize;
         bool prPacket;
         PrPacketRole prRole;
+        uint64_t prRow = 0;
         uint64_t prIndex;
     };
 
@@ -253,17 +263,19 @@ class ASMC : public ClockedObject
                    uint64_t size) const;
     bool validatePrDescriptor(ThreadContext *tc,
                               const pr_row_offload_desc &desc) const;
-    bool reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+    bool reservePrRead(PrDescriptorState &state, PrRowState &row,
+                       Addr addr, uint64_t size,
                        PrPacketRole role, uint64_t index, uint8_t *target);
-    bool reservePrWrite(PrDescriptorState &state, Addr addr,
+    bool reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                         const void *data, uint64_t size);
     void processPrDescriptors();
     bool processPrDescriptor(PrDescriptorState &state);
+    bool processPrRow(PrDescriptorState &state, PrRowState &row);
     bool recvPrTimingResp(PacketPtr pkt, PacketSenderState *sender_state);
     void schedulePrService(Tick when);
-    void schedulePrCompute(uint64_t id, Cycles cycles);
-    void finishPrCompute(uint64_t id);
-    void advancePrRow(PrDescriptorState &state);
+    void schedulePrCompute(uint64_t id, uint64_t row, Cycles cycles);
+    void finishPrCompute(uint64_t id, uint64_t row);
+    void advancePrRow(PrDescriptorState &state, uint64_t row);
     void completePrDescriptor(uint64_t id);
     uint64_t totalOutstanding() const;
     ThreadConfig &configFor(ThreadContext *tc);

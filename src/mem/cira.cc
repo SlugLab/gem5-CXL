@@ -969,7 +969,7 @@ CIRA::issuePrRows(ThreadContext *tc, Addr desc_addr)
     state->targetCore = targetCore;
     state->tc = tc;
     state->desc = desc;
-    state->row = desc.row_begin;
+    state->nextRow = desc.row_begin;
     state->issueTick = curTick();
     const uint64_t policyPpm =
         prPolicyCostPpm(desc.row_window, desc.lead_blocks);
@@ -1025,7 +1025,8 @@ CIRA::clearPrStall(PrDescriptorState &state)
 }
 
 bool
-CIRA::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
+CIRA::reservePrRead(PrDescriptorState &state, PrRowState &row,
+                    Addr addr, uint64_t size,
                     PrPacketRole route, PrPayloadRole payload,
                     uint64_t index)
 {
@@ -1086,8 +1087,9 @@ CIRA::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
             PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
             pkt->allocate();
             pkt->senderState = new PacketSenderState(
-                route, payload, state.id, state.targetCore, index,
+                route, payload, state.id, state.targetCore, row.row, index,
                 chunk.offset + chunkOffset);
+            ++row.pendingPackets;
             ++state.pendingPackets;
             if (csr) {
                 ++pendingPrCsrPackets;
@@ -1107,13 +1109,20 @@ CIRA::reservePrRead(PrDescriptorState &state, Addr addr, uint64_t size,
 }
 
 bool
-CIRA::reservePrWrite(PrDescriptorState &state, Addr addr,
+CIRA::reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                      const void *data, uint64_t size)
 {
     std::vector<TranslationChunk> chunks;
     if (!translatePr(state.tc, addr, size, BaseMMU::Write, false, chunks))
         panic("CIRA accepted PR descriptor encountered a write fault");
     const uint32_t packets = countPackets(chunks);
+    panic_if(packets != 1,
+             "CIRA PR scalar result write crossed a cache line");
+    const Addr writeLine = chunks.front().paddr & ~(cacheLineSize - 1);
+    if (pendingPrWriteLines.count(writeLine)) {
+        notePrStall(state);
+        return false;
+    }
     const uint64_t queued = sendQueues[state.targetCore].size() +
         (retryPkts[state.targetCore] ? 1 : 0) +
         reservedPrCoherentSlots[state.targetCore];
@@ -1125,6 +1134,7 @@ CIRA::reservePrWrite(PrDescriptorState &state, Addr addr,
         return false;
     }
     clearPrStall(state);
+    pendingPrWriteLines.insert(writeLine);
 
     const auto *bytes = static_cast<const uint8_t *>(data);
     for (const auto &chunk : chunks) {
@@ -1144,8 +1154,9 @@ CIRA::reservePrWrite(PrDescriptorState &state, Addr addr,
                         bytes + chunk.offset + chunkOffset, packetSize);
             pkt->senderState = new PacketSenderState(
                 PrPacketRole::CoherentWrite, PrPayloadRole::Result,
-                state.id, state.targetCore, 0,
+                state.id, state.targetCore, row.row, 0,
                 chunk.offset + chunkOffset);
+            ++row.pendingPackets;
             ++state.pendingPackets;
             ++pendingPrCoherentPackets[state.targetCore];
             enqueuePacket(state.targetCore, pkt);
@@ -1197,77 +1208,110 @@ CIRA::processPrDescriptor(PrDescriptorState &state)
         schedulePr(state.targetCore, state.policyReadyTick);
         return false;
     }
+    const uint64_t window = std::max<uint64_t>(
+        1, std::min<uint64_t>(state.desc.row_window,
+                              state.desc.row_count));
+    const uint64_t rowEnd = state.desc.row_begin + state.desc.row_count;
+    while (state.rows.size() < window && state.nextRow < rowEnd) {
+        PrRowState row;
+        row.row = state.nextRow++;
+        state.rows.emplace(row.row, std::move(row));
+    }
+
+    std::vector<uint64_t> activeRows;
+    activeRows.reserve(state.rows.size());
+    for (const auto &[row, unused] : state.rows)
+        activeRows.push_back(row);
+
+    bool retryWithoutResponse = false;
+    for (uint64_t rowId : activeRows) {
+        const auto it = state.rows.find(rowId);
+        if (it != state.rows.end())
+            retryWithoutResponse |= processPrRow(state, it->second);
+    }
+    if (state.completedRows == state.desc.row_count) {
+        completePrDescriptor(state.id);
+        return false;
+    }
+    if (state.rows.size() < window && state.nextRow < rowEnd)
+        retryWithoutResponse = true;
+    return retryWithoutResponse;
+}
+
+bool
+CIRA::processPrRow(PrDescriptorState &state, PrRowState &row)
+{
     while (true) {
-        switch (state.stage) {
+        switch (row.stage) {
           case PrStage::StartRow:
-            panic_if(state.pendingPackets != 0,
+            panic_if(row.pendingPackets != 0,
                      "CIRA PR row started with pending packets");
-            state.nextRead = 0;
-            state.neighbors.clear();
-            state.contributions.clear();
-            state.scoreData.fill(0);
-            state.degreeData.fill(0);
-            state.offsetsData.fill(0);
-            state.stage = state.desc.phase == PR_ROW_CONTRIB ?
+            row.nextRead = 0;
+            row.neighbors.clear();
+            row.contributions.clear();
+            row.scoreData.fill(0);
+            row.degreeData.fill(0);
+            row.offsetsData.fill(0);
+            row.stage = state.desc.phase == PR_ROW_CONTRIB ?
                 PrStage::ContribRead : PrStage::PullOffsets;
             continue;
 
           case PrStage::ContribRead:
-            while (state.nextRead < 2) {
-                const bool score = state.nextRead == 0;
+            while (row.nextRead < 2) {
+                const bool score = row.nextRead == 0;
                 const Addr base = score ? state.desc.scores_in_addr :
                                           state.desc.out_degree_addr;
                 const uint64_t width = score ? sizeof(float) :
                                                sizeof(int64_t);
                 if (!reservePrRead(
-                        state, base + state.row * width, width,
+                        state, row, base + row.row * width, width,
                         score ? PrPacketRole::CoherentRead :
                                 PrPacketRole::CsrRead,
                         score ? PrPayloadRole::Score :
                                 PrPayloadRole::Degree,
                         0)) {
-                    return state.pendingPackets == 0;
+                    return row.pendingPackets == 0;
                 }
-                ++state.nextRead;
+                ++row.nextRead;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            state.stage = PrStage::ContribCompute;
-            schedulePrCompute(state.id, prFpDivCycles);
+            row.stage = PrStage::ContribCompute;
+            schedulePrCompute(state.id, row.row, prFpDivCycles);
             return false;
 
           case PrStage::PullOffsets:
-            if (state.nextRead == 0) {
+            if (row.nextRead == 0) {
                 const Addr addr = state.desc.in_offsets_addr +
-                    state.row * sizeof(uint64_t);
+                    row.row * sizeof(uint64_t);
                 if (!reservePrRead(
-                        state, addr, state.offsetsData.size(),
+                        state, row, addr, row.offsetsData.size(),
                         PrPacketRole::CsrRead, PrPayloadRole::Offsets, 0)) {
-                    return state.pendingPackets == 0;
+                    return row.pendingPackets == 0;
                 }
-                state.nextRead = 1;
+                row.nextRead = 1;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            std::memcpy(&state.edgeBegin, state.offsetsData.data(),
-                        sizeof(state.edgeBegin));
-            std::memcpy(&state.edgeEnd,
-                        state.offsetsData.data() + sizeof(state.edgeBegin),
-                        sizeof(state.edgeEnd));
-            panic_if(state.edgeEnd < state.edgeBegin ||
-                     state.edgeEnd - state.edgeBegin >
+            std::memcpy(&row.edgeBegin, row.offsetsData.data(),
+                        sizeof(row.edgeBegin));
+            std::memcpy(&row.edgeEnd,
+                        row.offsetsData.data() + sizeof(row.edgeBegin),
+                        sizeof(row.edgeEnd));
+            panic_if(row.edgeEnd < row.edgeBegin ||
+                     row.edgeEnd - row.edgeBegin >
                         std::numeric_limits<uint32_t>::max(),
                      "CIRA PR row has an invalid CSR edge interval");
-            state.neighbors.assign(state.edgeEnd - state.edgeBegin, 0);
-            state.contributions.assign(state.edgeEnd - state.edgeBegin,
+            row.neighbors.assign(row.edgeEnd - row.edgeBegin, 0);
+            row.contributions.assign(row.edgeEnd - row.edgeBegin,
                                        0.0f);
-            state.nextRead = 0;
-            state.stage = PrStage::PullNeighbors;
+            row.nextRead = 0;
+            row.stage = PrStage::PullNeighbors;
             continue;
 
           case PrStage::PullNeighbors:
-            while (state.nextRead < state.neighbors.size()) {
-                const uint64_t edge = state.edgeBegin + state.nextRead;
+            while (row.nextRead < row.neighbors.size()) {
+                const uint64_t edge = row.edgeBegin + row.nextRead;
                 panic_if(edge > std::numeric_limits<Addr>::max() /
                                     sizeof(int32_t) ||
                          state.desc.in_neighbors_addr >
@@ -1275,17 +1319,17 @@ CIRA::processPrDescriptor(PrDescriptorState &state)
                                 edge * sizeof(int32_t),
                          "CIRA PR neighbor address overflow");
                 if (!reservePrRead(
-                        state,
+                        state, row,
                         state.desc.in_neighbors_addr + edge * sizeof(int32_t),
                         sizeof(int32_t), PrPacketRole::CsrRead,
-                        PrPayloadRole::Neighbor, state.nextRead)) {
-                    return state.pendingPackets == 0;
+                        PrPayloadRole::Neighbor, row.nextRead)) {
+                    return row.pendingPackets == 0;
                 }
-                ++state.nextRead;
+                ++row.nextRead;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            for (int32_t neighbor : state.neighbors) {
+            for (int32_t neighbor : row.neighbors) {
                 panic_if(neighbor < 0 ||
                          static_cast<uint64_t>(neighbor) >=
                             state.desc.node_count,
@@ -1293,31 +1337,31 @@ CIRA::processPrDescriptor(PrDescriptorState &state)
                          neighbor, static_cast<unsigned long long>(
                              state.desc.node_count));
             }
-            state.nextRead = 0;
-            state.stage = PrStage::PullContributions;
+            row.nextRead = 0;
+            row.stage = PrStage::PullContributions;
             continue;
 
           case PrStage::PullContributions:
-            while (state.nextRead < state.contributions.size()) {
+            while (row.nextRead < row.contributions.size()) {
                 const uint64_t neighbor = static_cast<uint64_t>(
-                    state.neighbors[state.nextRead]);
+                    row.neighbors[row.nextRead]);
                 if (!reservePrRead(
-                        state,
+                        state, row,
                         state.desc.contributions_addr +
                             neighbor * sizeof(float),
                         sizeof(float), PrPacketRole::CoherentRead,
-                        PrPayloadRole::Contribution, state.nextRead)) {
-                    return state.pendingPackets == 0;
+                        PrPayloadRole::Contribution, row.nextRead)) {
+                    return row.pendingPackets == 0;
                 }
-                ++state.nextRead;
+                ++row.nextRead;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            state.stage = PrStage::PullCompute;
+            row.stage = PrStage::PullCompute;
             schedulePrCompute(
-                state.id,
+                state.id, row.row,
                 Cycles(static_cast<uint64_t>(prFpAddCycles) *
-                           state.contributions.size() +
+                           row.contributions.size() +
                        static_cast<uint64_t>(prFpMulCycles) +
                        static_cast<uint64_t>(prFpAddCycles)));
             return false;
@@ -1327,27 +1371,26 @@ CIRA::processPrDescriptor(PrDescriptorState &state)
             return false;
 
           case PrStage::WriteResult:
-            if (state.nextRead == 0) {
+            if (row.nextRead == 0) {
                 const Addr base = state.desc.phase == PR_ROW_CONTRIB ?
                     state.desc.contributions_addr : state.desc.scores_out_addr;
                 if (!reservePrWrite(
-                        state, base + state.row * sizeof(float),
-                        &state.result, sizeof(state.result))) {
-                    return state.pendingPackets == 0;
+                        state, row, base + row.row * sizeof(float),
+                        &row.result, sizeof(row.result))) {
+                    return row.pendingPackets == 0;
                 }
-                state.nextRead = 1;
+                row.nextRead = 1;
             }
-            if (state.pendingPackets != 0)
+            if (row.pendingPackets != 0)
                 return false;
-            const uint64_t id = state.id;
-            advancePrRow(state);
-            return prOutstanding.count(id) != 0;
+            advancePrRow(state, row.row);
+            return false;
         }
     }
 }
 
 void
-CIRA::schedulePrCompute(uint64_t id, Cycles cycles)
+CIRA::schedulePrCompute(uint64_t id, uint64_t row, Cycles cycles)
 {
     const auto it = prOutstanding.find(id);
     if (it == prOutstanding.end())
@@ -1358,59 +1401,59 @@ CIRA::schedulePrCompute(uint64_t id, Cycles cycles)
     stats.prComputeTicksPerCore[core] += ticks;
     const uint64_t epoch = prEpoch;
     auto *event = new EventFunctionWrapper(
-        [this, id, epoch] {
+        [this, id, row, epoch] {
             if (epoch == prEpoch)
-                finishPrCompute(id);
+                finishPrCompute(id, row);
         },
-        csprintf("%s.pr_compute_%llu", name(),
-                 static_cast<unsigned long long>(id)), true);
+        csprintf("%s.pr_compute_%llu_%llu", name(),
+                 static_cast<unsigned long long>(id),
+                 static_cast<unsigned long long>(row)), true);
     schedule(event, curTick() + ticks);
 }
 
 void
-CIRA::finishPrCompute(uint64_t id)
+CIRA::finishPrCompute(uint64_t id, uint64_t rowId)
 {
     const auto it = prOutstanding.find(id);
     if (it == prOutstanding.end())
         return;
     PrDescriptorState &state = *it->second;
-    if (state.stage == PrStage::ContribCompute) {
+    const auto rowIt = state.rows.find(rowId);
+    if (rowIt == state.rows.end())
+        return;
+    PrRowState &row = rowIt->second;
+    if (row.stage == PrStage::ContribCompute) {
         float score = 0.0f;
         int64_t degree = 0;
-        std::memcpy(&score, state.scoreData.data(), sizeof(score));
-        std::memcpy(&degree, state.degreeData.data(), sizeof(degree));
-        state.result = prF32Div(score, static_cast<float>(degree));
+        std::memcpy(&score, row.scoreData.data(), sizeof(score));
+        std::memcpy(&degree, row.degreeData.data(), sizeof(degree));
+        row.result = prF32Div(score, static_cast<float>(degree));
     } else {
-        panic_if(state.stage != PrStage::PullCompute,
+        panic_if(row.stage != PrStage::PullCompute,
                  "CIRA PR compute event observed an invalid stage");
         float sum = 0.0f;
-        for (float contribution : state.contributions)
+        for (float contribution : row.contributions)
             sum = prF32Add(sum, contribution);
         float damping = 0.0f;
         float base = 0.0f;
         std::memcpy(&damping, &state.desc.damping_bits, sizeof(damping));
         std::memcpy(&base, &state.desc.base_score_bits, sizeof(base));
-        state.result = prF32Add(base, prF32Mul(damping, sum));
+        row.result = prF32Add(base, prF32Mul(damping, sum));
     }
-    state.stage = PrStage::WriteResult;
-    state.nextRead = 0;
+    row.stage = PrStage::WriteResult;
+    row.nextRead = 0;
     schedulePr(state.targetCore, curTick());
 }
 
 void
-CIRA::advancePrRow(PrDescriptorState &state)
+CIRA::advancePrRow(PrDescriptorState &state, uint64_t row)
 {
     ++stats.prRows;
     ++stats.prRowsPerCore[state.targetCore];
     ++stats.usefulHoists;
     ++stats.usefulHoistsPerCore[state.targetCore];
-    ++state.row;
-    if (state.row == state.desc.row_begin + state.desc.row_count) {
-        completePrDescriptor(state.id);
-        return;
-    }
-    state.stage = PrStage::StartRow;
-    state.nextRead = 0;
+    ++state.completedRows;
+    state.rows.erase(row);
 }
 
 void
@@ -1420,7 +1463,8 @@ CIRA::completePrDescriptor(uint64_t id)
     if (it == prOutstanding.end())
         return;
     PrDescriptorState &state = *it->second;
-    panic_if(state.pendingPackets != 0 ||
+    panic_if(state.pendingPackets != 0 || !state.rows.empty() ||
+             state.completedRows != state.desc.row_count ||
              state.reservedInitialCsrPackets != 0 ||
              state.reservedInitialCoherentPackets != 0,
              "CIRA completed PR descriptor with outstanding credits");
@@ -1998,7 +2042,12 @@ CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
     panic_if(it == prOutstanding.end(),
              "CIRA PR coherent response has no descriptor");
     PrDescriptorState &state = *it->second;
+    const auto rowIt = state.rows.find(senderState->prRow);
+    panic_if(rowIt == state.rows.end(),
+             "CIRA PR coherent response has no active row");
+    PrRowState &row = rowIt->second;
     panic_if(pkt->isError() || state.pendingPackets == 0 ||
+             row.pendingPackets == 0 ||
              pendingPrCoherentPackets[targetCore] == 0,
              "CIRA PR coherent response failed its packet contract");
 
@@ -2007,14 +2056,14 @@ CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
         uint64_t targetSize = 0;
         switch (senderState->prPayload) {
           case PrPayloadRole::Score:
-            target = state.scoreData.data();
-            targetSize = state.scoreData.size();
+            target = row.scoreData.data();
+            targetSize = row.scoreData.size();
             break;
           case PrPayloadRole::Contribution:
-            panic_if(senderState->prIndex >= state.contributions.size(),
+            panic_if(senderState->prIndex >= row.contributions.size(),
                      "CIRA PR contribution response index is invalid");
             target = reinterpret_cast<uint8_t *>(
-                &state.contributions[senderState->prIndex]);
+                &row.contributions[senderState->prIndex]);
             targetSize = sizeof(float);
             break;
           default:
@@ -2027,8 +2076,12 @@ CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
     } else {
         panic_if(senderState->prPayload != PrPayloadRole::Result,
                  "CIRA PR coherent write has an invalid payload role");
+        const Addr writeLine = pkt->getAddr() & ~(cacheLineSize - 1);
+        panic_if(pendingPrWriteLines.erase(writeLine) != 1,
+                 "CIRA PR coherent write line was not reserved");
     }
     --pendingPrCoherentPackets[targetCore];
+    --row.pendingPackets;
     --state.pendingPackets;
     pkt->senderState = nullptr;
     delete senderState;
@@ -2047,7 +2100,12 @@ CIRA::recvPrCsrTimingResp(PacketPtr pkt,
     panic_if(it == prOutstanding.end(),
              "CIRA PR CSR response has no descriptor");
     PrDescriptorState &state = *it->second;
+    const auto rowIt = state.rows.find(senderState->prRow);
+    panic_if(rowIt == state.rows.end(),
+             "CIRA PR CSR response has no active row");
+    PrRowState &row = rowIt->second;
     panic_if(pkt->isError() || state.pendingPackets == 0 ||
+             row.pendingPackets == 0 ||
              pendingPrCsrPackets == 0 ||
              state.targetCore != senderState->targetCore,
              "CIRA PR CSR response failed its packet contract");
@@ -2056,18 +2114,18 @@ CIRA::recvPrCsrTimingResp(PacketPtr pkt,
     uint64_t targetSize = 0;
     switch (senderState->prPayload) {
       case PrPayloadRole::Degree:
-        target = state.degreeData.data();
-        targetSize = state.degreeData.size();
+        target = row.degreeData.data();
+        targetSize = row.degreeData.size();
         break;
       case PrPayloadRole::Offsets:
-        target = state.offsetsData.data();
-        targetSize = state.offsetsData.size();
+        target = row.offsetsData.data();
+        targetSize = row.offsetsData.size();
         break;
       case PrPayloadRole::Neighbor:
-        panic_if(senderState->prIndex >= state.neighbors.size(),
+        panic_if(senderState->prIndex >= row.neighbors.size(),
                  "CIRA PR neighbor response index is invalid");
         target = reinterpret_cast<uint8_t *>(
-            &state.neighbors[senderState->prIndex]);
+            &row.neighbors[senderState->prIndex]);
         targetSize = sizeof(int32_t);
         break;
       default:
@@ -2078,6 +2136,7 @@ CIRA::recvPrCsrTimingResp(PacketPtr pkt,
     std::memcpy(target + senderState->dataOffset,
                 pkt->getConstPtr<uint8_t>(), pkt->getSize());
     --pendingPrCsrPackets;
+    --row.pendingPackets;
     --state.pendingPackets;
     const PortID core = state.targetCore;
     pkt->senderState = nullptr;
@@ -2346,6 +2405,7 @@ CIRA::reset()
               pendingPrCoherentPackets.end(), 0);
     reservedPrCsrSlots = 0;
     pendingPrCsrPackets = 0;
+    pendingPrWriteLines.clear();
     prThreadConfigs.clear();
     prReconfigurations.clear();
     stats.prOutstandingWork = 0;
