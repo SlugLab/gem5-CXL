@@ -138,6 +138,7 @@ def build_identity(options, selected):
         REPO / "util/amu",
         REPO / "util/cira",
         REPO / "scripts/pr_offload_contract.py",
+        REPO / "scripts/m2ndp_pagerank_trace.py",
         Path(__file__).resolve(),
     )
     source_digest = hashlib.sha256()

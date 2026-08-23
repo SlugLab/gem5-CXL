@@ -9,6 +9,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from scripts import run_pr_asymmetric_offload as runner
 
@@ -65,6 +66,28 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         identity = runner.build_identity(self.options, selected)
         self.assertEqual(identity["source_inputs_sha256"], sha(self.inputs))
         self.assertEqual(identity["selected_inputs_sha256"], sha(path))
+
+    def test_identity_changes_when_m2ndp_trace_generator_changes(self):
+        selected = runner.select_inputs(self.options)
+        repository = self.root / "repository"
+        for relative in (
+            "util/pr_offload/source",
+            "util/amu/source",
+            "util/cira/source",
+            "util/m2ndp/patches/patch",
+            "scripts/pr_offload_contract.py",
+            "scripts/m2ndp_pagerank_trace.py",
+        ):
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(relative + "\n")
+        with mock.patch.object(runner, "REPO", repository):
+            before = runner.build_identity(self.options, selected)
+            (repository / "scripts/m2ndp_pagerank_trace.py").write_text(
+                "changed trace generator\n"
+            )
+            after = runner.build_identity(self.options, selected)
+        self.assertNotEqual(before["source_sha256"], after["source_sha256"])
 
     def test_missing_reordered_or_changed_formal_graph_fails_closed(self):
         source = json.loads(self.inputs.read_text())
