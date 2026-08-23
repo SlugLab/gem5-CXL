@@ -537,19 +537,16 @@ void
 ASMC::processPrDescriptors()
 {
     const size_t descriptors = prServiceQueue.size();
-    bool retryWithoutResponse = false;
     for (size_t index = 0; index < descriptors; ++index) {
         const uint64_t id = prServiceQueue.front();
         prServiceQueue.pop_front();
         const auto it = prOutstanding.find(id);
         if (it == prOutstanding.end())
             continue;
-        retryWithoutResponse |= processPrDescriptor(*it->second);
+        processPrDescriptor(*it->second);
         if (prOutstanding.count(id))
             prServiceQueue.push_back(id);
     }
-    if (retryWithoutResponse)
-        schedulePrService(clockEdge(Cycles(1)));
 }
 
 bool
@@ -570,19 +567,16 @@ ASMC::processPrDescriptor(PrDescriptorState &state)
     for (const auto &[row, unused] : state.rows)
         activeRows.push_back(row);
 
-    bool retryWithoutResponse = false;
     for (uint64_t rowId : activeRows) {
         const auto it = state.rows.find(rowId);
         if (it != state.rows.end())
-            retryWithoutResponse |= processPrRow(state, it->second);
+            processPrRow(state, it->second);
     }
     if (state.completedRows == state.desc.row_count) {
         completePrDescriptor(state.id);
         return false;
     }
-    if (state.rows.size() < window && state.nextRow < rowEnd)
-        retryWithoutResponse = true;
-    return retryWithoutResponse;
+    return false;
 }
 
 bool
@@ -791,6 +785,7 @@ ASMC::advancePrRow(PrDescriptorState &state, uint64_t row)
     ++stats.prRows;
     ++state.completedRows;
     state.rows.erase(row);
+    schedulePrService(curTick());
 }
 
 uint64_t

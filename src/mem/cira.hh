@@ -417,6 +417,7 @@ class CIRA : public ClockedObject
     bool reservePrWrite(PrDescriptorState &state, PrRowState &row, Addr addr,
                         const void *data, uint64_t size);
     void schedulePr(PortID targetCore, Tick when);
+    void scheduleAllPr(Tick when);
     void processPr(PortID targetCore);
     bool processPrDescriptor(PrDescriptorState &state);
     bool processPrRow(PrDescriptorState &state, PrRowState &row);

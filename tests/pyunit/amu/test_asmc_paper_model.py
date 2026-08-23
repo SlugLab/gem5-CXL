@@ -123,6 +123,14 @@ class AsmcPaperModelTest(unittest.TestCase):
         self.assertIn("uint64_t prRow", HEADER)
         self.assertIn("state.desc.row_window", SOURCE)
         self.assertIn("processPrRow(state, it->second)", SOURCE)
+        self.assertNotIn(
+            "schedulePrService(clockEdge(Cycles(1)))", SOURCE
+        )
+        advance = SOURCE[
+            SOURCE.index("ASMC::advancePrRow"):
+            SOURCE.index("ASMC::totalOutstanding")
+        ]
+        self.assertIn("schedulePrService(curTick())", advance)
         self.assertIn("PR_ROW_CONTRIB", PR_SMOKE)
         self.assertIn("PR_ROW_PULL", PR_SMOKE)
         self.assertIn("bits(next_scores[row]) != bits(expected)", PR_SMOKE)

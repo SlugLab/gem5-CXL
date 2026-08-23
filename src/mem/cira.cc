@@ -1182,23 +1182,27 @@ CIRA::schedulePr(PortID targetCore, Tick when)
 }
 
 void
+CIRA::scheduleAllPr(Tick when)
+{
+    for (PortID core = 0; core < prDescriptors.size(); ++core)
+        schedulePr(core, when);
+}
+
+void
 CIRA::processPr(PortID targetCore)
 {
     auto &queue = prDescriptors[targetCore];
     const size_t descriptors = queue.size();
-    bool retryWithoutResponse = false;
     for (size_t index = 0; index < descriptors; ++index) {
         const uint64_t id = queue.front();
         queue.pop_front();
         const auto it = prOutstanding.find(id);
         if (it == prOutstanding.end())
             continue;
-        retryWithoutResponse |= processPrDescriptor(*it->second);
+        processPrDescriptor(*it->second);
         if (prOutstanding.count(id))
             queue.push_back(id);
     }
-    if (retryWithoutResponse)
-        schedulePr(targetCore, clockEdge(Cycles(1)));
 }
 
 bool
@@ -1223,19 +1227,16 @@ CIRA::processPrDescriptor(PrDescriptorState &state)
     for (const auto &[row, unused] : state.rows)
         activeRows.push_back(row);
 
-    bool retryWithoutResponse = false;
     for (uint64_t rowId : activeRows) {
         const auto it = state.rows.find(rowId);
         if (it != state.rows.end())
-            retryWithoutResponse |= processPrRow(state, it->second);
+            processPrRow(state, it->second);
     }
     if (state.completedRows == state.desc.row_count) {
         completePrDescriptor(state.id);
         return false;
     }
-    if (state.rows.size() < window && state.nextRow < rowEnd)
-        retryWithoutResponse = true;
-    return retryWithoutResponse;
+    return false;
 }
 
 bool
@@ -1454,6 +1455,7 @@ CIRA::advancePrRow(PrDescriptorState &state, uint64_t row)
     ++stats.usefulHoistsPerCore[state.targetCore];
     ++state.completedRows;
     state.rows.erase(row);
+    schedulePr(state.targetCore, curTick());
 }
 
 void
@@ -2083,10 +2085,15 @@ CIRA::recvPrTimingResp(PortID targetCore, PacketPtr pkt,
     --pendingPrCoherentPackets[targetCore];
     --row.pendingPackets;
     --state.pendingPackets;
+    const bool releasedWriteLine =
+        senderState->prRole == PrPacketRole::CoherentWrite;
     pkt->senderState = nullptr;
     delete senderState;
     delete pkt;
-    schedulePr(targetCore, curTick());
+    if (releasedWriteLine)
+        scheduleAllPr(curTick());
+    else
+        schedulePr(targetCore, curTick());
     return true;
 }
 
@@ -2138,11 +2145,10 @@ CIRA::recvPrCsrTimingResp(PacketPtr pkt,
     --pendingPrCsrPackets;
     --row.pendingPackets;
     --state.pendingPackets;
-    const PortID core = state.targetCore;
     pkt->senderState = nullptr;
     delete senderState;
     delete pkt;
-    schedulePr(core, curTick());
+    scheduleAllPr(curTick());
     return true;
 }
 

@@ -93,6 +93,10 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("uint64_t prRow", header)
         self.assertIn("state.desc.row_window", source)
         self.assertIn("processPrRow(state, it->second)", source)
+        self.assertNotIn(
+            "schedulePr(targetCore, clockEdge(Cycles(1)))", source
+        )
+        self.assertIn("scheduleAllPr(curTick())", source)
 
     def test_cira_serializes_partial_result_writes_per_cache_line(self):
         source = CIRA_CC.read_text(encoding="utf-8")
