@@ -281,12 +281,6 @@ def validate_row(
     if _integer(row, "sim_ticks") <= 0:
         raise VariantRunError(f"{kind} sim_ticks must be positive")
     if kind == "amu":
-        issued = _integer(row, "asmc_loads")
-        completed = _integer(row, "asmc_completed")
-        logical_values = _integer(row, "amu_logical_values")
-        line_requests = _integer(row, "amu_line_requests")
-        cache_hits = _integer(row, "amu_line_cache_hits")
-        coalesced_misses = _integer(row, "amu_coalesced_misses")
         errors = sum(_integer(row, field) for field in (
             "asmc_queue_full_errors",
             "asmc_spm_full_errors",
@@ -298,23 +292,52 @@ def validate_row(
             raise VariantRunError(
                 f"AMU error counters are nonzero: {errors}"
             )
-        if issued <= 0 or issued != completed:
-            raise VariantRunError(
-                f"AMU issued/completed load mismatch: {issued}/{completed}"
-            )
-        if line_requests != issued:
-            raise VariantRunError(
-                "AMU line requests differ from issued loads"
-            )
-        if not 0 < line_requests < logical_values:
-            raise VariantRunError(
-                "AMU requires fewer line requests than logical values"
-            )
-        if row.get("scale") in (12, 14, 20):
-            if cache_hits <= 0:
-                raise VariantRunError("AMU cache hits must be nonzero")
-            if coalesced_misses <= 0:
-                raise VariantRunError("AMU coalesced misses must be nonzero")
+        descriptors = _integer(row, "pr_issued_descriptors")
+        if descriptors > 0:
+            completed = _integer(row, "pr_completed_descriptors")
+            if descriptors != completed:
+                raise VariantRunError(
+                    "AMU PR issued/completed descriptor mismatch: "
+                    f"{descriptors}/{completed}"
+                )
+            if (
+                _integer(row, "pr_rows") <= 0
+                or _integer(row, "pr_read_packets") <= 0
+                or _integer(row, "pr_write_packets") <= 0
+            ):
+                raise VariantRunError("AMU PR descriptor path is inactive")
+            if (
+                _integer(row, "pr_outstanding_work") != 0
+                or _integer(row, "pr_rejected_descriptors") != 0
+            ):
+                raise VariantRunError("AMU PR descriptor path did not drain")
+        else:
+            issued = _integer(row, "asmc_loads")
+            completed = _integer(row, "asmc_completed")
+            logical_values = _integer(row, "amu_logical_values")
+            line_requests = _integer(row, "amu_line_requests")
+            cache_hits = _integer(row, "amu_line_cache_hits")
+            coalesced_misses = _integer(row, "amu_coalesced_misses")
+            if issued <= 0 or issued != completed:
+                raise VariantRunError(
+                    "AMU issued/completed load mismatch: "
+                    f"{issued}/{completed}"
+                )
+            if line_requests != issued:
+                raise VariantRunError(
+                    "AMU line requests differ from issued loads"
+                )
+            if not 0 < line_requests < logical_values:
+                raise VariantRunError(
+                    "AMU requires fewer line requests than logical values"
+                )
+            if row.get("scale") in (12, 14, 20):
+                if cache_hits <= 0:
+                    raise VariantRunError("AMU cache hits must be nonzero")
+                if coalesced_misses <= 0:
+                    raise VariantRunError(
+                        "AMU coalesced misses must be nonzero"
+                    )
     elif kind == "cira":
         descriptors = (
             _integer(row, "cira_prefetches")

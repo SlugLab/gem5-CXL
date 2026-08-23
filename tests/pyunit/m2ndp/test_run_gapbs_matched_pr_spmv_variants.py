@@ -310,6 +310,27 @@ class MatchedVariantRunnerTest(unittest.TestCase):
             g4,
         )
 
+    def test_amu_row_descriptors_replace_scalar_line_cache_evidence(self):
+        row = self.valid_row("amu")
+        row.update(
+            asmc_loads=0,
+            asmc_completed=0,
+            amu_logical_values="",
+            amu_line_requests="",
+            amu_line_cache_hits="",
+            amu_coalesced_misses="",
+            pr_issued_descriptors=160,
+            pr_completed_descriptors=160,
+            pr_rows=163840,
+            pr_read_packets=4126880,
+            pr_write_packets=163840,
+            pr_outstanding_work=0,
+            pr_rejected_descriptors=0,
+        )
+        self.assertIs(
+            runner.validate_row(row, "amu", smoke_test=False), row
+        )
+
     def test_cira_row_requires_a_real_descriptor_and_completion(self):
         row = self.valid_row("cira")
         row.update(

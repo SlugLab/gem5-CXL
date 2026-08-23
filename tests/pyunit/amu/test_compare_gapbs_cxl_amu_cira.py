@@ -835,6 +835,10 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
         self.assertEqual(evidence["pr_issued_descriptors"], Decimal(8))
         self.assertEqual(evidence["pr_completed_descriptors"], Decimal(8))
         self.assertEqual(evidence["pr_outstanding_work"], Decimal(0))
+        self.assertFalse(self.runner.needs_amu_line_cache(evidence))
+        self.assertTrue(self.runner.needs_amu_line_cache({
+            "pr_issued_descriptors": 0
+        }))
 
     def test_counts_exact_cpu_switch_markers(self):
         with tempfile.TemporaryDirectory() as tmp:

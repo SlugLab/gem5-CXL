@@ -486,6 +486,10 @@ def pr_evidence_failure(evidence, kind):
     return None
 
 
+def needs_amu_line_cache(pr_evidence):
+    return pr_evidence.get("pr_issued_descriptors", 0) <= 0
+
+
 def empty_pr_phase_evidence():
     return {
         f"pr_e2e_{name}_ns": ""
@@ -1639,7 +1643,7 @@ def run_one_checkpoint(args, benchmark, label, binary_dir, kind):
         status = pr_evidence_failure(pr_evidence, kind) or status
 
     line_cache_evidence = {}
-    if kind == "amu":
+    if kind == "amu" and needs_amu_line_cache(pr_evidence):
         try:
             line_cache_evidence = parse_amu_line_cache(
                 log_path, measured_trial=args.measure_trial
@@ -1805,7 +1809,7 @@ def run_one(args, benchmark, label, binary_dir, kind):
         status = pr_evidence_failure(pr_evidence, kind) or status
 
     line_cache_evidence = {}
-    if kind == "amu":
+    if kind == "amu" and needs_amu_line_cache(pr_evidence):
         try:
             line_cache_evidence = parse_amu_line_cache(
                 log_path, measured_trial=args.measure_trial
