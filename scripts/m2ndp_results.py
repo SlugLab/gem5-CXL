@@ -92,6 +92,20 @@ def validate_formal_result(result):
         raise artifacts.EvidenceError(
             "M2NDP trace is not four-way partitioned"
         )
+    for field, expected in (
+        ("timing_commands_per_trial", 42),
+        ("timing_launch_records_per_trial", 165),
+    ):
+        try:
+            actual = int(result.get(field))
+        except (TypeError, ValueError) as error:
+            raise artifacts.EvidenceError(
+                f"M2NDP {field} is missing or invalid"
+            ) from error
+        if actual != expected:
+            raise artifacts.EvidenceError(
+                f"M2NDP {field}={actual}, expected {expected}"
+            )
     return result
 
 
@@ -222,15 +236,23 @@ def parse_ndpsim(log, *, returncode=0, output_text=None):
         raise artifacts.EvidenceError(
             f"NDPSim exit status {returncode}, expected 0"
         )
-    formal_marker = re.search(
-        r"K2_CONTRIB_TRIAL1_PART0[^\n]*?\b(?:at\s+)?cycle\s+(\d+)",
-        log,
-        re.IGNORECASE,
+    grouped_pattern = (
+        r"K2_CONTRIB_TRIAL1_GROUP[^\n]*?\b(?:at\s+)?cycle\s+(\d+)"
     )
-    if formal_marker is not None:
+    partition_pattern = (
+        r"K2_CONTRIB_TRIAL1_PART0[^\n]*?\b(?:at\s+)?cycle\s+(\d+)"
+    )
+    if re.search(grouped_pattern, log, re.IGNORECASE) is not None:
         start = _single_match(
             log,
-            r"K2_CONTRIB_TRIAL1_PART0[^\n]*?\b(?:at\s+)?cycle\s+(\d+)",
+            grouped_pattern,
+            "K2_CONTRIB_TRIAL1_GROUP",
+            flags=re.IGNORECASE,
+        )
+    elif re.search(partition_pattern, log, re.IGNORECASE) is not None:
+        start = _single_match(
+            log,
+            partition_pattern,
             "K2_CONTRIB_TRIAL1_PART0",
             flags=re.IGNORECASE,
         )

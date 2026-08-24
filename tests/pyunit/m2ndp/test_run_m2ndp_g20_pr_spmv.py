@@ -98,6 +98,12 @@ class OrchestratorTest(unittest.TestCase):
             "pr-offload-4thread-1us",
         )
 
+    def test_ndpsim_issues_grouped_partitions_concurrently(self):
+        command = runner._ndpsim_command(self.paths)
+        self.assertEqual(
+            command[command.index("--serial_launch") + 1], "false"
+        )
+
     def test_g4_commands_use_four_cores_and_selected_latency(self):
         options = dataclasses.replace(
             self.options,

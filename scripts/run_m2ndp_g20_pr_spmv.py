@@ -493,7 +493,7 @@ def _ndpsim_command(paths):
         "--synthetic_memory",
         "false",
         "--serial_launch",
-        "true",
+        "false",
     ]
 
 

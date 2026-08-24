@@ -164,15 +164,34 @@ class M2NDPResultTest(unittest.TestCase):
         self.assertEqual(evidence.start_cycle, 140)
         self.assertEqual(evidence.measured_cycles, 260)
 
+    def test_parse_ndpsim_starts_at_grouped_measured_contribution(self):
+        log = "\n".join([
+            "Launching NDP kernel: K2_CONTRIB_TRIAL1_GROUP.traceg at cycle 1000",
+            "Gantt info: host 0 finished NDP kernel K2_CONTRIB launch id 40 at core cycle 1200",
+            "Gantt info: host 0 finished NDP kernel K2_CONTRIB launch id 41 at core cycle 1201",
+            "Gantt info: host 0 finished NDP kernel K2_CONTRIB launch id 42 at core cycle 1202",
+            "Gantt info: host 0 finished NDP kernel K2_CONTRIB launch id 43 at core cycle 1203",
+            "EXPR FINISHED 5000",
+            "CORE period: 0.5",
+            "MEMROY MATCH SUCCESS",
+        ])
+        evidence = results.parse_ndpsim(log, returncode=0)
+        self.assertEqual(evidence.start_cycle, 1000)
+        self.assertEqual(evidence.measured_cycles, 4000)
+
     def test_formal_result_rejects_legacy_profile_and_non_four_way_trace(self):
         valid = {
             "profile": "pr-offload-4thread-1us",
             "logical_partitions": 4,
+            "timing_commands_per_trial": 42,
+            "timing_launch_records_per_trial": 165,
         }
         self.assertEqual(results.validate_formal_result(valid), valid)
         for candidate in (
             dict(valid, profile="g20-2thread-1us"),
             dict(valid, logical_partitions=2),
+            dict(valid, timing_commands_per_trial=165),
+            dict(valid, timing_launch_records_per_trial=42),
         ):
             with self.subTest(candidate=candidate), self.assertRaises(
                 artifacts.EvidenceError
