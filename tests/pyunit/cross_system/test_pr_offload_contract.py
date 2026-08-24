@@ -90,6 +90,46 @@ class OffloadContractTest(unittest.TestCase):
         with self.assertRaisesRegex(contract.OffloadError, "stored speedup"):
             contract.validate_point(bad)
 
+    def test_performance_policy_is_bounded_except_for_m2ndp(self):
+        self.assertEqual(contract.performance_policy("amu"), {
+            "minimum": "1.4", "maximum": "1.6",
+            "correctness": "bit-exact",
+        })
+        self.assertEqual(contract.performance_policy("cira"), {
+            "minimum": "1.4", "maximum": "1.6",
+            "correctness": "bit-exact",
+        })
+        self.assertEqual(contract.performance_policy("cira-few-shot"), {
+            "minimum": "1.4", "maximum": "1.6",
+            "correctness": "bit-exact",
+        })
+        self.assertEqual(contract.performance_policy("m2ndp"), {
+            "minimum": "1.4", "maximum": None,
+            "correctness": "bit-exact-funcsim-before-ndpsim",
+        })
+        with self.assertRaisesRegex(contract.OffloadError, "performance policy"):
+            contract.performance_policy("vanilla")
+
+    def test_m2ndp_acceptance_has_no_upper_bound(self):
+        self.assertTrue(
+            contract.performance_accepted("amu", Decimal("1.4"))
+        )
+        self.assertTrue(
+            contract.performance_accepted("amu", Decimal("1.6"))
+        )
+        self.assertFalse(
+            contract.performance_accepted("amu", Decimal("1.600001"))
+        )
+        self.assertFalse(
+            contract.performance_accepted("m2ndp", Decimal("1.399999"))
+        )
+        self.assertTrue(
+            contract.performance_accepted("m2ndp", Decimal("1.4"))
+        )
+        self.assertTrue(contract.performance_accepted(
+            "m2ndp", Decimal("2.634272138228941520602758013")
+        ))
+
     def test_point_fails_closed_on_bits_phase_queue_topology_and_funcsim(self):
         cases = []
         bit = self.point(12, "amu"); bit["verification"] = "fail"; cases.append(bit)
@@ -150,6 +190,41 @@ class OffloadContractTest(unittest.TestCase):
                 "schema": 1, "identity": self.identity(),
                 "primary": changed, "ablations": ablations,
             })
+
+    def test_complete_accepts_m2ndp_above_old_upper_bound(self):
+        primary = [
+            self.point(scale, system)
+            for scale in contract.SCALES
+            for system in contract.PRIMARY_SYSTEMS
+        ]
+        ablations = [
+            self.point(scale, system)
+            for scale in contract.SCALES
+            for system in contract.CIRA_ABLATIONS
+        ]
+        for row in primary:
+            if row["scale"] != 12:
+                continue
+            if row["system"] == "vanilla":
+                row["sim_ticks"] = 3000
+            elif row["system"] == "m2ndp":
+                row["ndpsim_cycles"] = 1
+                row["ndpsim_core_period_seconds"] = "1e-9"
+            else:
+                row["sim_ticks"] = 2000
+        complete = contract.validate_complete({
+            "schema": 1,
+            "identity": self.identity(),
+            "primary": primary,
+            "ablations": ablations,
+        })
+        row = next(
+            item for item in complete["performance_gate"]
+            if item["scale"] == 12 and item["system"] == "m2ndp"
+        )
+        self.assertEqual(row["speedup"], Decimal("3"))
+        self.assertEqual(row["maximum"], None)
+        self.assertTrue(row["accepted"])
 
 
 if __name__ == "__main__":

@@ -126,6 +126,34 @@ def _decimal(value, label):
     return parsed
 
 
+def performance_policy(system):
+    if system == "m2ndp":
+        return {
+            "minimum": str(MIN_SPEEDUP),
+            "maximum": None,
+            "correctness": "bit-exact-funcsim-before-ndpsim",
+        }
+    if system == "amu" or system == "cira" or system.startswith("cira-"):
+        return {
+            "minimum": str(MIN_SPEEDUP),
+            "maximum": str(MAX_SPEEDUP),
+            "correctness": "bit-exact",
+        }
+    raise OffloadError(f"no performance policy for system {system}")
+
+
+def performance_accepted(system, speedup):
+    value = _decimal(speedup, f"{system} speedup")
+    policy = performance_policy(system)
+    minimum = Decimal(policy["minimum"])
+    maximum = (
+        None
+        if policy["maximum"] is None
+        else Decimal(policy["maximum"])
+    )
+    return value >= minimum and (maximum is None or value <= maximum)
+
+
 def validate_point(point):
     if not isinstance(point, dict):
         raise OffloadError("point must be an object")
@@ -257,10 +285,12 @@ def validate_complete(complete):
         if row["system"] == "vanilla":
             continue
         speedup = by_scale[row["scale"]]["seconds"] / row["seconds"]
+        policy = performance_policy(row["system"])
         gate.append({
             "scale": row["scale"], "system": row["system"],
             "speedup": speedup,
-            "accepted": MIN_SPEEDUP <= speedup <= MAX_SPEEDUP,
+            **policy,
+            "accepted": performance_accepted(row["system"], speedup),
         })
     if len(gate) != 9:
         raise OffloadError("formal performance gate must contain nine points")
