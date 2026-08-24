@@ -10,8 +10,10 @@ import struct
 from pathlib import Path
 
 try:
+    from scripts import cxl_latency_spectrum
     from scripts import m2ndp_artifacts
 except ImportError:
+    import cxl_latency_spectrum
     import m2ndp_artifacts
 
 
@@ -26,12 +28,7 @@ SCALING_GRAPH_HASHES = {
     4: G4_SHA256,
     20: m2ndp_artifacts.EXPECTED_G20_SHA256,
 }
-LATENCY_TICKS = {
-    "200ns": 200_000,
-    "500ns": 500_000,
-    "1us": 1_000_000,
-    "2us": 2_000_000,
-}
+LATENCY_TICKS = cxl_latency_spectrum.TICKS
 
 
 class ProfileError(RuntimeError):
@@ -168,7 +165,7 @@ def require_latency(profile: ExperimentProfile, latency: str) -> int:
         raise ProfileError(
             f"latency {latency} is outside profile {profile.name}"
         )
-    return LATENCY_TICKS[latency]
+    return cxl_latency_spectrum.ticks(latency)
 
 
 def _is_int(value) -> bool:
