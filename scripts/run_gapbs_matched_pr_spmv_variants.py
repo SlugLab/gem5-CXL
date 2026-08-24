@@ -185,7 +185,10 @@ def make_compare_args(options):
         ),
         asmc_granularity=8,
         asmc_max_outstanding=256,
-        asmc_max_send_queue=512,
+        # Keep the transport queue wide enough to realize every calibrated
+        # AMU read entry.  A smaller, unrelated cap turns the paper's
+        # 32-state-machine x 32-ID-batch contract into a 512-entry design.
+        asmc_max_send_queue=amu_pr["read_entries"],
         asmc_issue_latency="1ns",
         asmc_completion_latency="0ns",
         asmc_latency="0ns",
