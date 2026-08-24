@@ -507,6 +507,65 @@ class BreadthRunnerTest(unittest.TestCase):
             self.assertTrue(any(evidence.parent.glob("reference.json.invalid.*")))
             self.assertTrue(any(evidence.parent.glob("reference.json.driver.log.retry.*")))
 
+    def test_hash_bound_shared_functional_evidence_may_be_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "latency/500ns"
+            artifact = base / "shared/output.raw"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"shared exact output")
+            evidence = base / "shared/functional.json"
+            record = {
+                "status": "pass",
+                "command": [],
+                "boundaries": boundaries(),
+                "outputs": {"output": {
+                    "path": str(artifact.resolve()),
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }},
+            }
+            evidence.write_text(
+                json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest = {"workloads": {"mcf": {"actions": {
+                "functional": {"vanilla": {
+                    "command": [], "evidence": str(evidence.resolve()),
+                }}
+            }}}}
+            executor = breadth.ManifestExecutor(
+                manifest, root=root, cxl_link_delay="500ns"
+            )
+            observed = executor(breadth.Action(
+                "functional", "mcf", system="vanilla"
+            ))
+            self.assertEqual(observed["status"], "pass")
+
+    def test_timing_evidence_may_not_escape_latency_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "latency/500ns"
+            evidence = base / "shared/{{cxl_link_delay}}/window.json"
+            manifest = {"workloads": {"mcf": {"actions": {"window": {
+                "pricing": {"vanilla": {
+                    "command": [
+                        "/bin/true", "--cxl-link-delay",
+                        "{{cxl_link_delay}}",
+                    ],
+                    "evidence": str(evidence),
+                }}
+            }}}}}
+            executor = breadth.ManifestExecutor(
+                manifest, root=root, cxl_link_delay="500ns"
+            )
+            with self.assertRaisesRegex(
+                breadth.BreadthError, "escapes the evidence root"
+            ):
+                executor(breadth.Action(
+                    "window", "mcf", system="vanilla", phase="pricing",
+                    window_index=0, level=8, stratum=0,
+                    warmup_start=0, measure_start=1, measure_stop=2,
+                ))
+
     def test_documented_cli_records_failed_input_without_formal_preparation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

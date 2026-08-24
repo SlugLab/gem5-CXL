@@ -955,15 +955,22 @@ class ManifestExecutor:
         if not evidence_path.is_absolute():
             evidence_path = self.root / evidence_path
         evidence_path = evidence_path.resolve()
-        try:
-            evidence_path.relative_to(self.root)
-        except ValueError as error:
-            raise BreadthError("action evidence path escapes the evidence root") from error
         command_value = specification.get("command", [])
         if not isinstance(command_value, list) or any(
             not isinstance(item, (str, int)) for item in command_value
         ):
             raise BreadthError("prepared action command is invalid")
+        try:
+            evidence_path.relative_to(self.root)
+        except ValueError as error:
+            if (
+                action.stage == "window"
+                or command_value
+                or not evidence_path.is_file()
+            ):
+                raise BreadthError(
+                    "action evidence path escapes the evidence root"
+                ) from error
         command = [_render(item, action) for item in command_value]
         if evidence_path.is_file():
             try:
