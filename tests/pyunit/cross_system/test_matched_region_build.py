@@ -42,6 +42,25 @@ class MatchedRegionBuildTest(unittest.TestCase):
             self.assertRegex(row["sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(row["source_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(row["trace_abi_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            manifest["shared_objects"]["binaries"], manifest["binaries"]
+        )
+        self.assertEqual(
+            set(manifest["latency_action_layouts"]),
+            {"mcf", "amg_gather", "lulesh_scatter"},
+        )
+
+    def test_latency_action_layout_shares_functional_and_templates_timing(self):
+        layout = builder.latency_action_layout("mcf", ("pricing",))
+        for system, action in layout["functional"].items():
+            rendered = json.dumps(action, sort_keys=True)
+            self.assertNotIn("{{cxl_link_delay}}", rendered)
+            for label in ("200ns", "500ns", "1us", "2us"):
+                self.assertNotIn(f"/{label}/", rendered)
+            self.assertIn(f"shared/functional/mcf/{system}", action["evidence"])
+        for action in layout["window"]["pricing"].values():
+            self.assertIn("{{cxl_link_delay}}", action["command"])
+            self.assertIn("{{cxl_link_delay}}", action["evidence"])
 
     def test_reference_mcf_records_both_hotspots_and_complete_boundaries(self):
         build = builder.build_fixture_suite(self.root / "build")

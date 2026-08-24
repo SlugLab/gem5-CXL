@@ -48,6 +48,8 @@ BACKENDS = ("reference", "vanilla", "amu", "cira")
 STRICT_FLAGS = ("-O3", "-fopenmp", "-ffp-contract=off", "-fno-fast-math")
 COMMAND_FLAGS = ("-std=c++17", *STRICT_FLAGS, "-Wall", "-Wextra", "-Werror")
 BACKEND_IDS = {name: index for index, name in enumerate(BACKENDS)}
+FUNCTIONAL_SYSTEMS = ("vanilla", "amu", "cira", "m2ndp-funcsim")
+TIMING_SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
 MCF_OUTPUTS = (
     "objective", "flow", "cost", "potential", "predecessor", "depth",
     "orientation", "tree",
@@ -64,6 +66,51 @@ MCF_BASES = {
     "pricing_index": 0x600000000,
     "price_out_index": 0x700000000,
 }
+
+
+def latency_action_layout(workload, phases):
+    """Return the latency-sharing layout used by a prepared formal suite.
+
+    Functional evidence is a content-addressed shared object.  Timing action
+    fragments are latency-local and retain the canonical delay placeholder;
+    the formal builder resolves the remaining tool/input paths only after all
+    six frozen inputs are available.
+    """
+    if not isinstance(workload, str) or not workload:
+        raise BuildError("action-layout workload is invalid")
+    phases = tuple(phases)
+    if not phases or any(
+        not isinstance(phase, str) or not phase for phase in phases
+    ):
+        raise BuildError("action-layout phases are invalid")
+    functional = {
+        system: {
+            "command": [],
+            "evidence": f"shared/functional/{workload}/{system}/evidence.json",
+        }
+        for system in FUNCTIONAL_SYSTEMS
+    }
+    windows = {}
+    for phase in phases:
+        windows[phase] = {}
+        for system in TIMING_SYSTEMS:
+            windows[phase][system] = {
+                "runner": (
+                    "scripts/run_matched_breadth_gem5.py"
+                    if system != "m2ndp"
+                    else "scripts/m2ndp_workload_trace.py:run_ndpsim_package"
+                ),
+                "command": [
+                    "--cxl-link-delay", "{{cxl_link_delay}}",
+                ],
+                "evidence": (
+                    "timing/{{cxl_link_delay}}/"
+                    f"{workload}/{phase}/{system}/{{{{window_index}}}}.json"
+                ),
+            }
+    return {"functional": functional, "window": windows}
+
+
 SPATTER_BASES = {
     "index": 0x100000000,
     "values": 0x200000000,
@@ -2958,6 +3005,21 @@ def build_suite(
         ),
         "binaries": binaries,
         "commands": commands,
+        "shared_objects": {
+            "inputs": inputs,
+            "binaries": binaries,
+        },
+        "latency_action_layouts": {
+            "mcf": latency_action_layout(
+                "mcf", ("pricing_kernel", "price_out_impl")
+            ),
+            "amg_gather": latency_action_layout(
+                "amg_gather", ("amg_gather",)
+            ),
+            "lulesh_scatter": latency_action_layout(
+                "lulesh_scatter", ("lulesh_scatter",)
+            ),
+        },
     }
     contract.atomic_write_json(outdir / "manifest.json", manifest)
     return manifest

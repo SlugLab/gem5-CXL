@@ -21,9 +21,11 @@ from pathlib import Path
 
 try:
     from scripts import cross_system_contract as contract
+    from scripts import cxl_latency_spectrum as latency
     from scripts import stratified_timing as timing
 except ImportError:
     import cross_system_contract as contract
+    import cxl_latency_spectrum as latency
     import stratified_timing as timing
 
 
@@ -62,6 +64,8 @@ class Action:
     warmup_start: int | None = None
     measure_start: int | None = None
     measure_stop: int | None = None
+    cxl_link_delay: str | None = None
+    cxl_link_delay_ticks: int | None = None
 
 
 def _sha256_file(path):
@@ -137,7 +141,16 @@ def _validate_specs(specifications):
     return normalized
 
 
-def new_state(identity, workload_specs, *, g20_graph_sha256):
+def _canonical_latency(label):
+    try:
+        return label, latency.ticks(label)
+    except latency.LatencyError as error:
+        raise BreadthError(str(error)) from error
+
+
+def new_state(
+    identity, workload_specs, *, g20_graph_sha256, cxl_link_delay="1us",
+):
     if not isinstance(identity, contract.ExperimentIdentity):
         raise BreadthError("experiment identity has the wrong type")
     if (
@@ -146,6 +159,7 @@ def new_state(identity, workload_specs, *, g20_graph_sha256):
     ):
         raise BreadthError("g20 graph SHA-256 is invalid")
     specifications = _validate_specs(workload_specs)
+    cxl_link_delay, cxl_link_delay_ticks = _canonical_latency(cxl_link_delay)
     workloads = {}
     for workload, specification in specifications.items():
         phases = {}
@@ -175,6 +189,8 @@ def new_state(identity, workload_specs, *, g20_graph_sha256):
         "reason": "",
         "identity": dataclasses.asdict(identity),
         "identity_sha256": identity.digest(),
+        "cxl_link_delay": cxl_link_delay,
+        "cxl_link_delay_ticks": cxl_link_delay_ticks,
         "g20_graph_sha256": g20_graph_sha256,
         "workload_order": list(specifications),
         "workloads": workloads,
@@ -726,7 +742,23 @@ def write_checkpoint(root, state, *, boundary, outputs):
     return record
 
 
-def select_resume(root, identity_digest):
+def _state_latency_matches(state, cxl_link_delay=None):
+    if not isinstance(state, dict):
+        return False
+    try:
+        label, expected_ticks = _canonical_latency(state.get("cxl_link_delay"))
+        if state.get("cxl_link_delay_ticks") != expected_ticks:
+            return False
+        if cxl_link_delay is not None:
+            selected, selected_ticks = _canonical_latency(cxl_link_delay)
+            if label != selected or expected_ticks != selected_ticks:
+                return False
+    except BreadthError:
+        return False
+    return True
+
+
+def select_resume(root, identity_digest, *, cxl_link_delay=None):
     if not isinstance(identity_digest, str) or _SHA256.fullmatch(identity_digest) is None:
         raise BreadthError("identity SHA-256 is invalid")
     valid = []
@@ -748,10 +780,14 @@ def select_resume(root, identity_digest):
             and contract.verify_named_hashes(record.get("outputs"))
             and isinstance(state, dict)
             and state.get("schema") == 1
+            and _state_latency_matches(state, cxl_link_delay)
             and state.get("identity_sha256") == identity_digest
             and record.get("state_sha256") == state_hash
             and (not bound_outputs or record.get("outputs") == bound_outputs)
-            and (not bound_outputs or _verify_bound_evidence(bound_outputs))
+            and (
+                not bound_outputs
+                or _verify_bound_evidence(bound_outputs, state=state)
+            )
             and _valid_boundary_state(state, record.get("boundary"))
         )
         (valid if okay else rejected).append(record)
@@ -759,7 +795,7 @@ def select_resume(root, identity_digest):
     return selected, tuple(rejected)
 
 
-def _verify_bound_evidence(records):
+def _verify_bound_evidence(records, *, state=None):
     if not contract.verify_named_hashes(records):
         return False
     try:
@@ -768,6 +804,13 @@ def _verify_bound_evidence(records):
             if (
                 evidence.get("status") != "pass"
                 or not contract.verify_named_hashes(evidence.get("outputs"))
+            ):
+                return False
+            if "cxl_link_delay_ticks" in evidence and (
+                state is None
+                or evidence.get("cxl_link_delay") != state.get("cxl_link_delay")
+                or evidence.get("cxl_link_delay_ticks")
+                != state.get("cxl_link_delay_ticks")
             ):
                 return False
             _boundary_records(evidence.get("boundaries"), "checkpoint")
@@ -815,6 +858,11 @@ def _render(value, action):
         "warmup_start": "" if action.warmup_start is None else str(action.warmup_start),
         "measure_start": "" if action.measure_start is None else str(action.measure_start),
         "measure_stop": "" if action.measure_stop is None else str(action.measure_stop),
+        "cxl_link_delay": action.cxl_link_delay or "",
+        "cxl_link_delay_ticks": (
+            "" if action.cxl_link_delay_ticks is None
+            else str(action.cxl_link_delay_ticks)
+        ),
     }
     result = str(value)
     for name, replacement in fields.items():
@@ -832,9 +880,54 @@ class ManifestExecutor:
     never silently overwritten.
     """
 
-    def __init__(self, manifest, *, root):
+    def __init__(self, manifest, *, root, cxl_link_delay="1us"):
         self.manifest = manifest
         self.root = Path(root).resolve()
+        self.cxl_link_delay, self.cxl_link_delay_ticks = _canonical_latency(
+            cxl_link_delay
+        )
+
+    def _latency_bound_action(self, action):
+        if action.cxl_link_delay not in {None, self.cxl_link_delay} or (
+            action.cxl_link_delay_ticks
+            not in {None, self.cxl_link_delay_ticks}
+        ):
+            raise BreadthError("action CXL latency differs")
+        return dataclasses.replace(
+            action,
+            cxl_link_delay=self.cxl_link_delay,
+            cxl_link_delay_ticks=self.cxl_link_delay_ticks,
+        )
+
+    @staticmethod
+    def _validate_latency_template(action, specification):
+        command = specification.get("command", [])
+        evidence = str(specification.get("evidence", ""))
+        if not isinstance(command, list) or any(
+            not isinstance(item, (str, int)) for item in command
+        ):
+            raise BreadthError("prepared action command is invalid")
+        serialized = json.dumps(command, sort_keys=True)
+        if action.stage == "window":
+            try:
+                delay_index = command.index("--cxl-link-delay")
+                delay_value = command[delay_index + 1]
+            except (AttributeError, IndexError, ValueError) as error:
+                raise BreadthError(
+                    "prepared timing action CXL latency differs"
+                ) from error
+            if delay_value != "{{cxl_link_delay}}" or (
+                "{{cxl_link_delay}}" not in evidence
+            ):
+                raise BreadthError("prepared timing action CXL latency differs")
+            return
+        if (
+            "--cxl-link-delay" in command
+            or "{{cxl_link_delay" in serialized
+            or "{{cxl_link_delay" in evidence
+            or any(label in Path(evidence).parts for label in latency.LABELS)
+        ):
+            raise BreadthError("prepared functional action is latency-specific")
 
     def _specification(self, action):
         try:
@@ -853,9 +946,11 @@ class ManifestExecutor:
         raise BreadthError(f"unsupported collection action: {action.stage}")
 
     def __call__(self, action):
+        action = self._latency_bound_action(action)
         specification = self._specification(action)
         if not isinstance(specification, dict):
             raise BreadthError("prepared action specification is invalid")
+        self._validate_latency_template(action, specification)
         evidence_path = Path(_render(specification.get("evidence", ""), action))
         if not evidence_path.is_absolute():
             evidence_path = self.root / evidence_path
@@ -986,7 +1081,13 @@ def _bind_action_evidence(state, evidence):
         files[f"action_{len(files):08d}"] = record
 
 
-def _validate_window_evidence(system, evidence):
+def _validate_window_evidence(system, evidence, state):
+    if (
+        evidence.get("cxl_link_delay") != state.get("cxl_link_delay")
+        or evidence.get("cxl_link_delay_ticks")
+        != state.get("cxl_link_delay_ticks")
+    ):
+        raise BreadthError("timing evidence CXL latency differs")
     if (
         evidence.get("verification") != "pass"
         or evidence.get("bit_exact") is not True
@@ -994,7 +1095,6 @@ def _validate_window_evidence(system, evidence):
         or evidence.get("threads") != 4
         or evidence.get("all_memory_cxl") is not True
         or evidence.get("allocated_on_cxl") is not True
-        or evidence.get("cxl_link_delay_ticks") != 1_000_000
     ):
         raise BreadthError("timing window correctness or 4-thread all-CXL gate failed")
     if _counter_errors(evidence):
@@ -1032,7 +1132,7 @@ def collect(state, *, root, executor):
                     begin_timing(state)
                     _checkpoint_after_action(root, state, "functional", evidence)
             elif action.stage == "window":
-                _validate_window_evidence(action.system, evidence)
+                _validate_window_evidence(action.system, evidence, state)
                 workload_row = _workload(state, action.workload)
                 fixed = evidence.get("fixed_seconds")
                 if action.system not in workload_row["fixed_seconds"]:
@@ -1115,6 +1215,9 @@ def parse_args(argv=None):
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--cxl-link-delay", choices=latency.LABELS, default="1us"
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 
@@ -1179,13 +1282,21 @@ def _preflight_identity_unchecked(options):
     if (
         manifest.get("threads") != 4
         or manifest.get("all_memory_cxl") is not True
-        or manifest.get("cxl_link_delay_ticks") != 1_000_000
         or tuple(manifest.get("functional_systems", ())) != FUNCTIONAL_SYSTEMS
         or tuple(manifest.get("timing_systems", ())) != TIMING_SYSTEMS
     ):
         raise BreadthError(
-            "prepared experiment is not four-thread, all-CXL, exact 1 us"
+            "prepared experiment is not four-thread and all-CXL"
         )
+    selected_label, selected_ticks = _canonical_latency(options.cxl_link_delay)
+    fixed_label = manifest.get("cxl_link_delay")
+    fixed_ticks = manifest.get("cxl_link_delay_ticks")
+    if (
+        fixed_label is not None and fixed_label != selected_label
+    ) or (
+        fixed_ticks is not None and fixed_ticks != selected_ticks
+    ):
+        raise BreadthError("prepared experiment CXL latency differs")
     local_code = {
         path.name: {"path": str(path), "sha256": _sha256_file(path)}
         for path in (
@@ -1202,7 +1313,12 @@ def _preflight_identity_unchecked(options):
         "local": _aggregate_files(local_code, "local code"),
         "prepared": _aggregate_files(prepared_code, "code"),
     })).hexdigest()
-    config_hash = _aggregate_files(prepared_config, "configuration")
+    prepared_config_hash = _aggregate_files(prepared_config, "configuration")
+    config_hash = hashlib.sha256(contract.canonical_json({
+        "prepared_config_sha256": prepared_config_hash,
+        "cxl_link_delay": selected_label,
+        "cxl_link_delay_ticks": selected_ticks,
+    })).hexdigest()
     identity = contract.ExperimentIdentity(
         code_sha256=code_hash,
         input_manifest_sha256=_sha256_file(options.inputs),
@@ -1229,7 +1345,9 @@ def main(argv=None):
         bind_or_resume(root, identity, resume=options.resume)
         state_path = root / "state.json"
         if options.resume:
-            selected, _ = select_resume(root, identity.digest())
+            selected, _ = select_resume(
+                root, identity.digest(), cxl_link_delay=options.cxl_link_delay
+            )
             if selected is None:
                 raise BreadthError("resume has no valid boundary checkpoint")
             state = selected["state"]
@@ -1238,9 +1356,16 @@ def main(argv=None):
                 identity,
                 specifications,
                 g20_graph_sha256=g20_graph_sha256,
+                cxl_link_delay=options.cxl_link_delay,
             )
         contract.atomic_write_json(state_path, state)
-        collect(state, root=root, executor=ManifestExecutor(manifest, root=root))
+        collect(
+            state,
+            root=root,
+            executor=ManifestExecutor(
+                manifest, root=root, cxl_link_delay=options.cxl_link_delay
+            ),
+        )
         if state.get("status") == "complete":
             print(f"BREADTH_COMPLETE workloads={len(WORKLOADS)} manifest={root / 'complete.json'}")
         else:

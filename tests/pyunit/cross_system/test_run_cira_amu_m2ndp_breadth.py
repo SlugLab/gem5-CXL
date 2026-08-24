@@ -95,9 +95,10 @@ def mechanism(system, *, bad=False, timing=False):
     return row
 
 
-def functional_state():
+def functional_state(*, cxl_link_delay="1us"):
     state = breadth.new_state(
-        identity(), specs(), g20_graph_sha256=sha("g20")
+        identity(), specs(), g20_graph_sha256=sha("g20"),
+        cxl_link_delay=cxl_link_delay,
     )
     breadth.record_reference(state, "mcf", boundaries())
     for system in breadth.FUNCTIONAL_SYSTEMS:
@@ -120,6 +121,82 @@ def functional_state():
 
 
 class BreadthRunnerTest(unittest.TestCase):
+    def test_breadth_state_records_canonical_cxl_latency(self):
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20"),
+            cxl_link_delay="500ns",
+        )
+        self.assertEqual(state["cxl_link_delay"], "500ns")
+        self.assertEqual(state["cxl_link_delay_ticks"], 500_000)
+
+    def test_action_rendering_includes_canonical_cxl_latency(self):
+        action = breadth.Action(
+            "window", "mcf", system="vanilla", phase="pricing",
+            cxl_link_delay="500ns", cxl_link_delay_ticks=500_000,
+        )
+        self.assertEqual(
+            breadth._render(
+                "timing/{{cxl_link_delay}}/{{cxl_link_delay_ticks}}", action
+            ),
+            "timing/500ns/500000",
+        )
+
+    def test_500ns_executor_rejects_fixed_1us_timing_action(self):
+        manifest = {
+            "workloads": {"mcf": {"actions": {"window": {
+                "pricing": {"vanilla": {
+                    "command": [
+                        "python3", "scripts/run_matched_breadth_gem5.py",
+                        "--cxl-link-delay", "1us",
+                    ],
+                    "evidence": "timing/1us/mcf/vanilla.json",
+                }}
+            }}}}
+        }
+        executor = breadth.ManifestExecutor(
+            manifest, root=".", cxl_link_delay="500ns"
+        )
+        with self.assertRaisesRegex(
+            breadth.BreadthError, "prepared timing action CXL latency differs"
+        ):
+            executor(breadth.Action(
+                "window", "mcf", system="vanilla", phase="pricing",
+                window_index=0, level=8, stratum=0,
+                warmup_start=0, measure_start=1, measure_stop=2,
+            ))
+
+    def test_500ns_window_rejects_1us_evidence(self):
+        state = functional_state(cxl_link_delay="500ns")
+        evidence = {
+            "verification": "pass", "bit_exact": True,
+            "mismatched_words": 0, "threads": 4,
+            "all_memory_cxl": True, "allocated_on_cxl": True,
+            "cxl_link_delay_ticks": 1_000_000,
+        }
+        with self.assertRaisesRegex(
+            breadth.BreadthError, "timing evidence CXL latency differs"
+        ):
+            breadth._validate_window_evidence("vanilla", evidence, state)
+
+    def test_500ns_resume_rejects_1us_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "boundary.raw"
+            output.write_bytes(b"proof")
+            state = functional_state(cxl_link_delay="1us")
+            breadth.write_checkpoint(
+                root, state, boundary="functional",
+                outputs={"boundary": {
+                    "path": str(output),
+                    "sha256": hashlib.sha256(b"proof").hexdigest(),
+                }},
+            )
+            selected, rejected = breadth.select_resume(
+                root, identity().digest(), cxl_link_delay="500ns"
+            )
+            self.assertIsNone(selected)
+            self.assertEqual(len(rejected), 1)
+
     def test_breadth_state_records_g20_graph_identity(self):
         state = breadth.new_state(
             identity(), specs(), g20_graph_sha256=sha("g20")
@@ -493,6 +570,7 @@ class BreadthRunnerTest(unittest.TestCase):
                         "threads": 4,
                         "all_memory_cxl": True,
                         "allocated_on_cxl": True,
+                        "cxl_link_delay": state["cxl_link_delay"],
                         "cxl_link_delay_ticks": 1_000_000,
                         "fixed_seconds": "1",
                         "seconds_per_item": (
