@@ -18,6 +18,11 @@ import tempfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+try:
+    from scripts import pr_offload_contract as gate_contract
+except ImportError:
+    import pr_offload_contract as gate_contract
+
 
 SCALES = (4, 12, 14, 20)
 PERFORMANCE_SCALES = (12, 14, 20)
@@ -25,8 +30,8 @@ SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
 ACCELERATORS = ("amu", "cira", "m2ndp")
 PROFILE = "pr-scaling-4thread-1us"
 TICKS_PER_SECOND = Decimal(10**12)
-MIN_ACCELERATOR_SPEEDUP = Decimal("1.4")
-MAX_ACCELERATOR_SPEEDUP = Decimal("1.6")
+MIN_ACCELERATOR_SPEEDUP = gate_contract.MIN_SPEEDUP
+MAX_ACCELERATOR_SPEEDUP = gate_contract.MAX_SPEEDUP
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -144,6 +149,10 @@ def load_data(path):
     if value.get("performance_gate") != {
         "status": "passed",
         "checked_points": len(PERFORMANCE_SCALES) * 3,
+        "policies": {
+            system: gate_contract.performance_policy(system)
+            for system in ACCELERATORS
+        },
         "offenders": [],
     }:
         raise ArtifactError("scaling evidence performance gate did not pass")
@@ -212,11 +221,7 @@ def load_data(path):
             if (
                 scale in PERFORMANCE_SCALES
                 and system != "vanilla"
-                and not (
-                MIN_ACCELERATOR_SPEEDUP
-                <= speedup
-                <= MAX_ACCELERATOR_SPEEDUP
-                )
+                and not gate_contract.performance_accepted(system, speedup)
             ):
                 raise ArtifactError(
                     f"g{scale}:{system} performance gate did not pass"

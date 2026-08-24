@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+from scripts import pr_offload_contract as gate_contract
 from scripts import qualify_pr_scaling_g12 as qualification
 
 
@@ -46,6 +47,10 @@ class G12QualificationTest(unittest.TestCase):
             "status": "passed",
             "checked_points": 2,
             "speedups": {"amu": "1.4", "cira": "1.6"},
+            "policies": {
+                system: gate_contract.performance_policy(system)
+                for system in ("amu", "cira")
+            },
             "offenders": [],
         })
 
@@ -56,6 +61,7 @@ class G12QualificationTest(unittest.TestCase):
         self.assertEqual(result["offenders"], [{
             "point": "g12:amu", "speedup": "1.39",
             "minimum": "1.4", "maximum": "1.6",
+            "correctness": "bit-exact",
         }])
         self.assertTrue(all(row["status"] == "passed" for row in points.values()))
 

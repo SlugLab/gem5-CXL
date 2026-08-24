@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from scripts import freeze_pr_scaling_inputs as freeze
+from scripts import pr_offload_contract as gate_contract
 from scripts import run_cira_amu_m2ndp_scaling as scaling
 
 
@@ -125,6 +126,10 @@ class ScalingRunnerTest(unittest.TestCase):
             "performance_gate": {
                 "status": "passed", "checked_points": 2,
                 "speedups": {"amu": "1.6", "cira": "1.6"},
+                "policies": {
+                    system: gate_contract.performance_policy(system)
+                    for system in ("amu", "cira")
+                },
                 "offenders": [],
             },
             "points": qualification_points,
@@ -510,7 +515,14 @@ class ScalingRunnerTest(unittest.TestCase):
         state = self.complete_state_with_overrides(overrides)
         self.assertEqual(
             scaling.evaluate_performance_gate(state),
-            {"status": "passed", "checked_points": 9, "offenders": []},
+            {
+                "status": "passed", "checked_points": 9,
+                "policies": {
+                    system: gate_contract.performance_policy(system)
+                    for system in ("amu", "cira", "m2ndp")
+                },
+                "offenders": [],
+            },
         )
 
     def test_performance_gate_checks_exactly_nine_points(self):
@@ -523,22 +535,46 @@ class ScalingRunnerTest(unittest.TestCase):
         })
         self.assertEqual(
             scaling.evaluate_performance_gate(state),
-            {"status": "passed", "checked_points": 9, "offenders": []},
+            {
+                "status": "passed", "checked_points": 9,
+                "policies": {
+                    system: gate_contract.performance_policy(system)
+                    for system in ("amu", "cira", "m2ndp")
+                },
+                "offenders": [],
+            },
         )
 
-    def test_performance_gate_reports_only_large_scale_offenders(self):
+    def test_performance_gate_accepts_m2ndp_above_old_upper_bound(self):
+        state = self.complete_state_with_overrides({
+            "g12:m2ndp": "2.634272138228941520602758013",
+            "g14:m2ndp": "2.1",
+            "g20:m2ndp": "1.600001",
+        })
+        result = scaling.evaluate_performance_gate(state)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["offenders"], [])
+        self.assertIsNone(result["policies"]["m2ndp"]["maximum"])
+
+    def test_performance_gate_reports_system_specific_offenders(self):
         state = self.complete_state_with_overrides({
             "g4:amu": "0.01",
-            "g12:amu": "1.399999",
-            "g20:m2ndp": "1.600001",
+            "g12:amu": "1.600001",
+            "g14:cira": "1.399999",
+            "g20:m2ndp": "1.399999",
         })
         result = scaling.evaluate_performance_gate(state)
         self.assertEqual(result["status"], "hold")
         self.assertEqual(result["checked_points"], 9)
         self.assertEqual(
-            {(row["point"], row["speedup"]) for row in result["offenders"]},
-            {("g12:amu", "1.399999"), ("g20:m2ndp", "1.600001")},
+            {row["point"] for row in result["offenders"]},
+            {"g12:amu", "g14:cira", "g20:m2ndp"},
         )
+        m2ndp = next(
+            row for row in result["offenders"]
+            if row["system"] == "m2ndp"
+        )
+        self.assertIsNone(m2ndp["maximum"])
 
     def test_performance_hold_is_successful_terminal_not_complete(self):
         state = self.complete_state_with_overrides({"g12:amu": "1.39"})

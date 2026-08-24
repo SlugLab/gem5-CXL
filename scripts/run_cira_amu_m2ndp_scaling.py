@@ -19,10 +19,12 @@ from pathlib import Path
 try:
     from scripts import cross_system_contract as contract
     from scripts import freeze_pr_scaling_inputs as scaling_inputs
+    from scripts import pr_offload_contract as gate_contract
     from scripts import pr_scaling_variant_build as variant_build
 except ImportError:
     import cross_system_contract as contract
     import freeze_pr_scaling_inputs as scaling_inputs
+    import pr_offload_contract as gate_contract
     import pr_scaling_variant_build as variant_build
 
 
@@ -31,8 +33,8 @@ PROFILE = "pr-scaling-4thread-1us"
 SCALES = (4, 12, 14, 20)
 PERFORMANCE_SCALES = (12, 14, 20)
 SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
-MIN_ACCELERATOR_SPEEDUP = Decimal("1.4")
-MAX_ACCELERATOR_SPEEDUP = Decimal("1.6")
+MIN_ACCELERATOR_SPEEDUP = gate_contract.MIN_SPEEDUP
+MAX_ACCELERATOR_SPEEDUP = gate_contract.MAX_SPEEDUP
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PRE_LAZY_VARIANT_CODE_SHA256 = (
     "438735b038266173d5337d86db3fdbcf26321794336f8af52180081ef08f94d3"
@@ -486,13 +488,17 @@ def load_qualification(path, options):
         )
         if stored != speedup:
             raise ScalingError(f"qualification {system} speedup differs")
-        if not MIN_ACCELERATOR_SPEEDUP <= speedup <= MAX_ACCELERATOR_SPEEDUP:
+        if not gate_contract.performance_accepted(system, speedup):
             raise ScalingError(f"qualification {system} performance is outside gate")
         recomputed[system] = format(speedup.normalize(), "f")
     if value.get("performance_gate") != {
         "status": "passed",
         "checked_points": 2,
         "speedups": recomputed,
+        "policies": {
+            system: gate_contract.performance_policy(system)
+            for system in ("amu", "cira")
+        },
         "offenders": [],
     }:
         raise ScalingError("qualification performance gate differs")
@@ -723,22 +729,22 @@ def evaluate_performance_gate(state):
             )
             if stored != speedup:
                 raise ScalingError(f"{key} stored speedup differs")
-            if not (
-                MIN_ACCELERATOR_SPEEDUP
-                <= speedup
-                <= MAX_ACCELERATOR_SPEEDUP
-            ):
+            policy = gate_contract.performance_policy(system)
+            if not gate_contract.performance_accepted(system, speedup):
                 offenders.append({
                     "point": key,
                     "scale": scale,
                     "system": system,
                     "speedup": str(speedup),
-                    "minimum": str(MIN_ACCELERATOR_SPEEDUP),
-                    "maximum": str(MAX_ACCELERATOR_SPEEDUP),
+                    **policy,
                 })
     return {
         "status": "hold" if offenders else "passed",
         "checked_points": len(PERFORMANCE_SCALES) * 3,
+        "policies": {
+            system: gate_contract.performance_policy(system)
+            for system in SYSTEMS if system != "vanilla"
+        },
         "offenders": offenders,
     }
 

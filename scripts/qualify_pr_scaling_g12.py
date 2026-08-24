@@ -13,9 +13,11 @@ from pathlib import Path
 
 try:
     from scripts import cross_system_contract as contract
+    from scripts import pr_offload_contract as gate_contract
     from scripts import run_cira_amu_m2ndp_scaling as scaling
 except ImportError:
     import cross_system_contract as contract
+    import pr_offload_contract as gate_contract
     import run_cira_amu_m2ndp_scaling as scaling
 
 
@@ -102,21 +104,21 @@ def evaluate_gate(points):
         if stored != speedup:
             raise QualificationError(f"{key} stored speedup differs")
         speedups[system] = _decimal_text(speedup)
-        if not (
-            scaling.MIN_ACCELERATOR_SPEEDUP
-            <= speedup
-            <= scaling.MAX_ACCELERATOR_SPEEDUP
-        ):
+        policy = gate_contract.performance_policy(system)
+        if not gate_contract.performance_accepted(system, speedup):
             offenders.append({
                 "point": key,
                 "speedup": _decimal_text(speedup),
-                "minimum": str(scaling.MIN_ACCELERATOR_SPEEDUP),
-                "maximum": str(scaling.MAX_ACCELERATOR_SPEEDUP),
+                **policy,
             })
     return {
         "status": "hold" if offenders else "passed",
         "checked_points": 2,
         "speedups": speedups,
+        "policies": {
+            system: gate_contract.performance_policy(system)
+            for system in ("amu", "cira")
+        },
         "offenders": offenders,
     }
 

@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from scripts import generate_pr_scaling_artifacts as artifacts
+from scripts import pr_offload_contract as gate_contract
 
 
 SCALES = (4, 12, 14, 20)
@@ -73,6 +74,10 @@ class PrScalingArtifactTest(unittest.TestCase):
                     "performance_gate": {
                         "status": "passed",
                         "checked_points": 9,
+                        "policies": {
+                            system: gate_contract.performance_policy(system)
+                            for system in ("amu", "cira", "m2ndp")
+                        },
                         "offenders": [],
                     },
                     "points": points,
@@ -92,9 +97,13 @@ class PrScalingArtifactTest(unittest.TestCase):
         point = value["points"][key]
         point["latency_seconds"] = str(seconds)
         point["speedup"] = str(Decimal(speedup))
-        point["mechanism"]["sim_ticks"] = str(
-            int(seconds * Decimal(10**12))
-        )
+        if key.endswith(":m2ndp"):
+            point["mechanism"]["ndpsim_measured_cycles"] = "1"
+            point["mechanism"]["ndpsim_core_period_seconds"] = str(seconds)
+        else:
+            point["mechanism"]["sim_ticks"] = str(
+                int(seconds * Decimal(10**12))
+            )
 
     def test_load_recomputes_speedup_and_native_counts(self):
         data = artifacts.load_data(self.complete)
@@ -120,6 +129,38 @@ class PrScalingArtifactTest(unittest.TestCase):
             artifacts.ArtifactError, "performance gate did not pass"
         ):
             artifacts.load_data(self.complete)
+
+    def test_load_accepts_m2ndp_above_old_upper_bound(self):
+        value = json.loads(self.complete.read_text())
+        for scale in (12, 14, 20):
+            self.set_speedup(
+                value,
+                f"g{scale}:m2ndp",
+                "2.634272138228941520602758013",
+            )
+        self.complete.write_text(json.dumps(value))
+        rows = {
+            (row.scale, row.system): row
+            for row in artifacts.load_data(self.complete).rows
+        }
+        self.assertEqual(
+            rows[(20, "m2ndp")].speedup,
+            Decimal("2.634272138228941520602758013"),
+        )
+
+    def test_load_rejects_bounded_upper_and_m2ndp_minimum_failures(self):
+        original = json.loads(self.complete.read_text())
+        for key, speedup in (
+            ("g12:amu", "1.600001"),
+            ("g20:m2ndp", "1.399999"),
+        ):
+            value = copy.deepcopy(original)
+            self.set_speedup(value, key, speedup)
+            self.complete.write_text(json.dumps(value))
+            with self.subTest(key=key), self.assertRaisesRegex(
+                artifacts.ArtifactError, "performance gate did not pass"
+            ):
+                artifacts.load_data(self.complete)
 
     def test_rejects_performance_hold_or_unpassed_gate(self):
         value = json.loads(self.complete.read_text())
