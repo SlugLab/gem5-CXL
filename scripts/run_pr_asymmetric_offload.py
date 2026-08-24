@@ -318,14 +318,19 @@ def qualification_gate(points):
         for system in contract.PRIMARY_SYSTEMS
         if system != "vanilla"
     }
+    policies = {
+        system: contract.performance_policy(system)
+        for system in speedups
+    }
     offenders = [
         system for system, speedup in speedups.items()
-        if not contract.MIN_SPEEDUP <= speedup <= contract.MAX_SPEEDUP
+        if not contract.performance_accepted(system, speedup)
     ]
     return {
         "status": "failed" if offenders else "passed",
         "checked_points": 3,
         "speedups": {name: str(value) for name, value in speedups.items()},
+        "policies": policies,
         "offenders": offenders,
     }
 
@@ -394,7 +399,10 @@ def run_qualification_state_machine(root, run_point, *, identity=None):
         _write_hold(
             root,
             "diagnostic-performance-hold.json",
-            error="g12 accelerated speedup outside 1.4x--1.6x",
+            error=(
+                "g12 accelerated speedup outside system-specific "
+                "performance policy"
+            ),
             gate=gate,
         )
         raise OffloadError("g12 qualification performance gate failed")

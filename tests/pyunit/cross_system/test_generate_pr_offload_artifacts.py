@@ -124,6 +124,13 @@ class PublisherTest(unittest.TestCase):
         pending = copy.deepcopy(base); pending["primary"][1]["pending"]["all"] = 1; mutations.append(pending)
         funcsim = copy.deepcopy(base); funcsim["primary"][3]["funcsim"]["status"] = "missing"; mutations.append(funcsim)
         gate = copy.deepcopy(base); gate["performance_gate"][0]["accepted"] = False; mutations.append(gate)
+        policy = copy.deepcopy(base)
+        m2ndp_gate = next(
+            row for row in policy["performance_gate"]
+            if row["system"] == "m2ndp"
+        )
+        m2ndp_gate.pop("maximum")
+        mutations.append(policy)
         source = copy.deepcopy(base); source["identity"]["source_sha256"] = "bad"; mutations.append(source)
         for index, value in enumerate(mutations):
             path = self.root / f"mutated-{index}.json"

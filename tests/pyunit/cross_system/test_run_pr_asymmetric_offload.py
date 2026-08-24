@@ -239,6 +239,44 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         self.assertEqual(gate["status"], "passed")
         self.assertEqual(set(gate["speedups"]), {"amu", "cira-few-shot", "m2ndp"})
 
+    def test_qualification_accepts_measured_m2ndp_without_upper_bound(self):
+        points = self.qualification_points()
+        points["g12:vanilla"]["sim_ticks"] = 1_990_498_176
+        points["g12:amu"]["sim_ticks"] = 1_418_052_861
+        points["g12:cira-few-shot"]["sim_ticks"] = 1_392_734_871
+        points["g12:cira-few-shot"]["phases"]["execution"] = 1_392_734_866
+        points["g12:cira-few-shot"]["phase_total_ns"] = 1_392_734_871
+        points["g12:m2ndp"]["ndpsim_cycles"] = 1_511_232
+        points["g12:m2ndp"]["ndpsim_core_period_seconds"] = (
+            "5.0000000000000003114e-10"
+        )
+        gate = runner.qualification_gate(points)
+        self.assertEqual(
+            gate["speedups"]["m2ndp"],
+            "2.634272138228941520602758013",
+        )
+        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(gate["offenders"], [])
+        self.assertEqual(gate["policies"]["m2ndp"], {
+            "minimum": "1.4", "maximum": None,
+            "correctness": "bit-exact-funcsim-before-ndpsim",
+        })
+
+    def test_qualification_keeps_bounded_and_minimum_failures(self):
+        slow_m2ndp = self.qualification_points()
+        slow_m2ndp["g12:m2ndp"]["ndpsim_cycles"] = 1_142_858
+        cases = (
+            (self.qualification_points(amu="1.600001"), "amu"),
+            (self.qualification_points(cira="1.600001"), "cira-few-shot"),
+            (slow_m2ndp, "m2ndp"),
+        )
+        for points, offender in cases:
+            with self.subTest(offender=offender):
+                self.assertEqual(
+                    runner.qualification_gate(points)["offenders"],
+                    [offender],
+                )
+
     def test_qualification_rejects_1399_bits_and_zero_jit(self):
         offender = self.qualification_points(amu="1.399")
         self.assertEqual(runner.qualification_gate(offender)["status"], "failed")
