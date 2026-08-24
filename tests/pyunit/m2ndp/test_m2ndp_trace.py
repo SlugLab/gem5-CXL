@@ -250,16 +250,32 @@ class PageRankTraceTest(unittest.TestCase):
         self.assertEqual(meta["logical_partitions"], 4)
         self.assertEqual(meta["partition_bounds"], [[0, 1], [1, 2], [2, 3], [3, 3]])
         self.assertTrue(meta["double_buffered"])
-        self.assertEqual(result.measure_marker, "K2_CONTRIB_TRIAL1_PART0")
+        self.assertEqual(result.measure_marker, "K2_CONTRIB_TRIAL1_GROUP")
         self.assertEqual(meta["measure_marker"], result.measure_marker)
-        self.assertEqual(result.funcsim_launches, 4 + 1 + 20 * 8)
-        self.assertEqual(result.ndpsim_launches, 2 * result.funcsim_launches)
+        self.assertEqual(result.funcsim_launches, 165)
+        self.assertEqual(result.ndpsim_launches, 84)
+        self.assertEqual(meta["timing_commands_per_trial"], 42)
+        self.assertEqual(meta["timing_launch_records_per_trial"], 165)
 
         names = (self.root / "formal-trace/0/kernelslist.g").read_text().splitlines()
-        marker_index = names.index("K2_CONTRIB_TRIAL1_PART0")
-        self.assertTrue(all("K0_INIT_TRIAL1_PART" in name for name in names[165:169]))
-        self.assertEqual(names[169], "K1_META_TRIAL1")
-        self.assertEqual(marker_index, 170)
+        self.assertEqual(len(names), 84)
+        self.assertEqual(names[42], "K0_INIT_TRIAL1_GROUP")
+        self.assertEqual(names[44], "K2_CONTRIB_TRIAL1_GROUP")
+
+        launch_lines = (
+            self.root
+            / "formal-trace/0/K2_CONTRIB_TRIAL1_GROUP_launch.txt"
+        ).read_text().splitlines()
+        self.assertEqual(len(launch_lines), 4)
+        self.assertEqual(
+            [line.split()[9:11] for line in launch_lines],
+            [
+                ["0x0", "0x1"],
+                ["0x1", "0x1"],
+                ["0x2", "0x1"],
+                ["0x3", "0x0"],
+            ],
+        )
 
         first_k2 = (self.root / "formal-trace/0/K2_CONTRIB_TRIAL1_PART0_launch.txt").read_text().split()
         final_k3 = (self.root / "formal-trace/0/K3_PULL_DAMP_TRIAL1_ITER19_PART3_launch.txt").read_text().split()
@@ -270,13 +286,13 @@ class PageRankTraceTest(unittest.TestCase):
 
         trace_dir = self.root / "formal-trace/0"
         self.assertEqual(
-            (trace_dir / "K0_INIT_TRIAL0_PART0_input.data").read_bytes(),
+            (trace_dir / "K0_INIT_TRIAL0_GROUP_input.data").read_bytes(),
             (trace_dir / "K0_INIT_input.data").read_bytes(),
         )
         self.assertEqual(
             (
                 trace_dir
-                / "K3_PULL_DAMP_TRIAL1_ITER19_PART3_output.data"
+                / "K3_PULL_DAMP_TRIAL1_ITER19_GROUP_output.data"
             ).read_bytes(),
             (trace_dir / "K3_PULL_DAMP_output.data").read_bytes(),
         )

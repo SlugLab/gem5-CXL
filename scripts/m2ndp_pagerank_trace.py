@@ -538,6 +538,37 @@ def _formal_trial_records(
     return records
 
 
+def _formal_timing_records(records):
+    grouped = []
+    cursor = 0
+    while cursor < len(records):
+        name, kernel, launch = records[cursor]
+        if kernel == "K1_META":
+            grouped.append((name, kernel, launch, 1))
+            cursor += 1
+            continue
+        prefix = name.rsplit("_PART", 1)[0]
+        phase = records[cursor:cursor + 4]
+        if (
+            len(phase) != 4
+            or any(row[1] != kernel for row in phase)
+            or [row[0] for row in phase]
+            != [f"{prefix}_PART{index}" for index in range(4)]
+        ):
+            raise artifacts.EvidenceError(
+                "formal timing phase is not four contiguous partitions: "
+                f"{prefix}"
+            )
+        grouped.append((
+            f"{prefix}_GROUP",
+            kernel,
+            "".join(row[2] for row in phase),
+            4,
+        ))
+        cursor += 4
+    return grouped
+
+
 def read_trace_meta(path):
     return json.loads(Path(path).read_text())
 
@@ -559,7 +590,7 @@ def validate_trace_binding(
         "iterations": profile.page_rank_iterations,
         "stage_sequence": list(UNIQUE_KERNELS),
         "measure_marker": (
-            "K2_CONTRIB_TRIAL1_PART0"
+            "K2_CONTRIB_TRIAL1_GROUP"
             if profile.name == "pr-offload-4thread-1us"
             else "K0_INIT_TRIAL1"
         ),
@@ -747,9 +778,20 @@ def generate_trace(
                 _atomic_write_text(
                     trace_dir / f"{name}_launch.txt", launch
                 )
+        timing_records = [
+            _formal_timing_records(records) for records in trial_records
+        ]
+        for records in timing_records:
+            for name, kernel_name, launch, _ in records:
+                _atomic_write_text(
+                    trace_dir / f"{name}.traceg", kernels[kernel_name]
+                )
+                _atomic_write_text(
+                    trace_dir / f"{name}_launch.txt", launch
+                )
         functional_names = [name for name, _, _ in trial_records[0]]
         timing_names = [
-            name for records in trial_records for name, _, _ in records
+            name for records in timing_records for name, _, _, _ in records
         ]
     else:
         functional_names = _trial_names(iterations, measured=False)
@@ -800,7 +842,14 @@ def generate_trace(
         "funcsim_launches": len(functional_names),
         "ndpsim_launches": len(timing_names),
         "measure_marker": (
-            "K2_CONTRIB_TRIAL1_PART0" if formal else "K0_INIT_TRIAL1"
+            "K2_CONTRIB_TRIAL1_GROUP" if formal else "K0_INIT_TRIAL1"
+        ),
+        "timing_commands_per_trial": (
+            len(timing_records[0]) if formal else len(functional_names)
+        ),
+        "timing_launch_records_per_trial": (
+            sum(record[3] for record in timing_records[0])
+            if formal else len(functional_names)
         ),
         "logical_partitions": 4 if formal else 1,
         "partition_bounds": (
@@ -844,6 +893,6 @@ def generate_trace(
         UNIQUE_KERNELS,
         len(functional_names),
         len(timing_names),
-        "K2_CONTRIB_TRIAL1_PART0" if formal else "K0_INIT_TRIAL1",
+        "K2_CONTRIB_TRIAL1_GROUP" if formal else "K0_INIT_TRIAL1",
         meta_path,
     )
