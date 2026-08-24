@@ -101,13 +101,14 @@ def functional_evidence(package):
     }
 
 
-def calibration(package):
+def calibration(package, *, cxl_link_delay="1us"):
     manifest = json.loads(Path(package).read_text())
     config = Path(package).parent / manifest["timing_config"]["path"]
     links = tuple(config.parent.rglob("cxl_link.icnt"))
     assert len(links) == 1
     return {
-        "passed": True, "cxl_delay": "1us",
+        "passed": True, "cxl_delay": cxl_link_delay,
+        "cxl_link_delay": cxl_link_delay,
         "target_ns": "2012.652", "measured_ns": "2012.625",
         "residual_ns": "0.027", "link_period_ns": "0.125",
         "target_cxl_boundary_ticks": 2_012_652,
@@ -729,6 +730,43 @@ class M2NDPWorkloadTraceTest(unittest.TestCase):
                                 package, functional_evidence=functional,
                                 calibration=timing_calibration,
                             )
+
+            shutil.rmtree(output.parent, ignore_errors=True)
+
+            def successful_result(*_args, **_kwargs):
+                output.write_text("timing\n", encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    [], 0,
+                    "EXPR FINISHED 10\nMEMROY MATCH SUCCESS\n"
+                    "Gantt info: host 0 finished NDP kernel X\n",
+                    "",
+                )
+
+            with mock.patch.object(
+                m2ndp.subprocess, "run", side_effect=successful_result
+            ):
+                evidence = m2ndp.run_ndpsim_package(
+                    package, functional_evidence=functional,
+                    calibration=calibration(
+                        package, cxl_link_delay="2us"
+                    ),
+                    cxl_link_delay="2us",
+                )
+            self.assertEqual(evidence["cxl_link_delay"], "2us")
+            self.assertEqual(evidence["cxl_link_delay_ticks"], 2_000_000)
+            self.assertEqual(evidence["memory_match"], "pass")
+
+            shutil.rmtree(output.parent, ignore_errors=True)
+            with mock.patch.object(m2ndp.subprocess, "run") as run:
+                with self.assertRaisesRegex(
+                    m2ndp.TraceTranslationError, "calibration CXL latency"
+                ):
+                    m2ndp.run_ndpsim_package(
+                        package, functional_evidence=functional,
+                        calibration=calibration(package),
+                        cxl_link_delay="2us",
+                    )
+            run.assert_not_called()
 
     def test_ndpsim_rejects_cross_package_functional_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

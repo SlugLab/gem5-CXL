@@ -23,6 +23,7 @@ try:
     from scripts import canonical_work_trace as canonical
     from scripts import compare_gapbs_cxl_amu_cira as comparison
     from scripts import cross_system_contract as contract
+    from scripts import cxl_latency_spectrum as latency
     from scripts import lazy_work_trace as lazy
     from scripts import npb_lazy_trace as npb
     from scripts import stratified_timing as timing
@@ -30,6 +31,7 @@ except ImportError:
     import canonical_work_trace as canonical
     import compare_gapbs_cxl_amu_cira as comparison
     import cross_system_contract as contract
+    import cxl_latency_spectrum as latency
     import lazy_work_trace as lazy
     import npb_lazy_trace as npb
     import stratified_timing as timing
@@ -1032,7 +1034,9 @@ def _integer(row, field):
     return result
 
 
-def validate_mechanism(system, row, *, require_activity=True):
+def validate_mechanism(
+    system, row, *, require_activity=True, cxl_link_delay="1us"
+):
     """Fail closed on topology, correctness, or mechanism-counter drift."""
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
@@ -1044,8 +1048,10 @@ def validate_mechanism(system, row, *, require_activity=True):
         raise ReplayError("matched replay requires all-CXL memory")
     if row.get("allocated_on_cxl") is not True:
         raise ReplayError("matched replay allocation is not on CXL")
-    if _integer(row, "cxl_link_delay_ticks") != 1_000_000:
-        raise ReplayError("matched replay requires a 1 us CXL link")
+    if _integer(row, "cxl_link_delay_ticks") != latency.ticks(
+        cxl_link_delay
+    ):
+        raise ReplayError("gem5 CXL latency differs from the campaign identity")
     if _integer(row, "queue_errors"):
         raise ReplayError(f"{system} queue errors are nonzero")
     if _integer(row, "descriptor_errors"):
@@ -1081,7 +1087,7 @@ def validate_mechanism(system, row, *, require_activity=True):
     return row
 
 
-def validate_config_ini(path):
+def validate_config_ini(path, *, cxl_link_delay="1us"):
     """Prove the generated gem5 topology is four-core, timing, and all CXL."""
     path = Path(path)
     parser = configparser.ConfigParser(interpolation=None, strict=True)
@@ -1123,8 +1129,9 @@ def validate_config_ini(path):
     delays = {
         int(parser.get(section, "delay", fallback="-1")) for section in links
     }
-    if delays != {1_000_000}:
-        raise ReplayError("matched replay requires a 1 us CXL link")
+    expected_ticks = latency.ticks(cxl_link_delay)
+    if delays != {expected_ticks}:
+        raise ReplayError("gem5 CXL latency differs from the campaign identity")
     covered = set()
     link_ports = set()
 
@@ -1166,7 +1173,7 @@ def validate_config_ini(path):
     return {
         "threads": 4,
         "all_memory_cxl": True,
-        "cxl_link_delay_ticks": 1_000_000,
+        "cxl_link_delay_ticks": expected_ticks,
         "cxl_links": links,
         "memory_ranges": board_ranges,
     }
@@ -1259,7 +1266,7 @@ def command_for(options):
         "--cores", "4",
         "--cpu", "timing",
         "--cxl-memory",
-        "--cxl-link-delay", "1us",
+        "--cxl-link-delay", getattr(options, "cxl_link_delay", "1us"),
         "--require-m5-verification-exit",
     ]
     if options.system == "amu":
@@ -1324,7 +1331,7 @@ def _required_shadow_bytes(bundle):
 
 def collect_run_evidence(run_dir, *, system, trace, config,
                          expected=None, required_bytes=None,
-                         require_activity=True):
+                         require_activity=True, cxl_link_delay="1us"):
     """Join bit-exact program output with gem5-owned causal statistics."""
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
@@ -1368,7 +1375,12 @@ def collect_run_evidence(run_dir, *, system, trace, config,
             if hashlib.sha256(payload).hexdigest() != digest:
                 raise ReplayError(f"stream replay boundary {name} differs")
 
-    topology = validate_config_ini(config)
+    topology = validate_config_ini(
+        config, cxl_link_delay=cxl_link_delay
+    )
+    expected_ticks = latency.ticks(cxl_link_delay)
+    if topology["cxl_link_delay_ticks"] != expected_ticks:
+        raise ReplayError("gem5 CXL latency differs from the campaign identity")
     allocation = (
         parse_allocation_log(run_dir / "simout", required_bytes=required_bytes)
         if required_bytes
@@ -1385,6 +1397,7 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         "threads": _integer(result, "threads"),
         "phases": _integer(result, "phases"),
         "all_memory_cxl": topology["all_memory_cxl"],
+        "cxl_link_delay": cxl_link_delay,
         "cxl_link_delay_ticks": topology["cxl_link_delay_ticks"],
         "allocated_on_cxl": allocation["allocated_on_cxl"],
         "allocated_bytes": allocation["allocated_bytes"],
@@ -1441,7 +1454,10 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         row["descriptor_errors"] = _stat_integer(
             stats, "board.cira.droppedCsrDescriptors"
         )
-    validate_mechanism(system, row, require_activity=require_activity)
+    validate_mechanism(
+        system, row, require_activity=require_activity,
+        cxl_link_delay=cxl_link_delay,
+    )
     return row
 
 
@@ -1506,6 +1522,9 @@ def parse_args(argv=None):
     parser.add_argument("--gem5", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument(
+        "--cxl-link-delay", choices=latency.LABELS, default="1us"
+    )
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
     options = parser.parse_args(argv)
@@ -1652,6 +1671,7 @@ def run(options):
         row = collect_run_evidence(
             outdir, system=options.system, trace=replay_trace,
             config=outdir / "config.ini",
+            cxl_link_delay=options.cxl_link_delay,
         )
     else:
         widths = {"u32": 4, "u64": 8, "f32": 4, "f64": 8}
@@ -1663,6 +1683,7 @@ def run(options):
             outdir, system=options.system, trace=None,
             config=outdir / "config.ini", expected=producer_evidence,
             required_bytes=required_bytes,
+            cxl_link_delay=options.cxl_link_delay,
         )
     fixed_command = None
     fixed_row = None
@@ -1694,6 +1715,7 @@ def run(options):
             fixed_outdir, system=options.system,
             trace=materialized.fixed_root,
             config=fixed_outdir / "config.ini", require_activity=False,
+            cxl_link_delay=options.cxl_link_delay,
         )
         row = combine_window_evidence(
             row, fixed_row,
@@ -1709,6 +1731,8 @@ def run(options):
         "status": "pass",
         "mode": options.mode,
         "system": options.system,
+        "cxl_link_delay": options.cxl_link_delay,
+        "cxl_link_delay_ticks": latency.ticks(options.cxl_link_delay),
         "trace": str(trace),
         "trace_meta_sha256": _sha256_file(source_descriptor),
         "trace_identity_sha256": trace_identity_sha256(trace),

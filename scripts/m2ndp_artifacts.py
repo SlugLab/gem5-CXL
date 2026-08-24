@@ -131,7 +131,9 @@ def compare_funcsim_boundaries(
     }
 
 
-def require_ndpsim_timing_gate(functional, calibration):
+def require_ndpsim_timing_gate(
+    functional, calibration, *, cxl_link_delay="1us"
+):
     if not isinstance(functional, dict) or functional.get("status") != "pass":
         raise EvidenceError("NDPSim timing requires complete FuncSim PASS")
     boundary_gate = (
@@ -153,8 +155,8 @@ def require_ndpsim_timing_gate(functional, calibration):
         raise EvidenceError("M2NDP CXL calibration is invalid")
     if calibration.get("passed") is not True:
         raise EvidenceError("M2NDP CXL calibration did not pass")
-    if calibration.get("cxl_delay") != "1us":
-        raise EvidenceError("M2NDP calibration is not bound to 1 us CXL")
+    if calibration.get("cxl_delay") != cxl_link_delay:
+        raise EvidenceError("M2NDP calibration CXL latency differs")
     try:
         target = Decimal(calibration["target_ns"])
         observed = Decimal(calibration["measured_ns"])
@@ -174,7 +176,7 @@ def require_ndpsim_timing_gate(functional, calibration):
         raise EvidenceError("M2NDP calibration residual differs")
     if residual > link_cycle:
         raise EvidenceError(
-            "M2NDP 1 us calibration differs by more than one link cycle"
+            "M2NDP calibration differs by more than one link cycle"
         )
     return True
 

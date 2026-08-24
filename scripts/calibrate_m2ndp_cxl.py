@@ -776,6 +776,7 @@ def main():
         "response_count": gem5_evidence.response_count,
         "round_trip_packets": gem5_evidence.round_trip_packets,
         "cxl_delay": args.cxl_delay,
+        "cxl_link_delay": args.cxl_delay,
         "probe_roi_ticks": gem5_evidence.sim_ticks,
         "target_cxl_boundary_ticks": gem5_evidence.target_ticks,
         "target_ns": str(result.target_ns),

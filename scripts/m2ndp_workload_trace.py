@@ -19,12 +19,14 @@ from types import SimpleNamespace
 try:
     from scripts import canonical_work_trace as canonical
     from scripts import cross_system_contract as contract
+    from scripts import cxl_latency_spectrum as latency
     from scripts import m2ndp_artifacts as artifact_helpers
     from scripts import lazy_work_trace as lazy
     from scripts import npb_lazy_trace as npb
 except ImportError:
     import canonical_work_trace as canonical
     import cross_system_contract as contract
+    import cxl_latency_spectrum as latency
     import m2ndp_artifacts as artifact_helpers
     import lazy_work_trace as lazy
     import npb_lazy_trace as npb
@@ -762,9 +764,9 @@ def _verify_funcsim_evidence_cardinality(
 
 def run_ndpsim_package(
     manifest_path, *, functional_evidence, calibration,
-    ndpsim=None, evidence_path=None,
+    ndpsim=None, evidence_path=None, cxl_link_delay="1us",
 ):
-    """Run timing only after complete functional and exact-1us gates."""
+    """Run timing only after complete functional and latency-bound gates."""
     if (
         not isinstance(functional_evidence, dict)
         or functional_evidence.get("status") != "pass"
@@ -796,8 +798,20 @@ def run_ndpsim_package(
     _verify_funcsim_evidence_cardinality(
         root, manifest, boundaries, functional_evidence
     )
+    try:
+        cxl_link_delay_ticks = latency.ticks(cxl_link_delay)
+    except latency.LatencyError as error:
+        raise TraceTranslationError(str(error)) from error
+    if (
+        calibration.get("cxl_delay") != cxl_link_delay
+        or calibration.get("cxl_link_delay") != cxl_link_delay
+    ):
+        raise TraceTranslationError(
+            "M2NDP calibration CXL latency differs"
+        )
     artifact_helpers.require_ndpsim_timing_gate(
-        functional_evidence, calibration
+        functional_evidence, calibration,
+        cxl_link_delay=cxl_link_delay,
     )
     configured = Path(provenance.get("ndpsim_path", "")).resolve()
     selected = configured if ndpsim is None else Path(ndpsim).resolve()
@@ -891,6 +905,8 @@ def run_ndpsim_package(
         "expected_launches": expected_launches,
         "completed_launches": completed_launches,
         "memory_match": "pass",
+        "cxl_link_delay": cxl_link_delay,
+        "cxl_link_delay_ticks": cxl_link_delay_ticks,
         "calibration": calibration,
         "ndpsim_sha256": provenance["ndpsim_sha256"],
         "config_sha256": provenance["ndpsim_config_sha256"],

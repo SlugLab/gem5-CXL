@@ -1266,7 +1266,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             ({"threads": 2}, "four threads"),
             ({"all_memory_cxl": False}, "all-CXL"),
             ({"allocated_on_cxl": False}, "allocation"),
-            ({"cxl_link_delay_ticks": 500_000}, "1 us"),
+            ({"cxl_link_delay_ticks": 500_000}, "campaign identity"),
         ):
             with self.subTest(change=change), self.assertRaisesRegex(
                 replay.ReplayError, message
@@ -1305,12 +1305,16 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         )
         return path
 
-    def test_config_parser_proves_four_core_timing_all_cxl_one_microsecond(self):
+    def test_config_parser_proves_four_core_timing_all_cxl_selected_latency(self):
         evidence = replay.validate_config_ini(self._write_config())
         self.assertEqual(evidence["threads"], 4)
         self.assertEqual(evidence["cxl_link_delay_ticks"], 1_000_000)
         self.assertTrue(evidence["all_memory_cxl"])
-        with self.assertRaisesRegex(replay.ReplayError, "1 us"):
+        evidence = replay.validate_config_ini(
+            self._write_config(delay=200_000), cxl_link_delay="200ns"
+        )
+        self.assertEqual(evidence["cxl_link_delay_ticks"], 200_000)
+        with self.assertRaisesRegex(replay.ReplayError, "campaign identity"):
             replay.validate_config_ini(self._write_config(delay=500_000))
         with self.assertRaisesRegex(replay.ReplayError, "bypasses CXL"):
             replay.validate_config_ini(self._write_config(direct_memory=True))
@@ -1348,6 +1352,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             system="amu", trace=trace, binary=binary, gem5=gem5,
             config=config, outdir=self.root / "out",
             calibration=self.root / "calibration.json",
+            cxl_link_delay="200ns",
         )
         functional = replay.command_for(SimpleNamespace(
             **common, mode="functional", window_manifest=None,
@@ -1359,6 +1364,9 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertNotIn("--window-index", functional_args)
         self.assertIn("--redirect-stdout", functional)
         self.assertIn("--stdout-file=simout", functional)
+        self.assertEqual(
+            functional[functional.index("--cxl-link-delay") + 1], "200ns"
+        )
         self.assertIn("--mode", functional_args)
         self.assertEqual(
             functional_args[functional_args.index("--mode") + 1],
