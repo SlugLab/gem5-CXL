@@ -139,6 +139,7 @@ def build_identity(options, selected):
         REPO / "util/cira",
         REPO / "scripts/pr_offload_contract.py",
         REPO / "scripts/m2ndp_pagerank_trace.py",
+        REPO / "scripts/run_gapbs_matched_pr_spmv_variants.py",
         Path(__file__).resolve(),
     )
     source_digest = hashlib.sha256()

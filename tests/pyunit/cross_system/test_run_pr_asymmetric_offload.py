@@ -77,6 +77,7 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
             "util/m2ndp/patches/patch",
             "scripts/pr_offload_contract.py",
             "scripts/m2ndp_pagerank_trace.py",
+            "scripts/run_gapbs_matched_pr_spmv_variants.py",
         ):
             path = repository / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +86,29 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
             before = runner.build_identity(self.options, selected)
             (repository / "scripts/m2ndp_pagerank_trace.py").write_text(
                 "changed trace generator\n"
+            )
+            after = runner.build_identity(self.options, selected)
+        self.assertNotEqual(before["source_sha256"], after["source_sha256"])
+
+    def test_identity_changes_when_matched_runner_changes(self):
+        selected = runner.select_inputs(self.options)
+        repository = self.root / "repository"
+        for relative in (
+            "util/pr_offload/source",
+            "util/amu/source",
+            "util/cira/source",
+            "util/m2ndp/patches/patch",
+            "scripts/pr_offload_contract.py",
+            "scripts/m2ndp_pagerank_trace.py",
+            "scripts/run_gapbs_matched_pr_spmv_variants.py",
+        ):
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(relative + "\n")
+        with mock.patch.object(runner, "REPO", repository):
+            before = runner.build_identity(self.options, selected)
+            (repository / "scripts/run_gapbs_matched_pr_spmv_variants.py").write_text(
+                "changed matched runner\n"
             )
             after = runner.build_identity(self.options, selected)
         self.assertNotEqual(before["source_sha256"], after["source_sha256"])
