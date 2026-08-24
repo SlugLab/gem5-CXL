@@ -748,6 +748,9 @@ class ScalingRunnerTest(unittest.TestCase):
             scaling.REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py",
             paths,
         )
+        self.assertIn(
+            scaling.REPO / "scripts/pr_offload_contract.py", paths
+        )
 
     def test_amu_queue_error_and_cira_inactive_core_fail_mechanism_gate(self):
         amu = {

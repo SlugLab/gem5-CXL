@@ -92,6 +92,7 @@ def _code_sha256():
         REPO / "scripts/compare_gapbs_cxl_amu_cira.py",
         REPO / "scripts/freeze_pr_scaling_inputs.py",
         REPO / "scripts/gapbs_pr_experiment_profiles.py",
+        REPO / "scripts/pr_offload_contract.py",
         REPO / "scripts/pr_scaling_variant_build.py",
         REPO / "scripts/qualify_pr_scaling_g12.py",
         REPO / "scripts/build_gapbs_matched_pr_spmv_variants.py",
