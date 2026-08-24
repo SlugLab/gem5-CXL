@@ -339,8 +339,14 @@ def validate_replay(primary, replay):
     expected = tuple(
         f"g12:{system}" for system in contract.PRIMARY_SYSTEMS
     )
-    if tuple(primary) != expected or tuple(replay) != expected:
-        raise OffloadError("g12 replay point set or order differs")
+    expected_set = set(expected)
+    if (
+        not isinstance(primary, dict)
+        or not isinstance(replay, dict)
+        or set(primary) != expected_set
+        or set(replay) != expected_set
+    ):
+        raise OffloadError("g12 replay point set differs")
     for key in expected:
         first = contract.validate_point(primary[key])
         again = contract.validate_point(replay[key])

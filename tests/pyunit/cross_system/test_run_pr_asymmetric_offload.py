@@ -304,6 +304,20 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
             ):
                 runner.validate_replay(primary, candidate)
 
+    def test_replay_accepts_canonical_json_key_order(self):
+        primary = self.qualification_points()
+        replay = copy.deepcopy(primary)
+        persisted = json.loads(json.dumps({
+            "primary": primary,
+            "replay": replay,
+        }, sort_keys=True))
+        self.assertEqual(
+            runner.validate_replay(
+                persisted["primary"], persisted["replay"]
+            ),
+            persisted["replay"],
+        )
+
     def test_g12_gate_failure_writes_hold_before_larger_scale(self):
         launched = []
         points = self.qualification_points(amu="1.399")
