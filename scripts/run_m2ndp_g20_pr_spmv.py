@@ -898,6 +898,10 @@ def _publish(options, paths):
         ),
     )
     if options.profile == profiles.FORMAL_PROFILE_NAME:
+        trace_meta = pagerank_trace.read_trace_meta(
+            paths.trace / "trace.meta.json"
+        )
+        results.bind_formal_trace_cardinality(row, trace_meta)
         results.validate_formal_result(row)
     artifacts.atomic_write_csv(
         paths.summary,

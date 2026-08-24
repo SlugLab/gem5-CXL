@@ -198,6 +198,23 @@ class M2NDPResultTest(unittest.TestCase):
             ):
                 results.validate_formal_result(candidate)
 
+    def test_formal_summary_inherits_grouped_trace_cardinality(self):
+        row = {
+            "profile": "pr-offload-4thread-1us",
+            "logical_partitions": 4,
+        }
+        trace_meta = {
+            "timing_commands_per_trial": 42,
+            "timing_launch_records_per_trial": 165,
+        }
+
+        bound = results.bind_formal_trace_cardinality(row, trace_meta)
+
+        self.assertIs(bound, row)
+        self.assertEqual(bound["timing_commands_per_trial"], 42)
+        self.assertEqual(bound["timing_launch_records_per_trial"], 165)
+        self.assertEqual(results.validate_formal_result(bound), bound)
+
     def test_parse_ndpsim_rejects_duplicate_and_reordered_markers(self):
         duplicate = "\n".join(
             [

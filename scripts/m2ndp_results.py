@@ -77,6 +77,20 @@ REAL_CXL_FIELDS = (
 FORMAL_PROFILE = "pr-offload-4thread-1us"
 
 
+def bind_formal_trace_cardinality(result, trace_meta):
+    """Copy grouped timing cardinality from its authoritative trace meta."""
+    if not isinstance(result, dict) or not isinstance(trace_meta, dict):
+        raise artifacts.EvidenceError(
+            "M2NDP formal trace cardinality binding is invalid"
+        )
+    for field in (
+        "timing_commands_per_trial",
+        "timing_launch_records_per_trial",
+    ):
+        result[field] = trace_meta.get(field)
+    return result
+
+
 def validate_formal_result(result):
     if result.get("profile") != FORMAL_PROFILE:
         raise artifacts.EvidenceError(
