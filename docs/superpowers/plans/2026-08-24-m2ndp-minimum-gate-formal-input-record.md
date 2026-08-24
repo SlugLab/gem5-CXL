@@ -69,7 +69,7 @@ def test_m2ndp_acceptance_has_no_upper_bound(self):
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.cross_system.test_pr_offload_contract -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_pr_offload_contract.py' -v
 ```
 
 Expected: failure because both policy functions are absent.
@@ -122,7 +122,7 @@ gate.append({
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.cross_system.test_pr_offload_contract -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_pr_offload_contract.py' -v
 git diff --check
 git add scripts/pr_offload_contract.py tests/pyunit/cross_system/test_pr_offload_contract.py
 git commit -m "feat: define system-specific offload gates"
@@ -158,7 +158,7 @@ period or cycle count with `Decimal`, never a Python float.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.cross_system.test_run_pr_asymmetric_offload -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_run_pr_asymmetric_offload.py' -v
 ```
 
 Expected: the measured M2NDP point is an offender under the old maximum.
@@ -199,9 +199,8 @@ each recomputed gate row. Add a mutation removing M2NDP `maximum` and expect
 Run:
 
 ```bash
-python3 -m unittest \
-  tests.pyunit.cross_system.test_run_pr_asymmetric_offload \
-  tests.pyunit.cross_system.test_generate_pr_offload_artifacts -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_run_pr_asymmetric_offload.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_pr_offload_artifacts.py' -v
 git diff --check
 git add scripts/run_pr_asymmetric_offload.py \
   tests/pyunit/cross_system/test_run_pr_asymmetric_offload.py \
@@ -271,10 +270,9 @@ separate mutations for AMU `1.600001` and M2NDP `1.399999` and expect
 Run:
 
 ```bash
-python3 -m unittest \
-  tests.pyunit.cross_system.test_run_cira_amu_m2ndp_scaling \
-  tests.pyunit.cross_system.test_qualify_pr_scaling_g12 \
-  tests.pyunit.cross_system.test_generate_pr_scaling_artifacts -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_run_cira_amu_m2ndp_scaling.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_qualify_pr_scaling_g12.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_pr_scaling_artifacts.py' -v
 ```
 
 Expected: failures name the old uniform maximum or missing policy fields.
@@ -320,10 +318,9 @@ M2NDP point, so it emits only the shared AMU and CIRA bounded policies.
 Run:
 
 ```bash
-python3 -m unittest \
-  tests.pyunit.cross_system.test_run_cira_amu_m2ndp_scaling \
-  tests.pyunit.cross_system.test_qualify_pr_scaling_g12 \
-  tests.pyunit.cross_system.test_generate_pr_scaling_artifacts -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_run_cira_amu_m2ndp_scaling.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_qualify_pr_scaling_g12.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_pr_scaling_artifacts.py' -v
 git diff --check
 git add scripts/run_cira_amu_m2ndp_scaling.py \
   scripts/qualify_pr_scaling_g12.py \
@@ -385,7 +382,7 @@ Reuse the fixture builder from `test_freeze_cross_system_inputs.py`.
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.cross_system.test_audit_cross_system_input_record -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_audit_cross_system_input_record.py' -v
 ```
 
 Expected: import failure because the audit module is absent.
@@ -448,9 +445,8 @@ writes both outputs with `cross_system_contract.atomic_write_json`.
 Run:
 
 ```bash
-python3 -m unittest \
-  tests.pyunit.cross_system.test_audit_cross_system_input_record \
-  tests.pyunit.cross_system.test_freeze_cross_system_inputs -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_audit_cross_system_input_record.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_freeze_cross_system_inputs.py' -v
 git diff --check
 git add scripts/audit_cross_system_input_record.py \
   tests/pyunit/cross_system/test_audit_cross_system_input_record.py
