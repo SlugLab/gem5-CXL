@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -741,11 +742,12 @@ sectionText(const Package &package, uint16_t type)
     return std::string(found->second.begin(), found->second.end());
 }
 
-class EventReader
+class JsonLineReader
 {
   public:
-    explicit EventReader(const Package &package)
-        : data(sectionData(package)), schema(sectionSchema(package))
+    JsonLineReader(const Package &package, uint16_t section)
+        : data(sectionData(package, section)),
+          schema(sectionSchema(package, section))
     {
         if (schema == 1U) {
             pending.assign(data.begin(), data.end());
@@ -756,11 +758,11 @@ class EventReader
                 throw Error("MCFREG2 gzip event initialization failed");
             initialized = true;
         } else {
-            throw Error("MCFREG2 event section schema is unsupported");
+            throw Error("MCFREG2 JSONL section schema is unsupported");
         }
     }
 
-    ~EventReader()
+    ~JsonLineReader()
     {
         if (initialized)
             inflateEnd(&stream);
@@ -796,24 +798,24 @@ class EventReader
 
   private:
     static const std::vector<uint8_t> &
-    sectionData(const Package &package)
+    sectionData(const Package &package, uint16_t section)
     {
-        const auto found = package.sections.find(MCFREG2_EVENTS);
+        const auto found = package.sections.find(section);
         if (found == package.sections.end())
-            throw Error("MCFREG2 event section is missing");
+            throw Error("MCFREG2 JSONL section is missing");
         return found->second;
     }
 
     static uint16_t
-    sectionSchema(const Package &package)
+    sectionSchema(const Package &package, uint16_t section)
     {
         const auto found = std::find_if(
             package.directory.begin(), package.directory.end(),
-            [](const auto &entry) {
-                return entry.sectionType == MCFREG2_EVENTS;
+            [section](const auto &entry) {
+                return entry.sectionType == section;
             });
         if (found == package.directory.end())
-            throw Error("MCFREG2 event directory entry is missing");
+            throw Error("MCFREG2 JSONL directory entry is missing");
         return found->schema;
     }
 
@@ -836,13 +838,13 @@ class EventReader
         pending.append(output.data(), produced);
         if (status == Z_STREAM_END) {
             if (stream.avail_in != 0U || inputOffset != data.size())
-                throw Error("MCFREG2 gzip event stream has trailing bytes");
+                throw Error("MCFREG2 gzip JSONL stream has trailing bytes");
             finished = true;
         } else if (status != Z_OK) {
-            throw Error("MCFREG2 gzip event stream is invalid");
+            throw Error("MCFREG2 gzip JSONL stream is invalid");
         } else if (produced == 0U && stream.avail_in == 0U &&
                    inputOffset == data.size()) {
-            throw Error("MCFREG2 gzip event stream is truncated");
+            throw Error("MCFREG2 gzip JSONL stream is truncated");
         }
     }
 
@@ -969,26 +971,6 @@ jsonArray(const std::vector<Json> &values)
     return result;
 }
 
-std::map<uint64_t, std::pair<std::string, std::string>>
-boundaryDigests(const Package &package)
-{
-    const Json root = JsonParser(sectionText(package, MCFREG2_BOUNDARIES)).parse();
-    const Json &rows = field(root, "rows");
-    if (rows.kind != Json::Kind::Array)
-        throw Error("MCFREG2 boundaries rows are not an array");
-    std::map<uint64_t, std::pair<std::string, std::string>> result;
-    for (const Json &row : rows.array) {
-        const uint64_t order = nonnegative(row, "order");
-        if (!result.emplace(
-                order,
-                std::make_pair(
-                    stringField(row, "pre_sha256"),
-                    stringField(row, "post_sha256"))).second)
-            throw Error("MCFREG2 boundary order is duplicated");
-    }
-    return result;
-}
-
 std::vector<Json>
 sectionRows(const Package &package, uint16_t section)
 {
@@ -997,6 +979,76 @@ sectionRows(const Package &package, uint16_t section)
     if (rows.kind != Json::Kind::Array)
         throw Error("MCFREG2 section rows are not an array");
     return rows.array;
+}
+
+class SectionRowReader
+{
+  public:
+    SectionRowReader(const Package &package, uint16_t section)
+    {
+        const auto found = std::find_if(
+            package.directory.begin(), package.directory.end(),
+            [section](const auto &entry) {
+                return entry.sectionType == section;
+            });
+        if (found == package.directory.end())
+            throw Error("MCFREG2 row directory entry is missing");
+        expectedRows = found->elementCount;
+        if (found->schema == 1U) {
+            legacy = sectionRows(package, section);
+            expectedRows = legacy.size();
+        } else if (found->schema == 2U) {
+            stream = std::make_unique<JsonLineReader>(package, section);
+        } else {
+            throw Error("MCFREG2 row section schema is unsupported");
+        }
+    }
+
+    bool next(Json &result)
+    {
+        bool available = false;
+        if (stream) {
+            available = stream->next(result);
+        } else if (position < legacy.size()) {
+            result = legacy[position++];
+            available = true;
+        }
+        if (available)
+            ++rows;
+        if (rows > expectedRows)
+            throw Error("MCFREG2 row section exceeds its element count");
+        return available;
+    }
+
+    uint64_t count() const { return rows; }
+    uint64_t expected() const { return expectedRows; }
+
+  private:
+    std::unique_ptr<JsonLineReader> stream;
+    std::vector<Json> legacy;
+    size_t position = 0;
+    uint64_t rows = 0;
+    uint64_t expectedRows = 0;
+};
+
+void
+matchSectionRow(
+    SectionRowReader &reader, const Json &expected, const char *label)
+{
+    Json recorded;
+    if (!reader.next(recorded) ||
+        canonicalJson(recorded) != canonicalJson(expected))
+        throw Error(std::string("MCFREG2 ") + label +
+                    " section differs from events");
+}
+
+void
+finishSectionRows(SectionRowReader &reader, const char *label)
+{
+    Json extra;
+    if (reader.next(extra) || reader.count() != reader.expected())
+        throw Error(std::string("MCFREG2 ") + label +
+                    " section row count differs");
 }
 
 const McfReg2DirectoryEntry &
@@ -1111,21 +1163,11 @@ replay(
     constexpr uint64_t DeltaAddress = UINT64_C(0xa00000000);
     TraceSink trace(canonicalTrace);
     validateInitialState(package);
-    EventReader events(package);
-    const auto boundaries = boundaryDigests(package);
-    const std::vector<Json> callRows =
-        sectionRows(package, MCFREG2_CALL_INDEX);
-    std::map<uint64_t, Json> callIndex;
-    for (const Json &row : callRows) {
-        if (!callIndex.emplace(nonnegative(row, "order"), row).second)
-            throw Error("MCFREG2 call index order is duplicated");
-    }
-    const std::vector<Json> recordedBasket =
-        sectionRows(package, MCFREG2_BASKET);
-    const std::vector<Json> recordedDeltas =
-        sectionRows(package, MCFREG2_DELTAS);
-    std::vector<Json> expectedBasket;
-    std::vector<Json> expectedDeltas;
+    JsonLineReader events(package, MCFREG2_EVENTS);
+    SectionRowReader basketRows(package, MCFREG2_BASKET);
+    SectionRowReader callRows(package, MCFREG2_CALL_INDEX);
+    SectionRowReader deltaRows(package, MCFREG2_DELTAS);
+    SectionRowReader boundaryRows(package, MCFREG2_BOUNDARIES);
     ReplaySummary summary;
     uint64_t sequence = 0;
     uint64_t expectedOrder = 0;
@@ -1196,10 +1238,10 @@ replay(
               stringField(event, "phase") == "live_out")))
             frameRows.push_back(event);
         if (kind == "BASKET")
-            expectedBasket.push_back(event);
+            matchSectionRow(basketRows, event, "basket");
         if (kind == "ARC_STATE" || kind == "ARENA_REMAP" ||
             kind == "ADJACENCY")
-            expectedDeltas.push_back(event);
+            matchSectionRow(deltaRows, event, "delta");
         if (phase == "pricing" && kind == "SCAN") {
             const int64_t computed = reducedCost(event);
             if (computed != integer(event, "reduced_cost"))
@@ -1387,19 +1429,23 @@ replay(
                  stringField(row, "phase") == "live_out"))
                 post.push_back(row);
         }
-        const auto boundary = boundaries.find(expectedOrder);
-        if (boundary == boundaries.end() ||
+        Json boundary;
+        if (!boundaryRows.next(boundary) ||
+            nonnegative(boundary, "order") != expectedOrder ||
+            stringField(boundary, "phase") != activePhase ||
+            nonnegative(boundary, "ordinal") != activeOrdinal ||
             sha256Hex(canonicalJson(jsonArray(pre)) + "\n") !=
-                boundary->second.first ||
+                stringField(boundary, "pre_sha256") ||
             sha256Hex(canonicalJson(jsonArray(post)) + "\n") !=
-                boundary->second.second)
+                stringField(boundary, "post_sha256"))
             throw Error("MCFREG2 boundary digest differs");
-        const auto indexed = callIndex.find(expectedOrder);
-        if (indexed == callIndex.end() ||
-            stringField(indexed->second, "phase") != activePhase ||
-            nonnegative(indexed->second, "ordinal") != activeOrdinal ||
-            nonnegative(indexed->second, "event_begin") != frameStart ||
-            nonnegative(indexed->second, "event_count") !=
+        Json indexed;
+        if (!callRows.next(indexed) ||
+            nonnegative(indexed, "order") != expectedOrder ||
+            stringField(indexed, "phase") != activePhase ||
+            nonnegative(indexed, "ordinal") != activeOrdinal ||
+            nonnegative(indexed, "event_begin") != frameStart ||
+            nonnegative(indexed, "event_count") !=
                 eventIndex - frameStart + 1U)
             throw Error("MCFREG2 call index differs");
         emitTrace(
@@ -1412,16 +1458,15 @@ replay(
     if (events.count() != package.header.eventCount)
         throw Error("MCFREG2 event count differs");
     if (active || summary.pricingCalls != package.header.pricingCalls ||
-        summary.priceOutCalls != package.header.priceOutCalls ||
-        expectedOrder != boundaries.size() ||
-        expectedOrder != callIndex.size())
+        summary.priceOutCalls != package.header.priceOutCalls)
         throw Error("MCFREG2 replay call counts differ");
-    if (canonicalJson(jsonArray(expectedBasket)) !=
-            canonicalJson(jsonArray(recordedBasket)))
-        throw Error("MCFREG2 basket section differs from events");
-    if (canonicalJson(jsonArray(expectedDeltas)) !=
-            canonicalJson(jsonArray(recordedDeltas)))
-        throw Error("MCFREG2 delta section differs from events");
+    finishSectionRows(basketRows, "basket");
+    finishSectionRows(callRows, "call index");
+    finishSectionRows(deltaRows, "delta");
+    finishSectionRows(boundaryRows, "boundary");
+    if (expectedOrder != callRows.count() ||
+        expectedOrder != boundaryRows.count())
+        throw Error("MCFREG2 replay call counts differ");
     summary.operations = sequence;
     summary.traceSha256 = trace.finish();
     std::filesystem::create_directories(outputRoot);

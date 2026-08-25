@@ -622,7 +622,13 @@ def write_package(path, package: Package) -> str:
                     raise FormatError("cannot write a lazy MCFREG2 section")
             stream.flush()
             os.fsync(stream.fileno())
-        read_package(temporary, lazy_section_names=("EVENTS",))
+        lazy_sections = tuple(
+            SECTION_NAMES[section.section_type]
+            for section in sections
+            if isinstance(section.data, Path)
+            and section.section_type in SECTION_NAMES
+        )
+        read_package(temporary, lazy_section_names=lazy_sections)
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:

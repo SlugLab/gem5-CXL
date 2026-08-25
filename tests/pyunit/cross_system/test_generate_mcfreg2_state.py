@@ -801,9 +801,14 @@ int main(int argc, char **argv)
         ]
         nodes_entry = directory[generator.mcfreg2.SECTION_TYPES["NODES"]]
         arcs_entry = directory[generator.mcfreg2.SECTION_TYPES["ARCS"]]
-        events_entry = directory[
-            generator.mcfreg2.SECTION_TYPES["EVENTS"]
-        ]
+        streamed_names = (
+            "BASKET",
+            "CALL_INDEX",
+            "EVENTS",
+            "DELTAS",
+            "BOUNDARIES",
+        )
+        events_entry = directory[generator.mcfreg2.SECTION_TYPES["EVENTS"]]
         self.assertEqual(
             (network_entry.element_count, network_entry.element_size),
             (generator.STATE_NETWORK_WORDS, 8),
@@ -824,10 +829,10 @@ int main(int argc, char **argv)
             events_entry.element_count, parsed_package.header.event_count
         )
         self.assertEqual(events_entry.element_size, 0)
-        self.assertEqual(events_entry.schema, 2)
-        self.assertEqual(
-            parsed_package.section("EVENTS")[:2], b"\x1f\x8b"
-        )
+        for name in streamed_names:
+            entry = directory[generator.mcfreg2.SECTION_TYPES[name]]
+            self.assertEqual(entry.schema, 2)
+            self.assertEqual(parsed_package.section(name)[:2], b"\x1f\x8b")
         validation = json.loads(
             (accepted_root / "validation.json").read_text(encoding="utf-8")
         )

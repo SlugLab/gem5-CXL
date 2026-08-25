@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import json
@@ -711,113 +712,143 @@ class _JournalFrames:
         self.expected_ordinal += 1
 
 
-def _stream_frame_sections(run_root, events_path):
+STREAMED_SECTIONS = (
+    "BASKET",
+    "CALL_INDEX",
+    "EVENTS",
+    "DELTAS",
+    "BOUNDARIES",
+)
+
+
+def _stream_frame_sections(run_root, section_paths):
     run_root = Path(run_root)
+    section_paths = {
+        name: Path(section_paths[name]) for name in STREAMED_SECTIONS
+    }
     readers = (
         _JournalFrames(run_root / "pricing.jsonl.gz", "pricing"),
         _JournalFrames(run_root / "price_out.jsonl.gz", "price_out"),
     )
-    call_index = []
-    boundaries = []
-    basket_rows = []
-    delta_rows = []
-    event_count = 0
-    pricing_calls = 0
-    price_out_calls = 0
-    raw = Path(events_path).open("wb")
-    compressed = gzip.GzipFile(
-        filename="", mode="wb", fileobj=raw, compresslevel=1, mtime=0
-    )
     try:
-        expected_order = 0
-        while True:
-            available = [
-                (reader.begin()["order"], reader)
-                for reader in readers
-                if reader.begin() is not None
-            ]
-            if not available:
-                break
-            order, reader = min(available, key=lambda item: item[0])
-            if order != expected_order:
-                raise GenerationError("native MCF call order is not contiguous")
-            ordinal = reader.expected_ordinal
-            start = event_count
-            live_in = []
-            live_out = []
-            last_kind = None
-            for row in reader.rows():
-                event = {
-                    "phase_name": reader.phase,
-                    "ordinal": ordinal,
-                    **row,
-                }
-                compressed.write(_canonical_event_json(event))
-                event_count += 1
-                last_kind = row.get("kind")
-                if last_kind == "BASKET":
-                    basket_rows.append(event)
-                if last_kind in {"ARC_STATE", "ARENA_REMAP", "ADJACENCY"}:
-                    delta_rows.append(event)
-                if last_kind == "BEGIN" or (
-                    last_kind == "BASKET" and row.get("phase") == "live_in"
-                ):
-                    live_in.append(event)
-                if (
-                    last_kind == "END"
-                    or (
-                        last_kind == "BASKET"
-                        and row.get("phase") == "live_out"
+        with contextlib.ExitStack() as stack:
+            writers = {}
+            for name, path in section_paths.items():
+                raw = stack.enter_context(path.open("wb"))
+                writers[name] = stack.enter_context(gzip.GzipFile(
+                    filename="",
+                    mode="wb",
+                    fileobj=raw,
+                    compresslevel=1,
+                    mtime=0,
+                ))
+            counts = {name: 0 for name in STREAMED_SECTIONS}
+            event_count = 0
+            pricing_calls = 0
+            price_out_calls = 0
+            expected_order = 0
+            while True:
+                available = [
+                    (reader.begin()["order"], reader)
+                    for reader in readers
+                    if reader.begin() is not None
+                ]
+                if not available:
+                    break
+                order, reader = min(available, key=lambda item: item[0])
+                if order != expected_order:
+                    raise GenerationError(
+                        "native MCF call order is not contiguous"
                     )
-                    or last_kind in {
-                        "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
+                ordinal = reader.expected_ordinal
+                start = event_count
+                live_in = []
+                live_out = []
+                last_kind = None
+                for row in reader.rows():
+                    event = {
+                        "phase_name": reader.phase,
+                        "ordinal": ordinal,
+                        **row,
                     }
-                ):
-                    live_out.append(event)
-            if last_kind != "END":
-                raise GenerationError(f"{reader.phase} call frame is incomplete")
-            count = event_count - start
-            call_index.append({
-                "phase": reader.phase,
-                "ordinal": ordinal,
-                "order": order,
-                "event_begin": start,
-                "event_count": count,
-            })
-            boundaries.append({
-                "phase": reader.phase,
-                "ordinal": ordinal,
-                "order": order,
-                "pre_sha256": hashlib.sha256(
-                    _canonical_json(live_in)
-                ).hexdigest(),
-                "post_sha256": hashlib.sha256(
-                    _canonical_json(live_out)
-                ).hexdigest(),
-            })
-            if reader.phase == "pricing":
-                pricing_calls += 1
-            else:
-                price_out_calls += 1
-            expected_order += 1
-        if event_count == 0:
-            raise GenerationError("native MCF event stream is empty")
+                    encoded = _canonical_event_json(event)
+                    writers["EVENTS"].write(encoded)
+                    counts["EVENTS"] += 1
+                    event_count += 1
+                    last_kind = row.get("kind")
+                    if last_kind == "BASKET":
+                        writers["BASKET"].write(encoded)
+                        counts["BASKET"] += 1
+                    if last_kind in {
+                        "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
+                    }:
+                        writers["DELTAS"].write(encoded)
+                        counts["DELTAS"] += 1
+                    if last_kind == "BEGIN" or (
+                        last_kind == "BASKET"
+                        and row.get("phase") == "live_in"
+                    ):
+                        live_in.append(event)
+                    if (
+                        last_kind == "END"
+                        or (
+                            last_kind == "BASKET"
+                            and row.get("phase") == "live_out"
+                        )
+                        or last_kind in {
+                            "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
+                        }
+                    ):
+                        live_out.append(event)
+                if last_kind != "END":
+                    raise GenerationError(
+                        f"{reader.phase} call frame is incomplete"
+                    )
+                count = event_count - start
+                call_row = {
+                    "phase": reader.phase,
+                    "ordinal": ordinal,
+                    "order": order,
+                    "event_begin": start,
+                    "event_count": count,
+                }
+                boundary_row = {
+                    "phase": reader.phase,
+                    "ordinal": ordinal,
+                    "order": order,
+                    "pre_sha256": hashlib.sha256(
+                        _canonical_json(live_in)
+                    ).hexdigest(),
+                    "post_sha256": hashlib.sha256(
+                        _canonical_json(live_out)
+                    ).hexdigest(),
+                }
+                writers["CALL_INDEX"].write(
+                    _canonical_event_json(call_row)
+                )
+                writers["BOUNDARIES"].write(
+                    _canonical_event_json(boundary_row)
+                )
+                counts["CALL_INDEX"] += 1
+                counts["BOUNDARIES"] += 1
+                if reader.phase == "pricing":
+                    pricing_calls += 1
+                else:
+                    price_out_calls += 1
+                expected_order += 1
+            if event_count == 0:
+                raise GenerationError("native MCF event stream is empty")
     except (OSError, EOFError, gzip.BadGzipFile) as error:
         raise GenerationError(f"invalid compressed MCF journal: {error}") from error
     finally:
-        compressed.close()
-        raw.close()
         for reader in readers:
             reader.close()
     return {
-        "events": Path(events_path),
+        "sections": section_paths,
+        "section_counts": counts,
         "event_count": event_count,
         "pricing_calls": pricing_calls,
         "price_out_calls": price_out_calls,
-        "call_index": call_index,
-        "boundaries": boundaries,
-        "basket": basket_rows,
-        "deltas": delta_rows,
     }
 
 
@@ -855,79 +886,79 @@ def assemble_capture_package(*, run_root, identity, output):
         raise GenerationError("MCF package source is not a capture run")
     initial = _read_native_state(run_root / "initial.state")
     final = _read_native_state(run_root / "final.state")
-    events_path = Path(output).with_name(f".{Path(output).name}.events.jsonl.gz")
-    streamed = _stream_frame_sections(run_root, events_path)
-    call_index = streamed["call_index"]
-    boundaries = streamed["boundaries"]
-    basket = streamed["basket"]
-    deltas = streamed["deltas"]
-    pricing_calls = streamed["pricing_calls"]
-    price_out_calls = streamed["price_out_calls"]
-    if (
-        pricing_calls != run.get("pricing_calls")
-        or price_out_calls != run.get("price_out_calls")
-    ):
-        raise GenerationError("native MCF run call counts differ")
-    output_path = run_root / "mcf.out"
-    if not output_path.is_file():
-        raise GenerationError("native MCF output is missing")
-    provenance = {
-        "schema": 1,
-        **identity,
-        "roi_begin": run.get("roi_begin"),
-        "roi_end": run.get("roi_end"),
-        "capture_enabled": True,
+    output = Path(output)
+    section_paths = {
+        name: output.with_name(
+            f".{output.name}.{name.lower()}.jsonl.gz"
+        )
+        for name in STREAMED_SECTIONS
     }
-    final_row = {
-        "schema": 1,
-        "initial_state_sha256": initial["sha256"],
-        "final_state_sha256": final["sha256"],
-        "final_network_words": list(final["words"]),
-        "mcf_output_bytes": output_path.stat().st_size,
-        "mcf_output_sha256": _sha256_file(output_path),
-        "peak_allocated_bytes": run.get("peak_allocated_bytes"),
-    }
-    sections = {
-        "PROVENANCE": _canonical_json(provenance),
-        "NETWORK": initial["network"],
-        "NODES": initial["nodes"],
-        "ARCS": initial["active_arcs"] + initial["dummy_arcs"],
-        "BASKET": _canonical_json({"schema": 1, "rows": basket}),
-        "CALL_INDEX": _canonical_json({"schema": 1, "rows": call_index}),
-        "EVENTS": streamed["events"],
-        "DELTAS": _canonical_json({"schema": 1, "rows": deltas}),
-        "BOUNDARIES": _canonical_json({"schema": 1, "rows": boundaries}),
-        "FINAL": _canonical_json(final_row),
-    }
-    package = mcfreg2.new_package(
-        nodes=initial["nodes_count"],
-        active_arcs=initial["m"],
-        dummy_arcs=initial["n"],
-        arena_capacity=initial["max_m"],
-        pricing_calls=pricing_calls,
-        price_out_calls=price_out_calls,
-        event_count=streamed["event_count"],
-        sections=sections,
-        section_layouts={
-            "NETWORK": (STATE_NETWORK_WORDS, 8),
-            "NODES": (initial["nodes_count"], STATE_NODE_BYTES),
-            "ARCS": (
-                initial["m"] + initial["n"],
-                STATE_ARC_BYTES,
-            ),
-            "BASKET": (len(basket), 0),
-            "CALL_INDEX": (len(call_index), 0),
-            "EVENTS": (streamed["event_count"], 0),
-            "DELTAS": (len(deltas), 0),
-            "BOUNDARIES": (len(boundaries), 0),
-        },
-        section_schemas={"EVENTS": 2},
-    )
     try:
+        streamed = _stream_frame_sections(run_root, section_paths)
+        pricing_calls = streamed["pricing_calls"]
+        price_out_calls = streamed["price_out_calls"]
+        if (
+            pricing_calls != run.get("pricing_calls")
+            or price_out_calls != run.get("price_out_calls")
+        ):
+            raise GenerationError("native MCF run call counts differ")
+        output_path = run_root / "mcf.out"
+        if not output_path.is_file():
+            raise GenerationError("native MCF output is missing")
+        provenance = {
+            "schema": 1,
+            **identity,
+            "roi_begin": run.get("roi_begin"),
+            "roi_end": run.get("roi_end"),
+            "capture_enabled": True,
+        }
+        final_row = {
+            "schema": 1,
+            "initial_state_sha256": initial["sha256"],
+            "final_state_sha256": final["sha256"],
+            "final_network_words": list(final["words"]),
+            "mcf_output_bytes": output_path.stat().st_size,
+            "mcf_output_sha256": _sha256_file(output_path),
+            "peak_allocated_bytes": run.get("peak_allocated_bytes"),
+        }
+        sections = {
+            "PROVENANCE": _canonical_json(provenance),
+            "NETWORK": initial["network"],
+            "NODES": initial["nodes"],
+            "ARCS": initial["active_arcs"] + initial["dummy_arcs"],
+            **streamed["sections"],
+            "FINAL": _canonical_json(final_row),
+        }
+        package = mcfreg2.new_package(
+            nodes=initial["nodes_count"],
+            active_arcs=initial["m"],
+            dummy_arcs=initial["n"],
+            arena_capacity=initial["max_m"],
+            pricing_calls=pricing_calls,
+            price_out_calls=price_out_calls,
+            event_count=streamed["event_count"],
+            sections=sections,
+            section_layouts={
+                "NETWORK": (STATE_NETWORK_WORDS, 8),
+                "NODES": (initial["nodes_count"], STATE_NODE_BYTES),
+                "ARCS": (
+                    initial["m"] + initial["n"],
+                    STATE_ARC_BYTES,
+                ),
+                **{
+                    name: (streamed["section_counts"][name], 0)
+                    for name in STREAMED_SECTIONS
+                },
+            },
+            section_schemas={name: 2 for name in STREAMED_SECTIONS},
+        )
         digest = mcfreg2.write_package(output, package)
     finally:
-        events_path.unlink(missing_ok=True)
-    parsed = mcfreg2.read_package(output, lazy_section_names=("EVENTS",))
+        for path in section_paths.values():
+            path.unlink(missing_ok=True)
+    parsed = mcfreg2.read_package(
+        output, lazy_section_names=STREAMED_SECTIONS
+    )
     if parsed.header.event_count != streamed["event_count"]:
         raise GenerationError("written MCFREG2 event count differs")
     return {
