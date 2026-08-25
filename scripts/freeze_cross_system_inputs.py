@@ -14,9 +14,11 @@ from pathlib import Path
 try:
     from scripts import cross_system_contract as contract
     from scripts import gapbs_pr_experiment_profiles as profiles
+    from scripts import mcfreg2
 except ImportError:
     import cross_system_contract as contract
     import gapbs_pr_experiment_profiles as profiles
+    import mcfreg2
 
 
 WORKLOADS = (
@@ -35,6 +37,11 @@ REQUIRED = {
         "allocated_bytes",
         "source",
         "source_sha256",
+        "format",
+        "source_commit",
+        "source_tree_sha256",
+        "validation",
+        "validation_sha256",
         "synthetic",
     },
     "amg_gather": {
@@ -129,6 +136,151 @@ def _require_allocated_bytes(row, workload):
         )
 
 
+def _read_json_file(path, label):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InputError(f"{label} is invalid: {error}") from error
+    if not isinstance(value, dict):
+        raise InputError(f"{label} must be an object")
+    return value
+
+
+def _require_equal_hashes(value, names, label):
+    hashes = []
+    for name in names:
+        digest = _require_sha256(value.get(name), f"mcf validation {name}")
+        hashes.append(digest)
+    if len(set(hashes)) != 1:
+        raise InputError(f"mcf {label} hashes differ")
+    return hashes[0]
+
+
+def validate_mcf_record(row):
+    """Validate one generated MCFREG2 candidate without other workloads."""
+    if not isinstance(row, dict):
+        raise InputError("mcf record must be an object")
+    missing = REQUIRED["mcf"] - set(row)
+    if missing:
+        raise InputError(f"mcf.{sorted(missing)[0]} is required")
+    if row.get("format") != "MCFREG2":
+        raise InputError("mcf format must be MCFREG2")
+    if row.get("synthetic") is not False:
+        raise InputError("mcf.synthetic must be false")
+    if _GIT_COMMIT.fullmatch(str(row.get("source_commit", ""))) is None:
+        raise InputError("mcf.source_commit is invalid")
+    _require_sha256(row.get("source_tree_sha256"), "mcf source tree")
+    _require_allocated_bytes(row, "mcf")
+
+    package_path = _verify_file(
+        row["input"], row["input_sha256"], "mcf package/input"
+    )
+    source_path = _verify_file(
+        row["source"], row["source_sha256"], "mcf source"
+    )
+    validation_path = _verify_file(
+        row["validation"], row["validation_sha256"], "mcf validation"
+    )
+    try:
+        package = mcfreg2.read_package(package_path)
+    except mcfreg2.FormatError as error:
+        raise InputError(f"mcf MCFREG2 package is invalid: {error}") from error
+    validation = _read_json_file(validation_path, "mcf validation")
+    if validation.get("schema") != 2:
+        raise InputError("mcf validation schema must be 2")
+    if validation.get("status") != "accepted":
+        raise InputError("mcf validation status is not accepted")
+    if validation.get("boundary_mismatches") != 0:
+        raise InputError("mcf validation has boundary mismatches")
+    if validation.get("primary_replay_equal") is not True:
+        raise InputError("mcf validation primary/replay packages differ")
+    if validation.get("native_outputs_equal") is not True:
+        raise InputError("mcf validation native outputs differ")
+
+    package_sha256 = _require_equal_hashes(
+        validation,
+        ("package_sha256", "primary_package_sha256", "replay_package_sha256"),
+        "primary/replay package",
+    )
+    if package_sha256 != row["input_sha256"]:
+        raise InputError("mcf package/input SHA-256 differs from validation")
+    if (
+        validation.get("source_sha256") is not None
+        and validation.get("source_sha256") != row["source_sha256"]
+    ):
+        raise InputError("mcf source SHA-256 differs from validation")
+    if source_path.stat().st_size == 0:
+        raise InputError("mcf source is empty")
+
+    identity = validation.get("identity")
+    identity_names = (
+        "source_commit",
+        "source_tree_sha256",
+        "input_sha256",
+        "common_patch_sha256",
+        "capture_patch_sha256",
+        "compiler_sha256",
+    )
+    if not isinstance(identity, dict) or set(identity) != set(identity_names):
+        raise InputError("mcf validation identity fields differ")
+    if identity["source_commit"] != row["source_commit"]:
+        raise InputError("mcf source commit differs from validation")
+    if identity["source_tree_sha256"] != row["source_tree_sha256"]:
+        raise InputError("mcf source tree SHA-256 differs from validation")
+    for name in identity_names[1:]:
+        _require_sha256(identity.get(name), f"mcf identity {name}")
+
+    try:
+        provenance = json.loads(package.section("PROVENANCE"))
+        final = json.loads(package.section("FINAL"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InputError(f"mcf package JSON section is invalid: {error}") from error
+    if not isinstance(provenance, dict) or provenance.get("schema") != 1:
+        raise InputError("mcf package provenance is invalid")
+    for name, expected in identity.items():
+        if provenance.get(name) != expected:
+            raise InputError(f"mcf package provenance {name} differs")
+    if not isinstance(final, dict) or final.get("schema") != 1:
+        raise InputError("mcf package FINAL section is invalid")
+
+    final_state = _require_equal_hashes(
+        validation,
+        (
+            "authority_final_state_sha256",
+            "capture_primary_final_state_sha256",
+            "capture_replay_final_state_sha256",
+        ),
+        "authority/capture final-state",
+    )
+    output = _require_equal_hashes(
+        validation,
+        (
+            "authority_mcf_output_sha256",
+            "capture_primary_mcf_output_sha256",
+            "capture_replay_mcf_output_sha256",
+        ),
+        "authority/capture mcf.out",
+    )
+    if final.get("final_state_sha256") != final_state:
+        raise InputError("mcf package final state differs from validation")
+    if final.get("mcf_output_sha256") != output:
+        raise InputError("mcf package mcf.out differs from validation")
+    peak = validation.get("peak_allocated_bytes")
+    if (
+        not isinstance(peak, int)
+        or isinstance(peak, bool)
+        or peak != row["allocated_bytes"]
+        or final.get("peak_allocated_bytes") != peak
+    ):
+        raise InputError("mcf observed allocated bytes differ")
+    return {
+        "package": package,
+        "validation": validation,
+        "package_path": package_path,
+        "validation_path": validation_path,
+    }
+
+
 def validate_paper_record(value):
     if not isinstance(value, dict) or set(value) != set(WORKLOADS):
         raise InputError("paper input record workload set differs")
@@ -205,14 +357,7 @@ def validate_bound_inputs(value):
         value["pr_spmv"]["input_sha256"],
         "pr_spmv input",
     )
-    _verify_file(
-        value["mcf"]["input"], value["mcf"]["input_sha256"], "mcf input"
-    )
-    _verify_file(
-        value["mcf"]["source"],
-        value["mcf"]["source_sha256"],
-        "mcf source",
-    )
+    validate_mcf_record(value["mcf"])
     for workload in ("amg_gather", "lulesh_scatter"):
         _verify_file(
             value[workload]["input"],

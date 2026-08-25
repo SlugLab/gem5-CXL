@@ -727,6 +727,7 @@ def assemble_capture_package(*, run_root, identity, output):
         "initial_state_sha256": initial["sha256"],
         "final_state_sha256": final["sha256"],
         "mcf_output_sha256": final_row["mcf_output_sha256"],
+        "peak_allocated_bytes": final_row["peak_allocated_bytes"],
     }
 
 
@@ -876,6 +877,15 @@ def generate_candidate(
             tempfile.mkdtemp(prefix=".candidate-", dir=evidence_root)
         )
         gate = "native_equivalence"
+        authority_run = _read_json(
+            authority_root / "run.json", "authority MCF run.json"
+        )
+        primary_run = _read_json(
+            primary_root / "run.json", "primary MCF run.json"
+        )
+        replay_run = _read_json(
+            replay_root / "run.json", "replay MCF run.json"
+        )
         for name in ("final.state", "mcf.out"):
             if not _same_file(authority_root / name, primary_root / name):
                 raise GenerationError(
@@ -885,6 +895,20 @@ def generate_candidate(
                 raise GenerationError(
                     f"native_equivalence: authority/replay {name} differs"
                 )
+        peaks = tuple(
+            run.get("peak_allocated_bytes")
+            for run in (authority_run, primary_run, replay_run)
+        )
+        if (
+            any(
+                not isinstance(peak, int) or isinstance(peak, bool) or peak <= 0
+                for peak in peaks
+            )
+            or len(set(peaks)) != 1
+        ):
+            raise GenerationError(
+                "native_equivalence: authority/capture peak allocation differs"
+            )
         gate = "capture_determinism"
         primary = assemble_capture_package(
             run_root=primary_root,
@@ -910,6 +934,12 @@ def generate_candidate(
         replay_validation = _run_independent_replay(
             staging / "mcf.reg2", staging
         )
+        authority_final_sha256 = _sha256_file(authority_root / "final.state")
+        primary_final_sha256 = _sha256_file(primary_root / "final.state")
+        replay_final_sha256 = _sha256_file(replay_root / "final.state")
+        authority_output_sha256 = _sha256_file(authority_root / "mcf.out")
+        primary_output_sha256 = _sha256_file(primary_root / "mcf.out")
+        replay_output_sha256 = _sha256_file(replay_root / "mcf.out")
         manifest = {
             "schema": 1,
             "status": "candidate",
@@ -917,18 +947,17 @@ def generate_candidate(
             "package_sha256": digest,
             "primary_package_sha256": primary["package_sha256"],
             "replay_package_sha256": replay["package_sha256"],
-            "authority_final_state_sha256": _sha256_file(
-                authority_root / "final.state"
-            ),
-            "authority_mcf_output_sha256": _sha256_file(
-                authority_root / "mcf.out"
-            ),
+            "authority_final_state_sha256": authority_final_sha256,
+            "authority_mcf_output_sha256": authority_output_sha256,
             "independent_replay": replay_validation,
         }
         validation = {
-            "schema": 1,
+            "schema": 2,
             "status": "accepted",
+            "identity": identity,
             "package_sha256": digest,
+            "primary_package_sha256": primary["package_sha256"],
+            "replay_package_sha256": replay["package_sha256"],
             "primary_replay_equal": True,
             "native_outputs_equal": True,
             "boundary_mismatches": replay_validation[
@@ -937,6 +966,13 @@ def generate_candidate(
             "pricing_calls": primary["pricing_calls"],
             "price_out_calls": primary["price_out_calls"],
             "event_count": primary["event_count"],
+            "authority_final_state_sha256": authority_final_sha256,
+            "capture_primary_final_state_sha256": primary_final_sha256,
+            "capture_replay_final_state_sha256": replay_final_sha256,
+            "authority_mcf_output_sha256": authority_output_sha256,
+            "capture_primary_mcf_output_sha256": primary_output_sha256,
+            "capture_replay_mcf_output_sha256": replay_output_sha256,
+            "peak_allocated_bytes": primary["peak_allocated_bytes"],
             "canonical_trace_sha256": replay_validation["trace_sha256"],
             "replay_validation_sha256": replay_validation[
                 "validation_sha256"
@@ -962,6 +998,10 @@ def generate_candidate(
                 existing_manifest.get("identity") != identity
                 or not _same_file(
                     final_root / "mcf.reg2", staging / "mcf.reg2"
+                )
+                or not _same_file(
+                    final_root / "validation.json",
+                    staging / "validation.json",
                 )
             ):
                 raise GenerationError(

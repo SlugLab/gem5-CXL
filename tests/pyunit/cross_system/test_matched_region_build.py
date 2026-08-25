@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import hashlib
+import dataclasses
 import json
 import shutil
 import tempfile
@@ -10,6 +11,9 @@ from pathlib import Path
 
 from scripts import build_matched_breadth_workloads as builder
 from scripts import canonical_work_trace as trace
+from scripts import generate_mcfreg2_state as generator
+from scripts import mcfreg2
+from test_mcfreg2 import MCFREG2Test
 
 
 class MatchedRegionBuildTest(unittest.TestCase):
@@ -19,6 +23,124 @@ class MatchedRegionBuildTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def make_verified_formal_record(self):
+        helper = MCFREG2Test()
+        helper.root = self.root
+        package_path = helper.write_semantic_fixture("formal-mcf.reg2")
+        package = mcfreg2.read_package(package_path)
+        source = self.root / "formal-mcf-source.c"
+        source.write_text("int formal_mcf_source;\n", encoding="ascii")
+        identity = {
+            "source_commit": "2b30de22399402d8c44bd74b8ebf743b6a6a55e9",
+            "source_tree_sha256": "1" * 64,
+            "input_sha256": "2" * 64,
+            "common_patch_sha256": "3" * 64,
+            "capture_patch_sha256": "4" * 64,
+            "compiler_sha256": "5" * 64,
+        }
+        final_state_sha256 = "6" * 64
+        mcf_output_sha256 = "7" * 64
+        replacements = {
+            "PROVENANCE": generator._canonical_json({
+                "schema": 1, **identity,
+            }),
+            "FINAL": generator._canonical_json({
+                "schema": 1,
+                "initial_state_sha256": "8" * 64,
+                "final_state_sha256": final_state_sha256,
+                "final_network_words": [0],
+                "mcf_output_bytes": 1,
+                "mcf_output_sha256": mcf_output_sha256,
+                "peak_allocated_bytes": 345_000_000,
+            }),
+        }
+        package = dataclasses.replace(
+            package,
+            sections=tuple(
+                dataclasses.replace(
+                    section,
+                    data=replacements[mcfreg2.SECTION_NAMES[section.section_type]],
+                    element_count=1,
+                    element_size=len(
+                        replacements[mcfreg2.SECTION_NAMES[section.section_type]]
+                    ),
+                )
+                if mcfreg2.SECTION_NAMES[section.section_type] in replacements
+                else section
+                for section in package.sections
+            ),
+        )
+        package_sha256 = mcfreg2.write_package(package_path, package)
+        validation = {
+            "schema": 2,
+            "status": "accepted",
+            "identity": identity,
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "package_sha256": package_sha256,
+            "primary_package_sha256": package_sha256,
+            "replay_package_sha256": package_sha256,
+            "primary_replay_equal": True,
+            "native_outputs_equal": True,
+            "boundary_mismatches": 0,
+            "authority_final_state_sha256": final_state_sha256,
+            "capture_primary_final_state_sha256": final_state_sha256,
+            "capture_replay_final_state_sha256": final_state_sha256,
+            "authority_mcf_output_sha256": mcf_output_sha256,
+            "capture_primary_mcf_output_sha256": mcf_output_sha256,
+            "capture_replay_mcf_output_sha256": mcf_output_sha256,
+            "peak_allocated_bytes": 345_000_000,
+        }
+        validation_path = self.root / "formal-validation.json"
+        validation_path.write_bytes(generator._canonical_json(validation))
+
+        files = {}
+        for name in (
+            "amg_values", "amg_index", "lulesh_values", "lulesh_index",
+        ):
+            path = self.root / name
+            path.write_bytes(b"\x00" * (16 if "index" in name else 8))
+            files[name] = path.resolve()
+
+        def digest(path):
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        record = {
+            "schema": 1,
+            "status": "accepted",
+            "workloads": {
+                "mcf": {
+                    "input": str(package_path.resolve()),
+                    "input_sha256": package_sha256,
+                    "source": str(source.resolve()),
+                    "source_sha256": digest(source),
+                    "allocated_bytes": 345_000_000,
+                    "synthetic": False,
+                    "format": "MCFREG2",
+                    "source_commit": identity["source_commit"],
+                    "source_tree_sha256": identity["source_tree_sha256"],
+                    "validation": str(validation_path.resolve()),
+                    "validation_sha256": digest(validation_path),
+                },
+                "amg_gather": {
+                    "input": str(files["amg_values"]),
+                    "input_sha256": digest(files["amg_values"]),
+                    "index": str(files["amg_index"]),
+                    "index_sha256": digest(files["amg_index"]),
+                    "allocated_bytes": 1 << 30,
+                },
+                "lulesh_scatter": {
+                    "input": str(files["lulesh_values"]),
+                    "input_sha256": digest(files["lulesh_values"]),
+                    "index": str(files["lulesh_index"]),
+                    "index_sha256": digest(files["lulesh_index"]),
+                    "allocated_bytes": 1 << 30,
+                },
+            },
+        }
+        manifest = self.root / "formal-inputs.json"
+        manifest.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return manifest
 
     def test_fixture_builds_strict_four_backend_manifest(self):
         manifest = builder.build_fixture_suite(self.root / "build")
@@ -42,6 +164,10 @@ class MatchedRegionBuildTest(unittest.TestCase):
             self.assertRegex(row["sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(row["source_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(row["trace_abi_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            set(manifest["binaries"]["mcf:reference"]["source_files"]),
+            {"mcf_regions.cc", "mcfreg2.cc", "mcfreg2.hh", "mcfreg2_format.h"},
+        )
         self.assertEqual(
             manifest["shared_objects"]["binaries"], manifest["binaries"]
         )
@@ -198,114 +324,33 @@ class MatchedRegionBuildTest(unittest.TestCase):
             self.assertRegex(row["sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(manifest["input_manifest_sha256"], r"^[0-9a-f]{64}$")
 
-    def test_formal_inputs_require_mcf_source_and_paper_allocations(self):
-        files = {}
-        for name in (
-            "mcf", "mcf_source", "amg_values", "amg_index",
-            "lulesh_values", "lulesh_index",
-        ):
-            path = self.root / name
-            path.write_bytes(name.encode("utf-8"))
-            files[name] = path.resolve()
-        for name in ("amg_values", "lulesh_values"):
-            files[name].write_bytes(b"\x00" * 8)
-        for name in ("amg_index", "lulesh_index"):
-            files[name].write_bytes(b"\x00" * 16)
-        def row(path):
-            return {
-                "input": str(path),
-                "input_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-
-        record = {
-            "schema": 1,
-            "status": "accepted",
-            "workloads": {
-                "mcf": {
-                    **row(files["mcf"]),
-                    "source": str(files["mcf_source"]),
-                    "source_sha256": hashlib.sha256(
-                        files["mcf_source"].read_bytes()
-                    ).hexdigest(),
-                    "allocated_bytes": 345_000_000,
-                    "synthetic": False,
-                },
-                "amg_gather": {
-                    **row(files["amg_values"]),
-                    "index": str(files["amg_index"]),
-                    "index_sha256": hashlib.sha256(
-                        files["amg_index"].read_bytes()
-                    ).hexdigest(),
-                    "allocated_bytes": 1 << 30,
-                },
-                "lulesh_scatter": {
-                    **row(files["lulesh_values"]),
-                    "index": str(files["lulesh_index"]),
-                    "index_sha256": hashlib.sha256(
-                        files["lulesh_index"].read_bytes()
-                    ).hexdigest(),
-                    "allocated_bytes": 1 << 30,
-                },
-            },
-        }
-        manifest = self.root / "inputs.json"
-        manifest.write_text(json.dumps(record) + "\n", encoding="utf-8")
-
+    def test_formal_inputs_require_mcfreg2_and_paper_allocations(self):
+        manifest = self.make_verified_formal_record()
         inputs, digest = builder.load_formal_inputs(manifest)
 
-        self.assertEqual(inputs["mcf_source"]["path"], str(files["mcf_source"]))
+        self.assertEqual(inputs["mcf"]["format"], "MCFREG2")
+        self.assertEqual(inputs["mcf"]["boundary_mismatches"], 0)
         self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        record = json.loads(manifest.read_text(encoding="utf-8"))
         record["workloads"]["amg_gather"]["allocated_bytes"] = 1024
         manifest.write_text(json.dumps(record) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(builder.BuildError, "amg_gather.*allocated"):
             builder.load_formal_inputs(manifest)
 
-    def test_formal_cli_fails_closed_without_real_spec_mcf(self):
-        files = {}
-        for name in (
-            "mcf", "mcf_source", "amg_values", "amg_index",
-            "lulesh_values", "lulesh_index",
-        ):
-            path = self.root / f"formal-{name}"
-            path.write_bytes(b"\x00" * (8 if "index" in name else 4))
-            files[name] = path.resolve()
-
-        def digest(path):
-            return hashlib.sha256(path.read_bytes()).hexdigest()
-
-        record = {
-            "schema": 1, "status": "accepted", "workloads": {
-                "mcf": {
-                    "input": str(files["mcf"]),
-                    "input_sha256": digest(files["mcf"]),
-                    "source": str(files["mcf_source"]),
-                    "source_sha256": digest(files["mcf_source"]),
-                    "allocated_bytes": 345_000_000, "synthetic": False,
-                },
-                "amg_gather": {
-                    "input": str(files["amg_values"]),
-                    "input_sha256": digest(files["amg_values"]),
-                    "index": str(files["amg_index"]),
-                    "index_sha256": digest(files["amg_index"]),
-                    "allocated_bytes": 1 << 30,
-                },
-                "lulesh_scatter": {
-                    "input": str(files["lulesh_values"]),
-                    "input_sha256": digest(files["lulesh_values"]),
-                    "index": str(files["lulesh_index"]),
-                    "index_sha256": digest(files["lulesh_index"]),
-                    "allocated_bytes": 1 << 30,
-                },
-            },
-        }
-        manifest = self.root / "formal-inputs.json"
-        manifest.write_text(json.dumps(record) + "\n", encoding="utf-8")
-        status = builder.main([
-            "--formal", "--inputs", str(manifest),
-            "--outdir", str(self.root / "formal-build"),
-        ])
-        self.assertEqual(status, 1)
-        self.assertFalse((self.root / "formal-build/manifest.json").exists())
+    def test_formal_mcfreg2_builds_verified_reference_bundle(self):
+        record = self.make_verified_formal_record()
+        inputs, digest = builder.load_formal_inputs(record)
+        manifest = builder.build_suite(
+            self.root / "formal-build",
+            inputs=inputs,
+            input_manifest_sha256=digest,
+        )
+        outputs = builder.run_formal_references(
+            manifest, self.root / "formal-runs"
+        )
+        bundle = trace.read_bundle(outputs["mcf"])
+        self.assertEqual(bundle.meta["input_format"], "MCFREG2")
+        self.assertEqual(bundle.meta["boundary_mismatches"], 0)
 
 
 if __name__ == "__main__":

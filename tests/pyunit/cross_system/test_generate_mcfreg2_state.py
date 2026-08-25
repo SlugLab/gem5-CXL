@@ -779,13 +779,30 @@ int main(int argc, char **argv)
             events_entry.element_count, parsed_package.header.event_count
         )
         self.assertEqual(events_entry.element_size, 0)
+        validation = json.loads(
+            (accepted_root / "validation.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(validation["schema"], 2)
+        self.assertEqual(validation["status"], "accepted")
+        self.assertEqual(validation["identity"], identity)
+        self.assertEqual(validation["package_sha256"], accepted["package_sha256"])
         self.assertEqual(
+            validation["primary_package_sha256"],
+            validation["replay_package_sha256"],
+        )
+        self.assertEqual(
+            validation["authority_final_state_sha256"],
+            validation["capture_primary_final_state_sha256"],
+        )
+        self.assertEqual(
+            validation["authority_mcf_output_sha256"],
+            validation["capture_replay_mcf_output_sha256"],
+        )
+        self.assertEqual(
+            validation["peak_allocated_bytes"],
             json.loads(
-                (accepted_root / "validation.json").read_text(
-                    encoding="utf-8"
-                )
-            )["status"],
-            "accepted",
+                (primary_root / "run.json").read_text(encoding="utf-8")
+            )["peak_allocated_bytes"],
         )
         self.assertTrue(
             (accepted_root / "replay-validation/mcfreg2-replay.json").is_file()

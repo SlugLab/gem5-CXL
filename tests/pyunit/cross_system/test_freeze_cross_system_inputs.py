@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from scripts import freeze_cross_system_inputs as freeze
+from scripts import generate_mcfreg2_state as generator
+from scripts import mcfreg2
 
 
 def sha256(path):
@@ -50,8 +52,73 @@ def make_git_source(root):
 
 def valid_record(root):
     graph = write(root / "g20.sg", b"graph")
-    mcf_input = write(root / "mcf.in", b"mcf input")
     mcf_source = write(root / "mcf.cc", b"mcf source")
+    source_commit = "2b30de22399402d8c44bd74b8ebf743b6a6a55e9"
+    source_tree_sha256 = "1" * 64
+    identity = {
+        "source_commit": source_commit,
+        "source_tree_sha256": source_tree_sha256,
+        "input_sha256": "2" * 64,
+        "common_patch_sha256": "3" * 64,
+        "capture_patch_sha256": "4" * 64,
+        "compiler_sha256": "5" * 64,
+    }
+    final_state_sha256 = "6" * 64
+    mcf_output_sha256 = "7" * 64
+    sections = {
+        name: f"{name.lower()}\n".encode("ascii")
+        for name in mcfreg2.REQUIRED_SECTIONS
+    }
+    sections["PROVENANCE"] = generator._canonical_json({
+        "schema": 1, **identity,
+    })
+    sections["FINAL"] = generator._canonical_json({
+        "schema": 1,
+        "initial_state_sha256": "8" * 64,
+        "final_state_sha256": final_state_sha256,
+        "final_network_words": [0],
+        "mcf_output_bytes": 1,
+        "mcf_output_sha256": mcf_output_sha256,
+        "peak_allocated_bytes": 345_000_000,
+    })
+    mcf_input = root / "mcf.reg2"
+    mcfreg2.write_package(
+        mcf_input,
+        mcfreg2.new_package(
+            nodes=4,
+            active_arcs=6,
+            dummy_arcs=3,
+            arena_capacity=16,
+            pricing_calls=2,
+            price_out_calls=1,
+            event_count=9,
+            sections=sections,
+        ),
+    )
+    mcf_input = mcf_input.resolve()
+    validation = {
+        "schema": 2,
+        "status": "accepted",
+        "identity": identity,
+        "source_sha256": sha256(mcf_source),
+        "package_sha256": sha256(mcf_input),
+        "primary_package_sha256": sha256(mcf_input),
+        "replay_package_sha256": sha256(mcf_input),
+        "primary_replay_equal": True,
+        "native_outputs_equal": True,
+        "boundary_mismatches": 0,
+        "authority_final_state_sha256": final_state_sha256,
+        "capture_primary_final_state_sha256": final_state_sha256,
+        "capture_replay_final_state_sha256": final_state_sha256,
+        "authority_mcf_output_sha256": mcf_output_sha256,
+        "capture_primary_mcf_output_sha256": mcf_output_sha256,
+        "capture_replay_mcf_output_sha256": mcf_output_sha256,
+        "peak_allocated_bytes": 345_000_000,
+    }
+    validation_path = write(
+        root / "validation.json",
+        generator._canonical_json(validation),
+    )
     amg_input = write(root / "amg.values", b"amg values")
     amg_index = write(root / "amg.index", b"amg index")
     lulesh_input = write(root / "lulesh.values", b"lulesh values")
@@ -70,6 +137,11 @@ def valid_record(root):
             "allocated_bytes": 345_000_000,
             "source": str(mcf_source),
             "source_sha256": sha256(mcf_source),
+            "format": "MCFREG2",
+            "source_commit": source_commit,
+            "source_tree_sha256": source_tree_sha256,
+            "validation": str(validation_path),
+            "validation_sha256": sha256(validation_path),
             "synthetic": False,
         },
         "amg_gather": {
@@ -159,6 +231,49 @@ class FreezeInputTest(unittest.TestCase):
             with self.assertRaisesRegex(freeze.InputError, "synthetic"):
                 freeze.validate_paper_record(value)
 
+    def test_mcf_requires_accepted_bit_exact_mcfreg2_evidence(self):
+        mutations = (
+            ("format", "MCFREG1", "MCFREG2"),
+            ("validation", None, "validation"),
+            ("status", "candidate", "accepted"),
+            ("boundary_mismatches", 1, "boundary"),
+            ("primary_replay_equal", False, "primary/replay"),
+        )
+        for field, replacement, message in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                value = valid_record(Path(tmp))
+                if field == "format":
+                    value["mcf"][field] = replacement
+                elif field == "validation":
+                    value["mcf"].pop(field)
+                else:
+                    path = Path(value["mcf"]["validation"])
+                    validation = json.loads(path.read_text(encoding="utf-8"))
+                    validation[field] = replacement
+                    path.write_bytes(generator._canonical_json(validation))
+                    value["mcf"]["validation_sha256"] = sha256(path)
+                with self.assertRaisesRegex(freeze.InputError, message):
+                    freeze.validate_bound_inputs(value)
+
+    def test_mcf_rejects_package_validation_hash_and_allocation_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            value["mcf"]["input_sha256"] = "0" * 64
+            with self.assertRaisesRegex(freeze.InputError, "package|input"):
+                freeze.validate_bound_inputs(value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            value["mcf"]["validation_sha256"] = "0" * 64
+            with self.assertRaisesRegex(freeze.InputError, "validation"):
+                freeze.validate_bound_inputs(value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            value["mcf"]["allocated_bytes"] = 344_999_999
+            with self.assertRaisesRegex(freeze.InputError, "allocated"):
+                freeze.validate_bound_inputs(value)
+
     def test_spatter_requires_the_index_path_not_only_its_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = valid_record(Path(tmp))
@@ -180,7 +295,9 @@ class FreezeInputTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             value = valid_record(Path(tmp))
             Path(value["mcf"]["input"]).write_bytes(b"changed")
-            with self.assertRaisesRegex(freeze.InputError, "mcf input SHA-256"):
+            with self.assertRaisesRegex(
+                freeze.InputError, "mcf package/input SHA-256"
+            ):
                 freeze.validate_bound_inputs(value)
 
     def test_cli_writes_terminal_failed_input_record(self):

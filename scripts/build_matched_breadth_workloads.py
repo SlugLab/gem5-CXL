@@ -18,12 +18,16 @@ from pathlib import Path
 try:
     from scripts import canonical_work_trace as canonical
     from scripts import cross_system_contract as contract
+    from scripts import freeze_cross_system_inputs as freezer
     from scripts import lazy_work_trace as lazy
+    from scripts import mcfreg2
     from scripts import npb_lazy_trace as npb
 except ImportError:
     import canonical_work_trace as canonical
     import cross_system_contract as contract
+    import freeze_cross_system_inputs as freezer
     import lazy_work_trace as lazy
+    import mcfreg2
     import npb_lazy_trace as npb
 
 
@@ -2927,6 +2931,10 @@ def load_formal_inputs(path):
             )
     if workloads.get("mcf", {}).get("synthetic") is not False:
         raise BuildError("formal mcf synthetic input is forbidden")
+    try:
+        qualified_mcf = freezer.validate_mcf_record(workloads.get("mcf", {}))
+    except freezer.InputError as error:
+        raise BuildError(f"formal mcf qualification failed: {error}") from error
     records = {
         "mcf": (workloads.get("mcf", {}).get("input"),
                 workloads.get("mcf", {}).get("input_sha256")),
@@ -2940,11 +2948,32 @@ def load_formal_inputs(path):
                          workloads.get("lulesh_scatter", {}).get("index_sha256")),
         "mcf_source": (workloads.get("mcf", {}).get("source"),
                        workloads.get("mcf", {}).get("source_sha256")),
+        "mcf_validation": (workloads.get("mcf", {}).get("validation"),
+                           workloads.get("mcf", {}).get("validation_sha256")),
     }
     result = {
         name: _formal_file(path_value, expected, name)
         for name, (path_value, expected) in records.items()
     }
+    mcf_row = workloads["mcf"]
+    validation = qualified_mcf["validation"]
+    result["mcf"].update({
+        "format": "MCFREG2",
+        "allocated_bytes": mcf_row["allocated_bytes"],
+        "source_commit": mcf_row["source_commit"],
+        "source_tree_sha256": mcf_row["source_tree_sha256"],
+        "validation_path": result["mcf_validation"]["path"],
+        "validation_sha256": result["mcf_validation"]["sha256"],
+        "boundary_mismatches": validation["boundary_mismatches"],
+        "common_patch_sha256": validation["identity"][
+            "common_patch_sha256"
+        ],
+        "capture_patch_sha256": validation["identity"][
+            "capture_patch_sha256"
+        ],
+        "native_input_sha256": validation["identity"]["input_sha256"],
+        "peak_allocated_bytes": validation["peak_allocated_bytes"],
+    })
     for prefix, workload in (
         ("amg", "amg_gather"),
         ("lulesh", "lulesh_scatter"),
@@ -2991,6 +3020,16 @@ def build_suite(
                 "source_sha256": _sha256_file(SOURCES[workload]),
                 "trace_abi_sha256": _sha256_file(TRACE_ABI),
             }
+            if workload == "mcf":
+                binaries[key]["source_files"] = {
+                    source_path.name: _sha256_file(source_path)
+                    for source_path in (
+                        SOURCES["mcf"],
+                        SOURCE_ROOT / "mcfreg2.cc",
+                        SOURCE_ROOT / "mcfreg2.hh",
+                        SOURCE_ROOT / "mcfreg2_format.h",
+                    )
+                }
     manifest = {
         "schema": 1,
         "mode": "fixture" if fixture else "formal",
@@ -3089,6 +3128,32 @@ def _combined_input_sha256(inputs, names):
 
 def _mcf_initial_memory(path):
     payload = Path(path).read_bytes()
+    if payload[:8] == mcfreg2.MAGIC:
+        try:
+            package = mcfreg2.read_package(path)
+        except mcfreg2.FormatError as error:
+            raise BuildError(f"MCFREG2 initial state is invalid: {error}") from error
+        arcs = package.section("ARCS")
+        nodes = package.section("NODES")
+        if len(arcs) % 8 or len(nodes) != package.header.nodes * 176:
+            raise BuildError("MCFREG2 normalized initial state layout differs")
+        arc_words = struct.unpack(f"<{len(arcs) // 8}Q", arcs)
+        potential_words = tuple(
+            struct.unpack_from("<Q", nodes, node * 176)[0]
+            for node in range(package.header.nodes)
+        )
+        return {
+            "arcs": {
+                "logical_base": 0x800000000,
+                "word_bits": 64,
+                "words": arc_words,
+            },
+            "potential": {
+                "logical_base": 0x900000000,
+                "word_bits": 64,
+                "words": potential_words,
+            },
+        }
     header = struct.Struct("<8sQQQQQ")
     if len(payload) < header.size:
         raise BuildError("MCF input is shorter than its header")
@@ -3250,6 +3315,60 @@ def _run_mcf_reference(manifest, root):
         row["path"], "--input", manifest["inputs"]["mcf"]["path"],
         "--output-root", raw, "--trace", trace_path,
     ], "MCF reference")
+    if manifest["inputs"]["mcf"].get("format") == "MCFREG2":
+        try:
+            replay = json.loads(
+                (raw / "mcfreg2-replay.json").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BuildError(f"MCFREG2 replay validation is invalid: {error}") from error
+        if replay.get("status") != "verified" or replay.get(
+            "boundary_mismatches"
+        ) != 0:
+            raise BuildError("MCFREG2 replay validation differs")
+        operations = canonical.decode_operations(trace_path.read_bytes())
+        work, invocations, duplicate_policy, state_shape = _markers(stdout)
+        meta = {
+            "schema": 1,
+            "workload": "mcf",
+            "input_sha256": manifest["inputs"]["mcf"]["sha256"],
+            "input_format": "MCFREG2",
+            "validation_sha256": manifest["inputs"]["mcf"][
+                "validation_sha256"
+            ],
+            "source_tree_sha256": manifest["inputs"]["mcf"][
+                "source_tree_sha256"
+            ],
+            "common_patch_sha256": manifest["inputs"]["mcf"][
+                "common_patch_sha256"
+            ],
+            "capture_patch_sha256": manifest["inputs"]["mcf"][
+                "capture_patch_sha256"
+            ],
+            "source_sha256": row["source_sha256"],
+            "binary_sha256": row["sha256"],
+            "config_sha256": _sha256_file(
+                Path(manifest["root"]) / "manifest.json"
+            ),
+            "phases": ["pricing_kernel", "price_out_impl"],
+            "phase_work": work,
+            "phase_invocations": invocations,
+            "state_shape": state_shape,
+            "boundary_mismatches": replay["boundary_mismatches"],
+            "output_boundaries": {},
+        }
+        if duplicate_policy is not None:
+            meta["duplicate_policy"] = duplicate_policy
+        canonical.write_bundle(
+            root / "bundle",
+            meta,
+            operations,
+            {},
+            initial_memory=_mcf_initial_memory(
+                manifest["inputs"]["mcf"]["path"]
+            ),
+        )
+        return (root / "bundle").resolve()
     return _write_reference_bundle(
         bundle_root=root / "bundle", workload="mcf",
         phases=("pricing_kernel", "price_out_impl"),
@@ -3304,6 +3423,24 @@ def _run_spatter_reference(manifest, root, *, kind, faulty=False):
 def run_fixture_references(manifest, outdir):
     if manifest.get("mode") != "fixture":
         raise BuildError("fixture reference execution requires a fixture build")
+    outdir = Path(outdir).resolve()
+    if outdir.exists():
+        raise BuildError(f"fresh reference root required: {outdir}")
+    outdir.mkdir(parents=True)
+    return {
+        "mcf": _run_mcf_reference(manifest, outdir / "mcf"),
+        "amg_gather": _run_spatter_reference(
+            manifest, outdir / "amg_gather", kind="gather"
+        ),
+        "lulesh_scatter": _run_spatter_reference(
+            manifest, outdir / "lulesh_scatter", kind="scatter"
+        ),
+    }
+
+
+def run_formal_references(manifest, outdir):
+    if manifest.get("mode") != "formal":
+        raise BuildError("formal reference execution requires a formal build")
     outdir = Path(outdir).resolve()
     if outdir.exists():
         raise BuildError(f"fresh reference root required: {outdir}")
@@ -3395,10 +3532,12 @@ def main(argv=None):
         if options.formal:
             if options.inputs is None:
                 raise BuildError("formal mode requires --inputs")
-            load_formal_inputs(options.inputs)
-            raise BuildError(
-                "formal MCF is failed_input: the frozen SPEC MCF source and "
-                "345 MB input are not available to the exact instrumentation path"
+            inputs, digest = load_formal_inputs(options.inputs)
+            manifest = build_suite(
+                options.outdir,
+                inputs=inputs,
+                cxx=options.cxx,
+                input_manifest_sha256=digest,
             )
         else:
             if options.inputs is not None:
