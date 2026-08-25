@@ -267,6 +267,29 @@ readBytes(std::ifstream &stream, uint64_t offset, uint64_t count)
     return result;
 }
 
+std::array<uint8_t, 32>
+hashBytes(std::ifstream &stream, uint64_t offset, uint64_t count)
+{
+    stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!stream)
+        throw Error("MCFREG2 section seek failed");
+    Sha256 digest;
+    std::array<uint8_t, 1024 * 1024> buffer{};
+    uint64_t remaining = count;
+    while (remaining != 0U) {
+        const size_t bytes = static_cast<size_t>(std::min<uint64_t>(
+            remaining, buffer.size()));
+        stream.read(
+            reinterpret_cast<char *>(buffer.data()),
+            static_cast<std::streamsize>(bytes));
+        if (!stream)
+            throw Error("MCFREG2 section is truncated");
+        digest.update(buffer.data(), bytes);
+        remaining -= bytes;
+    }
+    return digest.finish();
+}
+
 } // anonymous namespace
 
 std::string
@@ -372,12 +395,13 @@ readPackage(const std::string &path)
             checkedAdd(entry.offset, entry.storedBytes, "section end");
         if (end > fileSize)
             throw Error("MCFREG2 section is truncated");
-        auto data = readBytes(stream, entry.offset, entry.storedBytes);
-        const auto digest = sha256(data.data(), data.size());
+        const auto digest = hashBytes(stream, entry.offset, entry.storedBytes);
         if (!std::equal(
                 digest.begin(), digest.end(), std::begin(entry.sha256)))
             throw Error("MCFREG2 section SHA-256 differs");
-        package.sections.emplace(entry.sectionType, std::move(data));
+        package.sections.emplace(
+            entry.sectionType,
+            Package::SectionView{path, entry.offset, entry.storedBytes});
         cursor = end;
     }
     if (cursor != fileSize)
@@ -764,28 +788,49 @@ sectionText(const Package &package, uint16_t type)
     const auto found = package.sections.find(type);
     if (found == package.sections.end())
         throw Error("MCFREG2 replay section is missing");
-    return std::string(found->second.begin(), found->second.end());
+    std::ifstream stream(found->second.path, std::ios::binary);
+    if (!stream)
+        throw Error("cannot reopen MCFREG2 package");
+    const auto data = readBytes(
+        stream, found->second.offset, found->second.storedBytes);
+    return std::string(data.begin(), data.end());
 }
 
 class JsonLineReader
 {
   public:
     JsonLineReader(const Package &package, uint16_t section)
-        : data(sectionData(package, section)),
+        : view(sectionView(package, section)),
+          input(view.path, std::ios::binary),
           schema(sectionSchema(package, section))
     {
-        if (schema == 1U) {
-            pending.assign(data.begin(), data.end());
-            finished = true;
+        if (!input)
+            throw Error("cannot reopen MCFREG2 JSONL section");
+        input.seekg(static_cast<std::streamoff>(view.offset), std::ios::beg);
+        if (!input)
+            throw Error("MCFREG2 JSONL section seek failed");
+        std::array<uint8_t, 2> prefix{};
+        const size_t prefixBytes = static_cast<size_t>(
+            std::min<uint64_t>(view.storedBytes, prefix.size()));
+        input.read(
+            reinterpret_cast<char *>(prefix.data()),
+            static_cast<std::streamsize>(prefixBytes));
+        if (!input)
+            throw Error("MCFREG2 JSONL section is truncated");
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(view.offset), std::ios::beg);
+        if (!input)
+            throw Error("MCFREG2 JSONL section seek failed");
+        const bool gzip = prefixBytes == 2U && prefix[0] == 0x1fU &&
+                          prefix[1] == 0x8bU;
+        if (schema == 1U || (schema == 3U && !gzip)) {
+            raw = true;
         } else if (schema == 2U || schema == 3U) {
-            if (data.size() >= 2U && data[0] == 0x1fU && data[1] == 0x8bU) {
+            if (gzip) {
                 std::memset(&stream, 0, sizeof(stream));
                 if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK)
                     throw Error("MCFREG2 gzip event initialization failed");
                 initialized = true;
-            } else if (schema == 3U) {
-                pending.assign(data.begin(), data.end());
-                finished = true;
             } else {
                 throw Error("MCFREG2 schema-2 JSONL is not gzip");
             }
@@ -827,15 +872,15 @@ class JsonLineReader
                 pending.erase(0, pendingOffset);
                 pendingOffset = 0;
             }
-            decompress();
+            fill();
         }
     }
 
     uint64_t count() const { return rows; }
 
   private:
-    static const std::vector<uint8_t> &
-    sectionData(const Package &package, uint16_t section)
+    static const Package::SectionView &
+    sectionView(const Package &package, uint16_t section)
     {
         const auto found = package.sections.find(section);
         if (found == package.sections.end())
@@ -856,16 +901,37 @@ class JsonLineReader
         return found->schema;
     }
 
-    void decompress()
+    void fill()
     {
-        if (stream.avail_in == 0U && inputOffset < data.size()) {
-            const size_t bytes = std::min(
-                data.size() - inputOffset,
-                static_cast<size_t>(std::numeric_limits<uInt>::max()));
-            stream.next_in = const_cast<Bytef *>(
-                reinterpret_cast<const Bytef *>(data.data() + inputOffset));
+        if (raw) {
+            if (bytesRead == view.storedBytes) {
+                finished = true;
+                return;
+            }
+            const size_t bytes = static_cast<size_t>(std::min<uint64_t>(
+                view.storedBytes - bytesRead, inputBuffer.size()));
+            input.read(
+                reinterpret_cast<char *>(inputBuffer.data()),
+                static_cast<std::streamsize>(bytes));
+            if (!input)
+                throw Error("MCFREG2 JSONL section is truncated");
+            pending.append(
+                reinterpret_cast<const char *>(inputBuffer.data()), bytes);
+            bytesRead += bytes;
+            finished = bytesRead == view.storedBytes;
+            return;
+        }
+        if (stream.avail_in == 0U && bytesRead < view.storedBytes) {
+            const size_t bytes = static_cast<size_t>(std::min<uint64_t>(
+                view.storedBytes - bytesRead, inputBuffer.size()));
+            input.read(
+                reinterpret_cast<char *>(inputBuffer.data()),
+                static_cast<std::streamsize>(bytes));
+            if (!input)
+                throw Error("MCFREG2 gzip JSONL stream is truncated");
+            stream.next_in = reinterpret_cast<Bytef *>(inputBuffer.data());
             stream.avail_in = static_cast<uInt>(bytes);
-            inputOffset += bytes;
+            bytesRead += bytes;
         }
         std::array<char, 1024 * 1024> output{};
         stream.next_out = reinterpret_cast<Bytef *>(output.data());
@@ -874,24 +940,27 @@ class JsonLineReader
         const size_t produced = output.size() - stream.avail_out;
         pending.append(output.data(), produced);
         if (status == Z_STREAM_END) {
-            if (stream.avail_in != 0U || inputOffset != data.size())
+            if (stream.avail_in != 0U || bytesRead != view.storedBytes)
                 throw Error("MCFREG2 gzip JSONL stream has trailing bytes");
             finished = true;
         } else if (status != Z_OK) {
             throw Error("MCFREG2 gzip JSONL stream is invalid");
         } else if (produced == 0U && stream.avail_in == 0U &&
-                   inputOffset == data.size()) {
+                   bytesRead == view.storedBytes) {
             throw Error("MCFREG2 gzip JSONL stream is truncated");
         }
     }
 
-    const std::vector<uint8_t> &data;
+    const Package::SectionView &view;
+    std::ifstream input;
     uint16_t schema;
     z_stream stream{};
     bool initialized = false;
+    bool raw = false;
     bool finished = false;
-    size_t inputOffset = 0;
+    uint64_t bytesRead = 0;
     uint64_t rows = 0;
+    std::array<uint8_t, 1024 * 1024> inputBuffer{};
     std::string pending;
     size_t pendingOffset = 0;
 };
@@ -1019,6 +1088,19 @@ sectionRows(const Package &package, uint16_t section)
     return rows.array;
 }
 
+bool
+sectionStartsWithGzip(const Package &package, uint16_t section)
+{
+    const auto found = package.sections.find(section);
+    if (found == package.sections.end() || found->second.storedBytes < 2U)
+        return false;
+    std::ifstream stream(found->second.path, std::ios::binary);
+    if (!stream)
+        throw Error("cannot reopen MCFREG2 row section");
+    const auto prefix = readBytes(stream, found->second.offset, 2U);
+    return prefix[0] == 0x1fU && prefix[1] == 0x8bU;
+}
+
 class SectionRowReader
 {
   public:
@@ -1036,9 +1118,7 @@ class SectionRowReader
             legacy = sectionRows(package, section);
             expectedRows = legacy.size();
         } else if (
-            found->schema == 3U && found->storedBytes >= 2U &&
-            package.sections.at(section).size() >= 2U &&
-            package.sections.at(section)[0] != 0x1fU) {
+            found->schema == 3U && !sectionStartsWithGzip(package, section)) {
             legacy = sectionRows(package, section);
             expectedRows = legacy.size();
         } else if (found->schema == 2U || found->schema == 3U) {
@@ -1166,32 +1246,54 @@ validateInitialState(const Package &package)
             package.header.activeArcs + package.header.dummyArcs ||
         arcEntry.elementSize != ArcBytes)
         throw Error("MCFREG2 normalized state layout differs");
-    const auto &nodes = package.sections.at(MCFREG2_NODES);
-    const auto &arcs = package.sections.at(MCFREG2_ARCS);
-    for (uint64_t node = 0; node < package.header.nodes; ++node) {
-        const size_t base = static_cast<size_t>(node * NodeBytes);
-        for (size_t index = 0; index < 4; ++index)
-            validateStableRef(
-                stableRefAt(nodes, base + 16U + index * 16U),
-                package, true);
-        for (size_t index = 0; index < 4; ++index)
-            validateStableRef(
-                stableRefAt(nodes, base + 80U + index * 16U),
-                package, false);
+    const auto &nodeView = package.sections.at(MCFREG2_NODES);
+    const auto &arcView = package.sections.at(MCFREG2_ARCS);
+    std::ifstream nodeStream(nodeView.path, std::ios::binary);
+    std::ifstream arcStream(arcView.path, std::ios::binary);
+    if (!nodeStream || !arcStream)
+        throw Error("cannot reopen MCFREG2 normalized state");
+    constexpr uint64_t BufferBytes = 1024U * 1024U;
+    const uint64_t nodeBatch = std::max<uint64_t>(1U, BufferBytes / NodeBytes);
+    for (uint64_t first = 0; first < package.header.nodes;
+         first += nodeBatch) {
+        const uint64_t count = std::min(
+            nodeBatch, package.header.nodes - first);
+        const auto nodes = readBytes(
+            nodeStream, nodeView.offset + first * NodeBytes,
+            count * NodeBytes);
+        for (uint64_t node = 0; node < count; ++node) {
+            const size_t base = static_cast<size_t>(node * NodeBytes);
+            for (size_t index = 0; index < 4; ++index)
+                validateStableRef(
+                    stableRefAt(nodes, base + 16U + index * 16U),
+                    package, true);
+            for (size_t index = 0; index < 4; ++index)
+                validateStableRef(
+                    stableRefAt(nodes, base + 80U + index * 16U),
+                    package, false);
+        }
     }
     const uint64_t arcCount =
         package.header.activeArcs + package.header.dummyArcs;
-    for (uint64_t arc = 0; arc < arcCount; ++arc) {
-        const size_t base = static_cast<size_t>(arc * ArcBytes);
-        const McfStableRef tail = stableRefAt(arcs, base + 8U);
-        const McfStableRef head = stableRefAt(arcs, base + 24U);
-        validateStableRef(tail, package, true);
-        validateStableRef(head, package, true);
-        if (tail.kind == MCFREG2_OBJECT_NULL ||
-            head.kind == MCFREG2_OBJECT_NULL)
-            throw Error("MCFREG2 arc endpoint is null");
-        validateStableRef(stableRefAt(arcs, base + 48U), package, false);
-        validateStableRef(stableRefAt(arcs, base + 64U), package, false);
+    const uint64_t arcBatch = std::max<uint64_t>(1U, BufferBytes / ArcBytes);
+    for (uint64_t first = 0; first < arcCount; first += arcBatch) {
+        const uint64_t count = std::min(arcBatch, arcCount - first);
+        const auto arcs = readBytes(
+            arcStream, arcView.offset + first * ArcBytes, count * ArcBytes);
+        for (uint64_t arc = 0; arc < count; ++arc) {
+            const size_t base = static_cast<size_t>(arc * ArcBytes);
+            const McfStableRef tail = stableRefAt(arcs, base + 8U);
+            const McfStableRef head = stableRefAt(arcs, base + 24U);
+            validateStableRef(tail, package, true);
+            validateStableRef(head, package, true);
+            if (tail.kind == MCFREG2_OBJECT_NULL ||
+                head.kind == MCFREG2_OBJECT_NULL)
+                throw Error("MCFREG2 arc endpoint is null");
+            validateStableRef(
+                stableRefAt(arcs, base + 48U), package, false);
+            validateStableRef(
+                stableRefAt(arcs, base + 64U), package, false);
+        }
     }
 }
 

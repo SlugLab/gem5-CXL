@@ -8,7 +8,9 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 try:
@@ -85,6 +87,8 @@ MINIMUM_ALLOCATED_BYTES = {
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MCF_SOURCE_ROOT = _REPO_ROOT / "util/amu/matched_workloads"
 
 
 class InputError(RuntimeError):
@@ -156,6 +160,141 @@ def _require_equal_hashes(value, names, label):
     return hashes[0]
 
 
+def _canonical_value_sha256(value):
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _source_set_sha256(paths):
+    rows = [
+        {"name": path.name, "sha256": _sha256_file(path)}
+        for path in map(Path, paths)
+    ]
+    return _canonical_value_sha256(
+        sorted(rows, key=lambda row: row["name"])
+    )
+
+
+def _require_current_replayer_identity(identity):
+    if "cpp_kernel_sha256" not in identity:
+        return
+    current = {
+        "wire_abi_sha256": _sha256_file(
+            _MCF_SOURCE_ROOT / "mcfreg2_format.h"
+        ),
+        "generator_sha256": _sha256_file(
+            _REPO_ROOT / "scripts/generate_mcfreg2_state.py"
+        ),
+        "python_reader_sha256": _sha256_file(
+            _REPO_ROOT / "scripts/mcfreg2.py"
+        ),
+        "cpp_kernel_sha256": _sha256_file(
+            _MCF_SOURCE_ROOT / "mcfreg2_kernels.cc"
+        ),
+        "cpp_reader_sha256": _source_set_sha256((
+            _MCF_SOURCE_ROOT / "mcfreg2.hh",
+            _MCF_SOURCE_ROOT / "mcfreg2.cc",
+            _MCF_SOURCE_ROOT / "mcfreg2_state.hh",
+            _MCF_SOURCE_ROOT / "mcfreg2_state.cc",
+        )),
+    }
+    for name, digest in current.items():
+        if identity.get(name) != digest:
+            raise InputError(f"mcf semantic replay identity {name} differs")
+
+
+def run_strict_mcfreg2_replay(package_path, output_root):
+    """Compile and run the identity-local strict semantic MCFREG2 replay."""
+    compiler = shutil.which("g++")
+    if compiler is None:
+        raise InputError("mcf semantic replay compiler is unavailable")
+    output_root = Path(output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=False)
+    binary = output_root.parent / "mcfreg2-strict-replay"
+    command = [
+        compiler,
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I",
+        str(_MCF_SOURCE_ROOT),
+        str(_MCF_SOURCE_ROOT / "mcf_regions.cc"),
+        str(_MCF_SOURCE_ROOT / "mcfreg2.cc"),
+        str(_MCF_SOURCE_ROOT / "mcfreg2_state.cc"),
+        str(_MCF_SOURCE_ROOT / "mcfreg2_kernels.cc"),
+        "-o",
+        str(binary),
+        "-lz",
+    ]
+    compiled = subprocess.run(
+        command,
+        cwd=_REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if compiled.returncode != 0:
+        raise InputError(
+            "mcf semantic replay compilation failed: " + compiled.stdout
+        )
+    replayed = subprocess.run(
+        [
+            str(binary),
+            "--input",
+            str(package_path),
+            "--output-root",
+            str(output_root),
+            "--hash-only",
+        ],
+        cwd=_REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if replayed.returncode != 0:
+        raise InputError(
+            "mcf semantic replay failed: " + replayed.stdout.strip()
+        )
+    replay_path = output_root / "mcfreg2-replay.json"
+    replay_record = _read_json_file(replay_path, "mcf semantic replay")
+    expected = {
+        "boundary_mismatches",
+        "operations",
+        "price_out_calls",
+        "pricing_calls",
+        "status",
+        "trace_sha256",
+    }
+    if set(replay_record) != expected:
+        raise InputError("mcf semantic replay fields differ")
+    counters = (
+        replay_record["boundary_mismatches"],
+        replay_record["pricing_calls"],
+        replay_record["price_out_calls"],
+        replay_record["operations"],
+    )
+    if (
+        not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in counters
+        )
+        or replay_record["status"] != "verified"
+        or replay_record["boundary_mismatches"] != 0
+        or replay_record["pricing_calls"] < 0
+        or replay_record["price_out_calls"] < 0
+        or replay_record["operations"] <= 0
+        or _SHA256.fullmatch(str(replay_record["trace_sha256"])) is None
+    ):
+        raise InputError("mcf semantic replay is not verified")
+    return replay_record
+
+
 def validate_mcf_record(row):
     """Validate one generated MCFREG2 candidate without other workloads."""
     if not isinstance(row, dict):
@@ -183,10 +322,22 @@ def validate_mcf_record(row):
     )
     try:
         package = mcfreg2.read_package(
-            package_path, lazy_section_names=("EVENTS",)
+            package_path,
+            lazy_section_names=tuple(
+                name for name in mcfreg2.REQUIRED_SECTIONS
+                if name not in {"PROVENANCE", "FINAL"}
+            ),
         )
     except mcfreg2.FormatError as error:
         raise InputError(f"mcf MCFREG2 package is invalid: {error}") from error
+    schemas = {
+        entry.section_type: entry.schema for entry in package.directory
+    }
+    for name in ("EVENTS", "CALL_INDEX", "BOUNDARIES"):
+        if schemas.get(mcfreg2.SECTION_TYPES[name]) != 3:
+            raise InputError(
+                f"mcf semantic replay requires schema-3 {name}"
+            )
     validation = _read_json_file(validation_path, "mcf validation")
     if validation.get("schema") != 2:
         raise InputError("mcf validation schema must be 2")
@@ -255,6 +406,7 @@ def validate_mcf_record(row):
             not isinstance(identity[name], str) or not identity[name]
         ):
             raise InputError(f"mcf identity {name} is invalid")
+    _require_current_replayer_identity(identity)
 
     try:
         provenance = json.loads(package.section("PROVENANCE"))
@@ -299,11 +451,21 @@ def validate_mcf_record(row):
         or final.get("peak_allocated_bytes") != peak
     ):
         raise InputError("mcf observed allocated bytes differ")
+    with tempfile.TemporaryDirectory(prefix="mcfreg2-semantic-replay-") as tmp:
+        replay_record = run_strict_mcfreg2_replay(
+            package_path, Path(tmp) / "output"
+        )
+    if (
+        replay_record["pricing_calls"] != package.header.pricing_calls
+        or replay_record["price_out_calls"] != package.header.price_out_calls
+    ):
+        raise InputError("mcf semantic replay call counts differ")
     return {
         "package": package,
         "validation": validation,
         "package_path": package_path,
         "validation_path": validation_path,
+        "replay": replay_record,
     }
 
 

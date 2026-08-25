@@ -1,6 +1,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -13,6 +14,7 @@ from scripts import audit_cross_system_input_record as audit
 from scripts import freeze_cross_system_inputs as freeze
 from scripts import generate_mcfreg2_state as generator
 from scripts import mcfreg2
+from test_mcfreg2 import MCFREG2Test
 
 
 def sha256(path):
@@ -65,14 +67,10 @@ def valid_record(root):
     }
     final_state_sha256 = "6" * 64
     mcf_output_sha256 = "7" * 64
-    sections = {
-        name: f"{name.lower()}\n".encode("ascii")
-        for name in mcfreg2.REQUIRED_SECTIONS
-    }
-    sections["PROVENANCE"] = generator._canonical_json({
+    provenance = generator._canonical_json({
         "schema": 1, **identity,
     })
-    sections["FINAL"] = generator._canonical_json({
+    final = generator._canonical_json({
         "schema": 1,
         "initial_state_sha256": "8" * 64,
         "final_state_sha256": final_state_sha256,
@@ -82,18 +80,27 @@ def valid_record(root):
         "peak_allocated_bytes": 345_000_000,
     })
     mcf_input = root / "mcf.reg2"
+    helper = MCFREG2Test()
+    package = helper.strict_semantic_fixture(pricing_only=False)
+    replacements = {
+        mcfreg2.SECTION_TYPES["PROVENANCE"]: provenance,
+        mcfreg2.SECTION_TYPES["FINAL"]: final,
+    }
+    package = dataclasses.replace(
+        package,
+        sections=tuple(
+            dataclasses.replace(
+                section,
+                data=replacements[section.section_type],
+                element_size=len(replacements[section.section_type]),
+            )
+            if section.section_type in replacements else section
+            for section in package.sections
+        ),
+    )
     mcfreg2.write_package(
         mcf_input,
-        mcfreg2.new_package(
-            nodes=4,
-            active_arcs=6,
-            dummy_arcs=3,
-            arena_capacity=16,
-            pricing_calls=2,
-            price_out_calls=1,
-            event_count=9,
-            sections=sections,
-        ),
+        package,
     )
     mcf_input = mcf_input.resolve()
     validation = {

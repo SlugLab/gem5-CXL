@@ -27,7 +27,9 @@ class MatchedRegionBuildTest(unittest.TestCase):
     def make_verified_formal_record(self):
         helper = MCFREG2Test()
         helper.root = self.root
-        package_path = helper.write_semantic_fixture("formal-mcf.reg2")
+        package_path = helper.write_strict_semantic_fixture(
+            "formal-mcf.reg2", pricing_only=False
+        )
         package = mcfreg2.read_package(package_path)
         source = self.root / "formal-mcf-source.c"
         source.write_text("int formal_mcf_source;\n", encoding="ascii")

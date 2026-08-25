@@ -29,7 +29,13 @@ struct Package
 {
     McfReg2Header header{};
     std::vector<McfReg2DirectoryEntry> directory;
-    std::map<uint16_t, std::vector<uint8_t>> sections;
+    struct SectionView
+    {
+        std::string path;
+        uint64_t offset = 0;
+        uint64_t storedBytes = 0;
+    };
+    std::map<uint16_t, SectionView> sections;
 };
 
 struct ReplaySummary

@@ -84,23 +84,47 @@ class DirectoryEntry:
 
 
 @dataclasses.dataclass(frozen=True)
+class SectionView:
+    path: Path
+    offset: int
+    stored_bytes: int
+
+    def chunks(self, chunk_bytes=1024 * 1024):
+        if chunk_bytes <= 0:
+            raise FormatError("MCFREG2 section chunk size is invalid")
+        with self.path.open("rb") as stream:
+            stream.seek(self.offset)
+            remaining = self.stored_bytes
+            while remaining:
+                chunk = stream.read(min(remaining, chunk_bytes))
+                if not chunk:
+                    raise FormatError("MCFREG2 section is truncated")
+                remaining -= len(chunk)
+                yield chunk
+
+    def read(self) -> bytes:
+        return b"".join(self.chunks())
+
+
+@dataclasses.dataclass(frozen=True)
 class Section:
     section_type: int
     schema: int
     flags: int
     element_count: int
     element_size: int
-    data: bytes | Path | None
+    data: bytes | Path | SectionView
 
     def __post_init__(self):
-        if self.data is None:
-            return
-        if isinstance(self.data, Path):
-            if not self.data.is_file():
+        if isinstance(self.data, (Path, SectionView)):
+            path = self.data if isinstance(self.data, Path) else self.data.path
+            if not path.is_file():
                 raise TypeError("MCFREG2 file-backed section is missing")
             return
         if not isinstance(self.data, bytes):
-            raise TypeError("MCFREG2 section data must be bytes or a Path")
+            raise TypeError(
+                "MCFREG2 section data must be bytes, a Path, or a SectionView"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -392,11 +416,12 @@ class Package:
     def section_by_type(self, section_type: int) -> bytes:
         for section in self.sections:
             if section.section_type == section_type:
-                if not isinstance(section.data, bytes):
-                    raise FormatError(
-                        f"MCFREG2 section {section_type} data is lazy"
-                    )
-                return section.data
+                if isinstance(section.data, bytes):
+                    return section.data
+                if isinstance(section.data, SectionView):
+                    return section.data.read()
+                if isinstance(section.data, Path):
+                    return section.data.read_bytes()
         raise FormatError(f"MCFREG2 section {section_type} is absent")
 
     def section(self, name: str) -> bytes:
@@ -780,10 +805,10 @@ def validate_semantic_roles(package: Package) -> tuple[SemanticFrame, ...]:
     for name in ("EVENTS", "CALL_INDEX", "BOUNDARIES"):
         if section_by_name[name].schema != 3:
             raise FormatError(f"MCFREG2 {name} section schema differs")
-    events = _semantic_events(section_by_name["EVENTS"].data)
-    call_rows = _semantic_json(section_by_name["CALL_INDEX"].data, "CALL_INDEX")
+    events = _semantic_events(package.section("EVENTS"))
+    call_rows = _semantic_json(package.section("CALL_INDEX"), "CALL_INDEX")
     boundary_rows = _semantic_json(
-        section_by_name["BOUNDARIES"].data, "BOUNDARIES"
+        package.section("BOUNDARIES"), "BOUNDARIES"
     )
     frames = []
     active = None
@@ -1043,6 +1068,8 @@ def _section_source_size(data) -> int:
         return len(data)
     if isinstance(data, Path) and data.is_file():
         return data.stat().st_size
+    if isinstance(data, SectionView):
+        return data.stored_bytes
     raise FormatError("MCFREG2 section source is invalid")
 
 
@@ -1092,13 +1119,10 @@ def _entry_from_values(values) -> DirectoryEntry:
 
 
 def read_package(path, *, lazy_section_names=()) -> Package:
-    path = Path(path)
-    lazy_types = set()
+    path = Path(path).resolve()
     for name in lazy_section_names:
-        try:
-            lazy_types.add(SECTION_TYPES[name])
-        except KeyError as error:
-            raise FormatError(f"unknown lazy MCFREG2 section: {name}") from error
+        if name not in SECTION_TYPES:
+            raise FormatError(f"unknown lazy MCFREG2 section: {name}")
     try:
         file_size = path.stat().st_size
         with path.open("rb") as stream:
@@ -1164,22 +1188,15 @@ def read_package(path, *, lazy_section_names=()) -> Package:
                 if end > file_size:
                     raise FormatError("MCFREG2 section is truncated")
                 stream.seek(entry.offset)
-                if entry.section_type in lazy_types:
-                    remaining = entry.stored_bytes
-                    digest = hashlib.sha256()
-                    while remaining:
-                        chunk = stream.read(min(remaining, 1024 * 1024))
-                        if not chunk:
-                            raise FormatError("MCFREG2 section is truncated")
-                        digest.update(chunk)
-                        remaining -= len(chunk)
-                    data = None
-                    actual_digest = digest.digest()
-                else:
-                    data = stream.read(entry.stored_bytes)
-                    if len(data) != entry.stored_bytes:
+                remaining = entry.stored_bytes
+                digest = hashlib.sha256()
+                while remaining:
+                    chunk = stream.read(min(remaining, 1024 * 1024))
+                    if not chunk:
                         raise FormatError("MCFREG2 section is truncated")
-                    actual_digest = hashlib.sha256(data).digest()
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                actual_digest = digest.digest()
                 if actual_digest != entry.sha256:
                     raise FormatError("MCFREG2 section SHA-256 differs")
                 sections.append(Section(
@@ -1188,7 +1205,7 @@ def read_package(path, *, lazy_section_names=()) -> Package:
                     flags=entry.flags,
                     element_count=entry.element_count,
                     element_size=entry.element_size,
-                    data=data,
+                    data=SectionView(path, entry.offset, entry.stored_bytes),
                 ))
                 cursor = end
             if cursor != file_size:
@@ -1227,6 +1244,8 @@ def _section_size(section: Section) -> int:
         return len(section.data)
     if isinstance(section.data, Path):
         return section.data.stat().st_size
+    if isinstance(section.data, SectionView):
+        return section.data.stored_bytes
     raise FormatError("cannot write a lazy MCFREG2 section")
 
 
@@ -1238,6 +1257,11 @@ def _section_sha256(section: Section) -> bytes:
         with section.data.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
+        return digest.digest()
+    if isinstance(section.data, SectionView):
+        digest = hashlib.sha256()
+        for chunk in section.data.chunks():
+            digest.update(chunk)
         return digest.digest()
     raise FormatError("cannot hash a lazy MCFREG2 section")
 
@@ -1346,17 +1370,14 @@ def write_package(path, package: Package) -> str:
                 elif isinstance(section.data, Path):
                     with section.data.open("rb") as source:
                         shutil.copyfileobj(source, stream, 1024 * 1024)
+                elif isinstance(section.data, SectionView):
+                    for chunk in section.data.chunks():
+                        stream.write(chunk)
                 else:
                     raise FormatError("cannot write a lazy MCFREG2 section")
             stream.flush()
             os.fsync(stream.fileno())
-        lazy_sections = tuple(
-            SECTION_NAMES[section.section_type]
-            for section in sections
-            if isinstance(section.data, Path)
-            and section.section_type in SECTION_NAMES
-        )
-        read_package(temporary, lazy_section_names=lazy_sections)
+        read_package(temporary)
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:

@@ -1022,8 +1022,12 @@ int main()
         )
         self.assertEqual(mcfreg2.sha256_file(path), digest)
         self.assertEqual(actual.section("PROVENANCE"), b"provenance\n")
-        with self.assertRaisesRegex(mcfreg2.FormatError, "lazy"):
-            actual.section("EVENTS")
+        event_section = next(
+            section for section in actual.sections
+            if section.section_type == mcfreg2.SECTION_TYPES["EVENTS"]
+        )
+        self.assertIsInstance(event_section.data, mcfreg2.SectionView)
+        self.assertEqual(actual.section("EVENTS"), events.read_bytes())
 
     def compile_cpp_probe(self):
         compiler = shutil.which("g++")
@@ -1165,6 +1169,54 @@ int main(int argc, char **argv)
         ).read_text(encoding="utf-8")
         self.assertIn("pendingOffset", implementation)
         self.assertNotIn("pending.erase(0, newline", implementation)
+
+    def test_cpp_reader_rss_is_not_proportional_to_section_bytes(self):
+        timer = Path("/usr/bin/time")
+        if not timer.is_file():
+            self.skipTest("/usr/bin/time is unavailable")
+        probe = self.compile_cpp_probe()
+
+        def package_with_payload(name, size):
+            payload = self.root / f"{name}.payload"
+            with payload.open("wb") as stream:
+                stream.seek(size - 1)
+                stream.write(b"\0")
+            package = self.fixture_package()
+            package = dataclasses.replace(
+                package,
+                sections=tuple(
+                    dataclasses.replace(
+                        section,
+                        data=payload,
+                        element_count=1,
+                        element_size=size,
+                    )
+                    if section.section_type ==
+                    mcfreg2.SECTION_TYPES["PROVENANCE"] else section
+                    for section in package.sections
+                ),
+            )
+            path = self.root / f"{name}.reg2"
+            mcfreg2.write_package(path, package)
+            return path
+
+        def maximum_rss(path, name):
+            output = self.root / f"{name}.rss"
+            subprocess.run(
+                [timer, "-f", "%M", "-o", output, probe, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            return int(output.read_text(encoding="ascii").strip())
+
+        small = maximum_rss(
+            package_with_payload("small", 1 * 1024 * 1024), "small"
+        )
+        large = maximum_rss(
+            package_with_payload("large", 96 * 1024 * 1024), "large"
+        )
+        self.assertLessEqual(large - small, 64 * 1024)
 
     def test_cpp_sha256_matches_standard_vectors(self):
         self.require_module()
