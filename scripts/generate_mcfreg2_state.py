@@ -57,6 +57,26 @@ STATE_MAGIC = b"MCFSTATE2"
 STATE_NETWORK_WORDS = 22
 STATE_NODE_BYTES = 176
 STATE_ARC_BYTES = 96
+EVIDENCE_IDENTITY_FIELDS = {
+    "source_commit",
+    "source_tree_sha256",
+    "input_sha256",
+    "common_patch_sha256",
+    "capture_patch_sha256",
+    "capture_runtime_sha256",
+    "wire_abi_sha256",
+    "compiler_sha256",
+    "compiler_version",
+    "compiler_target",
+    "authority_command_sha256",
+    "capture_command_sha256",
+    "authority_binary_sha256",
+    "capture_binary_sha256",
+    "generator_sha256",
+    "python_reader_sha256",
+    "cpp_reader_sha256",
+    "cpp_kernel_sha256",
+}
 
 
 class GenerationError(RuntimeError):
@@ -107,6 +127,13 @@ def _sha256_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_value_sha256(value):
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _source_subdir(value):
@@ -212,7 +239,9 @@ def freeze_source(
     tracked_names = {row[0].as_posix() for row in files}
     if input_relative_to_repo.as_posix() not in tracked_names:
         raise GenerationError("MCF input is not a tracked source file")
-    actual_input_sha256 = _sha256_file(input_path)
+    recorded_by_name = {row["path"]: row for row in file_rows}
+    recorded_input = recorded_by_name[input_relative_to_repo.as_posix()]
+    actual_input_sha256 = recorded_input["sha256"]
     if actual_input_sha256 != expected_input_sha256:
         raise GenerationError(
             "MCF input SHA-256 differs: "
@@ -225,7 +254,11 @@ def freeze_source(
             target = copied_root.joinpath(*relative.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-            if _sha256_file(target) != _sha256_file(source):
+            recorded = recorded_by_name[relative.as_posix()]
+            if (
+                target.stat().st_size != recorded["bytes"]
+                or _sha256_file(target) != recorded["sha256"]
+            ):
                 raise GenerationError(
                     f"MCF frozen copy SHA-256 differs: {relative}"
                 )
@@ -246,10 +279,51 @@ def freeze_source(
         "input": str(input_path),
         "input_relative": input_relative_to_repo.as_posix(),
         "input_sha256": actual_input_sha256,
-        "input_bytes": input_path.stat().st_size,
+        "input_bytes": recorded_input["bytes"],
         "copied_source_root": str(copied_root),
-        "copied_input": str(copied_input),
+        "copied_input": str(copied_input.resolve()),
     }
+
+
+def verify_frozen_input(frozen):
+    if not isinstance(frozen, dict):
+        raise GenerationError("MCF frozen source record is invalid")
+    try:
+        copied_input = Path(frozen["copied_input"])
+        expected_sha256 = frozen["input_sha256"]
+        expected_bytes = frozen["input_bytes"]
+    except (KeyError, TypeError) as error:
+        raise GenerationError("MCF frozen input identity is incomplete") from error
+    if not copied_input.is_absolute() or copied_input.resolve() != copied_input:
+        raise GenerationError("MCF frozen input path is not resolved")
+    if not copied_input.is_file():
+        raise GenerationError(f"MCF frozen input is missing: {copied_input}")
+    if copied_input.stat().st_size != expected_bytes:
+        raise GenerationError("MCF frozen input size differs")
+    if _sha256_file(copied_input) != expected_sha256:
+        raise GenerationError("MCF frozen input SHA-256 differs")
+    return copied_input
+
+
+def run_frozen_native_matrix(
+    *, frozen, authority_binary, capture_binary, work_root
+):
+    copied_input = verify_frozen_input(frozen)
+    work_root = Path(work_root).resolve()
+    runs = {}
+    for name, binary in (
+        ("authority", authority_binary),
+        ("capture_primary", capture_binary),
+        ("capture_replay", capture_binary),
+    ):
+        verify_frozen_input(frozen)
+        runs[name] = run_native(
+            binary=binary,
+            input_path=copied_input,
+            output_root=work_root / name.replace("_", "-"),
+        )
+        verify_frozen_input(frozen)
+    return {"input": str(copied_input), "runs": runs}
 
 
 def _run_checked(command, *, cwd, label):
@@ -354,10 +428,62 @@ def _compiler_identity(compiler):
     if not path.is_file():
         raise GenerationError(f"C compiler does not exist: {path}")
     version = _run_checked((path, "--version"), cwd=REPO, label="compiler")
+    target = _run_checked((path, "-dumpmachine"), cwd=REPO, label="compiler")
     return {
         "path": str(path),
         "version": version.splitlines()[0],
+        "target": target.strip(),
         "sha256": _sha256_file(path),
+    }
+
+
+def _canonical_build_command(command, *, compiler, source_dir, output):
+    compiler = str(Path(compiler).resolve())
+    source_dir = Path(source_dir).resolve()
+    output = str(Path(output).resolve())
+    canonical = []
+    for raw in command:
+        item = str(raw)
+        if item == compiler:
+            canonical.append("<COMPILER>")
+        elif item == str(source_dir):
+            canonical.append("<SOURCE>")
+        elif item == output:
+            canonical.append("<OUTPUT>")
+        else:
+            path = Path(item)
+            try:
+                relative = path.resolve().relative_to(source_dir)
+            except (OSError, ValueError):
+                canonical.append(item)
+            else:
+                canonical.append(f"<SOURCE>/{relative.as_posix()}")
+    return canonical
+
+
+def _implementation_identity(prepared):
+    runtime_rows = sorted(
+        prepared["capture_runtime"], key=lambda row: row["name"]
+    )
+    dedicated_kernel = MATCHED_ROOT / "mcfreg2_kernels.cc"
+    kernel_source = (
+        dedicated_kernel
+        if dedicated_kernel.is_file()
+        else MATCHED_ROOT / "mcfreg2.cc"
+    )
+    paths = {
+        "wire_abi_sha256": MATCHED_ROOT / "mcfreg2_format.h",
+        "generator_sha256": Path(__file__).resolve(),
+        "python_reader_sha256": REPO / "scripts/mcfreg2.py",
+        "cpp_reader_sha256": MATCHED_ROOT / "mcfreg2.cc",
+        "cpp_kernel_sha256": kernel_source,
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise GenerationError(f"MCF evidence implementation is missing: {missing[0]}")
+    return {
+        "capture_runtime_sha256": _canonical_value_sha256(runtime_rows),
+        **{name: _sha256_file(path) for name, path in paths.items()},
     }
 
 
@@ -382,24 +508,182 @@ def build_native(*, prepared, output, compiler):
         command.append("-DMCF_CAPTURE_EVENTS=1")
     command.extend(str(source_dir / name) for name in NATIVE_SOURCES)
     command.extend(("-o", str(output), "-lz"))
+    canonical_command = _canonical_build_command(
+        command,
+        compiler=compiler_row["path"],
+        source_dir=source_dir,
+        output=output,
+    )
     build_output = _run_checked(command, cwd=source_dir, label="native MCF build")
     if not output.is_file():
         raise GenerationError("native MCF build did not create its binary")
     row = {
-        "schema": 1,
+        "schema": 2,
         "binary": str(output),
         "binary_sha256": _sha256_file(output),
         "compiler": compiler_row,
         "command": command,
+        "canonical_command": canonical_command,
+        "command_sha256": _canonical_value_sha256(canonical_command),
         "stdout": build_output,
         "common_patch_sha256": prepared["common_patch_sha256"],
+        "capture_patch_sha256": prepared["capture_patch_sha256"],
         "source_tree_sha256": prepared["source_tree_sha256"],
         "capture_enabled": prepared["capture_enabled"],
+        **_implementation_identity(prepared),
     }
     (output.parent / f"{output.name}.build.json").write_text(
         json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return output
+
+
+def _build_record(value, label):
+    if isinstance(value, dict):
+        return dict(value)
+    path = Path(value)
+    if path.name.endswith(".build.json"):
+        record = path
+        binary = None
+    else:
+        record = path.parent / f"{path.name}.build.json"
+        binary = path.resolve()
+    row = _read_json(record, f"{label} build record")
+    if binary is not None:
+        if not binary.is_file():
+            raise GenerationError(f"MCF {label} binary is missing: {binary}")
+        if row.get("binary") != str(binary):
+            raise GenerationError(f"MCF {label} build binary path differs")
+        if row.get("binary_sha256") != _sha256_file(binary):
+            raise GenerationError(f"MCF {label} build binary SHA-256 differs")
+    return row
+
+
+def _require_sha256(row, name, label):
+    value = row.get(name)
+    if not isinstance(value, str) or len(value) != 64:
+        raise GenerationError(f"MCF {label} {name} is invalid")
+    try:
+        bytes.fromhex(value)
+    except ValueError as error:
+        raise GenerationError(f"MCF {label} {name} is invalid") from error
+    return value
+
+
+def derive_evidence_identity(source_record, authority_build, capture_build):
+    if not isinstance(source_record, dict):
+        source_record = _read_json(source_record, "MCF source record")
+    authority = _build_record(authority_build, "authority")
+    capture = _build_record(capture_build, "capture")
+    if authority.get("capture_enabled") is not False:
+        raise GenerationError("MCF authority build is capture-enabled")
+    if capture.get("capture_enabled") is not True:
+        raise GenerationError("MCF capture build is not capture-enabled")
+    if authority.get("capture_patch_sha256") is not None:
+        raise GenerationError("MCF authority capture_patch_sha256 is not null")
+    capture_patch = _require_sha256(
+        capture, "capture_patch_sha256", "capture build"
+    )
+    shared = (
+        "source_tree_sha256",
+        "common_patch_sha256",
+        "capture_runtime_sha256",
+        "wire_abi_sha256",
+        "generator_sha256",
+        "python_reader_sha256",
+        "cpp_reader_sha256",
+        "cpp_kernel_sha256",
+    )
+    for name in shared:
+        authority_value = _require_sha256(authority, name, "authority build")
+        capture_value = _require_sha256(capture, name, "capture build")
+        if authority_value != capture_value:
+            raise GenerationError(f"MCF build {name} differs")
+    for label, row in (("authority", authority), ("capture", capture)):
+        canonical_command = row.get("canonical_command")
+        if not isinstance(canonical_command, list) or not all(
+            isinstance(item, str) for item in canonical_command
+        ):
+            raise GenerationError(
+                f"MCF {label} canonical build command is invalid"
+            )
+        if row.get("command_sha256") != _canonical_value_sha256(
+            canonical_command
+        ):
+            raise GenerationError(f"MCF {label} command_sha256 differs")
+    source_tree = _require_sha256(
+        source_record, "source_tree_sha256", "source record"
+    )
+    if source_tree != authority["source_tree_sha256"]:
+        raise GenerationError("MCF source_tree_sha256 differs from builds")
+    compiler_fields = ("sha256", "version", "target")
+    authority_compiler = authority.get("compiler")
+    capture_compiler = capture.get("compiler")
+    if not isinstance(authority_compiler, dict) or not isinstance(
+        capture_compiler, dict
+    ):
+        raise GenerationError("MCF compiler identity is invalid")
+    for name in compiler_fields:
+        if authority_compiler.get(name) != capture_compiler.get(name):
+            raise GenerationError(f"MCF compiler {name} differs")
+    compiler_path = authority_compiler.get("path")
+    if compiler_path is not None:
+        compiler_path = Path(compiler_path)
+        if (
+            not compiler_path.is_absolute()
+            or not compiler_path.is_file()
+            or _sha256_file(compiler_path) != authority_compiler.get("sha256")
+        ):
+            raise GenerationError("MCF compiler binary SHA-256 differs")
+    compiler_sha256 = _require_sha256(
+        authority_compiler, "sha256", "compiler"
+    )
+    for name in ("version", "target"):
+        if (
+            not isinstance(authority_compiler.get(name), str)
+            or not authority_compiler[name]
+        ):
+            raise GenerationError(f"MCF compiler {name} is invalid")
+    source_commit = source_record.get("source_commit")
+    if not isinstance(source_commit, str) or len(source_commit) != 40:
+        raise GenerationError("MCF source commit is invalid")
+    try:
+        bytes.fromhex(source_commit)
+    except ValueError as error:
+        raise GenerationError("MCF source commit is invalid") from error
+    identity = {
+        "source_commit": source_commit,
+        "source_tree_sha256": source_tree,
+        "input_sha256": _require_sha256(
+            source_record, "input_sha256", "source record"
+        ),
+        "common_patch_sha256": authority["common_patch_sha256"],
+        "capture_patch_sha256": capture_patch,
+        "capture_runtime_sha256": authority["capture_runtime_sha256"],
+        "wire_abi_sha256": authority["wire_abi_sha256"],
+        "compiler_sha256": compiler_sha256,
+        "compiler_version": authority_compiler["version"],
+        "compiler_target": authority_compiler["target"],
+        "authority_command_sha256": _require_sha256(
+            authority, "command_sha256", "authority build"
+        ),
+        "capture_command_sha256": _require_sha256(
+            capture, "command_sha256", "capture build"
+        ),
+        "authority_binary_sha256": _require_sha256(
+            authority, "binary_sha256", "authority build"
+        ),
+        "capture_binary_sha256": _require_sha256(
+            capture, "binary_sha256", "capture build"
+        ),
+        "generator_sha256": authority["generator_sha256"],
+        "python_reader_sha256": authority["python_reader_sha256"],
+        "cpp_reader_sha256": authority["cpp_reader_sha256"],
+        "cpp_kernel_sha256": authority["cpp_kernel_sha256"],
+    }
+    if set(identity) != EVIDENCE_IDENTITY_FIELDS:
+        raise GenerationError("MCF derived evidence identity fields differ")
+    return identity
 
 
 def run_native(*, binary, input_path, output_root):
@@ -854,21 +1138,20 @@ def _stream_frame_sections(run_root, section_paths):
 
 
 def _validate_identity(identity):
-    required = (
-        "source_commit",
-        "source_tree_sha256",
-        "input_sha256",
-        "common_patch_sha256",
-        "capture_patch_sha256",
-        "compiler_sha256",
-    )
-    if not isinstance(identity, dict) or set(identity) != set(required):
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != EVIDENCE_IDENTITY_FIELDS
+    ):
         raise GenerationError("MCF package identity fields differ")
     if not isinstance(identity["source_commit"], str) or len(
         identity["source_commit"]
     ) != 40:
         raise GenerationError("MCF package source commit is invalid")
-    for name in required[1:]:
+    text_fields = ("compiler_version", "compiler_target")
+    for name in text_fields:
+        if not isinstance(identity[name], str) or not identity[name]:
+            raise GenerationError(f"MCF package {name} is invalid")
+    for name in EVIDENCE_IDENTITY_FIELDS - {"source_commit", *text_fields}:
         value = identity[name]
         if not isinstance(value, str) or len(value) != 64:
             raise GenerationError(f"MCF package {name} is invalid")
@@ -1513,6 +1796,29 @@ def _attach_binary(run_root, binary):
     shutil.copy2(build_record, run_root / "native-mcf.build.json")
 
 
+def _clone_frozen_source(frozen, destination):
+    verify_frozen_input(frozen)
+    destination = Path(destination).resolve()
+    if destination.exists():
+        raise GenerationError(
+            f"MCF build source destination already exists: {destination}"
+        )
+    source = Path(frozen["copied_source_root"]).resolve()
+    shutil.copytree(source, destination, copy_function=shutil.copy2)
+    for row in frozen["tracked_files"]:
+        target = destination.joinpath(*PurePosixPath(row["path"]).parts)
+        if (
+            not target.is_file()
+            or target.stat().st_size != row["bytes"]
+            or _sha256_file(target) != row["sha256"]
+        ):
+            shutil.rmtree(destination, ignore_errors=True)
+            raise GenerationError(
+                f"MCF build source copy differs: {row['path']}"
+            )
+    return {**frozen, "copied_source_root": str(destination)}
+
+
 def generate_evidence(
     *,
     source_root,
@@ -1536,13 +1842,16 @@ def generate_evidence(
     compiler = _resolve_compiler(compiler)
     work = Path(tempfile.mkdtemp(prefix=".generation-", dir=output_root))
     try:
-        authority_frozen = freeze_source(
+        frozen = freeze_source(
             source_root=source_root,
             expected_commit=source_commit,
             source_subdir=source_subdir,
             input_path=input_path,
             expected_input_sha256=input_sha256,
-            destination=work / "authority-source",
+            destination=work / "frozen-source",
+        )
+        authority_frozen = _clone_frozen_source(
+            frozen, work / "authority-source"
         )
         authority_prepared = prepare_native_source(
             frozen=authority_frozen, capture_enabled=False
@@ -1552,21 +1861,8 @@ def generate_evidence(
             output=work / "bin/authority-mcf",
             compiler=compiler,
         )
-        authority_run = work / "authority-run"
-        run_native(
-            binary=authority_binary,
-            input_path=input_path,
-            output_root=authority_run,
-        )
-        _attach_binary(authority_run, authority_binary)
-
-        capture_frozen = freeze_source(
-            source_root=source_root,
-            expected_commit=source_commit,
-            source_subdir=source_subdir,
-            input_path=input_path,
-            expected_input_sha256=input_sha256,
-            destination=work / "capture-source",
+        capture_frozen = _clone_frozen_source(
+            frozen, work / "capture-source"
         )
         capture_prepared = prepare_native_source(
             frozen=capture_frozen, capture_enabled=True
@@ -1576,29 +1872,23 @@ def generate_evidence(
             output=work / "bin/capture-mcf",
             compiler=compiler,
         )
-        primary_run = work / "capture-primary-run"
-        replay_run = work / "capture-replay-run"
+        run_frozen_native_matrix(
+            frozen=frozen,
+            authority_binary=authority_binary,
+            capture_binary=capture_binary,
+            work_root=work,
+        )
+        authority_run = work / "authority"
+        primary_run = work / "capture-primary"
+        replay_run = work / "capture-replay"
+        _attach_binary(authority_run, authority_binary)
         for run_root in (primary_run, replay_run):
-            run_native(
-                binary=capture_binary,
-                input_path=input_path,
-                output_root=run_root,
-            )
             _attach_binary(run_root, capture_binary)
-        identity = {
-            "source_commit": capture_prepared["source_commit"],
-            "source_tree_sha256": capture_prepared["source_tree_sha256"],
-            "input_sha256": input_sha256,
-            "common_patch_sha256": capture_prepared[
-                "common_patch_sha256"
-            ],
-            "capture_patch_sha256": capture_prepared[
-                "capture_patch_sha256"
-            ],
-            "compiler_sha256": readiness["compiler"]["sha256"],
-        }
+        identity = derive_evidence_identity(
+            _source_record(frozen), authority_binary, capture_binary
+        )
         source_record = work / "source.json"
-        _atomic_json(source_record, _source_record(capture_frozen))
+        _atomic_json(source_record, _source_record(frozen))
         result = generate_candidate(
             authority_root=authority_run,
             capture_primary_root=primary_run,

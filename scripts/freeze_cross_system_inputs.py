@@ -215,22 +215,46 @@ def validate_mcf_record(row):
         raise InputError("mcf source is empty")
 
     identity = validation.get("identity")
-    identity_names = (
+    legacy_identity_names = {
         "source_commit",
         "source_tree_sha256",
         "input_sha256",
         "common_patch_sha256",
         "capture_patch_sha256",
         "compiler_sha256",
-    )
-    if not isinstance(identity, dict) or set(identity) != set(identity_names):
+    }
+    strict_identity_names = legacy_identity_names | {
+        "capture_runtime_sha256",
+        "wire_abi_sha256",
+        "compiler_version",
+        "compiler_target",
+        "authority_command_sha256",
+        "capture_command_sha256",
+        "authority_binary_sha256",
+        "capture_binary_sha256",
+        "generator_sha256",
+        "python_reader_sha256",
+        "cpp_reader_sha256",
+        "cpp_kernel_sha256",
+    }
+    if (
+        not isinstance(identity, dict)
+        or set(identity) not in (legacy_identity_names, strict_identity_names)
+    ):
         raise InputError("mcf validation identity fields differ")
     if identity["source_commit"] != row["source_commit"]:
         raise InputError("mcf source commit differs from validation")
     if identity["source_tree_sha256"] != row["source_tree_sha256"]:
         raise InputError("mcf source tree SHA-256 differs from validation")
-    for name in identity_names[1:]:
+    for name in set(identity) - {
+        "source_commit", "compiler_version", "compiler_target"
+    }:
         _require_sha256(identity.get(name), f"mcf identity {name}")
+    for name in ("compiler_version", "compiler_target"):
+        if name in identity and (
+            not isinstance(identity[name], str) or not identity[name]
+        ):
+            raise InputError(f"mcf identity {name} is invalid")
 
     try:
         provenance = json.loads(package.section("PROVENANCE"))

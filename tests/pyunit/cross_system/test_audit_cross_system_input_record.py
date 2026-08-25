@@ -183,6 +183,11 @@ class InputAuditTest(unittest.TestCase):
         self.assertEqual(value["amg_gather"]["allocated_bytes"], 1 << 30)
         self.assertEqual(value["npb_cg"]["allocated_bytes"], 12_800_000_000)
 
+    def test_template_mcf_shape_matches_formal_required_shape(self):
+        self.assertEqual(
+            set(audit.template_record()["mcf"]), freeze.REQUIRED["mcf"]
+        )
+
     @mock.patch.object(audit.subprocess, "check_output", return_value="clean\n")
     def test_git_inspection_scopes_safe_directory_to_source_root(self, check):
         source = (self.root / "npb").resolve()

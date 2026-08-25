@@ -162,6 +162,128 @@ class GenerateMCFREG2Test(unittest.TestCase):
                 destination=destination,
             )
 
+    def test_copied_file_is_checked_against_recorded_source_hash(self):
+        self.require_module()
+        source, commit, input_path = self.make_source_repo()
+        original_copy2 = shutil.copy2
+
+        def mutate_input_then_copy(source_path, target_path, *args, **kwargs):
+            if Path(source_path).resolve() == input_path:
+                input_path.write_text(
+                    "2 1\nchanged after hash\n", encoding="ascii"
+                )
+            return original_copy2(source_path, target_path, *args, **kwargs)
+
+        with mock.patch.object(
+            generator.shutil, "copy2", side_effect=mutate_input_then_copy
+        ):
+            with self.assertRaisesRegex(
+                generator.GenerationError, "frozen copy"
+            ):
+                self.freeze(source, commit, input_path)
+
+    def test_all_native_runs_use_the_frozen_input_after_source_drift(self):
+        self.require_module()
+        source, commit, input_path = self.make_source_repo()
+        frozen = self.freeze(source, commit, input_path)
+        input_path.write_text("changed after freeze\n", encoding="ascii")
+
+        with mock.patch.object(generator, "run_native", return_value={}) as run:
+            result = generator.run_frozen_native_matrix(
+                frozen=frozen,
+                authority_binary=self.root / "authority-mcf",
+                capture_binary=self.root / "capture-mcf",
+                work_root=self.root / "runs",
+            )
+
+        copied_input = Path(frozen["copied_input"])
+        self.assertEqual(len(run.call_args_list), 3)
+        self.assertEqual(
+            {call.kwargs["input_path"] for call in run.call_args_list},
+            {copied_input},
+        )
+        self.assertEqual(result["input"], str(copied_input))
+
+    def test_evidence_identity_is_derived_from_consistent_build_records(self):
+        self.require_module()
+        hashes = {name: format(index, "064x") for index, name in enumerate((
+            "source_tree_sha256",
+            "input_sha256",
+            "common_patch_sha256",
+            "capture_patch_sha256",
+            "capture_runtime_sha256",
+            "wire_abi_sha256",
+            "compiler_sha256",
+            "authority_command_sha256",
+            "capture_command_sha256",
+            "authority_binary_sha256",
+            "capture_binary_sha256",
+            "generator_sha256",
+            "python_reader_sha256",
+            "cpp_reader_sha256",
+            "cpp_kernel_sha256",
+        ), start=1)}
+        source = {
+            "source_commit": "a" * 40,
+            "source_tree_sha256": hashes["source_tree_sha256"],
+            "input_sha256": hashes["input_sha256"],
+        }
+        shared = {
+            "schema": 2,
+            "source_tree_sha256": hashes["source_tree_sha256"],
+            "common_patch_sha256": hashes["common_patch_sha256"],
+            "capture_runtime_sha256": hashes["capture_runtime_sha256"],
+            "wire_abi_sha256": hashes["wire_abi_sha256"],
+            "compiler": {
+                "sha256": hashes["compiler_sha256"],
+                "version": "cc fixture 1.0",
+                "target": "x86_64-fixture-linux-gnu",
+            },
+            "generator_sha256": hashes["generator_sha256"],
+            "python_reader_sha256": hashes["python_reader_sha256"],
+            "cpp_reader_sha256": hashes["cpp_reader_sha256"],
+            "cpp_kernel_sha256": hashes["cpp_kernel_sha256"],
+        }
+        authority = {
+            **shared,
+            "capture_enabled": False,
+            "capture_patch_sha256": None,
+            "canonical_command": ["<COMPILER>", "-O2", "<OUTPUT>"],
+            "binary_sha256": hashes["authority_binary_sha256"],
+        }
+        capture = {
+            **shared,
+            "capture_enabled": True,
+            "capture_patch_sha256": hashes["capture_patch_sha256"],
+            "canonical_command": [
+                "<COMPILER>", "-O2", "-DMCF_CAPTURE_EVENTS=1", "<OUTPUT>"
+            ],
+            "binary_sha256": hashes["capture_binary_sha256"],
+        }
+        authority["command_sha256"] = generator._canonical_value_sha256(
+            authority["canonical_command"]
+        )
+        capture["command_sha256"] = generator._canonical_value_sha256(
+            capture["canonical_command"]
+        )
+
+        identity = generator.derive_evidence_identity(
+            source, authority, capture
+        )
+
+        self.assertEqual(set(identity), generator.EVIDENCE_IDENTITY_FIELDS)
+        self.assertEqual(
+            identity["authority_binary_sha256"],
+            hashes["authority_binary_sha256"],
+        )
+        inconsistent = dict(capture, wire_abi_sha256="f" * 64)
+        with self.assertRaisesRegex(
+            generator.GenerationError, "wire_abi_sha256"
+        ):
+            generator.derive_evidence_identity(
+                source, authority, inconsistent
+            )
+
     def test_preflight_reports_bound_source_lp64_and_capacity(self):
         self.require_module()
         source, commit, input_path = self.make_source_repo()
@@ -752,25 +874,17 @@ int main(int argc, char **argv)
             input_path=tiny_input,
             output_root=replay_root,
         )
-        identity = {
+        source_value = {
+            "schema": 1,
             "source_commit": capture_prepared["source_commit"],
             "source_tree_sha256": capture_prepared["source_tree_sha256"],
             "input_sha256": sha256(tiny_input),
-            "common_patch_sha256": capture_prepared[
-                "common_patch_sha256"
-            ],
-            "capture_patch_sha256": capture_prepared[
-                "capture_patch_sha256"
-            ],
-            "compiler_sha256": sha256(Path(shutil.which("cc")).resolve()),
         }
+        identity = generator.derive_evidence_identity(
+            source_value, authority_binary, capture_binary
+        )
         source_record = self.root / "source-record.json"
-        source_record.write_bytes(generator._canonical_json({
-            "schema": 1,
-            "source_commit": identity["source_commit"],
-            "source_tree_sha256": identity["source_tree_sha256"],
-            "input_sha256": identity["input_sha256"],
-        }))
+        source_record.write_bytes(generator._canonical_json(source_value))
         evidence_root = self.root / "accepted"
         accepted = generator.generate_candidate(
             authority_root=authority_root,
@@ -965,13 +1079,11 @@ int main(int argc, char **argv)
     def test_publication_preflight_rejects_insufficient_disk(self):
         self.require_module()
         identity = {
-            "source_commit": "1" * 40,
-            "source_tree_sha256": "2" * 64,
-            "input_sha256": "3" * 64,
-            "common_patch_sha256": "4" * 64,
-            "capture_patch_sha256": "5" * 64,
-            "compiler_sha256": "6" * 64,
+            name: "6" * 64 for name in generator.EVIDENCE_IDENTITY_FIELDS
         }
+        identity["source_commit"] = "1" * 40
+        identity["compiler_version"] = "cc fixture 1.0"
+        identity["compiler_target"] = "x86_64-fixture-linux-gnu"
         evidence_root = self.root / "no-space"
         usage = mock.Mock(free=0)
         with mock.patch.object(

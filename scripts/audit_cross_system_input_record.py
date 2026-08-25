@@ -38,11 +38,16 @@ def template_record():
             "scale": 20,
         },
         "mcf": {
-            "input": "REQUIRED_ABSOLUTE_INPUT_PATH",
+            "input": "REQUIRED_ABSOLUTE_MCFREG2_PATH",
             "input_sha256": "REQUIRED_SHA256",
             "allocated_bytes": 345_000_000,
-            "source": "REQUIRED_ABSOLUTE_SOURCE_PATH",
+            "source": "REQUIRED_ABSOLUTE_SOURCE_RECORD_PATH",
             "source_sha256": "REQUIRED_SHA256",
+            "format": "MCFREG2",
+            "source_commit": "REQUIRED_EXACT_COMMIT",
+            "source_tree_sha256": "REQUIRED_SHA256",
+            "validation": "REQUIRED_ABSOLUTE_VALIDATION_PATH",
+            "validation_sha256": "REQUIRED_SHA256",
             "synthetic": False,
         },
         "amg_gather": {
