@@ -136,6 +136,16 @@ def _canonical_value_sha256(value):
     return hashlib.sha256(payload).hexdigest()
 
 
+def _source_set_sha256(paths):
+    rows = []
+    for path in paths:
+        path = Path(path)
+        if not path.is_file():
+            raise GenerationError(f"MCF evidence implementation is missing: {path}")
+        rows.append({"name": path.name, "sha256": _sha256_file(path)})
+    return _canonical_value_sha256(sorted(rows, key=lambda row: row["name"]))
+
+
 def _source_subdir(value):
     if not isinstance(value, str) or not value:
         raise GenerationError("MCF source subdirectory is invalid")
@@ -475,7 +485,6 @@ def _implementation_identity(prepared):
         "wire_abi_sha256": MATCHED_ROOT / "mcfreg2_format.h",
         "generator_sha256": Path(__file__).resolve(),
         "python_reader_sha256": REPO / "scripts/mcfreg2.py",
-        "cpp_reader_sha256": MATCHED_ROOT / "mcfreg2.cc",
         "cpp_kernel_sha256": kernel_source,
     }
     missing = [str(path) for path in paths.values() if not path.is_file()]
@@ -484,6 +493,12 @@ def _implementation_identity(prepared):
     return {
         "capture_runtime_sha256": _canonical_value_sha256(runtime_rows),
         **{name: _sha256_file(path) for name, path in paths.items()},
+        "cpp_reader_sha256": _source_set_sha256((
+            MATCHED_ROOT / "mcfreg2.hh",
+            MATCHED_ROOT / "mcfreg2.cc",
+            MATCHED_ROOT / "mcfreg2_state.hh",
+            MATCHED_ROOT / "mcfreg2_state.cc",
+        )),
     }
 
 

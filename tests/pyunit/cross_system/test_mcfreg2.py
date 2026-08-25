@@ -259,7 +259,7 @@ class MCFREG2Test(unittest.TestCase):
         actual = mcfreg2.read_package(path)
 
         self.assertEqual(actual.header.magic, b"MCFREG2\0")
-        self.assertEqual(actual.header.schema, 2)
+        self.assertEqual(actual.header.schema, 3)
         self.assertEqual(actual.header.nodes, 4)
         self.assertEqual(actual.header.active_arcs, 6)
         self.assertEqual(actual.header.arena_capacity, 16)
@@ -267,6 +267,319 @@ class MCFREG2Test(unittest.TestCase):
         self.assertEqual(mcfreg2.sha256_file(path), digest)
         for name in mcfreg2.REQUIRED_SECTIONS:
             self.assertEqual(actual.section(name), expected.section(name))
+
+    def strict_semantic_fixture(self, mutation=None):
+        pricing_live_in = mcfreg2.PricingLiveIn(
+            ordinal=0,
+            m=6,
+            nr_group=3,
+            group_pos=0,
+            initialize=True,
+            basket=(mcfreg2.BasketState(
+                slot=1,
+                arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 2),
+                cost=-4,
+                abs_cost=4,
+            ),),
+            scans=(mcfreg2.PricingScanLiveIn(
+                scan_position=0,
+                arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
+                tail=mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 0),
+                head=mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 1),
+                cost=5,
+                ident=1,
+                tail_potential=10,
+                head_potential=3,
+            ),),
+        )
+        pricing_out = mcfreg2.PricingDerivedOut(
+            ordinal=0,
+            candidates=(mcfreg2.PricingCandidate(
+                scan_position=0,
+                reduced_cost=-2,
+                candidate=True,
+                basket_slot=2,
+            ),),
+            basket=(mcfreg2.BasketState(
+                slot=1,
+                arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
+                cost=-2,
+                abs_cost=2,
+            ),),
+            selected_arc=mcfreg2.StableRef(
+                mcfreg2.OBJECT_ARC, 0, 0
+            ),
+            selected_reduced_cost=-2,
+            arcs_priced=1,
+            nr_group=3,
+            group_pos=1,
+            initialize=False,
+        )
+        price_out_live_in = mcfreg2.PriceOutLiveIn(
+            ordinal=0,
+            network_words=(6, 16),
+            objects=(),
+            arena_generation=0,
+            arena_capacity=16,
+            heap=(),
+        )
+        price_out_observed = mcfreg2.PriceOutDerivedOut(
+            ordinal=0,
+            network_words=(6, 16),
+            objects=(),
+            arena_generation=0,
+            arena_capacity=16,
+            heap=(),
+            candidates=(mcfreg2.PriceOutCandidate(
+                candidate=0,
+                tail=mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 0),
+                head=mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 1),
+                cost=30,
+                reduced_cost=10,
+            ),),
+            decisions=(mcfreg2.PriceOutDecision(
+                candidate=0,
+                decision="NO_CHANGE",
+                reference=mcfreg2.StableRef.null(),
+            ),),
+        )
+        events = [
+            {"kind": "CALL_BEGIN", "role": "live_in", "call": 0,
+             "order": 0, "ordinal": 0, "phase": "pricing", "m": 6,
+             "nr_group": 3, "group_pos": 0, "initialize": True},
+            {"kind": "BASKET_LIVE_IN", "role": "live_in", "call": 0,
+             "slot": 1, "arc": {"kind": "arc", "generation": 0,
+             "index": 2}, "cost": -4, "abs_cost": 4},
+            {"kind": "PRICING_SCAN_LIVE_IN", "role": "live_in",
+             "call": 0, "scan_position": 0,
+             "arc": {"kind": "arc", "generation": 0, "index": 0},
+             "tail": {"kind": "node", "generation": 0, "index": 0},
+             "head": {"kind": "node", "generation": 0, "index": 1},
+             "cost": 5, "ident": 1, "tail_potential": 10,
+             "head_potential": 3},
+            {"kind": "PRICING_CANDIDATE_OBSERVED",
+             "role": "observed_result", "call": 0, "scan_position": 0,
+             "reduced_cost": -2, "candidate": True, "basket_slot": 2},
+            {"kind": "BASKET_LIVE_OUT_OBSERVED",
+             "role": "observed_result", "call": 0, "slot": 1,
+             "arc": {"kind": "arc", "generation": 0, "index": 0},
+             "cost": -2, "abs_cost": 2},
+            {"kind": "PRICING_END_OBSERVED",
+             "role": "observed_result", "call": 0,
+             "selected_arc": {"kind": "arc", "generation": 0,
+             "index": 0}, "selected_reduced_cost": -2,
+             "arcs_priced": 1, "nr_group": 3, "group_pos": 1,
+             "initialize": False},
+            {"kind": "CALL_END", "role": "observed_result", "call": 0,
+             "order": 0, "ordinal": 0, "phase": "pricing"},
+        ]
+        if mutation == "result-in-live-in":
+            events[2]["selected_arc_id"] = 4
+        pricing_event_count = len(events)
+        null_ref = {
+            "kind": "null", "generation": 0,
+            "index": mcfreg2.UINT64_MAX,
+        }
+        events.extend([
+            {"kind": "CALL_BEGIN", "role": "live_in", "call": 0,
+             "order": 1, "ordinal": 0, "phase": "price_out"},
+            {"kind": "PRICE_OUT_STATE_LIVE_IN", "role": "live_in",
+             "call": 0, "network_words": [6, 16], "objects": [],
+             "arena_generation": 0, "arena_capacity": 16, "heap": []},
+            {"kind": "PRICE_OUT_CANDIDATE_OBSERVED",
+             "role": "observed_result", "call": 0, "candidate": 0,
+             "tail": {"kind": "node", "generation": 0, "index": 0},
+             "head": {"kind": "node", "generation": 0, "index": 1},
+             "cost": 30, "reduced_cost": 10},
+            {"kind": "PRICE_OUT_DECISION_OBSERVED",
+             "role": "observed_result", "call": 0, "candidate": 0,
+             "decision": "NO_CHANGE", "reference": null_ref},
+            {"kind": "PRICE_OUT_END_OBSERVED",
+             "role": "observed_result", "call": 0,
+             "network_words": [6, 16], "objects": [],
+             "arena_generation": 0, "arena_capacity": 16, "heap": []},
+            {"kind": "CALL_END", "role": "observed_result", "call": 0,
+             "order": 1, "ordinal": 0, "phase": "price_out"},
+        ])
+        boundary = {
+            "schema": 3,
+            "rows": [
+                {"call": 0, "order": 0, "phase": "pricing",
+                 "pre_sha256": mcfreg2.digest_call_state(pricing_live_in),
+                 "post_sha256": mcfreg2.digest_call_state(pricing_out)},
+                {"call": 0, "order": 1, "phase": "price_out",
+                 "pre_sha256": mcfreg2.digest_call_state(price_out_live_in),
+                 "post_sha256": mcfreg2.digest_call_state(
+                     price_out_observed
+                 )},
+            ],
+        }
+        call_index = {"schema": 3, "rows": [
+            {"call": 0, "order": 0, "ordinal": 0, "phase": "pricing",
+             "event_begin": 0, "event_count": pricing_event_count},
+            {"call": 0, "order": 1, "ordinal": 0, "phase": "price_out",
+             "event_begin": pricing_event_count,
+             "event_count": len(events) - pricing_event_count},
+        ]}
+        sections = {
+            name: f"{name.lower()}\n".encode("ascii")
+            for name in mcfreg2.REQUIRED_SECTIONS
+        }
+        sections["EVENTS"] = b"".join(
+            (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+            .encode("ascii") for row in events
+        )
+        sections["CALL_INDEX"] = (
+            json.dumps(call_index, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+        sections["BOUNDARIES"] = (
+            json.dumps(boundary, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+        package = mcfreg2.new_package(
+            nodes=4, active_arcs=6, dummy_arcs=3, arena_capacity=16,
+            pricing_calls=1, price_out_calls=1, event_count=len(events),
+            sections=sections,
+            section_schemas={
+                "EVENTS": 3, "CALL_INDEX": 3, "BOUNDARIES": 3,
+            },
+            section_layouts={"EVENTS": (len(events), 0)},
+        )
+        return package
+
+    def test_formal_schema_three_separates_inputs_and_observed_results(self):
+        self.require_module()
+        frames = mcfreg2.validate_semantic_roles(
+            self.strict_semantic_fixture()
+        )
+        self.assertEqual(
+            frames[0].live_in_roles, {"pricing_scan", "basket"}
+        )
+        self.assertEqual(
+            frames[0].result_roles, {"candidate", "selection"}
+        )
+
+    def test_result_field_in_live_in_record_fails_closed(self):
+        self.require_module()
+        with self.assertRaisesRegex(mcfreg2.FormatError, "record role"):
+            mcfreg2.validate_semantic_roles(
+                self.strict_semantic_fixture("result-in-live-in")
+            )
+
+    def replace_section(self, package, name, payload):
+        section_type = mcfreg2.SECTION_TYPES[name]
+        return dataclasses.replace(
+            package,
+            sections=tuple(
+                dataclasses.replace(section, data=payload)
+                if section.section_type == section_type else section
+                for section in package.sections
+            ),
+        )
+
+    def test_formal_semantics_reject_schema_two(self):
+        package = self.strict_semantic_fixture()
+        package = dataclasses.replace(
+            package,
+            header=dataclasses.replace(package.header, schema=2),
+        )
+        with self.assertRaisesRegex(mcfreg2.FormatError, "schema 3"):
+            mcfreg2.validate_semantic_roles(package)
+
+    def test_duplicate_semantic_role_fails_closed(self):
+        package = self.strict_semantic_fixture()
+        events = package.section("EVENTS").splitlines(keepends=True)
+        events.insert(3, events[2])
+        package = self.replace_section(package, "EVENTS", b"".join(events))
+        with self.assertRaisesRegex(mcfreg2.FormatError, "duplicated"):
+            mcfreg2.validate_semantic_roles(package)
+
+    def test_missing_call_exit_fails_closed(self):
+        package = self.strict_semantic_fixture()
+        events = package.section("EVENTS").splitlines(keepends=True)
+        package = self.replace_section(package, "EVENTS", b"".join(events[:-1]))
+        with self.assertRaisesRegex(mcfreg2.FormatError, "call exit"):
+            mcfreg2.validate_semantic_roles(package)
+
+    def test_json_row_boundary_digest_is_not_a_canonical_state_digest(self):
+        package = self.strict_semantic_fixture()
+        boundaries = json.loads(package.section("BOUNDARIES"))
+        events = package.section("EVENTS").splitlines()
+        boundaries["rows"][0]["pre_sha256"] = hashlib.sha256(
+            b"".join(events[:3])
+        ).hexdigest()
+        payload = (
+            json.dumps(boundaries, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+        package = self.replace_section(package, "BOUNDARIES", payload)
+        with self.assertRaisesRegex(mcfreg2.FormatError, "canonical boundary"):
+            mcfreg2.validate_semantic_roles(package)
+
+    def test_python_and_cpp_canonical_call_state_digests_match(self):
+        compiler = shutil.which("g++")
+        if compiler is None:
+            self.skipTest("g++ is unavailable")
+        state = mcfreg2.PricingLiveIn(
+            ordinal=0, m=6, nr_group=3, group_pos=0, initialize=True,
+            basket=(mcfreg2.BasketState(
+                1, mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 2), -4, 4
+            ),),
+            scans=(mcfreg2.PricingScanLiveIn(
+                0,
+                mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
+                mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 0),
+                mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 1),
+                5, 1, 10, 3,
+            ),),
+        )
+        source = self.root / "mcfreg2_state_probe.cc"
+        source.write_text(
+            r'''#include "mcfreg2_state.hh"
+#include <iostream>
+
+int main()
+{
+    mcfreg2::PricingLiveIn state;
+    state.ordinal = 0;
+    state.m = 6;
+    state.nrGroup = 3;
+    state.groupPos = 0;
+    state.initialize = true;
+    state.basket.push_back({1, {MCFREG2_OBJECT_ARC, 0, 2}, -4, 4});
+    state.scans.push_back({
+        0,
+        {MCFREG2_OBJECT_ARC, 0, 0},
+        {MCFREG2_OBJECT_NODE, 0, 0},
+        {MCFREG2_OBJECT_NODE, 0, 1},
+        5, 1, 10, 3,
+    });
+    std::cout << mcfreg2::digestCallState(state) << "\n";
+}
+''',
+            encoding="ascii",
+        )
+        binary = self.root / "mcfreg2-state-probe"
+        subprocess.run(
+            [
+                compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                "-I", str(self.repo / "util/amu/matched_workloads"),
+                str(source),
+                str(self.repo / "util/amu/matched_workloads/mcfreg2_state.cc"),
+                str(self.repo / "util/amu/matched_workloads/mcfreg2.cc"),
+                "-o", str(binary), "-lz",
+            ],
+            cwd=self.repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        completed = subprocess.run(
+            [binary], text=True, stdout=subprocess.PIPE, check=True
+        )
+        self.assertEqual(completed.stdout.strip(), mcfreg2.digest_call_state(state))
 
     def test_truncated_header_is_rejected(self):
         self.require_module()

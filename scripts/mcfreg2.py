@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import dataclasses
+import gzip
 import hashlib
+import json
 import os
 import shutil
 import struct
@@ -16,7 +18,7 @@ from typing import Iterable, Mapping
 
 
 MAGIC = b"MCFREG2\0"
-SCHEMA = 2
+SCHEMA = 3
 ENDIAN_TAG = 0x0102
 HEADER = struct.Struct("<8sHHI11Q")
 DIRECTORY = struct.Struct("<HHIQQQQ32s")
@@ -116,6 +118,265 @@ class StableRef:
 
 
 @dataclasses.dataclass(frozen=True)
+class BasketState:
+    slot: int
+    arc: StableRef
+    cost: int
+    abs_cost: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PricingScanLiveIn:
+    scan_position: int
+    arc: StableRef
+    tail: StableRef
+    head: StableRef
+    cost: int
+    ident: int
+    tail_potential: int
+    head_potential: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PricingCandidate:
+    scan_position: int
+    reduced_cost: int
+    candidate: bool
+    basket_slot: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PricingLiveIn:
+    ordinal: int
+    m: int
+    nr_group: int
+    group_pos: int
+    initialize: bool
+    basket: tuple[BasketState, ...]
+    scans: tuple[PricingScanLiveIn, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PricingDerivedOut:
+    ordinal: int
+    candidates: tuple[PricingCandidate, ...]
+    basket: tuple[BasketState, ...]
+    selected_arc: StableRef
+    selected_reduced_cost: int
+    arcs_priced: int
+    nr_group: int
+    group_pos: int
+    initialize: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class ObjectState:
+    reference: StableRef
+    words: tuple[int, ...]
+    links: tuple[StableRef, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PriceOutCandidate:
+    candidate: int
+    tail: StableRef
+    head: StableRef
+    cost: int
+    reduced_cost: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PriceOutDecision:
+    candidate: int
+    decision: str
+    reference: StableRef
+
+
+@dataclasses.dataclass(frozen=True)
+class PriceOutLiveIn:
+    ordinal: int
+    network_words: tuple[int, ...]
+    objects: tuple[ObjectState, ...]
+    arena_generation: int
+    arena_capacity: int
+    heap: tuple[StableRef, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PriceOutDerivedOut:
+    ordinal: int
+    network_words: tuple[int, ...]
+    objects: tuple[ObjectState, ...]
+    arena_generation: int
+    arena_capacity: int
+    heap: tuple[StableRef, ...]
+    candidates: tuple[PriceOutCandidate, ...]
+    decisions: tuple[PriceOutDecision, ...]
+
+
+CanonicalCallState = (
+    PricingLiveIn | PricingDerivedOut | PriceOutLiveIn | PriceOutDerivedOut
+)
+
+
+def _append_u8(output, value):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 256:
+        raise FormatError("MCFREG2 canonical u8 is invalid")
+    output.extend(struct.pack("<B", value))
+
+
+def _append_u32(output, value):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 1 << 32:
+        raise FormatError("MCFREG2 canonical u32 is invalid")
+    output.extend(struct.pack("<I", value))
+
+
+def _append_u64(output, value):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= UINT64_MAX:
+        raise FormatError("MCFREG2 canonical u64 is invalid")
+    output.extend(struct.pack("<Q", value))
+
+
+def _append_i64(output, value):
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not -(1 << 63) <= value < 1 << 63
+    ):
+        raise FormatError("MCFREG2 canonical i64 is invalid")
+    output.extend(struct.pack("<q", value))
+
+
+def _append_bool(output, value):
+    if not isinstance(value, bool):
+        raise FormatError("MCFREG2 canonical boolean is invalid")
+    _append_u8(output, int(value))
+
+
+def _append_ref(output, reference):
+    if not isinstance(reference, StableRef):
+        raise FormatError("MCFREG2 canonical stable reference is invalid")
+    _append_u32(output, reference.kind)
+    _append_u32(output, reference.generation)
+    _append_u64(output, reference.object_id)
+
+
+def _append_refs(output, values):
+    _append_u64(output, len(values))
+    for value in values:
+        _append_ref(output, value)
+
+
+def _append_basket(output, values):
+    _append_u64(output, len(values))
+    for value in values:
+        _append_u64(output, value.slot)
+        _append_ref(output, value.arc)
+        _append_i64(output, value.cost)
+        _append_i64(output, value.abs_cost)
+
+
+def _ref_key(reference):
+    return (reference.kind, reference.generation, reference.object_id)
+
+
+def _append_objects(output, values):
+    ordered = sorted(values, key=lambda value: _ref_key(value.reference))
+    if len({_ref_key(value.reference) for value in ordered}) != len(ordered):
+        raise FormatError("MCFREG2 canonical object reference is duplicated")
+    _append_u64(output, len(ordered))
+    for value in ordered:
+        _append_ref(output, value.reference)
+        _append_u64(output, len(value.words))
+        for word in value.words:
+            _append_i64(output, word)
+        _append_refs(output, value.links)
+
+
+def encode_call_state(state: CanonicalCallState) -> bytes:
+    output = bytearray(b"MCFCS3\0\0")
+    if isinstance(state, PricingLiveIn):
+        _append_u8(output, 1)
+        _append_u64(output, state.ordinal)
+        _append_u64(output, state.m)
+        _append_u64(output, state.nr_group)
+        _append_u64(output, state.group_pos)
+        _append_bool(output, state.initialize)
+        _append_basket(output, state.basket)
+        _append_u64(output, len(state.scans))
+        for scan in state.scans:
+            _append_u64(output, scan.scan_position)
+            _append_ref(output, scan.arc)
+            _append_ref(output, scan.tail)
+            _append_ref(output, scan.head)
+            _append_i64(output, scan.cost)
+            _append_i64(output, scan.ident)
+            _append_i64(output, scan.tail_potential)
+            _append_i64(output, scan.head_potential)
+    elif isinstance(state, PricingDerivedOut):
+        _append_u8(output, 2)
+        _append_u64(output, state.ordinal)
+        _append_u64(output, len(state.candidates))
+        for candidate in state.candidates:
+            _append_u64(output, candidate.scan_position)
+            _append_i64(output, candidate.reduced_cost)
+            _append_bool(output, candidate.candidate)
+            _append_i64(output, candidate.basket_slot)
+        _append_basket(output, state.basket)
+        _append_ref(output, state.selected_arc)
+        _append_i64(output, state.selected_reduced_cost)
+        _append_u64(output, state.arcs_priced)
+        _append_u64(output, state.nr_group)
+        _append_u64(output, state.group_pos)
+        _append_bool(output, state.initialize)
+    elif isinstance(state, (PriceOutLiveIn, PriceOutDerivedOut)):
+        _append_u8(output, 3 if isinstance(state, PriceOutLiveIn) else 4)
+        _append_u64(output, state.ordinal)
+        _append_u64(output, len(state.network_words))
+        for word in state.network_words:
+            _append_i64(output, word)
+        _append_objects(output, state.objects)
+        _append_u32(output, state.arena_generation)
+        _append_u64(output, state.arena_capacity)
+        _append_refs(output, state.heap)
+        if isinstance(state, PriceOutDerivedOut):
+            _append_u64(output, len(state.candidates))
+            for candidate in state.candidates:
+                _append_u64(output, candidate.candidate)
+                _append_ref(output, candidate.tail)
+                _append_ref(output, candidate.head)
+                _append_i64(output, candidate.cost)
+                _append_i64(output, candidate.reduced_cost)
+            _append_u64(output, len(state.decisions))
+            decisions = {"NO_CHANGE": 0, "INSERT": 1, "REPLACE": 2}
+            for decision in state.decisions:
+                _append_u64(output, decision.candidate)
+                if decision.decision not in decisions:
+                    raise FormatError("MCFREG2 canonical decision is invalid")
+                _append_u8(output, decisions[decision.decision])
+                _append_ref(output, decision.reference)
+    else:
+        raise FormatError("MCFREG2 canonical call state type is invalid")
+    return bytes(output)
+
+
+def digest_call_state(state: CanonicalCallState) -> str:
+    return hashlib.sha256(encode_call_state(state)).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class SemanticFrame:
+    call: int
+    order: int
+    ordinal: int
+    phase: str
+    live_in_roles: frozenset[str]
+    result_roles: frozenset[str]
+    live_in_state: CanonicalCallState
+    observed_state: CanonicalCallState
+
+
+@dataclasses.dataclass(frozen=True)
 class Package:
     header: Header
     directory: tuple[DirectoryEntry, ...]
@@ -171,6 +432,450 @@ class Package:
             }
             for entry in self.directory
         ]
+
+
+_EVENT_SPECS = {
+    "PRICING_SCAN_LIVE_IN": (
+        "live_in",
+        "pricing_scan",
+        {"kind", "role", "call", "scan_position", "arc", "tail", "head",
+         "cost", "ident", "tail_potential", "head_potential"},
+    ),
+    "PRICING_CANDIDATE_OBSERVED": (
+        "observed_result",
+        "candidate",
+        {"kind", "role", "call", "scan_position", "reduced_cost",
+         "candidate", "basket_slot"},
+    ),
+    "BASKET_LIVE_IN": (
+        "live_in",
+        "basket",
+        {"kind", "role", "call", "slot", "arc", "cost", "abs_cost"},
+    ),
+    "BASKET_LIVE_OUT_OBSERVED": (
+        "observed_result",
+        "selection",
+        {"kind", "role", "call", "slot", "arc", "cost", "abs_cost"},
+    ),
+    "PRICING_END_OBSERVED": (
+        "observed_result",
+        "selection",
+        {"kind", "role", "call", "selected_arc", "selected_reduced_cost",
+         "arcs_priced", "nr_group", "group_pos", "initialize"},
+    ),
+    "PRICE_OUT_STATE_LIVE_IN": (
+        "live_in",
+        "price_out_state",
+        {"kind", "role", "call", "network_words", "objects",
+         "arena_generation", "arena_capacity", "heap"},
+    ),
+    "PRICE_OUT_CANDIDATE_OBSERVED": (
+        "observed_result",
+        "candidate",
+        {"kind", "role", "call", "candidate", "tail", "head", "cost",
+         "reduced_cost"},
+    ),
+    "PRICE_OUT_DECISION_OBSERVED": (
+        "observed_result",
+        "decision",
+        {"kind", "role", "call", "candidate", "decision", "reference"},
+    ),
+    "ARC_FINAL_OBSERVED": (
+        "observed_result",
+        "final_state",
+        {"kind", "role", "call", "reference", "words", "links"},
+    ),
+    "REMAP_OBSERVED": (
+        "observed_result",
+        "remap",
+        {"kind", "role", "call", "old_reference", "new_reference"},
+    ),
+    "ADJACENCY_FINAL_OBSERVED": (
+        "observed_result",
+        "final_state",
+        {"kind", "role", "call", "reference", "firstout", "firstin"},
+    ),
+    "PRICE_OUT_END_OBSERVED": (
+        "observed_result",
+        "final_state",
+        {"kind", "role", "call", "network_words", "objects",
+         "arena_generation", "arena_capacity", "heap"},
+    ),
+}
+
+_REFERENCE_KINDS = {
+    "null": OBJECT_NULL,
+    "node": OBJECT_NODE,
+    "arc": OBJECT_ARC,
+    "dummy_arc": OBJECT_DUMMY_ARC,
+}
+
+
+def _semantic_json(payload, label):
+    if not isinstance(payload, bytes):
+        raise FormatError(f"MCFREG2 {label} section is lazy")
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormatError(f"MCFREG2 {label} JSON is invalid") from error
+    if not isinstance(value, dict) or value.get("schema") != 3:
+        raise FormatError(f"MCFREG2 {label} schema differs")
+    rows = value.get("rows")
+    if not isinstance(rows, list):
+        raise FormatError(f"MCFREG2 {label} rows are invalid")
+    return rows
+
+
+def _semantic_events(payload):
+    if not isinstance(payload, bytes):
+        raise FormatError("MCFREG2 EVENTS section is lazy")
+    if payload.startswith(b"\x1f\x8b"):
+        try:
+            payload = gzip.decompress(payload)
+        except (OSError, EOFError) as error:
+            raise FormatError("MCFREG2 EVENTS gzip stream is invalid") from error
+    rows = []
+    for number, line in enumerate(payload.splitlines(), start=1):
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise FormatError(
+                f"MCFREG2 EVENTS row {number} is invalid"
+            ) from error
+        if not isinstance(row, dict):
+            raise FormatError(f"MCFREG2 EVENTS row {number} is not an object")
+        rows.append(row)
+    if not rows:
+        raise FormatError("MCFREG2 EVENTS section is empty")
+    return rows
+
+
+def _stable_ref_from_json(value, label):
+    if not isinstance(value, dict) or set(value) != {
+        "kind", "generation", "index"
+    }:
+        raise FormatError(f"MCFREG2 {label} stable reference is invalid")
+    kind = _REFERENCE_KINDS.get(value["kind"])
+    generation = value["generation"]
+    index = value["index"]
+    if kind is None or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item >= 0
+        for item in (generation, index)
+    ):
+        raise FormatError(f"MCFREG2 {label} stable reference is invalid")
+    if kind == OBJECT_NULL and (generation != 0 or index != UINT64_MAX):
+        raise FormatError(f"MCFREG2 {label} null reference is malformed")
+    return StableRef(kind, generation, index)
+
+
+def _integer(value, label, *, minimum=None):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise FormatError(f"MCFREG2 {label} is not an integer")
+    if minimum is not None and value < minimum:
+        raise FormatError(f"MCFREG2 {label} is out of range")
+    return value
+
+
+def _object_states(value, label):
+    if not isinstance(value, list):
+        raise FormatError(f"MCFREG2 {label} objects are invalid")
+    result = []
+    for row in value:
+        if not isinstance(row, dict) or set(row) != {
+            "reference", "words", "links"
+        }:
+            raise FormatError(f"MCFREG2 {label} object is invalid")
+        words = row["words"]
+        links = row["links"]
+        if not isinstance(words, list) or not isinstance(links, list):
+            raise FormatError(f"MCFREG2 {label} object fields are invalid")
+        result.append(ObjectState(
+            reference=_stable_ref_from_json(row["reference"], label),
+            words=tuple(_integer(word, f"{label} word") for word in words),
+            links=tuple(
+                _stable_ref_from_json(link, label) for link in links
+            ),
+        ))
+    return tuple(result)
+
+
+def _refs(value, label):
+    if not isinstance(value, list):
+        raise FormatError(f"MCFREG2 {label} references are invalid")
+    return tuple(_stable_ref_from_json(item, label) for item in value)
+
+
+def _pricing_states(begin, rows):
+    live_basket = []
+    scans = []
+    candidates = []
+    result_basket = []
+    ending = None
+    for row in rows:
+        kind = row["kind"]
+        if kind == "BASKET_LIVE_IN":
+            live_basket.append(BasketState(
+                _integer(row["slot"], "basket slot", minimum=1),
+                _stable_ref_from_json(row["arc"], "basket arc"),
+                _integer(row["cost"], "basket cost"),
+                _integer(row["abs_cost"], "basket absolute cost", minimum=0),
+            ))
+        elif kind == "PRICING_SCAN_LIVE_IN":
+            scans.append(PricingScanLiveIn(
+                _integer(row["scan_position"], "scan position", minimum=0),
+                _stable_ref_from_json(row["arc"], "scan arc"),
+                _stable_ref_from_json(row["tail"], "scan tail"),
+                _stable_ref_from_json(row["head"], "scan head"),
+                _integer(row["cost"], "scan cost"),
+                _integer(row["ident"], "scan ident"),
+                _integer(row["tail_potential"], "tail potential"),
+                _integer(row["head_potential"], "head potential"),
+            ))
+        elif kind == "PRICING_CANDIDATE_OBSERVED":
+            if not isinstance(row["candidate"], bool):
+                raise FormatError("MCFREG2 observed candidate is not boolean")
+            candidates.append(PricingCandidate(
+                _integer(row["scan_position"], "candidate position", minimum=0),
+                _integer(row["reduced_cost"], "candidate reduced cost"),
+                row["candidate"],
+                _integer(row["basket_slot"], "candidate basket slot"),
+            ))
+        elif kind == "BASKET_LIVE_OUT_OBSERVED":
+            result_basket.append(BasketState(
+                _integer(row["slot"], "basket slot", minimum=1),
+                _stable_ref_from_json(row["arc"], "basket arc"),
+                _integer(row["cost"], "basket cost"),
+                _integer(row["abs_cost"], "basket absolute cost", minimum=0),
+            ))
+        elif kind == "PRICING_END_OBSERVED":
+            if ending is not None:
+                raise FormatError("MCFREG2 pricing end role is duplicated")
+            ending = row
+    if ending is None:
+        raise FormatError("MCFREG2 pricing observed result is incomplete")
+    if not isinstance(begin["initialize"], bool) or not isinstance(
+        ending["initialize"], bool
+    ):
+        raise FormatError("MCFREG2 pricing initialize is not boolean")
+    live_in = PricingLiveIn(
+        ordinal=begin["ordinal"],
+        m=_integer(begin["m"], "pricing m", minimum=0),
+        nr_group=_integer(begin["nr_group"], "pricing group count", minimum=1),
+        group_pos=_integer(begin["group_pos"], "pricing group position", minimum=0),
+        initialize=begin["initialize"],
+        basket=tuple(live_basket),
+        scans=tuple(scans),
+    )
+    observed = PricingDerivedOut(
+        ordinal=begin["ordinal"],
+        candidates=tuple(candidates),
+        basket=tuple(result_basket),
+        selected_arc=_stable_ref_from_json(
+            ending["selected_arc"], "selected arc"
+        ),
+        selected_reduced_cost=_integer(
+            ending["selected_reduced_cost"], "selected reduced cost"
+        ),
+        arcs_priced=_integer(ending["arcs_priced"], "arcs priced", minimum=0),
+        nr_group=_integer(ending["nr_group"], "pricing group count", minimum=1),
+        group_pos=_integer(ending["group_pos"], "pricing group position", minimum=0),
+        initialize=ending["initialize"],
+    )
+    return live_in, observed
+
+
+def _price_out_states(begin, rows):
+    state = None
+    ending = None
+    candidates = []
+    decisions = []
+    for row in rows:
+        kind = row["kind"]
+        if kind == "PRICE_OUT_STATE_LIVE_IN":
+            if state is not None:
+                raise FormatError("MCFREG2 price-out live-in role is duplicated")
+            state = row
+        elif kind == "PRICE_OUT_CANDIDATE_OBSERVED":
+            candidates.append(PriceOutCandidate(
+                _integer(row["candidate"], "price-out candidate", minimum=0),
+                _stable_ref_from_json(row["tail"], "candidate tail"),
+                _stable_ref_from_json(row["head"], "candidate head"),
+                _integer(row["cost"], "candidate cost"),
+                _integer(row["reduced_cost"], "candidate reduced cost"),
+            ))
+        elif kind == "PRICE_OUT_DECISION_OBSERVED":
+            decisions.append(PriceOutDecision(
+                _integer(row["candidate"], "price-out decision", minimum=0),
+                row["decision"],
+                _stable_ref_from_json(row["reference"], "decision reference"),
+            ))
+        elif kind == "PRICE_OUT_END_OBSERVED":
+            if ending is not None:
+                raise FormatError("MCFREG2 price-out end role is duplicated")
+            ending = row
+    if state is None or ending is None:
+        raise FormatError("MCFREG2 price-out state is incomplete")
+
+    def make_common(row):
+        words = row["network_words"]
+        if not isinstance(words, list):
+            raise FormatError("MCFREG2 price-out network words are invalid")
+        return {
+            "ordinal": begin["ordinal"],
+            "network_words": tuple(
+                _integer(word, "price-out network word") for word in words
+            ),
+            "objects": _object_states(row["objects"], "price-out"),
+            "arena_generation": _integer(
+                row["arena_generation"], "arena generation", minimum=0
+            ),
+            "arena_capacity": _integer(
+                row["arena_capacity"], "arena capacity", minimum=0
+            ),
+            "heap": _refs(row["heap"], "price-out heap"),
+        }
+
+    return (
+        PriceOutLiveIn(**make_common(state)),
+        PriceOutDerivedOut(
+            **make_common(ending),
+            candidates=tuple(candidates),
+            decisions=tuple(decisions),
+        ),
+    )
+
+
+def validate_semantic_roles(package: Package) -> tuple[SemanticFrame, ...]:
+    if package.header.schema != 3:
+        raise FormatError("MCFREG2 formal schema 3 is required")
+    section_by_name = {
+        SECTION_NAMES[section.section_type]: section
+        for section in package.sections
+        if section.section_type in SECTION_NAMES
+    }
+    for name in ("EVENTS", "CALL_INDEX", "BOUNDARIES"):
+        if section_by_name[name].schema != 3:
+            raise FormatError(f"MCFREG2 {name} section schema differs")
+    events = _semantic_events(section_by_name["EVENTS"].data)
+    call_rows = _semantic_json(section_by_name["CALL_INDEX"].data, "CALL_INDEX")
+    boundary_rows = _semantic_json(
+        section_by_name["BOUNDARIES"].data, "BOUNDARIES"
+    )
+    frames = []
+    active = None
+    active_rows = []
+    active_roles = [set(), set()]
+    seen_unique = set()
+    frame_ranges = []
+    for event_index, row in enumerate(events):
+        kind = row.get("kind")
+        if kind == "CALL_BEGIN":
+            if active is not None:
+                raise FormatError("MCFREG2 call entry is duplicated")
+            phase = row.get("phase")
+            common = {"kind", "role", "call", "order", "ordinal", "phase"}
+            expected = common | (
+                {"m", "nr_group", "group_pos", "initialize"}
+                if phase == "pricing" else set()
+            )
+            if phase not in ("pricing", "price_out") or set(row) != expected:
+                raise FormatError("MCFREG2 CALL_BEGIN record role differs")
+            if row.get("role") != "live_in":
+                raise FormatError("MCFREG2 CALL_BEGIN record role differs")
+            for name in ("call", "order", "ordinal"):
+                _integer(row[name], f"call begin {name}", minimum=0)
+            active = row
+            active_rows = []
+            active_roles = [set(), set()]
+            seen_unique = set()
+            frame_begin = event_index
+            continue
+        if kind == "CALL_END":
+            expected = {"kind", "role", "call", "order", "ordinal", "phase"}
+            if active is None or set(row) != expected:
+                raise FormatError("MCFREG2 call exit record role differs")
+            if row.get("role") != "observed_result" or any(
+                row.get(name) != active[name]
+                for name in ("call", "order", "ordinal", "phase")
+            ):
+                raise FormatError("MCFREG2 call exit record role differs")
+            if active["phase"] == "pricing":
+                live_in, observed = _pricing_states(active, active_rows)
+            else:
+                live_in, observed = _price_out_states(active, active_rows)
+            frames.append(SemanticFrame(
+                call=active["call"],
+                order=active["order"],
+                ordinal=active["ordinal"],
+                phase=active["phase"],
+                live_in_roles=frozenset(active_roles[0]),
+                result_roles=frozenset(active_roles[1]),
+                live_in_state=live_in,
+                observed_state=observed,
+            ))
+            frame_ranges.append((frame_begin, event_index - frame_begin + 1))
+            active = None
+            continue
+        if active is None:
+            raise FormatError("MCFREG2 event has no call entry")
+        spec = _EVENT_SPECS.get(kind)
+        if spec is None:
+            raise FormatError("MCFREG2 event record kind differs")
+        role, logical_role, keys = spec
+        if row.get("role") != role or set(row) != keys:
+            raise FormatError(f"MCFREG2 {kind} record role differs")
+        if row.get("call") != active["call"]:
+            raise FormatError("MCFREG2 event call differs")
+        if active["phase"] == "pricing" and kind.startswith("PRICE_OUT"):
+            raise FormatError("MCFREG2 event phase differs")
+        if active["phase"] == "price_out" and (
+            kind.startswith("PRICING") or kind.startswith("BASKET")
+        ):
+            raise FormatError("MCFREG2 event phase differs")
+        unique_value = None
+        for name in ("scan_position", "slot", "candidate", "reference",
+                     "old_reference"):
+            if name in row:
+                unique_value = json.dumps(row[name], sort_keys=True)
+                break
+        unique = (kind, unique_value)
+        if unique in seen_unique:
+            raise FormatError(f"MCFREG2 {kind} record role is duplicated")
+        seen_unique.add(unique)
+        active_roles[0 if role == "live_in" else 1].add(logical_role)
+        active_rows.append(row)
+    if active is not None:
+        raise FormatError("MCFREG2 call exit is missing")
+    if len(frames) != len(call_rows) or len(frames) != len(boundary_rows):
+        raise FormatError("MCFREG2 call metadata count differs")
+    for index, (frame, call_row, boundary, event_range) in enumerate(
+        zip(frames, call_rows, boundary_rows, frame_ranges)
+    ):
+        expected_call = {
+            "call": frame.call, "order": frame.order,
+            "ordinal": frame.ordinal, "phase": frame.phase,
+            "event_begin": event_range[0], "event_count": event_range[1],
+        }
+        if call_row != expected_call:
+            raise FormatError(f"MCFREG2 call index {index} differs")
+        expected_boundary = {
+            "call": frame.call,
+            "order": frame.order,
+            "phase": frame.phase,
+            "pre_sha256": digest_call_state(frame.live_in_state),
+            "post_sha256": digest_call_state(frame.observed_state),
+        }
+        if boundary != expected_boundary:
+            raise FormatError(f"MCFREG2 canonical boundary {index} differs")
+    pricing = sum(frame.phase == "pricing" for frame in frames)
+    price_out = sum(frame.phase == "price_out" for frame in frames)
+    if pricing != package.header.pricing_calls:
+        raise FormatError("MCFREG2 pricing call count differs")
+    if price_out != package.header.price_out_calls:
+        raise FormatError("MCFREG2 price-out call count differs")
+    if len(events) != package.header.event_count:
+        raise FormatError("MCFREG2 event count differs")
+    return tuple(frames)
 
 
 def _checked_add(left: int, right: int, label: str) -> int:
