@@ -222,6 +222,31 @@ class FreezeInputTest(unittest.TestCase):
             with self.assertRaisesRegex(freeze.InputError, "semantic replay"):
                 freeze.validate_mcf_record(row)
 
+    def test_mcf_package_toctou_during_replay_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            row = value["mcf"]
+
+            def mutate_after_snapshot(package_path, output_root):
+                Path(row["input"]).write_bytes(b"changed during replay")
+                return {
+                    "boundary_mismatches": 0,
+                    "operations": 1,
+                    "price_out_calls": 1,
+                    "pricing_calls": 1,
+                    "status": "verified",
+                    "trace_sha256": "1" * 64,
+                }
+
+            with mock.patch.object(
+                freeze, "run_strict_mcfreg2_replay",
+                side_effect=mutate_after_snapshot,
+            ):
+                with self.assertRaisesRegex(
+                    freeze.InputError, "changed during semantic replay"
+                ):
+                    freeze.validate_mcf_record(row)
+
     def test_npb_paper_minimum_is_12_8_gb(self):
         self.assertEqual(
             freeze.MINIMUM_ALLOCATED_BYTES["npb_cg"], 12_800_000_000

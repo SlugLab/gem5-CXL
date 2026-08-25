@@ -452,9 +452,16 @@ def validate_mcf_record(row):
     ):
         raise InputError("mcf observed allocated bytes differ")
     with tempfile.TemporaryDirectory(prefix="mcfreg2-semantic-replay-") as tmp:
+        snapshot = Path(tmp) / "mcf.reg2"
+        shutil.copyfile(package_path, snapshot)
+        if _sha256_file(snapshot) != row["input_sha256"]:
+            raise InputError("mcf semantic replay snapshot SHA-256 differs")
         replay_record = run_strict_mcfreg2_replay(
-            package_path, Path(tmp) / "output"
+            snapshot, Path(tmp) / "output"
         )
+    if _sha256_file(package_path) != row["input_sha256"]:
+        raise InputError("mcf package changed during semantic replay")
+    _require_current_replayer_identity(identity)
     if (
         replay_record["pricing_calls"] != package.header.pricing_calls
         or replay_record["price_out_calls"] != package.header.price_out_calls
