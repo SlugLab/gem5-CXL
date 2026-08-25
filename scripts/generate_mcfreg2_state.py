@@ -18,6 +18,11 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 try:
+    import orjson as _orjson
+except ImportError:  # Keep the generator usable in minimal environments.
+    _orjson = None
+
+try:
     from scripts import mcfreg2
 except ImportError:  # Support direct execution from the scripts directory.
     import mcfreg2
@@ -466,6 +471,16 @@ def _canonical_json(value):
     ).encode("ascii") + b"\n"
 
 
+def _canonical_event_json(value):
+    if _orjson is not None:
+        payload = _orjson.dumps(
+            value, option=_orjson.OPT_APPEND_NEWLINE | _orjson.OPT_SORT_KEYS
+        )
+        if payload.isascii():
+            return payload
+    return _canonical_json(value)
+
+
 def _read_json(path, label):
     path = Path(path)
     try:
@@ -634,7 +649,7 @@ class _JournalFrames:
     def __init__(self, path, phase):
         self.path = Path(path)
         self.phase = phase
-        self.stream = gzip.open(self.path, "rt", encoding="utf-8")
+        self.stream = gzip.open(self.path, "rb")
         self.pending = None
         self.expected_ordinal = 0
 
@@ -646,8 +661,12 @@ class _JournalFrames:
         if not line:
             return None
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError as error:
+            row = (
+                _orjson.loads(line)
+                if _orjson is not None
+                else json.loads(line)
+            )
+        except ValueError as error:
             raise GenerationError(
                 f"invalid {self.phase} journal: {error}"
             ) from error
@@ -733,7 +752,7 @@ def _stream_frame_sections(run_root, events_path):
                     "ordinal": ordinal,
                     **row,
                 }
-                compressed.write(_canonical_json(event))
+                compressed.write(_canonical_event_json(event))
                 event_count += 1
                 last_kind = row.get("kind")
                 if last_kind == "BASKET":

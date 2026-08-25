@@ -40,6 +40,25 @@ class GenerateMCFREG2Test(unittest.TestCase):
             generator, "scripts.generate_mcfreg2_state is missing"
         )
 
+    def test_fast_event_json_is_canonical_byte_exact(self):
+        self.require_module()
+        rows = (
+            {
+                "kind": "SCAN",
+                "call": 17,
+                "order": 19,
+                "eligible": True,
+                "selected": None,
+                "cost": -42,
+            },
+            {"kind": "LABEL", "value": "non-ascii-\u00e9"},
+        )
+        for row in rows:
+            self.assertEqual(
+                generator._canonical_event_json(row),
+                generator._canonical_json(row),
+            )
+
     def make_source_repo(self):
         source = self.root / "source"
         mcf = source / "bench/mcf"
