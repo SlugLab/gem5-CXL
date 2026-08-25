@@ -438,8 +438,9 @@ _EVENT_SPECS = {
     "PRICING_SCAN_LIVE_IN": (
         "live_in",
         "pricing_scan",
-        {"kind", "role", "call", "scan_position", "arc", "tail", "head",
-         "cost", "ident", "tail_potential", "head_potential"},
+        {"kind", "role", "call", "scan_position", "group_pos", "arc",
+         "tail", "head", "cost", "ident", "tail_potential",
+         "head_potential"},
     ),
     "PRICING_CANDIDATE_OBSERVED": (
         "observed_result",
@@ -483,7 +484,8 @@ _EVENT_SPECS = {
     "ARC_FINAL_OBSERVED": (
         "observed_result",
         "final_state",
-        {"kind", "role", "call", "reference", "words", "links"},
+        {"kind", "role", "call", "reference", "tail", "head", "cost",
+         "org_cost", "flow", "ident", "nextout", "nextin"},
     ),
     "REMAP_OBSERVED": (
         "observed_result",
@@ -514,6 +516,27 @@ _REFERENCE_KINDS = {
 def _semantic_json(payload, label):
     if not isinstance(payload, bytes):
         raise FormatError(f"MCFREG2 {label} section is lazy")
+    if payload.startswith(b"\x1f\x8b"):
+        try:
+            payload = gzip.decompress(payload)
+        except (OSError, EOFError) as error:
+            raise FormatError(f"MCFREG2 {label} gzip stream is invalid") from error
+        rows = []
+        for number, line in enumerate(payload.splitlines(), start=1):
+            try:
+                row = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise FormatError(
+                    f"MCFREG2 {label} row {number} is invalid"
+                ) from error
+            if not isinstance(row, dict):
+                raise FormatError(
+                    f"MCFREG2 {label} row {number} is not an object"
+                )
+            rows.append(row)
+        if not rows:
+            raise FormatError(f"MCFREG2 {label} rows are invalid")
+        return rows
     try:
         value = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -618,9 +641,10 @@ def _pricing_states(begin, rows):
                 _integer(row["slot"], "basket slot", minimum=1),
                 _stable_ref_from_json(row["arc"], "basket arc"),
                 _integer(row["cost"], "basket cost"),
-                _integer(row["abs_cost"], "basket absolute cost", minimum=0),
+                _integer(row["abs_cost"], "basket absolute cost"),
             ))
         elif kind == "PRICING_SCAN_LIVE_IN":
+            _integer(row["group_pos"], "scan group position", minimum=0)
             scans.append(PricingScanLiveIn(
                 _integer(row["scan_position"], "scan position", minimum=0),
                 _stable_ref_from_json(row["arc"], "scan arc"),
@@ -645,7 +669,7 @@ def _pricing_states(begin, rows):
                 _integer(row["slot"], "basket slot", minimum=1),
                 _stable_ref_from_json(row["arc"], "basket arc"),
                 _integer(row["cost"], "basket cost"),
-                _integer(row["abs_cost"], "basket absolute cost", minimum=0),
+                _integer(row["abs_cost"], "basket absolute cost"),
             ))
         elif kind == "PRICING_END_OBSERVED":
             if ending is not None:

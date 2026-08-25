@@ -26,7 +26,9 @@ int mcf_capture_pricing_begin(
 int mcf_capture_pricing_basket(
     int live_out, long slot, const arc_t *arc, cost_t cost,
     cost_t abs_cost);
-int mcf_capture_pricing_scan(
+int mcf_capture_pricing_scan_live_in(
+    const arc_t *arc, long group_pos, long scan_position);
+int mcf_capture_pricing_candidate_observed(
     const arc_t *arc, cost_t reduced_cost, int candidate,
     long basket_slot);
 int mcf_capture_pricing_end(
@@ -39,7 +41,6 @@ int mcf_capture_price_out_candidate(
 int mcf_capture_price_out_decision(
     int decision, const arc_t *slot, const node_t *tail,
     const node_t *head);
-int mcf_capture_price_out_arc_state(const arc_t *slot);
 int mcf_capture_arena_remap(
     const arc_t *old_base, uint64_t old_capacity, const arc_t *new_base,
     uint64_t new_capacity);

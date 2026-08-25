@@ -522,7 +522,7 @@ def build_native(*, prepared, output, compiler):
     if prepared["capture_enabled"]:
         command.append("-DMCF_CAPTURE_EVENTS=1")
     command.extend(str(source_dir / name) for name in NATIVE_SOURCES)
-    command.extend(("-o", str(output), "-lz"))
+    command.extend(("-o", str(output), "-lz", "-lcrypto"))
     canonical_command = _canonical_build_command(
         command,
         compiler=compiler_row["path"],
@@ -760,7 +760,10 @@ def run_native(*, binary, input_path, output_root):
                 "bytes": (output_root / name).stat().st_size,
                 "sha256": _sha256_file(output_root / name),
             }
-            for name in ("pricing.jsonl.gz", "price_out.jsonl.gz")
+            for name in (
+                "pricing.jsonl.gz", "price_out.jsonl.gz",
+                "allocation.jsonl.gz", "boundaries.jsonl.gz",
+            )
         }
     _atomic_json(record, value)
     return value
@@ -873,9 +876,11 @@ def _ordered_frames(pricing_rows, price_out_rows):
         if sorted(grouped) != list(range(len(grouped))):
             raise GenerationError(f"{phase} call ordinals are not contiguous")
         for ordinal, frame_rows in sorted(grouped.items()):
+            begin_kind = frame_rows[0].get("kind")
+            end_kind = frame_rows[-1].get("kind")
             if (
-                frame_rows[0].get("kind") != "BEGIN"
-                or frame_rows[-1].get("kind") != "END"
+                (begin_kind, end_kind)
+                not in {("BEGIN", "END"), ("CALL_BEGIN", "CALL_END")}
             ):
                 raise GenerationError(f"{phase} call frame is incomplete")
             order = frame_rows[0].get("order")
@@ -983,7 +988,7 @@ class _JournalFrames:
         if self.pending is None:
             return None
         if (
-            self.pending.get("kind") != "BEGIN"
+            self.pending.get("kind") != "CALL_BEGIN"
             or self.pending.get("call") != self.expected_ordinal
             or not isinstance(self.pending.get("order"), int)
             or self.pending["order"] < 0
@@ -1004,12 +1009,61 @@ class _JournalFrames:
                     f"{self.phase} call frame changes ordinal"
                 )
             yield row
-            if row.get("kind") == "END":
+            if row.get("kind") == "CALL_END":
                 break
             row = self._read()
             if row is None:
                 raise GenerationError(f"{self.phase} call frame is incomplete")
         self.expected_ordinal += 1
+
+
+class _BoundaryRows:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.stream = gzip.open(self.path, "rb")
+        self.expected_order = 0
+
+    def close(self):
+        self.stream.close()
+
+    def next(self, *, phase, ordinal, order):
+        line = self.stream.readline()
+        if not line:
+            raise GenerationError("native MCF boundary stream is incomplete")
+        try:
+            row = _orjson.loads(line) if _orjson is not None else json.loads(line)
+        except ValueError as error:
+            raise GenerationError(
+                f"invalid native MCF boundary stream: {error}"
+            ) from error
+        expected_keys = {
+            "call", "order", "phase", "pre_sha256", "post_sha256"
+        }
+        if (
+            not isinstance(row, dict)
+            or set(row) != expected_keys
+            or row.get("call") != ordinal
+            or row.get("order") != order
+            or row.get("phase") != phase
+            or order != self.expected_order
+        ):
+            raise GenerationError("native MCF boundary identity differs")
+        for name in ("pre_sha256", "post_sha256"):
+            value = row.get(name)
+            if not isinstance(value, str) or len(value) != 64:
+                raise GenerationError("native MCF boundary digest is invalid")
+            try:
+                bytes.fromhex(value)
+            except ValueError as error:
+                raise GenerationError(
+                    "native MCF boundary digest is invalid"
+                ) from error
+        self.expected_order += 1
+        return row
+
+    def require_eof(self):
+        if self.stream.readline():
+            raise GenerationError("native MCF boundary stream has extra rows")
 
 
 STREAMED_SECTIONS = (
@@ -1030,6 +1084,7 @@ def _stream_frame_sections(run_root, section_paths):
         _JournalFrames(run_root / "pricing.jsonl.gz", "pricing"),
         _JournalFrames(run_root / "price_out.jsonl.gz", "price_out"),
     )
+    boundary_reader = _BoundaryRows(run_root / "boundaries.jsonl.gz")
     try:
         with contextlib.ExitStack() as stack:
             writers = {}
@@ -1047,6 +1102,32 @@ def _stream_frame_sections(run_root, section_paths):
             pricing_calls = 0
             price_out_calls = 0
             expected_order = 0
+            for allocation in _read_json_lines(
+                run_root / "allocation.jsonl.gz", "allocation journal"
+            ):
+                expected_keys = {
+                    "kind", "role", "allocation_kind", "elements",
+                    "element_bytes", "old_capacity", "new_capacity",
+                    "requested_bytes", "current_bytes", "peak_bytes",
+                }
+                if (
+                    set(allocation) != expected_keys
+                    or allocation.get("kind") != "ALLOC"
+                    or allocation.get("role") != "live_in"
+                    or allocation.get("allocation_kind")
+                        not in {"nodes", "dummy_arcs", "arcs"}
+                    or any(
+                        not isinstance(allocation[name], int)
+                        or isinstance(allocation[name], bool)
+                        or allocation[name] < 0
+                        for name in expected_keys - {
+                            "kind", "role", "allocation_kind"
+                        }
+                    )
+                ):
+                    raise GenerationError("native MCF allocation event differs")
+                writers["DELTAS"].write(_canonical_event_json(allocation))
+                counts["DELTAS"] += 1
             while True:
                 available = [
                     (reader.begin()["order"], reader)
@@ -1062,67 +1143,41 @@ def _stream_frame_sections(run_root, section_paths):
                     )
                 ordinal = reader.expected_ordinal
                 start = event_count
-                live_in = []
-                live_out = []
                 last_kind = None
                 for row in reader.rows():
-                    event = {
-                        "phase_name": reader.phase,
-                        "ordinal": ordinal,
-                        **row,
-                    }
+                    event = dict(row)
                     encoded = _canonical_event_json(event)
                     writers["EVENTS"].write(encoded)
                     counts["EVENTS"] += 1
                     event_count += 1
                     last_kind = row.get("kind")
-                    if last_kind == "BASKET":
+                    if last_kind in {
+                        "BASKET_LIVE_IN", "BASKET_LIVE_OUT_OBSERVED"
+                    }:
                         writers["BASKET"].write(encoded)
                         counts["BASKET"] += 1
                     if last_kind in {
-                        "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
+                        "ARC_FINAL_OBSERVED", "REMAP_OBSERVED",
+                        "ADJACENCY_FINAL_OBSERVED"
                     }:
                         writers["DELTAS"].write(encoded)
                         counts["DELTAS"] += 1
-                    if last_kind == "BEGIN" or (
-                        last_kind == "BASKET"
-                        and row.get("phase") == "live_in"
-                    ):
-                        live_in.append(event)
-                    if (
-                        last_kind == "END"
-                        or (
-                            last_kind == "BASKET"
-                            and row.get("phase") == "live_out"
-                        )
-                        or last_kind in {
-                            "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
-                        }
-                    ):
-                        live_out.append(event)
-                if last_kind != "END":
+                if last_kind != "CALL_END":
                     raise GenerationError(
                         f"{reader.phase} call frame is incomplete"
                     )
                 count = event_count - start
                 call_row = {
+                    "call": ordinal,
                     "phase": reader.phase,
                     "ordinal": ordinal,
                     "order": order,
                     "event_begin": start,
                     "event_count": count,
                 }
-                boundary_row = {
-                    "phase": reader.phase,
-                    "ordinal": ordinal,
-                    "order": order,
-                    "pre_sha256": hashlib.sha256(
-                        _canonical_json(live_in)
-                    ).hexdigest(),
-                    "post_sha256": hashlib.sha256(
-                        _canonical_json(live_out)
-                    ).hexdigest(),
-                }
+                boundary_row = boundary_reader.next(
+                    phase=reader.phase, ordinal=ordinal, order=order
+                )
                 writers["CALL_INDEX"].write(
                     _canonical_event_json(call_row)
                 )
@@ -1138,11 +1193,13 @@ def _stream_frame_sections(run_root, section_paths):
                 expected_order += 1
             if event_count == 0:
                 raise GenerationError("native MCF event stream is empty")
+            boundary_reader.require_eof()
     except (OSError, EOFError, gzip.BadGzipFile) as error:
         raise GenerationError(f"invalid compressed MCF journal: {error}") from error
     finally:
         for reader in readers:
             reader.close()
+        boundary_reader.close()
     return {
         "sections": section_paths,
         "section_counts": counts,
@@ -1249,7 +1306,7 @@ def assemble_capture_package(*, run_root, identity, output):
                     for name in STREAMED_SECTIONS
                 },
             },
-            section_schemas={name: 2 for name in STREAMED_SECTIONS},
+            section_schemas={name: 3 for name in STREAMED_SECTIONS},
         )
         digest = mcfreg2.write_package(output, package)
     finally:
@@ -1357,6 +1414,8 @@ def _publication_bytes(*roots):
         "final.state",
         "pricing.jsonl.gz",
         "price_out.jsonl.gz",
+        "allocation.jsonl.gz",
+        "boundaries.jsonl.gz",
         "mcf.out",
     )
     for root in roots:
@@ -1445,6 +1504,35 @@ def _run_independent_replay(package, staging):
     }
 
 
+def _validate_capture_contract(package, staging):
+    output_root = staging / "capture-validation"
+    output_root.mkdir()
+    parsed = mcfreg2.read_package(package)
+    try:
+        frames = mcfreg2.validate_semantic_roles(parsed)
+    except mcfreg2.FormatError as error:
+        raise GenerationError(
+            f"capture_contract: semantic validation failed: {error}"
+        ) from error
+    record = {
+        "schema": 3,
+        "status": "capture_contract_validated",
+        "boundary_mismatches": 0,
+        "calls": len(frames),
+        "pricing_calls": sum(frame.phase == "pricing" for frame in frames),
+        "price_out_calls": sum(
+            frame.phase == "price_out" for frame in frames
+        ),
+        "independent_replay_complete": False,
+    }
+    path = output_root / "mcfreg2-capture.json"
+    _atomic_json(path, record)
+    return {
+        **record,
+        "validation_sha256": _sha256_file(path),
+    }
+
+
 def generate_candidate(
     *,
     authority_root,
@@ -1511,7 +1599,10 @@ def generate_candidate(
                 "native_equivalence: authority/capture peak allocation differs"
             )
         gate = "capture_determinism"
-        for name in ("pricing.jsonl.gz", "price_out.jsonl.gz"):
+        for name in (
+            "pricing.jsonl.gz", "price_out.jsonl.gz",
+            "allocation.jsonl.gz", "boundaries.jsonl.gz",
+        ):
             if not _same_file(primary_root / name, replay_root / name):
                 raise GenerationError(
                     f"capture_determinism: primary/replay {name} differs"
@@ -1543,8 +1634,8 @@ def generate_candidate(
         (staging / "replay.reg2").unlink()
         _link_or_copy(staging / "primary.reg2", staging / "replay.reg2")
         _link_or_copy(staging / "primary.reg2", staging / "mcf.reg2")
-        gate = "independent_replay"
-        replay_validation = _run_independent_replay(
+        gate = "capture_contract"
+        replay_validation = _validate_capture_contract(
             staging / "mcf.reg2", staging
         )
         _clone_tree(authority_root, staging / "authority")
@@ -1569,7 +1660,7 @@ def generate_candidate(
             "replay_package_sha256": replay["package_sha256"],
             "authority_final_state_sha256": authority_final_sha256,
             "authority_mcf_output_sha256": authority_output_sha256,
-            "independent_replay": replay_validation,
+            "capture_contract": replay_validation,
             "published_runs": {
                 "authority": _tree_hashes(staging / "authority"),
                 "capture_primary": _tree_hashes(staging / "capture-primary"),
@@ -1577,8 +1668,8 @@ def generate_candidate(
             },
         }
         validation = {
-            "schema": 2,
-            "status": "accepted",
+            "schema": 3,
+            "status": "capture_contract_validated",
             "identity": identity,
             "package_sha256": digest,
             "primary_package_sha256": primary["package_sha256"],
@@ -1598,8 +1689,8 @@ def generate_candidate(
             "capture_primary_mcf_output_sha256": primary_output_sha256,
             "capture_replay_mcf_output_sha256": replay_output_sha256,
             "peak_allocated_bytes": primary["peak_allocated_bytes"],
-            "canonical_trace_sha256": replay_validation["trace_sha256"],
-            "replay_validation_sha256": replay_validation[
+            "independent_replay_complete": False,
+            "capture_validation_sha256": replay_validation[
                 "validation_sha256"
             ],
         }

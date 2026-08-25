@@ -1,66 +1,37 @@
+diff --git a/main_wrapper.c b/main_wrapper.c
+index dd442c6d19..26dcbdb992 100644
 --- a/main_wrapper.c
 +++ b/main_wrapper.c
-@@ -26,0 +27,2 @@
+@@ -26,0 +27,2 @@ void remote(arc_t *arc, long *basket_size, BASKET *perm[])
 +    int candidate;
 +    long basket_slot = -1;
-@@ -29,0 +32 @@
-+    candidate = ((red_cost < 0) && (arc->ident == AT_LOWER)) || ((red_cost > 0) && (arc->ident == AT_UPPER));
-@@ -40,0 +44 @@
+@@ -29,0 +32,3 @@ void remote(arc_t *arc, long *basket_size, BASKET *perm[])
++    candidate =
++        ((red_cost < 0) && (arc->ident == AT_LOWER)) ||
++        ((red_cost > 0) && (arc->ident == AT_UPPER));
+@@ -40,0 +46 @@ void remote(arc_t *arc, long *basket_size, BASKET *perm[])
 +            basket_slot = *basket_size;
-@@ -45,0 +50,5 @@
-+    if (mcf_capture_pricing_scan(arc, red_cost, candidate, basket_slot))
-+    {
-+        fprintf(stderr, "cannot capture MCF pricing scan\n");
+@@ -45,0 +52,5 @@ void remote(arc_t *arc, long *basket_size, BASKET *perm[])
++    if (mcf_capture_pricing_candidate_observed(
++            arc, red_cost, candidate, basket_slot)) {
++        fprintf(stderr, "cannot capture MCF pricing candidate result\n");
 +        exit(-1);
 +    }
+diff --git a/implicit.c b/implicit.c
+index 5f59426361..f61ed6c2ff 100644
 --- a/implicit.c
 +++ b/implicit.c
-@@ -120,0 +121,5 @@
-+    if( mcf_capture_price_out_arc_state( &new[newpos] ) )
-+    {
-+        printf( "cannot capture MCF inserted arc state\n" );
-+        exit(-1);
-+    }
-@@ -131,0 +137,5 @@
-+        if( mcf_capture_price_out_arc_state( &new[pos-1] ) )
-+        {
-+            printf( "cannot capture MCF moved arc state\n" );
-+            exit(-1);
-+        }
-@@ -138,0 +149,5 @@
-+        if( mcf_capture_price_out_arc_state( &new[pos-1] ) )
-+        {
-+            printf( "cannot capture MCF inserted arc state\n" );
-+            exit(-1);
-+        }
-@@ -169,0 +185,5 @@
-+    if( mcf_capture_price_out_arc_state( &new[0] ) )
-+    {
-+        printf( "cannot capture MCF replaced arc state\n" );
-+        exit(-1);
-+    }
-@@ -181,0 +202,5 @@
-+        if( mcf_capture_price_out_arc_state( &new[pos-1] ) )
-+        {
-+            printf( "cannot capture MCF moved arc state\n" );
-+            exit(-1);
-+        }
-@@ -187,0 +213,5 @@
-+        if( mcf_capture_price_out_arc_state( &new[cmp-1] ) )
-+        {
-+            printf( "cannot capture MCF replaced arc state\n" );
-+            exit(-1);
-+        }
-@@ -242,0 +273,2 @@
+@@ -242,0 +243,2 @@ long price_out_impl( net )
 +    int capture_decision;
 +    arc_t *capture_slot;
-@@ -250,0 +283,5 @@
+@@ -251,0 +254,6 @@ long price_out_impl( net )
 +    if( mcf_capture_price_out_begin( net ) )
 +    {
 +        printf( "cannot capture MCF price-out begin\n" );
 +        exit(-1);
 +    }
-@@ -322,0 +360,8 @@
++
+@@ -322,0 +331,8 @@ long price_out_impl( net )
 +            capture_decision = 0;
 +            capture_slot = (arc_t *)NULL;
 +            if( mcf_capture_price_out_candidate(
@@ -69,35 +40,37 @@
 +                printf( "cannot capture MCF price-out candidate\n" );
 +                exit(-1);
 +            }
-@@ -330,0 +376,2 @@
+@@ -330,0 +347,2 @@ long price_out_impl( net )
 +                    capture_decision = 1;
 +                    capture_slot = arcnew + new_arcs - 1;
-@@ -332,0 +380 @@
+@@ -332,0 +351 @@ long price_out_impl( net )
 +                {
-@@ -334,0 +383,3 @@
+@@ -334,0 +354,9 @@ long price_out_impl( net )
 +                    capture_decision = 2;
 +                    capture_slot = arcnew;
 +                }
-@@ -335,0 +387,6 @@
++            }
 +            if( mcf_capture_price_out_decision(
 +                    capture_decision, capture_slot, tail, head ) )
 +            {
 +                printf( "cannot capture MCF price-out decision\n" );
 +                exit(-1);
-+            }
-@@ -370,0 +428,5 @@
+@@ -371,0 +400,6 @@ long price_out_impl( net )
 +    if( mcf_capture_price_out_end( net, new_arcs ) )
 +    {
 +        printf( "cannot capture MCF price-out end\n" );
 +        exit(-1);
 +    }
++
+diff --git a/pbeampp.c b/pbeampp.c
+index 976cc42e01..f5caec4e31 100644
 --- a/pbeampp.c
 +++ b/pbeampp.c
-@@ -28,0 +29 @@
+@@ -28,0 +29 @@ Copyright (c) 2003-2005 Andreas Loebel.
 +#include "mcf_capture.h"
-@@ -161,0 +163 @@
+@@ -161,0 +163 @@ arc_t *primal_bea_mpp( m, arcs, stop_arcs, red_cost_of_bea )
 +    long initialize_in = initialize;
-@@ -199,0 +202,14 @@
+@@ -200,0 +203,15 @@ arc_t *primal_bea_mpp( m, arcs, stop_arcs, red_cost_of_bea )
 +    if( mcf_capture_pricing_begin(
 +            m, arcs, stop_arcs, (long)NR_GROUP_STATE,
 +            (long)GROUP_POS_STATE, initialize_in, basket_size ) )
@@ -112,7 +85,15 @@
 +            printf( "cannot capture MCF pricing live-in basket\n" );
 +            exit(-1);
 +        }
-@@ -225,0 +242,8 @@
++
+@@ -210,0 +228,6 @@ arc_t *primal_bea_mpp( m, arcs, stop_arcs, red_cost_of_bea )
++            if( mcf_capture_pricing_scan_live_in(
++                    arc, (long)GROUP_POS_STATE, arcs_priced ) )
++            {
++                printf( "cannot capture MCF pricing scan live-in\n" );
++                exit(-1);
++            }
+@@ -225,0 +249,8 @@ arc_t *primal_bea_mpp( m, arcs, stop_arcs, red_cost_of_bea )
 +        if( mcf_capture_pricing_end(
 +                (arc_t *)0, *red_cost_of_bea, arcs_priced,
 +                (long)NR_GROUP_STATE, (long)GROUP_POS_STATE,
@@ -121,7 +102,7 @@
 +            printf( "cannot capture MCF pricing end\n" );
 +            exit(-1);
 +        }
-@@ -234,0 +259,15 @@
+@@ -234,0 +266,15 @@ arc_t *primal_bea_mpp( m, arcs, stop_arcs, red_cost_of_bea )
 +    for( i = 1; i <= basket_size; ++i )
 +        if( mcf_capture_pricing_basket(
 +                1, i, perm[i]->a, perm[i]->cost, perm[i]->abs_cost ) )

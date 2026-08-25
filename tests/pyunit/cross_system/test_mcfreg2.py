@@ -351,7 +351,7 @@ class MCFREG2Test(unittest.TestCase):
              "slot": 1, "arc": {"kind": "arc", "generation": 0,
              "index": 2}, "cost": -4, "abs_cost": 4},
             {"kind": "PRICING_SCAN_LIVE_IN", "role": "live_in",
-             "call": 0, "scan_position": 0,
+             "call": 0, "scan_position": 0, "group_pos": 0,
              "arc": {"kind": "arc", "generation": 0, "index": 0},
              "tail": {"kind": "node", "generation": 0, "index": 0},
              "head": {"kind": "node", "generation": 0, "index": 1},

@@ -441,6 +441,7 @@ int main(int argc, char **argv)
                 "-o",
                 str(probe),
                 "-lz",
+                "-lcrypto",
             ],
             check=True,
         )
@@ -515,44 +516,59 @@ int main(int argc, char **argv)
                 row for row in price_out_rows
                 if row.get("call") == price_out_call
             ]
-            self.assertEqual(price_out_frame[0]["kind"], "BEGIN")
-            self.assertEqual(price_out_frame[-1]["kind"], "END")
+            self.assertEqual(price_out_frame[0]["kind"], "CALL_BEGIN")
+            self.assertEqual(price_out_frame[-1]["kind"], "CALL_END")
+            self.assertEqual(
+                price_out_frame[1]["kind"], "PRICE_OUT_STATE_LIVE_IN"
+            )
+            self.assertEqual(
+                price_out_frame[-2]["kind"], "PRICE_OUT_END_OBSERVED"
+            )
             candidates = [
                 row for row in price_out_frame
-                if row["kind"] == "CANDIDATE"
+                if row["kind"] == "PRICE_OUT_CANDIDATE_OBSERVED"
             ]
             decisions = [
                 row for row in price_out_frame
-                if row["kind"] == "DECISION"
+                if row["kind"] == "PRICE_OUT_DECISION_OBSERVED"
             ]
             self.assertEqual(len(candidates), len(decisions))
             for candidate, decision in zip(candidates, decisions):
                 self.assertEqual(
                     candidate["candidate"], decision["candidate"]
                 )
-                self.assertEqual(
-                    candidate["reduced_cost"],
-                    candidate["arc_cost"]
-                    - candidate["tail_potential"]
-                    + candidate["head_potential"],
-                )
+                self.assertIn(decision["decision"], {
+                    "NO_CHANGE", "INSERT", "REPLACE"
+                })
 
         previous_live_out = None
         for call_id, frame in sorted(calls.items()):
-            self.assertEqual(frame[0]["kind"], "BEGIN")
-            self.assertEqual(frame[-1]["kind"], "END")
+            self.assertEqual(frame[0]["kind"], "CALL_BEGIN")
+            self.assertEqual(frame[-1]["kind"], "CALL_END")
+            ending = next(
+                row for row in frame
+                if row["kind"] == "PRICING_END_OBSERVED"
+            )
             if call_id == 0:
                 self.assertTrue(frame[0]["initialize"])
-            scans = [row for row in frame if row["kind"] == "SCAN"]
+            scans = [
+                row for row in frame
+                if row["kind"] == "PRICING_SCAN_LIVE_IN"
+            ]
+            candidates = [
+                row for row in frame
+                if row["kind"] == "PRICING_CANDIDATE_OBSERVED"
+            ]
             live_in = [
                 row for row in frame
-                if row["kind"] == "BASKET" and row["phase"] == "live_in"
+                if row["kind"] == "BASKET_LIVE_IN"
             ]
             live_out = [
                 row for row in frame
-                if row["kind"] == "BASKET" and row["phase"] == "live_out"
+                if row["kind"] == "BASKET_LIVE_OUT_OBSERVED"
             ]
-            self.assertEqual(frame[-1]["arcs_priced"], len(scans))
+            self.assertEqual(ending["arcs_priced"], len(scans))
+            self.assertEqual(len(scans), len(candidates))
             expected_arc_ids = []
             group_pos = frame[0]["group_pos"]
             while True:
@@ -564,31 +580,34 @@ int main(int argc, char **argv)
                     )
                 )
                 group_pos = (group_pos + 1) % frame[0]["nr_group"]
-                if group_pos == frame[-1]["group_pos"]:
+                if group_pos == ending["group_pos"]:
                     break
             self.assertEqual(
-                [scan["arc_id"] for scan in scans], expected_arc_ids
+                [scan["arc"]["index"] for scan in scans], expected_arc_ids
             )
-            for scan in scans:
+            for scan, candidate in zip(scans, candidates):
                 self.assertEqual(
-                    scan["reduced_cost"],
-                    scan["arc_cost"]
+                    scan["scan_position"], candidate["scan_position"]
+                )
+                self.assertEqual(
+                    candidate["reduced_cost"],
+                    scan["cost"]
                     - scan["tail_potential"]
                     + scan["head_potential"],
                 )
                 expected_candidate = (
-                    scan["reduced_cost"] < 0 and scan["ident"] == 1
+                    candidate["reduced_cost"] < 0 and scan["ident"] == 1
                 ) or (
-                    scan["reduced_cost"] > 0 and scan["ident"] == 2
+                    candidate["reduced_cost"] > 0 and scan["ident"] == 2
                 )
-                self.assertEqual(scan["candidate"], expected_candidate)
+                self.assertEqual(candidate["candidate"], expected_candidate)
                 self.assertEqual(
-                    scan["group_pos"],
-                    scan["arc_id"] % frame[0]["nr_group"],
+                    scan["group_pos"], scan["arc"]["index"]
+                    % frame[0]["nr_group"],
                 )
-                if scan["basket_slot"] >= 0:
-                    self.assertTrue(scan["candidate"])
-                    self.assertGreater(scan["basket_slot"], 0)
+                if candidate["basket_slot"] >= 0:
+                    self.assertTrue(candidate["candidate"])
+                    self.assertGreater(candidate["basket_slot"], 0)
             self.assertEqual(
                 [row["slot"] for row in live_in],
                 list(range(1, len(live_in) + 1)),
@@ -605,20 +624,20 @@ int main(int argc, char **argv)
             )
             if live_out:
                 self.assertEqual(
-                    frame[-1]["selected_arc_id"], live_out[0]["arc_id"]
+                    ending["selected_arc"], live_out[0]["arc"]
                 )
                 self.assertEqual(
-                    frame[-1]["reduced_cost"], live_out[0]["cost"]
+                    ending["selected_reduced_cost"], live_out[0]["cost"]
                 )
             else:
-                self.assertEqual(frame[-1]["selected_arc_id"], -1)
-                self.assertEqual(frame[-1]["reduced_cost"], 0)
+                self.assertEqual(ending["selected_arc"]["kind"], "null")
+                self.assertEqual(ending["selected_reduced_cost"], 0)
             if previous_live_out is not None:
                 retained_candidates = {
-                    row["arc_id"] for row in previous_live_out[1:]
+                    row["arc"]["index"] for row in previous_live_out[1:]
                 }
                 self.assertTrue(
-                    {row["arc_id"] for row in live_in}.issubset(
+                    {row["arc"]["index"] for row in live_in}.issubset(
                         retained_candidates
                     )
                 )
@@ -649,7 +668,7 @@ int main(int argc, char **argv)
             (authority_root / "mcf.out").read_bytes(),
         )
 
-    def test_price_out_events_cover_decisions_and_remap_first(self):
+    def _capture_price_out_probe(self):
         self.require_module()
         if shutil.which("cc") is None:
             self.skipTest("C compiler is unavailable")
@@ -739,7 +758,15 @@ int main(int argc, char **argv)
     if (mcf_capture_price_out_decision(
             2, &net.arcs[1], &net.nodes[1], &net.nodes[0]))
         return 20;
+    net.arcs[1].flow = 0;
+    net.arcs[1].ident = AT_LOWER;
+    net.arcs[1].nextout = &net.arcs[0];
+    net.arcs[1].nextin = &net.arcs[0];
+    net.nodes[1].firstout = &net.arcs[1];
+    net.nodes[0].firstin = &net.arcs[1];
     net.m = 2;
+    net.m_impl += 1;
+    net.max_residual_new_m -= 1;
     net.stop_arcs = net.arcs + net.m;
     if (mcf_capture_price_out_end(&net, 1) ||
         mcf_capture_roi_end(&net))
@@ -774,6 +801,7 @@ int main(int argc, char **argv)
                 "-o",
                 str(probe),
                 "-lz",
+                "-lcrypto",
             ],
             check=True,
         )
@@ -784,43 +812,66 @@ int main(int argc, char **argv)
             output_root / "price_out.jsonl.gz", "rt", encoding="utf-8"
         ) as stream:
             rows = [json.loads(line) for line in stream]
-        self.assertEqual(rows[0]["kind"], "BEGIN")
-        self.assertEqual(rows[-1]["kind"], "END")
+        return rows
+
+    def test_arc_final_is_recorded_after_flow_ident_and_links(self):
+        rows = self._capture_price_out_probe()
+        self.assertEqual(rows[0]["kind"], "CALL_BEGIN")
+        self.assertEqual(rows[-1]["kind"], "CALL_END")
         self.assertEqual(
-            [row["decision"] for row in rows if row["kind"] == "DECISION"],
+            [
+                row["decision"] for row in rows
+                if row["kind"] == "PRICE_OUT_DECISION_OBSERVED"
+            ],
             ["NO_CHANGE", "INSERT", "REPLACE", "REPLACE"],
         )
-        for index, row in enumerate(rows):
-            if row.get("kind") != "DECISION" or row["decision"] == "NO_CHANGE":
-                continue
-            candidate = row["candidate"]
-            prior_candidate = max(
-                prior for prior in range(index)
-                if rows[prior].get("kind") == "CANDIDATE"
-                and rows[prior]["candidate"] == candidate
-            )
-            self.assertTrue(
-                any(
-                    event.get("kind") == "ARC_STATE"
-                    and event["candidate"] == candidate
-                    for event in rows[prior_candidate + 1:index]
-                )
-            )
-        remap = next(
-            index for index, row in enumerate(rows)
-            if row["kind"] == "ARENA_REMAP"
+        final = next(
+            row for row in rows
+            if row["kind"] == "ARC_FINAL_OBSERVED"
+            and row["reference"]["index"] == 1
         )
-        first_new_generation = next(
-            index for index, row in enumerate(rows)
-            if row.get("reference", {}).get("generation") == 1
+        self.assertEqual(final["flow"], 0)
+        self.assertEqual(final["ident"], 1)
+        self.assertEqual(final["nextout"]["kind"], "arc")
+        self.assertEqual(final["nextin"]["kind"], "arc")
+        adjacency = [
+            row for row in rows
+            if row["kind"] == "ADJACENCY_FINAL_OBSERVED"
+        ]
+        self.assertEqual(len(adjacency), 2)
+        ending = next(
+            row for row in rows
+            if row["kind"] == "PRICE_OUT_END_OBSERVED"
         )
-        self.assertLess(remap, first_new_generation)
+        live_in = next(
+            row for row in rows
+            if row["kind"] == "PRICE_OUT_STATE_LIVE_IN"
+        )
+        self.assertEqual(ending["network_words"][3], 2)
+        self.assertEqual(ending["network_words"][5], 1)
         self.assertEqual(
-            len([row for row in rows if row["kind"] == "ADJACENCY"]),
-            2,
+            ending["network_words"][6],
+            live_in["network_words"][6] + live_in["network_words"][7] - 1,
         )
-        self.assertEqual(rows[-1]["new_arcs"], 1)
-        self.assertEqual(rows[-1]["live_out_m"], 2)
+        self.assertEqual(ending["network_words"][22], 2)
+
+    def test_remap_contains_every_live_arc_reference(self):
+        rows = self._capture_price_out_probe()
+        live_in = next(
+            row for row in rows
+            if row["kind"] == "PRICE_OUT_STATE_LIVE_IN"
+        )
+        remaps = [row for row in rows if row["kind"] == "REMAP_OBSERVED"]
+        self.assertEqual(len(remaps), live_in["network_words"][3])
+        self.assertEqual(
+            [row["old_reference"]["index"] for row in remaps],
+            list(range(live_in["network_words"][3])),
+        )
+        self.assertTrue(all(
+            row["new_reference"]["generation"]
+            == row["old_reference"]["generation"] + 1
+            for row in remaps
+        ))
 
     def test_capture_packages_are_deterministic_and_publish_atomically(self):
         self.require_module()
@@ -945,13 +996,39 @@ int main(int argc, char **argv)
         self.assertEqual(events_entry.element_size, 0)
         for name in streamed_names:
             entry = directory[generator.mcfreg2.SECTION_TYPES[name]]
-            self.assertEqual(entry.schema, 2)
+            self.assertEqual(entry.schema, 3)
             self.assertEqual(parsed_package.section(name)[:2], b"\x1f\x8b")
+        frames = generator.mcfreg2.validate_semantic_roles(parsed_package)
+        self.assertEqual(len(frames), parsed_package.header.pricing_calls
+                         + parsed_package.header.price_out_calls)
+        delta_rows = [
+            json.loads(line)
+            for line in gzip.decompress(
+                parsed_package.section("DELTAS")
+            ).splitlines()
+        ]
+        allocations = [
+            row for row in delta_rows if row["kind"] == "ALLOC"
+        ]
+        primary_run = json.loads(
+            (primary_root / "run.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            len(allocations), primary_run["allocation_events"]
+        )
+        self.assertTrue(all(
+            row["requested_bytes"]
+            == row["elements"] * row["element_bytes"]
+            for row in allocations
+        ))
         validation = json.loads(
             (accepted_root / "validation.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(validation["schema"], 2)
-        self.assertEqual(validation["status"], "accepted")
+        self.assertEqual(validation["schema"], 3)
+        self.assertEqual(
+            validation["status"], "capture_contract_validated"
+        )
+        self.assertFalse(validation["independent_replay_complete"])
         self.assertEqual(validation["identity"], identity)
         self.assertEqual(validation["package_sha256"], accepted["package_sha256"])
         self.assertEqual(
@@ -972,12 +1049,9 @@ int main(int argc, char **argv)
                 (primary_root / "run.json").read_text(encoding="utf-8")
             )["peak_allocated_bytes"],
         )
-        self.assertTrue(
-            (accepted_root / "replay-validation/mcfreg2-replay.json").is_file()
-        )
-        self.assertTrue(
-            (accepted_root / "replay-validation/canonical.trace").is_file()
-        )
+        self.assertTrue((
+            accepted_root / "capture-validation/mcfreg2-capture.json"
+        ).is_file())
         self.assertTrue((accepted_root / "authority/run.json").is_file())
         self.assertTrue((accepted_root / "capture-primary/run.json").is_file())
         self.assertTrue((accepted_root / "capture-replay/run.json").is_file())
@@ -989,14 +1063,12 @@ int main(int argc, char **argv)
         with mock.patch.dict(
             freezer.MINIMUM_ALLOCATED_BYTES, {"mcf": 1}
         ):
-            qualified = freezer.validate_mcf_record(candidate["record"])
-            self.assertEqual(
-                qualified["validation"]["package_sha256"],
-                accepted["package_sha256"],
-            )
-            verified = generator.verify_accepted(evidence_root)
-        self.assertEqual(verified["status"], "verified")
-        self.assertEqual(verified["package_sha256"], accepted["package_sha256"])
+            with self.assertRaisesRegex(
+                freezer.InputError, "validation schema must be 2"
+            ):
+                freezer.validate_mcf_record(candidate["record"])
+            with self.assertRaises(generator.GenerationError):
+                generator.verify_accepted(evidence_root)
         accepted_again = generator.generate_candidate(
             authority_root=authority_root,
             capture_primary_root=primary_root,
@@ -1016,7 +1088,10 @@ int main(int argc, char **argv)
         pricing = fault_replay / "pricing.jsonl.gz"
         with gzip.open(pricing, "rt", encoding="utf-8") as stream:
             rows = [json.loads(line) for line in stream]
-        scan = next(row for row in rows if row["kind"] == "SCAN")
+        scan = next(
+            row for row in rows
+            if row["kind"] == "PRICING_CANDIDATE_OBSERVED"
+        )
         scan["reduced_cost"] += 1
         with pricing.open("wb") as raw:
             with gzip.GzipFile(
