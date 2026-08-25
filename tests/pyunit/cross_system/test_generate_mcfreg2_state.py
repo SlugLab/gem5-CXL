@@ -24,6 +24,66 @@ def sha256(path):
 
 
 class GenerateMCFREG2Test(unittest.TestCase):
+    def test_allocation_timeline_recomputes_peak_and_capacity(self):
+        events = [
+            {"kind": "ALLOC", "role": "live_in",
+             "allocation_kind": "nodes", "elements": 3,
+             "element_bytes": 10, "old_capacity": 0,
+             "new_capacity": 3, "requested_bytes": 30,
+             "current_bytes": 30, "peak_bytes": 30},
+            {"kind": "ALLOC", "role": "live_in",
+             "allocation_kind": "arcs", "elements": 4,
+             "element_bytes": 20, "old_capacity": 0,
+             "new_capacity": 4, "requested_bytes": 80,
+             "current_bytes": 110, "peak_bytes": 110},
+            {"kind": "ALLOC", "role": "live_in",
+             "allocation_kind": "arcs", "elements": 5,
+             "element_bytes": 20, "old_capacity": 4,
+             "new_capacity": 5, "requested_bytes": 100,
+             "current_bytes": 130, "peak_bytes": 130},
+        ]
+        summary = generator.recompute_allocation_timeline(events)
+        self.assertEqual(summary.events, 3)
+        self.assertEqual(summary.current_bytes, 130)
+        self.assertEqual(summary.peak_bytes, 130)
+        forged = [*events[:-1], {**events[-1], "peak_bytes": 131}]
+        with self.assertRaisesRegex(
+            generator.GenerationError, "allocation peak"
+        ):
+            generator.recompute_allocation_timeline(forged)
+
+    def test_failure_records_are_unique_and_preserve_first_gate(self):
+        identity = {"source_commit": "1" * 40}
+        first = generator.write_failure_record(
+            self.root, gate="frozen_input", identity=identity,
+            error="first", diagnostics={"command": ["mcf"]},
+        )
+        second = generator.write_failure_record(
+            self.root, gate="semantic_replay", identity=identity,
+            error="second", diagnostics={"command": ["replayer"]},
+        )
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            json.loads(second.read_text(encoding="utf-8"))[
+                "first_failed_gate"
+            ],
+            "frozen_input",
+        )
+
+    def test_rejected_root_is_preserved_but_not_accepted(self):
+        payload = self.root / "package"
+        payload.write_bytes(b"MCFREG2 rejection fixture")
+        digest = sha256(payload)
+        root = self.root / digest
+        root.mkdir()
+        shutil.move(payload, root / "mcf.reg2")
+        self.assertIn(root, generator.accepted_roots(self.root))
+        rejected = generator.reject_accepted_root(
+            root.resolve(), {"finding": "weak semantic replay"}
+        )
+        self.assertTrue((rejected / "rejection.json").is_file())
+        self.assertNotIn(root, generator.accepted_roots(self.root))
+
     APPROVED_SOURCE = Path("/home/victoryang00/CXLMemUring")
     APPROVED_COMMIT = "2b30de22399402d8c44bd74b8ebf743b6a6a55e9"
     APPROVED_INPUT_SHA256 = (
@@ -1024,11 +1084,9 @@ int main(int argc, char **argv)
         validation = json.loads(
             (accepted_root / "validation.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(validation["schema"], 3)
-        self.assertEqual(
-            validation["status"], "capture_contract_validated"
-        )
-        self.assertFalse(validation["independent_replay_complete"])
+        self.assertEqual(validation["schema"], 2)
+        self.assertEqual(validation["status"], "accepted")
+        self.assertTrue(validation["independent_replay_complete"])
         self.assertEqual(validation["identity"], identity)
         self.assertEqual(validation["package_sha256"], accepted["package_sha256"])
         self.assertEqual(
@@ -1050,7 +1108,7 @@ int main(int argc, char **argv)
             )["peak_allocated_bytes"],
         )
         self.assertTrue((
-            accepted_root / "capture-validation/mcfreg2-capture.json"
+            accepted_root / "replay-validation/mcfreg2-replay.json"
         ).is_file())
         self.assertTrue((accepted_root / "authority/run.json").is_file())
         self.assertTrue((accepted_root / "capture-primary/run.json").is_file())
@@ -1063,25 +1121,36 @@ int main(int argc, char **argv)
         with mock.patch.dict(
             freezer.MINIMUM_ALLOCATED_BYTES, {"mcf": 1}
         ):
-            with self.assertRaisesRegex(
-                freezer.InputError, "validation schema must be 2"
-            ):
-                freezer.validate_mcf_record(candidate["record"])
-            with self.assertRaises(generator.GenerationError):
-                generator.verify_accepted(evidence_root)
-        accepted_again = generator.generate_candidate(
-            authority_root=authority_root,
-            capture_primary_root=primary_root,
-            capture_replay_root=replay_root,
-            identity=identity,
-            evidence_root=evidence_root,
-            source_record=source_record,
-        )
+            qualified = freezer.validate_mcf_record(candidate["record"])
+            self.assertEqual(qualified["replay"]["status"], "verified")
+            generator.verify_accepted(evidence_root)
+        with mock.patch.dict(
+            freezer.MINIMUM_ALLOCATED_BYTES, {"mcf": 1}
+        ):
+            accepted_again = generator.generate_candidate(
+                authority_root=authority_root,
+                capture_primary_root=primary_root,
+                capture_replay_root=replay_root,
+                identity=identity,
+                evidence_root=evidence_root,
+                source_record=source_record,
+            )
         self.assertEqual(accepted_again["accepted_root"], str(accepted_root))
         self.assertEqual(
             sha256(accepted_root / "mcf.reg2"),
             accepted["package_sha256"],
         )
+        published_run = accepted_root / "capture-primary/run.json"
+        published_bytes = published_run.read_bytes()
+        published_run.write_text("corrupt\n", encoding="ascii")
+        with mock.patch.dict(
+            freezer.MINIMUM_ALLOCATED_BYTES, {"mcf": 1}
+        ):
+            with self.assertRaisesRegex(
+                generator.GenerationError, "published tree|artifact tree"
+            ):
+                generator.verify_existing_root(accepted_root, identity)
+        published_run.write_bytes(published_bytes)
 
         fault_replay = self.root / "fault-replay"
         shutil.copytree(replay_root, fault_replay)

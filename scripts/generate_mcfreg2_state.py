@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -17,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 
 try:
@@ -84,6 +86,83 @@ class GenerationError(RuntimeError):
 
 
 FORMAL_MINIMUM_ALLOCATED_BYTES = 345_000_000
+UINT64_MAX = (1 << 64) - 1
+
+
+@dataclasses.dataclass(frozen=True)
+class AllocationSummary:
+    events: int
+    current_bytes: int
+    peak_bytes: int
+    capacities: dict[str, int]
+    kind_bytes: dict[str, int]
+
+
+def recompute_allocation_timeline(events):
+    expected_keys = {
+        "kind", "role", "allocation_kind", "elements",
+        "element_bytes", "old_capacity", "new_capacity",
+        "requested_bytes", "current_bytes", "peak_bytes",
+    }
+    capacities = {"nodes": 0, "dummy_arcs": 0, "arcs": 0}
+    element_sizes = {name: None for name in capacities}
+    kind_bytes = {name: 0 for name in capacities}
+    peak = 0
+    count = 0
+    for event in events:
+        if (
+            not isinstance(event, dict)
+            or set(event) != expected_keys
+            or event.get("kind") != "ALLOC"
+            or event.get("role") != "live_in"
+            or event.get("allocation_kind") not in capacities
+        ):
+            raise GenerationError("allocation event differs")
+        numeric = (
+            "elements", "element_bytes", "old_capacity", "new_capacity",
+            "requested_bytes", "current_bytes", "peak_bytes",
+        )
+        if any(
+            not isinstance(event[name], int)
+            or isinstance(event[name], bool)
+            or not 0 <= event[name] <= UINT64_MAX
+            for name in numeric
+        ):
+            raise GenerationError("allocation event counter differs")
+        name = event["allocation_kind"]
+        elements = event["elements"]
+        element_bytes = event["element_bytes"]
+        if elements and element_bytes > UINT64_MAX // elements:
+            raise GenerationError("allocation requested bytes overflow")
+        requested = elements * element_bytes
+        if (
+            event["old_capacity"] != capacities[name]
+            or event["new_capacity"] != elements
+            or event["requested_bytes"] != requested
+        ):
+            raise GenerationError("allocation capacity differs")
+        prior_size = element_sizes[name]
+        if prior_size is not None and prior_size != element_bytes:
+            raise GenerationError("allocation element size differs")
+        element_sizes[name] = element_bytes
+        capacities[name] = elements
+        kind_bytes[name] = requested
+        current = sum(kind_bytes.values())
+        if current > UINT64_MAX or event["current_bytes"] != current:
+            raise GenerationError("allocation current bytes differs")
+        peak = max(peak, current)
+        if event["peak_bytes"] != peak:
+            raise GenerationError("allocation peak differs")
+        count += 1
+    if count == 0:
+        raise GenerationError("allocation timeline is empty")
+    return AllocationSummary(
+        events=count,
+        current_bytes=sum(kind_bytes.values()),
+        peak_bytes=peak,
+        capacities=dict(capacities),
+        kind_bytes=dict(kind_bytes),
+    )
 
 
 def _git_command(root, *arguments):
@@ -1102,30 +1181,11 @@ def _stream_frame_sections(run_root, section_paths):
             pricing_calls = 0
             price_out_calls = 0
             expected_order = 0
-            for allocation in _read_json_lines(
+            allocations = list(_read_json_lines(
                 run_root / "allocation.jsonl.gz", "allocation journal"
-            ):
-                expected_keys = {
-                    "kind", "role", "allocation_kind", "elements",
-                    "element_bytes", "old_capacity", "new_capacity",
-                    "requested_bytes", "current_bytes", "peak_bytes",
-                }
-                if (
-                    set(allocation) != expected_keys
-                    or allocation.get("kind") != "ALLOC"
-                    or allocation.get("role") != "live_in"
-                    or allocation.get("allocation_kind")
-                        not in {"nodes", "dummy_arcs", "arcs"}
-                    or any(
-                        not isinstance(allocation[name], int)
-                        or isinstance(allocation[name], bool)
-                        or allocation[name] < 0
-                        for name in expected_keys - {
-                            "kind", "role", "allocation_kind"
-                        }
-                    )
-                ):
-                    raise GenerationError("native MCF allocation event differs")
+            ))
+            allocation_summary = recompute_allocation_timeline(allocations)
+            for allocation in allocations:
                 writers["DELTAS"].write(_canonical_event_json(allocation))
                 counts["DELTAS"] += 1
             while True:
@@ -1206,6 +1266,7 @@ def _stream_frame_sections(run_root, section_paths):
         "event_count": event_count,
         "pricing_calls": pricing_calls,
         "price_out_calls": price_out_calls,
+        "allocation_summary": allocation_summary,
     }
 
 
@@ -1258,6 +1319,12 @@ def assemble_capture_package(*, run_root, identity, output):
             or price_out_calls != run.get("price_out_calls")
         ):
             raise GenerationError("native MCF run call counts differ")
+        allocation = streamed["allocation_summary"]
+        if (
+            allocation.events != run.get("allocation_events")
+            or allocation.peak_bytes != run.get("peak_allocated_bytes")
+        ):
+            raise GenerationError("native MCF allocation summary differs")
         output_path = run_root / "mcf.out"
         if not output_path.is_file():
             raise GenerationError("native MCF output is missing")
@@ -1275,7 +1342,7 @@ def assemble_capture_package(*, run_root, identity, output):
             "final_network_words": list(final["words"]),
             "mcf_output_bytes": output_path.stat().st_size,
             "mcf_output_sha256": _sha256_file(output_path),
-            "peak_allocated_bytes": run.get("peak_allocated_bytes"),
+            "peak_allocated_bytes": allocation.peak_bytes,
         }
         sections = {
             "PROVENANCE": _canonical_json(provenance),
@@ -1327,6 +1394,8 @@ def assemble_capture_package(*, run_root, identity, output):
         "final_state_sha256": final["sha256"],
         "mcf_output_sha256": final_row["mcf_output_sha256"],
         "peak_allocated_bytes": final_row["peak_allocated_bytes"],
+        "allocation_events": allocation.events,
+        "allocation_current_bytes": allocation.current_bytes,
     }
 
 
@@ -1351,6 +1420,44 @@ def _atomic_json(path, value):
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def write_failure_record(root, *, gate, identity, error, diagnostics=None):
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    identity_digest = _canonical_value_sha256(identity or {})
+    latest_path = root / "latest-failure.json"
+    first_gate = gate
+    if latest_path.is_file():
+        try:
+            latest = _read_json(latest_path, "latest MCF failure")
+        except GenerationError:
+            latest = {}
+        if latest.get("identity_digest") == identity_digest:
+            first_gate = latest.get("first_failed_gate", gate)
+    attempt = uuid.uuid4().hex
+    record = {
+        "schema": 1,
+        "status": "failed_input",
+        "identity_digest": identity_digest,
+        "attempt_id": attempt,
+        "first_failed_gate": first_gate,
+        "failed_gate": gate,
+        "error": str(error),
+        "diagnostics": diagnostics or {},
+    }
+    path = root / f"failed-input.{identity_digest[:16]}.{attempt}.json"
+    _atomic_json(path, record)
+    pointer = {
+        "schema": 1,
+        "status": "failed_input",
+        "identity_digest": identity_digest,
+        "first_failed_gate": first_gate,
+        "record": path.name,
+    }
+    _atomic_json(latest_path, pointer)
+    _atomic_json(root / "failed-input.json", record)
+    return path
 
 
 def _same_file(left, right):
@@ -1506,35 +1613,6 @@ def _run_independent_replay(package, staging):
     }
 
 
-def _validate_capture_contract(package, staging):
-    output_root = staging / "capture-validation"
-    output_root.mkdir()
-    parsed = mcfreg2.read_package(package)
-    try:
-        frames = mcfreg2.validate_semantic_roles(parsed)
-    except mcfreg2.FormatError as error:
-        raise GenerationError(
-            f"capture_contract: semantic validation failed: {error}"
-        ) from error
-    record = {
-        "schema": 3,
-        "status": "capture_contract_validated",
-        "boundary_mismatches": 0,
-        "calls": len(frames),
-        "pricing_calls": sum(frame.phase == "pricing" for frame in frames),
-        "price_out_calls": sum(
-            frame.phase == "price_out" for frame in frames
-        ),
-        "independent_replay_complete": False,
-    }
-    path = output_root / "mcfreg2-capture.json"
-    _atomic_json(path, record)
-    return {
-        **record,
-        "validation_sha256": _sha256_file(path),
-    }
-
-
 def generate_candidate(
     *,
     authority_root,
@@ -1636,8 +1714,8 @@ def generate_candidate(
         (staging / "replay.reg2").unlink()
         _link_or_copy(staging / "primary.reg2", staging / "replay.reg2")
         _link_or_copy(staging / "primary.reg2", staging / "mcf.reg2")
-        gate = "capture_contract"
-        replay_validation = _validate_capture_contract(
+        gate = "semantic_replay"
+        replay_validation = _run_independent_replay(
             staging / "mcf.reg2", staging
         )
         _clone_tree(authority_root, staging / "authority")
@@ -1655,14 +1733,14 @@ def generate_candidate(
         replay_output_sha256 = _sha256_file(replay_root / "mcf.out")
         manifest = {
             "schema": 1,
-            "status": "candidate",
+            "status": "accepted",
             "identity": identity,
             "package_sha256": digest,
             "primary_package_sha256": primary["package_sha256"],
             "replay_package_sha256": replay["package_sha256"],
             "authority_final_state_sha256": authority_final_sha256,
             "authority_mcf_output_sha256": authority_output_sha256,
-            "capture_contract": replay_validation,
+            "independent_replay": replay_validation,
             "published_runs": {
                 "authority": _tree_hashes(staging / "authority"),
                 "capture_primary": _tree_hashes(staging / "capture-primary"),
@@ -1670,8 +1748,8 @@ def generate_candidate(
             },
         }
         validation = {
-            "schema": 3,
-            "status": "capture_contract_validated",
+            "schema": 2,
+            "status": "accepted",
             "identity": identity,
             "package_sha256": digest,
             "primary_package_sha256": primary["package_sha256"],
@@ -1691,8 +1769,10 @@ def generate_candidate(
             "capture_primary_mcf_output_sha256": primary_output_sha256,
             "capture_replay_mcf_output_sha256": replay_output_sha256,
             "peak_allocated_bytes": primary["peak_allocated_bytes"],
-            "independent_replay_complete": False,
-            "capture_validation_sha256": replay_validation[
+            "independent_replay_complete": True,
+            "canonical_trace_sha256": replay_validation["trace_sha256"],
+            "replay_operations": replay_validation["operations"],
+            "replay_validation_sha256": replay_validation[
                 "validation_sha256"
             ],
         }
@@ -1724,6 +1804,7 @@ def generate_candidate(
             })
         _fsync_tree(staging)
         if final_root.exists():
+            verify_existing_root(final_root, identity)
             existing_manifest = _read_json(
                 final_root / "manifest.json", "existing MCF manifest"
             )
@@ -1765,14 +1846,13 @@ def generate_candidate(
     except Exception as error:
         if staging is not None and staging.exists():
             shutil.rmtree(staging)
-        failure = {
-            "schema": 1,
-            "status": "failed_input",
-            "first_failed_gate": gate,
-            "error": str(error),
-        }
         try:
-            _atomic_json(evidence_root / "failed-input.json", failure)
+            write_failure_record(
+                evidence_root,
+                gate=gate,
+                identity=identity if isinstance(identity, dict) else {},
+                error=error,
+            )
         except Exception:
             pass
         if isinstance(error, GenerationError):
@@ -2008,14 +2088,18 @@ def generate_evidence(
         shutil.rmtree(work)
         return {**result, "status": "accepted", "preflight": readiness}
     except Exception as error:
-        failure = {
-            "schema": 1,
-            "status": "failed_input",
-            "first_failed_gate": "generation",
-            "error": str(error),
-            "work_root": str(work),
-        }
-        _atomic_json(output_root / "failed-input.json", failure)
+        failure_gate = (
+            str(error).split(":", 1)[0]
+            if isinstance(error, GenerationError) and ":" in str(error)
+            else "generation"
+        )
+        write_failure_record(
+            output_root,
+            gate=failure_gate,
+            identity=locals().get("identity", {}),
+            error=error,
+            diagnostics={"work_root": str(work)},
+        )
         if isinstance(error, GenerationError):
             raise
         raise GenerationError(f"generation: {error}") from error
@@ -2048,18 +2132,74 @@ def _verify_published_tree(root, rows, label):
         raise GenerationError(f"{label} artifact tree differs")
 
 
-def verify_accepted(output_root):
+def accepted_roots(output_root):
     output_root = Path(output_root).resolve()
-    roots = [
-        path for path in output_root.iterdir()
+    if not output_root.is_dir():
+        return ()
+    return tuple(
+        path for path in sorted(output_root.iterdir())
         if path.is_dir()
         and len(path.name) == 64
         and all(character in "0123456789abcdef" for character in path.name)
         and (path / "mcf.reg2").is_file()
-    ]
-    if len(roots) != 1:
-        raise GenerationError("accepted MCFREG2 root count differs")
-    root = roots[0]
+        and not (path / "rejection.json").exists()
+    )
+
+
+def verify_existing_root(root, expected_identity):
+    root = Path(root).resolve()
+    if root not in accepted_roots(root.parent):
+        raise GenerationError("published tree root is not accepted")
+    manifest = _read_json(root / "manifest.json", "published tree manifest")
+    if manifest.get("identity") != expected_identity:
+        raise GenerationError("published tree identity differs")
+    return verify_accepted(root.parent, expected_root=root)
+
+
+def reject_accepted_root(root, finding):
+    raw = Path(root)
+    if not raw.is_absolute() or raw.resolve() != raw:
+        raise GenerationError("accepted root path must be resolved and absolute")
+    root = raw.resolve()
+    if root == Path("/") or root == REPO or REPO in root.parents:
+        raise GenerationError("accepted root rejection target is unsafe")
+    if (
+        len(root.name) != 64
+        or any(character not in "0123456789abcdef" for character in root.name)
+        or not (root / "mcf.reg2").is_file()
+        or _sha256_file(root / "mcf.reg2") != root.name
+    ):
+        raise GenerationError("accepted root/package identity differs")
+    target = root.parent / f".rejected-{root.name}"
+    if target.exists():
+        raise GenerationError("accepted root rejection target exists")
+    _atomic_json(root / "rejection.json", {
+        "schema": 1,
+        "status": "rejected",
+        "package_sha256": root.name,
+        "finding": finding,
+    })
+    _fsync_tree(root)
+    os.replace(root, target)
+    descriptor = os.open(root.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return target
+
+
+def verify_accepted(output_root, *, expected_root=None):
+    output_root = Path(output_root).resolve()
+    roots = accepted_roots(output_root)
+    if expected_root is None:
+        if len(roots) != 1:
+            raise GenerationError("accepted MCFREG2 root count differs")
+        root = roots[0]
+    else:
+        root = Path(expected_root).resolve()
+        if root not in roots:
+            raise GenerationError("expected accepted MCFREG2 root is absent")
     package_sha256 = _sha256_file(root / "mcf.reg2")
     if root.name != package_sha256:
         raise GenerationError("accepted root/package SHA-256 differs")
