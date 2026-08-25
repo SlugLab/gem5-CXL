@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import gzip
 import hashlib
@@ -1217,16 +1218,21 @@ def generate_candidate(
                 raise GenerationError(
                     f"capture_determinism: primary/replay {name} differs"
                 )
-        primary = assemble_capture_package(
-            run_root=primary_root,
-            identity=identity,
-            output=staging / "primary.reg2",
-        )
-        replay = assemble_capture_package(
-            run_root=replay_root,
-            identity=identity,
-            output=staging / "replay.reg2",
-        )
+        with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
+            primary_future = executor.submit(
+                assemble_capture_package,
+                run_root=primary_root,
+                identity=identity,
+                output=staging / "primary.reg2",
+            )
+            replay_future = executor.submit(
+                assemble_capture_package,
+                run_root=replay_root,
+                identity=identity,
+                output=staging / "replay.reg2",
+            )
+            primary = primary_future.result()
+            replay = replay_future.result()
         if not _same_file(primary["package"], replay["package"]):
             raise GenerationError(
                 "capture_determinism: primary/replay package bytes differ"
