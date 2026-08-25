@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import hashlib
+import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +20,7 @@ class MCFREG2Test(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.repo = Path(__file__).resolve().parents[3]
 
     def require_module(self):
         self.assertIsNotNone(mcfreg2, "scripts.mcfreg2 is missing")
@@ -212,6 +216,112 @@ class MCFREG2Test(unittest.TestCase):
         actual = mcfreg2.write_package(path, self.fixture_package())
         expected = hashlib.sha256(path.read_bytes()).hexdigest()
         self.assertEqual(actual, expected)
+
+    def compile_cpp_probe(self):
+        compiler = shutil.which("g++")
+        if compiler is None:
+            self.skipTest("g++ is unavailable")
+        implementation = (
+            self.repo / "util/amu/matched_workloads/mcfreg2.cc"
+        )
+        self.assertTrue(implementation.is_file(), "mcfreg2.cc is missing")
+        probe = self.root / "mcfreg2_probe.cc"
+        probe.write_text(
+            """
+#include "mcfreg2.hh"
+
+#include <exception>
+#include <iostream>
+#include <string>
+
+int main(int argc, char **argv)
+{
+    try {
+        if (argc == 3 && std::string(argv[1]) == "--sha") {
+            std::cout << mcfreg2::sha256Hex(argv[2]) << "\\n";
+            return 0;
+        }
+        if (argc != 2)
+            return 2;
+        const auto package = mcfreg2::readPackage(argv[1]);
+        std::cout << mcfreg2::directoryJson(package) << "\\n";
+        return 0;
+    } catch (const std::exception &error) {
+        std::cerr << error.what() << "\\n";
+        return 1;
+    }
+}
+""",
+            encoding="utf-8",
+        )
+        output = self.root / "mcfreg2-probe"
+        subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-I",
+                str(self.repo / "util/amu/matched_workloads"),
+                str(probe),
+                str(implementation),
+                "-o",
+                str(output),
+            ],
+            cwd=self.repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        return output
+
+    def test_cpp_reader_matches_python_directory(self):
+        self.require_module()
+        path = self.write_fixture("parity.reg2")
+        probe = self.compile_cpp_probe()
+        completed = subprocess.run(
+            [probe, path], text=True, stdout=subprocess.PIPE, check=True
+        )
+        self.assertEqual(
+            json.loads(completed.stdout),
+            mcfreg2.read_package(path).directory_json(),
+        )
+
+    def test_cpp_sha256_matches_standard_vectors(self):
+        self.require_module()
+        probe = self.compile_cpp_probe()
+        for value in ("", "abc"):
+            completed = subprocess.run(
+                [probe, "--sha", value],
+                text=True,
+                stdout=subprocess.PIPE,
+                check=True,
+            )
+            self.assertEqual(
+                completed.stdout.strip(),
+                hashlib.sha256(value.encode("ascii")).hexdigest(),
+            )
+
+    def test_cpp_reader_rejects_section_hash_drift(self):
+        self.require_module()
+        path = self.write_fixture("cpp-corrupt.reg2")
+        payload = bytearray(path.read_bytes())
+        first = mcfreg2.DIRECTORY.unpack_from(
+            payload, self.directory_offset(0)
+        )
+        payload[first[3]] ^= 1
+        path.write_bytes(payload)
+        completed = subprocess.run(
+            [self.compile_cpp_probe(), path],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("SHA-256", completed.stderr)
 
 
 if __name__ == "__main__":
