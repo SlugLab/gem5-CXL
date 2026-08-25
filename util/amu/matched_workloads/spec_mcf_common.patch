@@ -1,0 +1,106 @@
+--- a/main_wrapper.c
++++ b/main_wrapper.c
+@@ -4,0 +5 @@
++#include <string.h>
+@@ -5,0 +7 @@
++#include "mcf_capture.h"
+@@ -48 +50,35 @@
+-    /* Call the original main_ptr function */
++    const char *input = NULL;
++    const char *output_root = NULL;
++    int position;
++    int capture_enabled = 0;
++
++#ifdef MCF_CAPTURE_EVENTS
++    capture_enabled = 1;
++#endif
++
++    for (position = 1; position < argc; ++position) {
++        if (strcmp(argv[position], "--input") == 0) {
++            if (++position >= argc) {
++                fprintf(stderr, "missing --input value\n");
++                return 2;
++            }
++            input = argv[position];
++        } else if (strcmp(argv[position], "--output-root") == 0) {
++            if (++position >= argc) {
++                fprintf(stderr, "missing --output-root value\n");
++                return 2;
++            }
++            output_root = argv[position];
++        } else {
++            fprintf(stderr, "unknown argument: %s\n", argv[position]);
++            return 2;
++        }
++    }
++    if (!input || !output_root) {
++        fprintf(stderr, "--input and --output-root are required\n");
++        return 2;
++    }
++    if (mcf_capture_configure(input, output_root, capture_enabled)) {
++        fprintf(stderr, "cannot configure MCF capture harness\n");
++        return 1;
++    }
+--- a/mcf.c
++++ b/mcf.c
+@@ -23,0 +24 @@
++#include "mcf_capture.h"
+@@ -189 +190,5 @@
+-    set_default_inputfile( &net );
++    if( mcf_capture_set_inputfile( net.inputfile, sizeof(net.inputfile) ) )
++    {
++        fprintf( stderr, "cannot set explicit MCF input\n" );
++        return -1;
++    }
+@@ -203,0 +209,5 @@
++        if( mcf_capture_roi_begin( &net ) )
++        {
++            fprintf( stderr, "cannot begin MCF capture ROI\n" );
++            exit(-1);
++        }
+@@ -204,0 +215,5 @@
++        if( mcf_capture_roi_end( &net ) )
++        {
++            fprintf( stderr, "cannot end MCF capture ROI\n" );
++            exit(-1);
++        }
+@@ -210 +225,6 @@
+-      write_circulations( "mcf.out", &net ) ;
++        write_circulations( mcf_capture_output_file(), &net );
++        if( mcf_capture_finish( mcf_capture_output_file() ) )
++        {
++            fprintf( stderr, "cannot finish MCF capture harness\n" );
++            exit(-1);
++        }
+--- a/readmin.c
++++ b/readmin.c
+@@ -23,0 +24 @@
++#include "mcf_capture.h"
+@@ -100,0 +102,15 @@
++
++    if( mcf_capture_allocation(
++            "nodes", (uint64_t)(net->n + 1), sizeof(node_t),
++            (uint64_t)(net->n + 1) * sizeof(node_t) ) ||
++        mcf_capture_allocation(
++            "dummy_arcs", (uint64_t)net->n, sizeof(arc_t),
++            (uint64_t)net->n * sizeof(arc_t) ) ||
++        mcf_capture_allocation(
++            "arcs", (uint64_t)net->max_m, sizeof(arc_t),
++            (uint64_t)net->max_m * sizeof(arc_t) ) )
++    {
++      printf( "read_min(): allocation accounting failed\n" );
++      getfree( net );
++      exit(-1);
++    }
+--- a/implicit.c
++++ b/implicit.c
+@@ -23,0 +24 @@
++#include "mcf_capture.h"
+@@ -64,0 +66,7 @@
++    if( mcf_capture_allocation(
++            "arcs", (uint64_t)net->max_m, sizeof(arc_t),
++            (uint64_t)net->max_m * sizeof(arc_t) ) )
++    {
++        printf( "resize_prob(): allocation accounting failed\n" );
++        exit(-1);
++    }
