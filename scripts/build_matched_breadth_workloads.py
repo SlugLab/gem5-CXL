@@ -2884,7 +2884,11 @@ def _compile(cxx, workload, backend, output, *, fixture):
         command.append("-DMATCHED_FIXTURE=1")
     command.extend(("-I", str(SOURCE_ROOT), str(source)))
     if workload == "mcf":
-        command.append(str(SOURCE_ROOT / "mcfreg2.cc"))
+        command.extend((
+            str(SOURCE_ROOT / "mcfreg2.cc"),
+            str(SOURCE_ROOT / "mcfreg2_state.cc"),
+            str(SOURCE_ROOT / "mcfreg2_kernels.cc"),
+        ))
     command.extend(("-o", str(output)))
     if workload == "mcf":
         command.append("-lz")
@@ -3030,6 +3034,10 @@ def build_suite(
                         SOURCE_ROOT / "mcfreg2.cc",
                         SOURCE_ROOT / "mcfreg2.hh",
                         SOURCE_ROOT / "mcfreg2_format.h",
+                        SOURCE_ROOT / "mcfreg2_state.cc",
+                        SOURCE_ROOT / "mcfreg2_state.hh",
+                        SOURCE_ROOT / "mcfreg2_kernels.cc",
+                        SOURCE_ROOT / "mcfreg2_kernels.hh",
                     )
                 }
     manifest = {

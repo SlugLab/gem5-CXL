@@ -166,7 +166,12 @@ class MatchedRegionBuildTest(unittest.TestCase):
             self.assertRegex(row["trace_abi_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             set(manifest["binaries"]["mcf:reference"]["source_files"]),
-            {"mcf_regions.cc", "mcfreg2.cc", "mcfreg2.hh", "mcfreg2_format.h"},
+            {
+                "mcf_regions.cc", "mcfreg2.cc", "mcfreg2.hh",
+                "mcfreg2_format.h", "mcfreg2_state.cc",
+                "mcfreg2_state.hh", "mcfreg2_kernels.cc",
+                "mcfreg2_kernels.hh",
+            },
         )
         self.assertEqual(
             manifest["shared_objects"]["binaries"], manifest["binaries"]

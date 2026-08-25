@@ -1068,8 +1068,7 @@ def _validate_header(header: Header, file_size: int) -> int:
     if header.arena_capacity < header.active_arcs:
         raise FormatError("MCFREG2 arena capacity is below active arcs")
     if (
-        header.pricing_calls == 0
-        or header.price_out_calls == 0
+        (header.pricing_calls == 0 and header.price_out_calls == 0)
         or header.event_count == 0
     ):
         raise FormatError("MCFREG2 call and event counts must be positive")

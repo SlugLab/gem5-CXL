@@ -5,6 +5,8 @@
 
 #include "mcfreg2.hh"
 #include "canonical_trace.hh"
+#include "mcfreg2_kernels.hh"
+#include "mcfreg2_state.hh"
 
 #include <algorithm>
 #include <array>
@@ -309,7 +311,7 @@ readPackage(const std::string &path)
         throw Error("MCFREG2 network counts must be positive");
     if (header.arenaCapacity < header.activeArcs)
         throw Error("MCFREG2 arena capacity is below active arcs");
-    if (header.pricingCalls == 0U || header.priceOutCalls == 0U ||
+    if ((header.pricingCalls == 0U && header.priceOutCalls == 0U) ||
         header.eventCount == 0U)
         throw Error("MCFREG2 call and event counts must be positive");
 
@@ -416,6 +418,8 @@ struct Json
     Kind kind = Kind::Null;
     bool boolean = false;
     int64_t number = 0;
+    uint64_t unsignedNumber = 0;
+    bool numberIsUnsigned = false;
     std::string string;
     std::vector<Json> array;
     std::map<std::string, Json> object;
@@ -530,15 +534,26 @@ class JsonParser
             ++position;
         if (digits == position || (position - digits > 1 && input[digits] == '0'))
             throw Error("MCFREG2 JSON number is invalid");
-        int64_t result = 0;
+        Json value;
+        value.kind = Json::Kind::Number;
+        if (input[begin] != '-') {
+            const auto converted = std::from_chars(
+                input.data() + begin, input.data() + position,
+                value.unsignedNumber);
+            if (converted.ec != std::errc{} ||
+                converted.ptr != input.data() + position)
+                throw Error("MCFREG2 JSON number is out of range");
+            value.numberIsUnsigned = true;
+            if (value.unsignedNumber <=
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                value.number = static_cast<int64_t>(value.unsignedNumber);
+            return value;
+        }
         const auto converted = std::from_chars(
-            input.data() + begin, input.data() + position, result);
+            input.data() + begin, input.data() + position, value.number);
         if (converted.ec != std::errc{} ||
             converted.ptr != input.data() + position)
             throw Error("MCFREG2 JSON number is out of range");
-        Json value;
-        value.kind = Json::Kind::Number;
-        value.number = result;
         return value;
     }
 
@@ -642,16 +657,24 @@ integer(const Json &object, const char *name)
     const Json &value = field(object, name);
     if (value.kind != Json::Kind::Number)
         throw Error(std::string("MCFREG2 event field is not integer: ") + name);
+    if (value.numberIsUnsigned &&
+        value.unsignedNumber >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        throw Error(std::string("MCFREG2 event field exceeds i64: ") + name);
     return value.number;
 }
 
 uint64_t
 nonnegative(const Json &object, const char *name)
 {
-    const int64_t value = integer(object, name);
-    if (value < 0)
+    const Json &value = field(object, name);
+    if (value.kind != Json::Kind::Number)
+        throw Error(std::string("MCFREG2 event field is not integer: ") + name);
+    if (value.numberIsUnsigned)
+        return value.unsignedNumber;
+    if (value.number < 0)
         throw Error(std::string("MCFREG2 event field is negative: ") + name);
-    return static_cast<uint64_t>(value);
+    return static_cast<uint64_t>(value.number);
 }
 
 std::string
@@ -707,7 +730,9 @@ canonicalJson(const Json &value)
     switch (value.kind) {
       case Json::Kind::Null: return "null";
       case Json::Kind::Boolean: return value.boolean ? "true" : "false";
-      case Json::Kind::Number: return std::to_string(value.number);
+      case Json::Kind::Number:
+        return value.numberIsUnsigned ? std::to_string(value.unsignedNumber) :
+                                        std::to_string(value.number);
       case Json::Kind::String: return escapeJson(value.string);
       case Json::Kind::Array: {
         std::string result = "[";
@@ -752,11 +777,18 @@ class JsonLineReader
         if (schema == 1U) {
             pending.assign(data.begin(), data.end());
             finished = true;
-        } else if (schema == 2U) {
-            std::memset(&stream, 0, sizeof(stream));
-            if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK)
-                throw Error("MCFREG2 gzip event initialization failed");
-            initialized = true;
+        } else if (schema == 2U || schema == 3U) {
+            if (data.size() >= 2U && data[0] == 0x1fU && data[1] == 0x8bU) {
+                std::memset(&stream, 0, sizeof(stream));
+                if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK)
+                    throw Error("MCFREG2 gzip event initialization failed");
+                initialized = true;
+            } else if (schema == 3U) {
+                pending.assign(data.begin(), data.end());
+                finished = true;
+            } else {
+                throw Error("MCFREG2 schema-2 JSONL is not gzip");
+            }
         } else {
             throw Error("MCFREG2 JSONL section schema is unsupported");
         }
@@ -1003,7 +1035,13 @@ class SectionRowReader
         if (found->schema == 1U) {
             legacy = sectionRows(package, section);
             expectedRows = legacy.size();
-        } else if (found->schema == 2U) {
+        } else if (
+            found->schema == 3U && found->storedBytes >= 2U &&
+            package.sections.at(section).size() >= 2U &&
+            package.sections.at(section)[0] != 0x1fU) {
+            legacy = sectionRows(package, section);
+            expectedRows = legacy.size();
+        } else if (found->schema == 2U || found->schema == 3U) {
             stream = std::make_unique<JsonLineReader>(package, section);
         } else {
             throw Error("MCFREG2 row section schema is unsupported");
@@ -1157,6 +1195,347 @@ validateInitialState(const Package &package)
     }
 }
 
+void
+requireKeys(
+    const Json &value, std::initializer_list<const char *> expected,
+    const char *label)
+{
+    if (value.kind != Json::Kind::Object ||
+        value.object.size() != expected.size())
+        throw Error(std::string("MCFREG2 ") + label + " keys differ");
+    for (const char *name : expected) {
+        if (value.object.find(name) == value.object.end())
+            throw Error(std::string("MCFREG2 ") + label + " keys differ");
+    }
+}
+
+McfStableRef
+stableReference(const Json &value, const Package &package, const char *label)
+{
+    requireKeys(value, {"kind", "generation", "index"}, label);
+    const std::string kind = stringField(value, "kind");
+    McfStableRef result{};
+    if (kind == "null")
+        result.kind = MCFREG2_OBJECT_NULL;
+    else if (kind == "node")
+        result.kind = MCFREG2_OBJECT_NODE;
+    else if (kind == "arc")
+        result.kind = MCFREG2_OBJECT_ARC;
+    else if (kind == "dummy_arc")
+        result.kind = MCFREG2_OBJECT_DUMMY_ARC;
+    else
+        throw Error(std::string("MCFREG2 ") + label + " kind differs");
+    const uint64_t generation = nonnegative(value, "generation");
+    if (generation > std::numeric_limits<uint32_t>::max())
+        throw Error(std::string("MCFREG2 ") + label + " generation differs");
+    result.generation = static_cast<uint32_t>(generation);
+    result.objectId = nonnegative(value, "index");
+    if (result.kind == MCFREG2_OBJECT_NULL) {
+        if (result.generation != 0U || result.objectId != Uint64Max)
+            throw Error(std::string("MCFREG2 ") + label + " null differs");
+    } else if (result.kind == MCFREG2_OBJECT_NODE) {
+        if (result.generation != 0U ||
+            result.objectId >= package.header.nodes)
+            throw Error(std::string("MCFREG2 ") + label + " node differs");
+    } else if (result.kind == MCFREG2_OBJECT_ARC) {
+        if (result.objectId >= package.header.arenaCapacity)
+            throw Error(std::string("MCFREG2 ") + label + " arc differs");
+    } else if (result.generation != 0U ||
+               result.objectId >= package.header.dummyArcs) {
+        throw Error(std::string("MCFREG2 ") + label + " dummy arc differs");
+    }
+    return result;
+}
+
+bool
+sameReference(const McfStableRef &left, const McfStableRef &right)
+{
+    return left.kind == right.kind && left.generation == right.generation &&
+           left.objectId == right.objectId;
+}
+
+bool
+sameBasket(const BasketState &left, const BasketState &right)
+{
+    return left.slot == right.slot && sameReference(left.arc, right.arc) &&
+           left.cost == right.cost && left.absCost == right.absCost;
+}
+
+bool
+samePricing(const PricingDerivedOut &left, const PricingDerivedOut &right)
+{
+    if (left.ordinal != right.ordinal ||
+        left.candidates.size() != right.candidates.size() ||
+        left.basket.size() != right.basket.size() ||
+        !sameReference(left.selectedArc, right.selectedArc) ||
+        left.selectedReducedCost != right.selectedReducedCost ||
+        left.arcsPriced != right.arcsPriced ||
+        left.nrGroup != right.nrGroup || left.groupPos != right.groupPos ||
+        left.initialize != right.initialize)
+        return false;
+    for (size_t index = 0; index < left.candidates.size(); ++index) {
+        const auto &a = left.candidates[index];
+        const auto &b = right.candidates[index];
+        if (a.scanPosition != b.scanPosition ||
+            a.reducedCost != b.reducedCost || a.candidate != b.candidate ||
+            a.basketSlot != b.basketSlot)
+            return false;
+    }
+    for (size_t index = 0; index < left.basket.size(); ++index) {
+        if (!sameBasket(left.basket[index], right.basket[index]))
+            return false;
+    }
+    return true;
+}
+
+class PricingTraceAdapter final : public KernelTraceSink
+{
+  public:
+    PricingTraceAdapter(TraceSink &sink, uint64_t &sequence)
+        : sink(sink), sequence(sequence)
+    {}
+
+    void emit(
+        uint16_t phase, matched_trace::Opcode opcode, uint64_t workItem,
+        uint64_t address, uint64_t operand0, uint64_t operand1,
+        uint64_t result) override
+    {
+        emitTrace(
+            sink, phase, opcode, workItem, sequence, address,
+            operand0, operand1, result);
+    }
+
+  private:
+    TraceSink &sink;
+    uint64_t &sequence;
+};
+
+ReplaySummary
+replayStrictPricing(
+    const Package &package, std::FILE *canonicalTrace,
+    const std::string &outputRoot)
+{
+    if (package.header.priceOutCalls != 0U)
+        throw Error("MCFREG2 independent price-out replay is not implemented");
+    TraceSink trace(canonicalTrace);
+    uint64_t sequence = 0;
+    PricingTraceAdapter kernelTrace(trace, sequence);
+    JsonLineReader events(package, MCFREG2_EVENTS);
+    SectionRowReader callRows(package, MCFREG2_CALL_INDEX);
+    SectionRowReader boundaryRows(package, MCFREG2_BOUNDARIES);
+    ReplaySummary summary;
+    bool active = false;
+    bool endingSeen = false;
+    uint64_t expectedOrder = 0;
+    uint64_t frameBegin = 0;
+    PricingLiveIn liveIn;
+    PricingDerivedOut observed;
+
+    Json event;
+    while (events.next(event)) {
+        const uint64_t eventIndex = events.count() - 1U;
+        const std::string kind = stringField(event, "kind");
+        if (kind == "CALL_BEGIN") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "order", "ordinal", "phase",
+                 "m", "nr_group", "group_pos", "initialize"},
+                "pricing call begin");
+            if (active || stringField(event, "role") != "live_in" ||
+                stringField(event, "phase") != "pricing" ||
+                nonnegative(event, "order") != expectedOrder)
+                throw Error("MCFREG2 pricing call entry differs");
+            const uint64_t ordinal = nonnegative(event, "ordinal");
+            if (nonnegative(event, "call") != ordinal)
+                throw Error("MCFREG2 pricing call ordinal differs");
+            liveIn = PricingLiveIn{};
+            observed = PricingDerivedOut{};
+            liveIn.ordinal = ordinal;
+            liveIn.m = nonnegative(event, "m");
+            liveIn.nrGroup = nonnegative(event, "nr_group");
+            liveIn.groupPos = nonnegative(event, "group_pos");
+            liveIn.initialize = boolField(event, "initialize");
+            observed.ordinal = ordinal;
+            frameBegin = eventIndex;
+            endingSeen = false;
+            active = true;
+            continue;
+        }
+        if (!active)
+            throw Error("MCFREG2 pricing event has no call entry");
+        if (endingSeen && kind != "CALL_END")
+            throw Error("MCFREG2 pricing result follows call end state");
+        if (kind == "BASKET_LIVE_IN") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "slot", "arc", "cost",
+                 "abs_cost"},
+                "pricing live-in basket");
+            if (stringField(event, "role") != "live_in" ||
+                nonnegative(event, "call") != liveIn.ordinal)
+                throw Error("MCFREG2 pricing live-in basket role differs");
+            liveIn.basket.push_back(BasketState{
+                nonnegative(event, "slot"),
+                stableReference(field(event, "arc"), package, "basket arc"),
+                integer(event, "cost"), integer(event, "abs_cost"),
+            });
+        } else if (kind == "PRICING_SCAN_LIVE_IN") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "scan_position", "group_pos",
+                 "arc", "tail", "head", "cost", "ident",
+                 "tail_potential", "head_potential"},
+                "pricing scan live-in");
+            if (stringField(event, "role") != "live_in" ||
+                nonnegative(event, "call") != liveIn.ordinal)
+                throw Error("MCFREG2 pricing scan live-in role differs");
+            const uint64_t groupPos = nonnegative(event, "group_pos");
+            const McfStableRef arc = stableReference(
+                field(event, "arc"), package, "scan arc");
+            if (liveIn.nrGroup == 0 ||
+                groupPos != arc.objectId % liveIn.nrGroup)
+                throw Error("MCFREG2 pricing scan group differs");
+            liveIn.scans.push_back(PricingScanLiveIn{
+                nonnegative(event, "scan_position"), arc,
+                stableReference(field(event, "tail"), package, "scan tail"),
+                stableReference(field(event, "head"), package, "scan head"),
+                integer(event, "cost"), integer(event, "ident"),
+                integer(event, "tail_potential"),
+                integer(event, "head_potential"),
+            });
+        } else if (kind == "PRICING_CANDIDATE_OBSERVED") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "scan_position", "reduced_cost",
+                 "candidate", "basket_slot"},
+                "pricing candidate observed");
+            if (stringField(event, "role") != "observed_result" ||
+                nonnegative(event, "call") != liveIn.ordinal)
+                throw Error("MCFREG2 pricing candidate role differs");
+            observed.candidates.push_back(PricingCandidate{
+                nonnegative(event, "scan_position"),
+                integer(event, "reduced_cost"), boolField(event, "candidate"),
+                integer(event, "basket_slot"),
+            });
+        } else if (kind == "BASKET_LIVE_OUT_OBSERVED") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "slot", "arc", "cost",
+                 "abs_cost"},
+                "pricing basket observed");
+            if (stringField(event, "role") != "observed_result" ||
+                nonnegative(event, "call") != liveIn.ordinal)
+                throw Error("MCFREG2 pricing basket result role differs");
+            observed.basket.push_back(BasketState{
+                nonnegative(event, "slot"),
+                stableReference(field(event, "arc"), package, "basket arc"),
+                integer(event, "cost"), integer(event, "abs_cost"),
+            });
+        } else if (kind == "PRICING_END_OBSERVED") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "selected_arc",
+                 "selected_reduced_cost", "arcs_priced", "nr_group",
+                 "group_pos", "initialize"},
+                "pricing end observed");
+            if (endingSeen || stringField(event, "role") !=
+                                  "observed_result" ||
+                nonnegative(event, "call") != liveIn.ordinal)
+                throw Error("MCFREG2 pricing end result role differs");
+            observed.selectedArc = stableReference(
+                field(event, "selected_arc"), package, "selected arc");
+            observed.selectedReducedCost = integer(
+                event, "selected_reduced_cost");
+            observed.arcsPriced = nonnegative(event, "arcs_priced");
+            observed.nrGroup = nonnegative(event, "nr_group");
+            observed.groupPos = nonnegative(event, "group_pos");
+            observed.initialize = boolField(event, "initialize");
+            endingSeen = true;
+        } else if (kind == "CALL_END") {
+            requireKeys(
+                event,
+                {"kind", "role", "call", "order", "ordinal", "phase"},
+                "pricing call end");
+            if (!endingSeen || stringField(event, "role") !=
+                                   "observed_result" ||
+                stringField(event, "phase") != "pricing" ||
+                nonnegative(event, "call") != liveIn.ordinal ||
+                nonnegative(event, "ordinal") != liveIn.ordinal ||
+                nonnegative(event, "order") != expectedOrder)
+                throw Error("MCFREG2 pricing call exit differs");
+
+            Json indexed;
+            if (!callRows.next(indexed))
+                throw Error("MCFREG2 pricing call index is missing");
+            requireKeys(
+                indexed,
+                {"call", "order", "ordinal", "phase", "event_begin",
+                 "event_count"},
+                "pricing call index");
+            if (
+                nonnegative(indexed, "call") != liveIn.ordinal ||
+                nonnegative(indexed, "ordinal") != liveIn.ordinal ||
+                nonnegative(indexed, "order") != expectedOrder ||
+                stringField(indexed, "phase") != "pricing" ||
+                nonnegative(indexed, "event_begin") != frameBegin ||
+                nonnegative(indexed, "event_count") !=
+                    eventIndex - frameBegin + 1U)
+                throw Error("MCFREG2 pricing call index differs");
+            Json boundary;
+            if (!boundaryRows.next(boundary))
+                throw Error("MCFREG2 pricing boundary is missing");
+            requireKeys(
+                boundary,
+                {"call", "order", "phase", "pre_sha256", "post_sha256"},
+                "pricing boundary");
+            if (
+                nonnegative(boundary, "call") != liveIn.ordinal ||
+                nonnegative(boundary, "order") != expectedOrder ||
+                stringField(boundary, "phase") != "pricing" ||
+                stringField(boundary, "pre_sha256") !=
+                    digestCallState(liveIn))
+                throw Error("MCFREG2 pricing pre-boundary differs");
+            if (stringField(boundary, "post_sha256") !=
+                digestCallState(observed))
+                throw Error("MCFREG2 pricing observed boundary differs");
+            const PricingDerivedOut derived = replayPricing(
+                liveIn, kernelTrace);
+            if (!samePricing(derived, observed) ||
+                digestCallState(derived) !=
+                    stringField(boundary, "post_sha256"))
+                throw Error("MCFREG2 derived pricing result differs");
+            emitTrace(
+                trace, 1, matched_trace::Opcode::COMMIT, liveIn.ordinal,
+                sequence, 0, expectedOrder, 0, expectedOrder);
+            ++summary.pricingCalls;
+            ++expectedOrder;
+            active = false;
+        } else {
+            throw Error("MCFREG2 strict pricing event kind differs");
+        }
+    }
+    if (active || events.count() != package.header.eventCount ||
+        summary.pricingCalls != package.header.pricingCalls)
+        throw Error("MCFREG2 strict pricing call count differs");
+    finishSectionRows(callRows, "call index");
+    finishSectionRows(boundaryRows, "boundary");
+    summary.operations = sequence;
+    summary.traceSha256 = trace.finish();
+    std::filesystem::create_directories(outputRoot);
+    std::ofstream validation(outputRoot + "/mcfreg2-replay.json");
+    if (!validation)
+        throw Error("cannot write MCFREG2 replay validation");
+    validation << "{\"boundary_mismatches\":0,\"operations\":"
+               << summary.operations << ",\"price_out_calls\":0,"
+               << "\"pricing_calls\":" << summary.pricingCalls
+               << ",\"status\":\"verified\",\"trace_sha256\":\""
+               << summary.traceSha256 << "\"}\n";
+    validation.flush();
+    if (!validation)
+        throw Error("cannot flush MCFREG2 replay validation");
+    return summary;
+}
+
 } // anonymous namespace
 
 ReplaySummary
@@ -1167,8 +1546,10 @@ replay(
     constexpr uint64_t ArcAddress = UINT64_C(0x800000000);
     constexpr uint64_t PotentialAddress = UINT64_C(0x900000000);
     constexpr uint64_t DeltaAddress = UINT64_C(0xa00000000);
-    TraceSink trace(canonicalTrace);
     validateInitialState(package);
+    if (directoryEntry(package, MCFREG2_EVENTS).schema == 3U)
+        return replayStrictPricing(package, canonicalTrace, outputRoot);
+    TraceSink trace(canonicalTrace);
     JsonLineReader events(package, MCFREG2_EVENTS);
     SectionRowReader basketRows(package, MCFREG2_BASKET);
     SectionRowReader callRows(package, MCFREG2_CALL_INDEX);

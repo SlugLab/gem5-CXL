@@ -268,16 +268,16 @@ class MCFREG2Test(unittest.TestCase):
         for name in mcfreg2.REQUIRED_SECTIONS:
             self.assertEqual(actual.section(name), expected.section(name))
 
-    def strict_semantic_fixture(self, mutation=None):
+    def strict_semantic_fixture(self, mutation=None, *, pricing_only=False):
         pricing_live_in = mcfreg2.PricingLiveIn(
             ordinal=0,
-            m=6,
-            nr_group=3,
+            m=1,
+            nr_group=1,
             group_pos=0,
-            initialize=True,
+            initialize=False,
             basket=(mcfreg2.BasketState(
                 slot=1,
-                arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 2),
+                arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
                 cost=-4,
                 abs_cost=4,
             ),),
@@ -300,19 +300,27 @@ class MCFREG2Test(unittest.TestCase):
                 candidate=True,
                 basket_slot=2,
             ),),
-            basket=(mcfreg2.BasketState(
-                slot=1,
-                arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
-                cost=-2,
-                abs_cost=2,
-            ),),
+            basket=(
+                mcfreg2.BasketState(
+                    slot=1,
+                    arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
+                    cost=-4,
+                    abs_cost=4,
+                ),
+                mcfreg2.BasketState(
+                    slot=2,
+                    arc=mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, 0),
+                    cost=-2,
+                    abs_cost=2,
+                ),
+            ),
             selected_arc=mcfreg2.StableRef(
                 mcfreg2.OBJECT_ARC, 0, 0
             ),
-            selected_reduced_cost=-2,
+            selected_reduced_cost=-4,
             arcs_priced=1,
-            nr_group=3,
-            group_pos=1,
+            nr_group=1,
+            group_pos=0,
             initialize=False,
         )
         price_out_live_in = mcfreg2.PriceOutLiveIn(
@@ -345,11 +353,11 @@ class MCFREG2Test(unittest.TestCase):
         )
         events = [
             {"kind": "CALL_BEGIN", "role": "live_in", "call": 0,
-             "order": 0, "ordinal": 0, "phase": "pricing", "m": 6,
-             "nr_group": 3, "group_pos": 0, "initialize": True},
+             "order": 0, "ordinal": 0, "phase": "pricing", "m": 1,
+             "nr_group": 1, "group_pos": 0, "initialize": False},
             {"kind": "BASKET_LIVE_IN", "role": "live_in", "call": 0,
              "slot": 1, "arc": {"kind": "arc", "generation": 0,
-             "index": 2}, "cost": -4, "abs_cost": 4},
+             "index": 0}, "cost": -4, "abs_cost": 4},
             {"kind": "PRICING_SCAN_LIVE_IN", "role": "live_in",
              "call": 0, "scan_position": 0, "group_pos": 0,
              "arc": {"kind": "arc", "generation": 0, "index": 0},
@@ -363,24 +371,61 @@ class MCFREG2Test(unittest.TestCase):
             {"kind": "BASKET_LIVE_OUT_OBSERVED",
              "role": "observed_result", "call": 0, "slot": 1,
              "arc": {"kind": "arc", "generation": 0, "index": 0},
+             "cost": -4, "abs_cost": 4},
+            {"kind": "BASKET_LIVE_OUT_OBSERVED",
+             "role": "observed_result", "call": 0, "slot": 2,
+             "arc": {"kind": "arc", "generation": 0, "index": 0},
              "cost": -2, "abs_cost": 2},
             {"kind": "PRICING_END_OBSERVED",
              "role": "observed_result", "call": 0,
              "selected_arc": {"kind": "arc", "generation": 0,
-             "index": 0}, "selected_reduced_cost": -2,
-             "arcs_priced": 1, "nr_group": 3, "group_pos": 1,
+             "index": 0}, "selected_reduced_cost": -4,
+             "arcs_priced": 1, "nr_group": 1, "group_pos": 0,
              "initialize": False},
             {"kind": "CALL_END", "role": "observed_result", "call": 0,
              "order": 0, "ordinal": 0, "phase": "pricing"},
         ]
         if mutation == "result-in-live-in":
             events[2]["selected_arc_id"] = 4
+        elif mutation == "coupled-pricing-output":
+            events[3]["reduced_cost"] = -1
+            events[5]["cost"] = -1
+            events[5]["abs_cost"] = 1
+            pricing_out = dataclasses.replace(
+                pricing_out,
+                candidates=(dataclasses.replace(
+                    pricing_out.candidates[0], reduced_cost=-1
+                ),),
+                basket=(
+                    pricing_out.basket[0],
+                    dataclasses.replace(
+                        pricing_out.basket[1], cost=-1, abs_cost=1
+                    ),
+                ),
+            )
+        elif mutation == "tail-potential-results-only":
+            events[2]["tail_potential"] = 11
+            events[3]["reduced_cost"] = -3
+            events[5]["cost"] = -3
+            events[5]["abs_cost"] = 3
+            pricing_out = dataclasses.replace(
+                pricing_out,
+                candidates=(dataclasses.replace(
+                    pricing_out.candidates[0], reduced_cost=-3
+                ),),
+                basket=(
+                    pricing_out.basket[0],
+                    dataclasses.replace(
+                        pricing_out.basket[1], cost=-3, abs_cost=3
+                    ),
+                ),
+            )
         pricing_event_count = len(events)
         null_ref = {
             "kind": "null", "generation": 0,
             "index": mcfreg2.UINT64_MAX,
         }
-        events.extend([
+        price_out_events = [
             {"kind": "CALL_BEGIN", "role": "live_in", "call": 0,
              "order": 1, "ordinal": 0, "phase": "price_out"},
             {"kind": "PRICE_OUT_STATE_LIVE_IN", "role": "live_in",
@@ -400,31 +445,59 @@ class MCFREG2Test(unittest.TestCase):
              "arena_generation": 0, "arena_capacity": 16, "heap": []},
             {"kind": "CALL_END", "role": "observed_result", "call": 0,
              "order": 1, "ordinal": 0, "phase": "price_out"},
-        ])
+        ]
+        if not pricing_only:
+            events.extend(price_out_events)
         boundary = {
             "schema": 3,
             "rows": [
                 {"call": 0, "order": 0, "phase": "pricing",
                  "pre_sha256": mcfreg2.digest_call_state(pricing_live_in),
                  "post_sha256": mcfreg2.digest_call_state(pricing_out)},
-                {"call": 0, "order": 1, "phase": "price_out",
-                 "pre_sha256": mcfreg2.digest_call_state(price_out_live_in),
-                 "post_sha256": mcfreg2.digest_call_state(
-                     price_out_observed
-                 )},
+                *([] if pricing_only else [{
+                    "call": 0, "order": 1, "phase": "price_out",
+                    "pre_sha256": mcfreg2.digest_call_state(
+                        price_out_live_in
+                    ),
+                    "post_sha256": mcfreg2.digest_call_state(
+                        price_out_observed
+                    ),
+                }]),
             ],
         }
         call_index = {"schema": 3, "rows": [
             {"call": 0, "order": 0, "ordinal": 0, "phase": "pricing",
              "event_begin": 0, "event_count": pricing_event_count},
-            {"call": 0, "order": 1, "ordinal": 0, "phase": "price_out",
-             "event_begin": pricing_event_count,
-             "event_count": len(events) - pricing_event_count},
+            *([] if pricing_only else [{
+                "call": 0, "order": 1, "ordinal": 0,
+                "phase": "price_out", "event_begin": pricing_event_count,
+                "event_count": len(events) - pricing_event_count,
+            }]),
         ]}
         sections = {
             name: f"{name.lower()}\n".encode("ascii")
             for name in mcfreg2.REQUIRED_SECTIONS
         }
+        network_words = [3, 2, 16, 6] + [0] * 18
+        null_reference = mcfreg2.StableRef.null().pack()
+        node_record = bytearray(generator.STATE_NODE_BYTES)
+        for offset in range(16, 144, 16):
+            node_record[offset:offset + 16] = null_reference
+        arc_records = []
+        for index in range(9):
+            arc_record = bytearray(generator.STATE_ARC_BYTES)
+            arc_record[8:24] = mcfreg2.StableRef(
+                mcfreg2.OBJECT_NODE, 0, index % 4
+            ).pack()
+            arc_record[24:40] = mcfreg2.StableRef(
+                mcfreg2.OBJECT_NODE, 0, (index + 1) % 4
+            ).pack()
+            arc_record[48:64] = null_reference
+            arc_record[64:80] = null_reference
+            arc_records.append(bytes(arc_record))
+        sections["NETWORK"] = struct.pack("<22Q", *network_words)
+        sections["NODES"] = bytes(node_record) * 4
+        sections["ARCS"] = b"".join(arc_records)
         sections["EVENTS"] = b"".join(
             (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
             .encode("ascii") for row in events
@@ -439,14 +512,30 @@ class MCFREG2Test(unittest.TestCase):
         ).encode("ascii")
         package = mcfreg2.new_package(
             nodes=4, active_arcs=6, dummy_arcs=3, arena_capacity=16,
-            pricing_calls=1, price_out_calls=1, event_count=len(events),
+            pricing_calls=1, price_out_calls=0 if pricing_only else 1,
+            event_count=len(events),
             sections=sections,
             section_schemas={
                 "EVENTS": 3, "CALL_INDEX": 3, "BOUNDARIES": 3,
             },
-            section_layouts={"EVENTS": (len(events), 0)},
+            section_layouts={
+                "NETWORK": (22, 8), "NODES": (4, 176),
+                "ARCS": (9, 96), "EVENTS": (len(events), 0),
+            },
         )
         return package
+
+    def write_strict_semantic_fixture(
+        self, name="strict-semantic.reg2", mutation=None
+    ):
+        path = self.root / name
+        mcfreg2.write_package(
+            path,
+            self.strict_semantic_fixture(
+                mutation, pricing_only=True
+            ),
+        )
+        return path
 
     def test_formal_schema_three_separates_inputs_and_observed_results(self):
         self.require_module()
@@ -567,6 +656,7 @@ int main()
                 "-I", str(self.repo / "util/amu/matched_workloads"),
                 str(source),
                 str(self.repo / "util/amu/matched_workloads/mcfreg2_state.cc"),
+                str(self.repo / "util/amu/matched_workloads/mcfreg2_kernels.cc"),
                 str(self.repo / "util/amu/matched_workloads/mcfreg2.cc"),
                 "-o", str(binary), "-lz",
             ],
@@ -781,6 +871,14 @@ int main(int argc, char **argv)
                 str(self.repo / "util/amu/matched_workloads"),
                 str(probe),
                 str(implementation),
+                str(
+                    self.repo
+                    / "util/amu/matched_workloads/mcfreg2_state.cc"
+                ),
+                str(
+                    self.repo
+                    / "util/amu/matched_workloads/mcfreg2_kernels.cc"
+                ),
                 "-o",
                 str(output),
                 "-lz",
@@ -813,6 +911,14 @@ int main(int argc, char **argv)
                 ),
                 str(
                     self.repo / "util/amu/matched_workloads/mcfreg2.cc"
+                ),
+                str(
+                    self.repo
+                    / "util/amu/matched_workloads/mcfreg2_state.cc"
+                ),
+                str(
+                    self.repo
+                    / "util/amu/matched_workloads/mcfreg2_kernels.cc"
                 ),
                 "-o",
                 str(output),
@@ -913,6 +1019,38 @@ int main(int argc, char **argv)
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("selected arc differs", completed.stderr)
+
+    def test_pricing_rejects_coupled_result_forgery(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "coupled-pricing.reg2", "coupled-pricing-output"
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("derived pricing result differs", completed.stderr)
+
+    def test_pricing_replays_from_live_ins(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(), check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["pricing_calls"], 1)
+        self.assertEqual(result["price_out_calls"], 0)
+        self.assertGreater(result["operations"], 0)
+        self.assertEqual(result["boundary_mismatches"], 0)
+
+    def test_pricing_live_in_change_requires_pre_boundary(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "pricing-live-in-fault.reg2",
+                "tail-potential-results-only",
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("pricing pre-boundary differs", completed.stderr)
 
     def test_mcf_regions_dispatches_reg2_and_forbids_formal_reg1(self):
         binary = self.compile_mcf_regions()

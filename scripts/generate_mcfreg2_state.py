@@ -1444,6 +1444,8 @@ def _run_independent_replay(package, staging):
         str(MATCHED_ROOT),
         str(MATCHED_ROOT / "mcf_regions.cc"),
         str(MATCHED_ROOT / "mcfreg2.cc"),
+        str(MATCHED_ROOT / "mcfreg2_state.cc"),
+        str(MATCHED_ROOT / "mcfreg2_kernels.cc"),
         "-o",
         str(binary),
         "-lz",
