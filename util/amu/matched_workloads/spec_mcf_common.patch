@@ -96,11 +96,22 @@
 +++ b/implicit.c
 @@ -23,0 +24 @@
 +#include "mcf_capture.h"
-@@ -64,0 +66,7 @@
+@@ -41,0 +43,2 @@
++    arc_t *capture_old_arcs = net->arcs;
++    uint64_t capture_old_capacity = (uint64_t)net->max_m;
+@@ -64,0 +68,7 @@
 +    if( mcf_capture_allocation(
 +            "arcs", (uint64_t)net->max_m, sizeof(arc_t),
 +            (uint64_t)net->max_m * sizeof(arc_t) ) )
 +    {
 +        printf( "resize_prob(): allocation accounting failed\n" );
++        exit(-1);
++    }
+@@ -67,0 +78,7 @@
++    if( mcf_capture_arena_remap(
++            capture_old_arcs, capture_old_capacity, net->arcs,
++            (uint64_t)net->max_m ) )
++    {
++        printf( "cannot account for MCF arena remap\n" );
 +        exit(-1);
 +    }

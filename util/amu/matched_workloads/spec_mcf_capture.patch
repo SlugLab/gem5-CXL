@@ -13,6 +13,84 @@
 +        fprintf(stderr, "cannot capture MCF pricing scan\n");
 +        exit(-1);
 +    }
+--- a/implicit.c
++++ b/implicit.c
+@@ -120,0 +121,5 @@
++    if( mcf_capture_price_out_arc_state( &new[newpos] ) )
++    {
++        printf( "cannot capture MCF inserted arc state\n" );
++        exit(-1);
++    }
+@@ -131,0 +137,5 @@
++        if( mcf_capture_price_out_arc_state( &new[pos-1] ) )
++        {
++            printf( "cannot capture MCF moved arc state\n" );
++            exit(-1);
++        }
+@@ -138,0 +149,5 @@
++        if( mcf_capture_price_out_arc_state( &new[pos-1] ) )
++        {
++            printf( "cannot capture MCF inserted arc state\n" );
++            exit(-1);
++        }
+@@ -169,0 +185,5 @@
++    if( mcf_capture_price_out_arc_state( &new[0] ) )
++    {
++        printf( "cannot capture MCF replaced arc state\n" );
++        exit(-1);
++    }
+@@ -181,0 +202,5 @@
++        if( mcf_capture_price_out_arc_state( &new[pos-1] ) )
++        {
++            printf( "cannot capture MCF moved arc state\n" );
++            exit(-1);
++        }
+@@ -187,0 +213,5 @@
++        if( mcf_capture_price_out_arc_state( &new[cmp-1] ) )
++        {
++            printf( "cannot capture MCF replaced arc state\n" );
++            exit(-1);
++        }
+@@ -242,0 +273,2 @@
++    int capture_decision;
++    arc_t *capture_slot;
+@@ -250,0 +283,5 @@
++    if( mcf_capture_price_out_begin( net ) )
++    {
++        printf( "cannot capture MCF price-out begin\n" );
++        exit(-1);
++    }
+@@ -322,0 +360,8 @@
++            capture_decision = 0;
++            capture_slot = (arc_t *)NULL;
++            if( mcf_capture_price_out_candidate(
++                    tail, head, arc_cost, red_cost ) )
++            {
++                printf( "cannot capture MCF price-out candidate\n" );
++                exit(-1);
++            }
+@@ -330,0 +376,2 @@
++                    capture_decision = 1;
++                    capture_slot = arcnew + new_arcs - 1;
+@@ -332,0 +380 @@
++                {
+@@ -334,0 +383,3 @@
++                    capture_decision = 2;
++                    capture_slot = arcnew;
++                }
+@@ -335,0 +387,6 @@
++            if( mcf_capture_price_out_decision(
++                    capture_decision, capture_slot, tail, head ) )
++            {
++                printf( "cannot capture MCF price-out decision\n" );
++                exit(-1);
++            }
+@@ -370,0 +428,5 @@
++    if( mcf_capture_price_out_end( net, new_arcs ) )
++    {
++        printf( "cannot capture MCF price-out end\n" );
++        exit(-1);
++    }
 --- a/pbeampp.c
 +++ b/pbeampp.c
 @@ -28,0 +29 @@

@@ -32,6 +32,18 @@ int mcf_capture_pricing_scan(
 int mcf_capture_pricing_end(
     const arc_t *selected, cost_t reduced_cost, long arcs_priced,
     long nr_group, long group_pos, long initialize, long basket_size);
+int mcf_capture_price_out_begin(const network_t *net);
+int mcf_capture_price_out_candidate(
+    const node_t *tail, const node_t *head, cost_t arc_cost,
+    cost_t reduced_cost);
+int mcf_capture_price_out_decision(
+    int decision, const arc_t *slot, const node_t *tail,
+    const node_t *head);
+int mcf_capture_price_out_arc_state(const arc_t *slot);
+int mcf_capture_arena_remap(
+    const arc_t *old_base, uint64_t old_capacity, const arc_t *new_base,
+    uint64_t new_capacity);
+int mcf_capture_price_out_end(const network_t *net, long new_arcs);
 int mcf_capture_finish(const char *mcf_output);
 
 #endif /* MCF_CAPTURE_H */

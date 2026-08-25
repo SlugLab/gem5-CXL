@@ -336,6 +336,45 @@ int main(int argc, char **argv)
             calls.setdefault(row["call"], []).append(row)
         self.assertGreater(len(calls), 1)
         self.assertEqual(capture_run["pricing_calls"], len(calls))
+        price_out_rows = [
+            json.loads(line)
+            for line in (capture_root / "price_out.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        price_out_calls = {
+            row["call"] for row in price_out_rows if "call" in row
+        }
+        self.assertGreater(len(price_out_calls), 0)
+        self.assertEqual(
+            capture_run["price_out_calls"], len(price_out_calls)
+        )
+        for price_out_call in price_out_calls:
+            price_out_frame = [
+                row for row in price_out_rows
+                if row.get("call") == price_out_call
+            ]
+            self.assertEqual(price_out_frame[0]["kind"], "BEGIN")
+            self.assertEqual(price_out_frame[-1]["kind"], "END")
+            candidates = [
+                row for row in price_out_frame
+                if row["kind"] == "CANDIDATE"
+            ]
+            decisions = [
+                row for row in price_out_frame
+                if row["kind"] == "DECISION"
+            ]
+            self.assertEqual(len(candidates), len(decisions))
+            for candidate, decision in zip(candidates, decisions):
+                self.assertEqual(
+                    candidate["candidate"], decision["candidate"]
+                )
+                self.assertEqual(
+                    candidate["reduced_cost"],
+                    candidate["arc_cost"]
+                    - candidate["tail_potential"]
+                    + candidate["head_potential"],
+                )
 
         previous_live_out = None
         for call_id, frame in sorted(calls.items()):
@@ -448,6 +487,180 @@ int main(int argc, char **argv)
             (capture_root / "mcf.out").read_bytes(),
             (authority_root / "mcf.out").read_bytes(),
         )
+
+    def test_price_out_events_cover_decisions_and_remap_first(self):
+        self.require_module()
+        if shutil.which("cc") is None:
+            self.skipTest("C compiler is unavailable")
+        frozen = self.freeze_approved_source("price-out-frozen")
+        prepared = generator.prepare_native_source(
+            frozen=frozen,
+            capture_enabled=True,
+        )
+        source_dir = Path(prepared["source_dir"])
+        probe_source = self.root / "price_out_probe.c"
+        probe_source.write_text(
+            r'''#include "mcf_capture.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern long resize_prob(network_t *net);
+extern void insert_new_arc(
+    arc_t *new_arcs, long newpos, node_t *tail, node_t *head,
+    cost_t cost, cost_t reduced_cost);
+extern void replace_weaker_arc(
+    network_t *net, arc_t *new_arcs, node_t *tail, node_t *head,
+    cost_t cost, cost_t reduced_cost);
+
+int main(int argc, char **argv)
+{
+    network_t net;
+    char output[4096];
+    FILE *stream;
+    if (argc != 2)
+        return 10;
+    memset(&net, 0, sizeof(net));
+    net.n = 1;
+    net.m = 1;
+    net.max_m = 4;
+    net.max_new_m = 4;
+    net.max_residual_new_m = 2;
+    net.nodes = calloc(2, sizeof(node_t));
+    net.arcs = calloc(4, sizeof(arc_t));
+    net.dummy_arcs = calloc(1, sizeof(arc_t));
+    if (!net.nodes || !net.arcs || !net.dummy_arcs)
+        return 11;
+    net.arcs[0].tail = &net.nodes[0];
+    net.arcs[0].head = &net.nodes[1];
+    net.stop_nodes = net.nodes + 2;
+    net.stop_arcs = net.arcs + 1;
+    net.nodes[1].pred = &net.nodes[0];
+    net.nodes[0].potential = 25;
+    if (mcf_capture_configure("fixture.in", argv[1], 1) ||
+        mcf_capture_roi_begin(&net) ||
+        mcf_capture_price_out_begin(&net))
+        return 12;
+    if (mcf_capture_price_out_candidate(
+            &net.nodes[0], &net.nodes[1], 30, 5) ||
+        mcf_capture_price_out_decision(
+            0, NULL, &net.nodes[0], &net.nodes[1]))
+        return 13;
+    net.nodes[0].potential = 34;
+    if (mcf_capture_price_out_candidate(
+            &net.nodes[0], &net.nodes[1], 30, -4))
+        return 14;
+    insert_new_arc(
+        &net.arcs[1], 0, &net.nodes[0], &net.nodes[1], 30, -4);
+    if (mcf_capture_price_out_decision(
+            1, &net.arcs[1], &net.nodes[0], &net.nodes[1]))
+        return 15;
+    net.arcs[2].flow = -10;
+    net.arcs[3].flow = -10;
+    net.nodes[0].potential = 0;
+    net.nodes[1].potential = 36;
+    if (mcf_capture_price_out_candidate(
+            &net.nodes[1], &net.nodes[0], 30, -6))
+        return 16;
+    replace_weaker_arc(
+        &net, &net.arcs[1], &net.nodes[1], &net.nodes[0], 30, -6);
+    if (mcf_capture_price_out_decision(
+            2, &net.arcs[1], &net.nodes[1], &net.nodes[0]))
+        return 17;
+    if (resize_prob(&net))
+        return 18;
+    net.nodes[1].potential = 38;
+    if (mcf_capture_price_out_candidate(
+            &net.nodes[1], &net.nodes[0], 30, -8))
+        return 19;
+    replace_weaker_arc(
+        &net, &net.arcs[1], &net.nodes[1], &net.nodes[0], 30, -8);
+    if (mcf_capture_price_out_decision(
+            2, &net.arcs[1], &net.nodes[1], &net.nodes[0]))
+        return 20;
+    net.m = 2;
+    net.stop_arcs = net.arcs + net.m;
+    if (mcf_capture_price_out_end(&net, 1) ||
+        mcf_capture_roi_end(&net))
+        return 21;
+    if (snprintf(output, sizeof(output), "%s/mcf.out", argv[1]) < 0)
+        return 22;
+    stream = fopen(output, "w");
+    if (!stream || fputs("fixture\n", stream) == EOF || fclose(stream))
+        return 23;
+    if (mcf_capture_finish(output))
+        return 24;
+    free(net.arcs);
+    free(net.nodes);
+    free(net.dummy_arcs);
+    return 0;
+}
+''',
+            encoding="ascii",
+        )
+        probe = self.root / "price-out-probe"
+        subprocess.run(
+            [
+                shutil.which("cc"),
+                "-std=gnu11",
+                "-Werror=implicit-function-declaration",
+                "-I",
+                str(source_dir),
+                str(probe_source),
+                str(source_dir / "implicit.c"),
+                str(source_dir / "mcfutil.c"),
+                str(source_dir / "mcf_capture.c"),
+                "-o",
+                str(probe),
+            ],
+            check=True,
+        )
+        output_root = self.root / "price-out-run"
+        output_root.mkdir()
+        subprocess.run([str(probe), str(output_root)], check=True)
+        rows = [
+            json.loads(line)
+            for line in (output_root / "price_out.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(rows[0]["kind"], "BEGIN")
+        self.assertEqual(rows[-1]["kind"], "END")
+        self.assertEqual(
+            [row["decision"] for row in rows if row["kind"] == "DECISION"],
+            ["NO_CHANGE", "INSERT", "REPLACE", "REPLACE"],
+        )
+        for index, row in enumerate(rows):
+            if row.get("kind") != "DECISION" or row["decision"] == "NO_CHANGE":
+                continue
+            candidate = row["candidate"]
+            prior_candidate = max(
+                prior for prior in range(index)
+                if rows[prior].get("kind") == "CANDIDATE"
+                and rows[prior]["candidate"] == candidate
+            )
+            self.assertTrue(
+                any(
+                    event.get("kind") == "ARC_STATE"
+                    and event["candidate"] == candidate
+                    for event in rows[prior_candidate + 1:index]
+                )
+            )
+        remap = next(
+            index for index, row in enumerate(rows)
+            if row["kind"] == "ARENA_REMAP"
+        )
+        first_new_generation = next(
+            index for index, row in enumerate(rows)
+            if row.get("reference", {}).get("generation") == 1
+        )
+        self.assertLess(remap, first_new_generation)
+        self.assertEqual(
+            len([row for row in rows if row["kind"] == "ADJACENCY"]),
+            2,
+        )
+        self.assertEqual(rows[-1]["new_arcs"], 1)
+        self.assertEqual(rows[-1]["live_out_m"], 2)
 
 
 if __name__ == "__main__":

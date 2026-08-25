@@ -37,6 +37,19 @@ static long pricing_live_in_expected;
 static long pricing_live_in_seen;
 static long pricing_live_out_seen;
 static int pricing_active;
+static FILE *price_out_stream;
+static uint64_t price_out_calls;
+static uint64_t price_out_candidates;
+static long price_out_live_in_m;
+static int price_out_active;
+static int price_out_candidate_pending;
+static const node_t *price_out_tail;
+static const node_t *price_out_head;
+static cost_t price_out_reduced_cost;
+static int price_out_remapped;
+static const arc_t *capture_arc_base;
+static uint64_t capture_arc_capacity;
+static uint32_t capture_arc_generation;
 
 static char *
 copy_string(const char *value)
@@ -152,7 +165,7 @@ write_arc_ref(FILE *stream, const network_t *net, const arc_t *arc)
     int status = stable_index(
         arc, net->arcs, (uint64_t)net->m, sizeof(arc_t), &index);
     if (status == 0)
-        return write_ref(stream, 2, 0, index);
+        return write_ref(stream, 2, capture_arc_generation, index);
     status = stable_index(
         arc, net->dummy_arcs, (uint64_t)net->n, sizeof(arc_t), &index);
     if (status == 0)
@@ -296,9 +309,14 @@ mcf_capture_configure(
     const char *input, const char *output_root, int capture_enabled)
 {
     char *pricing_path = NULL;
+    char *price_out_path = NULL;
     if (pricing_stream) {
         fclose(pricing_stream);
         pricing_stream = NULL;
+    }
+    if (price_out_stream) {
+        fclose(price_out_stream);
+        price_out_stream = NULL;
     }
     free(capture_input);
     free(capture_root);
@@ -317,6 +335,18 @@ mcf_capture_configure(
     pricing_live_in_seen = 0;
     pricing_live_out_seen = 0;
     pricing_active = 0;
+    price_out_calls = 0;
+    price_out_candidates = 0;
+    price_out_live_in_m = 0;
+    price_out_active = 0;
+    price_out_candidate_pending = 0;
+    price_out_tail = NULL;
+    price_out_head = NULL;
+    price_out_reduced_cost = 0;
+    price_out_remapped = 0;
+    capture_arc_base = NULL;
+    capture_arc_capacity = 0;
+    capture_arc_generation = 0;
     memset(&allocation_state, 0, sizeof(allocation_state));
     if (!capture_input || !capture_root || !capture_output)
         return -1;
@@ -327,6 +357,13 @@ mcf_capture_configure(
         pricing_stream = fopen(pricing_path, "w");
         free(pricing_path);
         if (!pricing_stream)
+            return -1;
+        price_out_path = join_path(output_root, "price_out.jsonl");
+        if (!price_out_path)
+            return -1;
+        price_out_stream = fopen(price_out_path, "w");
+        free(price_out_path);
+        if (!price_out_stream)
             return -1;
     }
     return 0;
@@ -390,9 +427,14 @@ mcf_capture_roi_begin(const network_t *net)
 {
     if (!net || roi_begin_count != 0 || roi_end_count != 0)
         return -1;
-    if (write_network_state("initial.state", net))
+    if (validate_network_layout(net))
         return -1;
     capture_network = net;
+    capture_arc_base = net->arcs;
+    capture_arc_capacity = (uint64_t)net->max_m;
+    capture_arc_generation = 0;
+    if (write_network_state("initial.state", net))
+        return -1;
     ++roi_begin_count;
     printf("MCF_CAPTURE_ROI_BEGIN=after_primal_start_artificial\n");
     fflush(stdout);
@@ -404,7 +446,7 @@ mcf_capture_roi_end(const network_t *net)
 {
     if (!net || roi_begin_count != 1 || roi_end_count != 0)
         return -1;
-    if (net != capture_network || pricing_active)
+    if (net != capture_network || pricing_active || price_out_active)
         return -1;
     if (write_network_state("final.state", net))
         return -1;
@@ -576,6 +618,236 @@ mcf_capture_pricing_end(
 }
 
 int
+mcf_capture_price_out_begin(const network_t *net)
+{
+    if (!capture_events)
+        return 0;
+    if (!price_out_stream || !capture_network || net != capture_network ||
+        price_out_active || pricing_active || net->m < 0 || net->max_m < 0 ||
+        net->arcs != capture_arc_base ||
+        (uint64_t)net->max_m != capture_arc_capacity)
+        return -1;
+    if (fprintf(
+            price_out_stream,
+            "{\"kind\":\"BEGIN\",\"call\":%" PRIu64
+            ",\"live_in_m\":%ld,\"capacity\":%" PRIu64
+            ",\"generation\":%u}\n",
+            price_out_calls, net->m, capture_arc_capacity,
+            capture_arc_generation) < 0)
+        return -1;
+    price_out_active = 1;
+    price_out_candidate_pending = 0;
+    price_out_candidates = 0;
+    price_out_live_in_m = net->m;
+    price_out_remapped = 0;
+    return 0;
+}
+
+int
+mcf_capture_price_out_candidate(
+    const node_t *tail, const node_t *head, cost_t arc_cost,
+    cost_t reduced_cost)
+{
+    uint64_t tail_id;
+    uint64_t head_id;
+    cost_t recomputed;
+    if (!capture_events)
+        return 0;
+    if (!price_out_active || price_out_candidate_pending ||
+        pricing_node_index(tail, &tail_id) ||
+        pricing_node_index(head, &head_id))
+        return -1;
+    recomputed = arc_cost - tail->potential + head->potential;
+    if (recomputed != reduced_cost)
+        return -1;
+    if (fprintf(
+            price_out_stream,
+            "{\"kind\":\"CANDIDATE\",\"call\":%" PRIu64
+            ",\"candidate\":%" PRIu64 ",\"tail_id\":%" PRIu64
+            ",\"head_id\":%" PRIu64 ",\"arc_cost\":%ld,"
+            "\"tail_potential\":%ld,\"head_potential\":%ld,"
+            "\"reduced_cost\":%ld}\n",
+            price_out_calls, price_out_candidates, tail_id, head_id,
+            (long)arc_cost, (long)tail->potential, (long)head->potential,
+            (long)reduced_cost) < 0)
+        return -1;
+    price_out_tail = tail;
+    price_out_head = head;
+    price_out_reduced_cost = reduced_cost;
+    price_out_candidate_pending = 1;
+    return 0;
+}
+
+int
+mcf_capture_price_out_decision(
+    int decision, const arc_t *slot, const node_t *tail,
+    const node_t *head)
+{
+    static const char *const names[] = {
+        "NO_CHANGE", "INSERT", "REPLACE"
+    };
+    uint64_t index = UINT64_MAX;
+    if (!capture_events)
+        return 0;
+    if (!price_out_active || !price_out_candidate_pending || decision < 0 ||
+        decision > 2 || tail != price_out_tail || head != price_out_head)
+        return -1;
+    if (decision == 0) {
+        if (slot)
+            return -1;
+    } else {
+        if (!slot || stable_index(
+                slot, capture_arc_base, capture_arc_capacity,
+                sizeof(arc_t), &index))
+            return -1;
+        if (price_out_reduced_cost >= 0)
+            return -1;
+    }
+    if (decision == 0) {
+        if (fprintf(
+                price_out_stream,
+                "{\"kind\":\"DECISION\",\"call\":%" PRIu64
+                ",\"candidate\":%" PRIu64 ",\"decision\":\"%s\","
+                "\"reference\":{}}\n",
+                price_out_calls, price_out_candidates, names[decision]) < 0)
+            return -1;
+    } else if (fprintf(
+                   price_out_stream,
+                   "{\"kind\":\"DECISION\",\"call\":%" PRIu64
+                   ",\"candidate\":%" PRIu64
+                   ",\"decision\":\"%s\",\"reference\":{"
+                   "\"kind\":\"arc\",\"generation\":%u,"
+                   "\"index\":%" PRIu64 "}}\n",
+                   price_out_calls, price_out_candidates, names[decision],
+                   capture_arc_generation, index) < 0) {
+        return -1;
+    }
+    ++price_out_candidates;
+    price_out_candidate_pending = 0;
+    return 0;
+}
+
+int
+mcf_capture_price_out_arc_state(const arc_t *slot)
+{
+    uint64_t index;
+    uint64_t tail_id;
+    uint64_t head_id;
+    if (!capture_events)
+        return 0;
+    if (!price_out_active || !price_out_candidate_pending ||
+        !slot || stable_index(
+            slot, capture_arc_base, capture_arc_capacity,
+            sizeof(arc_t), &index) ||
+        pricing_node_index(slot->tail, &tail_id) ||
+        pricing_node_index(slot->head, &head_id))
+        return -1;
+    return fprintf(
+               price_out_stream,
+               "{\"kind\":\"ARC_STATE\",\"call\":%" PRIu64
+               ",\"candidate\":%" PRIu64 ",\"reference\":{"
+               "\"kind\":\"arc\",\"generation\":%u,"
+               "\"index\":%" PRIu64 "},\"tail_id\":%" PRIu64
+               ",\"head_id\":%" PRIu64 ",\"cost\":%ld,"
+               "\"org_cost\":%ld,\"flow\":%ld,\"ident\":%d}\n",
+               price_out_calls, price_out_candidates,
+               capture_arc_generation, index, tail_id, head_id,
+               (long)slot->cost, (long)slot->org_cost, (long)slot->flow,
+               slot->ident) < 0 ? -1 : 0;
+}
+
+int
+mcf_capture_arena_remap(
+    const arc_t *old_base, uint64_t old_capacity, const arc_t *new_base,
+    uint64_t new_capacity)
+{
+    uint32_t new_generation;
+    if ((capture_events &&
+         (!price_out_active || price_out_candidate_pending)) ||
+        !capture_network || !new_base || old_base != capture_arc_base ||
+        old_capacity != capture_arc_capacity ||
+        new_capacity <= old_capacity || capture_arc_generation == UINT32_MAX)
+        return -1;
+    new_generation = capture_arc_generation + 1;
+    if (capture_events && fprintf(
+            price_out_stream,
+            "{\"kind\":\"ARENA_REMAP\",\"call\":%" PRIu64
+            ",\"old_generation\":%u,\"new_generation\":%u,"
+            "\"mapped_elements\":%ld,\"old_capacity\":%" PRIu64
+            ",\"new_capacity\":%" PRIu64 "}\n",
+            price_out_calls, capture_arc_generation, new_generation,
+            price_out_live_in_m, old_capacity, new_capacity) < 0)
+        return -1;
+    capture_arc_base = new_base;
+    capture_arc_capacity = new_capacity;
+    capture_arc_generation = new_generation;
+    price_out_remapped = 1;
+    return 0;
+}
+
+static int
+price_out_adjacency(const network_t *net)
+{
+    uint64_t node_index;
+    uint64_t firstout;
+    uint64_t firstin;
+    int out_status;
+    int in_status;
+    for (node_index = 0; node_index < (uint64_t)net->n + 1; ++node_index) {
+        out_status = stable_index(
+            net->nodes[node_index].firstout, net->arcs, (uint64_t)net->m,
+            sizeof(arc_t), &firstout);
+        in_status = stable_index(
+            net->nodes[node_index].firstin, net->arcs, (uint64_t)net->m,
+            sizeof(arc_t), &firstin);
+        if (out_status < 0 || in_status < 0)
+            return -1;
+        if (fprintf(
+                price_out_stream,
+                "{\"kind\":\"ADJACENCY\",\"call\":%" PRIu64
+                ",\"node_id\":%" PRIu64 ",\"generation\":%u,"
+                "\"firstout_index\":%ld,\"firstin_index\":%ld}\n",
+                price_out_calls, node_index, capture_arc_generation,
+                out_status == 1 ? -1L : (long)firstout,
+                in_status == 1 ? -1L : (long)firstin) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+int
+mcf_capture_price_out_end(const network_t *net, long new_arcs)
+{
+    if (!capture_events)
+        return 0;
+    if (!price_out_active || price_out_candidate_pending ||
+        net != capture_network || new_arcs < 0 ||
+        price_out_live_in_m > LONG_MAX - new_arcs ||
+        net->m != price_out_live_in_m + new_arcs ||
+        net->arcs != capture_arc_base || net->max_m < 0 ||
+        (uint64_t)net->max_m != capture_arc_capacity)
+        return -1;
+    if ((new_arcs != 0 || price_out_remapped) && price_out_adjacency(net))
+        return -1;
+    if (fprintf(
+            price_out_stream,
+            "{\"kind\":\"END\",\"call\":%" PRIu64
+            ",\"new_arcs\":%ld,\"live_out_m\":%ld,"
+            "\"candidates\":%" PRIu64 ",\"capacity\":%" PRIu64
+            ",\"generation\":%u,\"m_impl\":%ld,"
+            "\"max_residual_new_m\":%ld}\n",
+            price_out_calls, new_arcs, net->m, price_out_candidates,
+            capture_arc_capacity, capture_arc_generation, net->m_impl,
+            net->max_residual_new_m) < 0)
+        return -1;
+    if (fflush(price_out_stream) || ferror(price_out_stream))
+        return -1;
+    price_out_active = 0;
+    ++price_out_calls;
+    return 0;
+}
+
+int
 mcf_capture_finish(const char *mcf_output)
 {
     char *path;
@@ -583,7 +855,7 @@ mcf_capture_finish(const char *mcf_output)
     struct stat output_stat;
     int status = -1;
     if (!mcf_output || roi_begin_count != 1 || roi_end_count != 1 ||
-        pricing_active ||
+        pricing_active || price_out_active ||
         stat(mcf_output, &output_stat))
         return -1;
     if (pricing_stream) {
@@ -593,6 +865,14 @@ mcf_capture_finish(const char *mcf_output)
             return -1;
         }
         pricing_stream = NULL;
+    }
+    if (price_out_stream) {
+        if (fflush(price_out_stream) || ferror(price_out_stream) ||
+            fclose(price_out_stream)) {
+            price_out_stream = NULL;
+            return -1;
+        }
+        price_out_stream = NULL;
     }
     path = join_path(capture_root, "run.json");
     if (!path)
@@ -619,6 +899,7 @@ mcf_capture_finish(const char *mcf_output)
             "  \"arcs_allocated_bytes\": %" PRIu64 ",\n"
             "  \"peak_allocated_bytes\": %" PRIu64 ",\n"
             "  \"pricing_calls\": %" PRIu64 ",\n"
+            "  \"price_out_calls\": %" PRIu64 ",\n"
             "  \"mcf_output_bytes\": %" PRIu64 "\n}\n",
             capture_events ? "true" : "false",
             roi_begin_count,
@@ -628,6 +909,7 @@ mcf_capture_finish(const char *mcf_output)
             allocation_state.arcs,
             allocation_state.peak,
             pricing_calls,
+            price_out_calls,
             (uint64_t)output_stat.st_size) < 0)
         goto done;
     if (fflush(stream) || ferror(stream))
