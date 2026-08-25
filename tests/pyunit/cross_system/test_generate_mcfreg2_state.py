@@ -11,8 +11,10 @@ from unittest import mock
 from pathlib import Path
 
 try:
+    from scripts import freeze_cross_system_inputs as freezer
     from scripts import generate_mcfreg2_state as generator
 except ImportError:
+    freezer = None
     generator = None
 
 
@@ -139,6 +141,25 @@ class GenerateMCFREG2Test(unittest.TestCase):
                 expected_input_sha256=sha256(input_path),
                 destination=destination,
             )
+
+    def test_preflight_reports_bound_source_lp64_and_capacity(self):
+        self.require_module()
+        source, commit, input_path = self.make_source_repo()
+        result = generator.preflight(
+            source_root=source,
+            source_commit=commit,
+            source_subdir="bench/mcf",
+            input_path=input_path,
+            input_sha256=sha256(input_path),
+            output_root=self.root / "preflight-output",
+            compiler=shutil.which("cc"),
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["source_commit"], commit)
+        self.assertEqual(result["tracked_file_count"], 3)
+        self.assertEqual(result["input_sha256"], sha256(input_path))
+        self.assertTrue(result["lp64"])
+        self.assertGreater(result["available_disk_bytes"], 0)
 
     def freeze_approved_source(self, name="approved-frozen"):
         if not self.APPROVED_SOURCE.is_dir():
@@ -727,6 +748,13 @@ int main(int argc, char **argv)
             ],
             "compiler_sha256": sha256(Path(shutil.which("cc")).resolve()),
         }
+        source_record = self.root / "source-record.json"
+        source_record.write_bytes(generator._canonical_json({
+            "schema": 1,
+            "source_commit": identity["source_commit"],
+            "source_tree_sha256": identity["source_tree_sha256"],
+            "input_sha256": identity["input_sha256"],
+        }))
         evidence_root = self.root / "accepted"
         accepted = generator.generate_candidate(
             authority_root=authority_root,
@@ -734,6 +762,7 @@ int main(int argc, char **argv)
             capture_replay_root=replay_root,
             identity=identity,
             evidence_root=evidence_root,
+            source_record=source_record,
         )
         accepted_root = Path(accepted["accepted_root"])
         self.assertEqual(accepted_root.name, accepted["package_sha256"])
@@ -810,12 +839,32 @@ int main(int argc, char **argv)
         self.assertTrue(
             (accepted_root / "replay-validation/canonical.trace").is_file()
         )
+        self.assertTrue((accepted_root / "authority/run.json").is_file())
+        self.assertTrue((accepted_root / "capture-primary/run.json").is_file())
+        self.assertTrue((accepted_root / "capture-replay/run.json").is_file())
+        candidate = json.loads(
+            (accepted_root / "candidate-record.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        with mock.patch.dict(
+            freezer.MINIMUM_ALLOCATED_BYTES, {"mcf": 1}
+        ):
+            qualified = freezer.validate_mcf_record(candidate["record"])
+            self.assertEqual(
+                qualified["validation"]["package_sha256"],
+                accepted["package_sha256"],
+            )
+            verified = generator.verify_accepted(evidence_root)
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(verified["package_sha256"], accepted["package_sha256"])
         accepted_again = generator.generate_candidate(
             authority_root=authority_root,
             capture_primary_root=primary_root,
             capture_replay_root=replay_root,
             identity=identity,
             evidence_root=evidence_root,
+            source_record=source_record,
         )
         self.assertEqual(accepted_again["accepted_root"], str(accepted_root))
         self.assertEqual(

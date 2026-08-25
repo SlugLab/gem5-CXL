@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
@@ -51,6 +53,9 @@ STATE_ARC_BYTES = 96
 
 class GenerationError(RuntimeError):
     """Formal MCF state generation cannot continue safely."""
+
+
+FORMAL_MINIMUM_ALLOCATED_BYTES = 345_000_000
 
 
 def _git_command(root, *arguments):
@@ -765,6 +770,49 @@ def _same_file(left, right):
     )
 
 
+def _link_or_copy(source, destination):
+    try:
+        os.link(source, destination)
+        return destination
+    except OSError:
+        return shutil.copy2(source, destination)
+
+
+def _clone_tree(source, destination):
+    source = Path(source).resolve()
+    if not source.is_dir():
+        raise GenerationError(f"publication source root is missing: {source}")
+    shutil.copytree(source, destination, copy_function=_link_or_copy)
+
+
+def _tree_hashes(root):
+    root = Path(root)
+    return [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    ]
+
+
+def _fsync_tree(root):
+    root = Path(root)
+    for path in root.rglob("*"):
+        if path.is_file():
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+    directories = [root, *(path for path in root.rglob("*") if path.is_dir())]
+    for path in reversed(directories):
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def _publication_bytes(*roots):
     total = 1024 * 1024
     names = (
@@ -857,6 +905,7 @@ def generate_candidate(
     capture_replay_root,
     identity,
     evidence_root,
+    source_record=None,
 ):
     evidence_root = Path(evidence_root).resolve()
     evidence_root.mkdir(parents=True, exist_ok=True)
@@ -867,6 +916,11 @@ def generate_candidate(
         authority_root = Path(authority_root).resolve()
         primary_root = Path(capture_primary_root).resolve()
         replay_root = Path(capture_replay_root).resolve()
+        source_record = (
+            Path(source_record).resolve() if source_record is not None else None
+        )
+        if source_record is not None and not source_record.is_file():
+            raise GenerationError("preflight: source record is missing")
         required_bytes = _publication_bytes(primary_root, replay_root)
         available_bytes = shutil.disk_usage(evidence_root).free
         if available_bytes < required_bytes:
@@ -934,6 +988,13 @@ def generate_candidate(
         replay_validation = _run_independent_replay(
             staging / "mcf.reg2", staging
         )
+        _clone_tree(authority_root, staging / "authority")
+        _clone_tree(primary_root, staging / "capture-primary")
+        _clone_tree(replay_root, staging / "capture-replay")
+        source_sha256 = None
+        if source_record is not None:
+            shutil.copy2(source_record, staging / "source.json")
+            source_sha256 = _sha256_file(staging / "source.json")
         authority_final_sha256 = _sha256_file(authority_root / "final.state")
         primary_final_sha256 = _sha256_file(primary_root / "final.state")
         replay_final_sha256 = _sha256_file(replay_root / "final.state")
@@ -950,6 +1011,11 @@ def generate_candidate(
             "authority_final_state_sha256": authority_final_sha256,
             "authority_mcf_output_sha256": authority_output_sha256,
             "independent_replay": replay_validation,
+            "published_runs": {
+                "authority": _tree_hashes(staging / "authority"),
+                "capture_primary": _tree_hashes(staging / "capture-primary"),
+                "capture_replay": _tree_hashes(staging / "capture-replay"),
+            },
         }
         validation = {
             "schema": 2,
@@ -978,18 +1044,33 @@ def generate_candidate(
                 "validation_sha256"
             ],
         }
+        if source_sha256 is not None:
+            validation["source_sha256"] = source_sha256
         _atomic_json(staging / "manifest.json", manifest)
         _atomic_json(staging / "validation.json", validation)
-        for artifact in staging.iterdir():
-            if artifact.is_file():
-                with artifact.open("rb") as stream:
-                    os.fsync(stream.fileno())
-        directory_fd = os.open(staging, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
         final_root = evidence_root / digest
+        if source_sha256 is not None:
+            _atomic_json(staging / "candidate-record.json", {
+                "schema": 1,
+                "status": "candidate",
+                "workload": "mcf",
+                "record": {
+                    "input": str(final_root / "mcf.reg2"),
+                    "input_sha256": digest,
+                    "allocated_bytes": primary["peak_allocated_bytes"],
+                    "source": str(final_root / "source.json"),
+                    "source_sha256": source_sha256,
+                    "synthetic": False,
+                    "format": "MCFREG2",
+                    "source_commit": identity["source_commit"],
+                    "source_tree_sha256": identity["source_tree_sha256"],
+                    "validation": str(final_root / "validation.json"),
+                    "validation_sha256": _sha256_file(
+                        staging / "validation.json"
+                    ),
+                },
+            })
+        _fsync_tree(staging)
         if final_root.exists():
             existing_manifest = _read_json(
                 final_root / "manifest.json", "existing MCF manifest"
@@ -1023,6 +1104,11 @@ def generate_candidate(
             "replay_package": str(final_root / "replay.reg2"),
             "manifest": str(final_root / "manifest.json"),
             "validation": str(final_root / "validation.json"),
+            "candidate": (
+                str(final_root / "candidate-record.json")
+                if source_sha256 is not None
+                else None
+            ),
         }
     except Exception as error:
         if staging is not None and staging.exists():
@@ -1042,3 +1128,410 @@ def generate_candidate(
                 raise GenerationError(f"{gate}: {error}") from error
             raise
         raise GenerationError(f"{gate}: {error}") from error
+
+
+def _resolve_compiler(compiler):
+    resolved = shutil.which(str(compiler))
+    if resolved is None:
+        path = Path(compiler).resolve()
+        if not path.is_file():
+            raise GenerationError(f"C compiler is missing: {compiler}")
+        resolved = str(path)
+    return str(Path(resolved).resolve())
+
+
+def _available_memory_bytes():
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, UnicodeDecodeError, ValueError, IndexError):
+        pass
+    pages = os.sysconf("SC_AVPHYS_PAGES")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    return int(pages) * int(page_size)
+
+
+def preflight(
+    *,
+    source_root,
+    source_commit,
+    source_subdir,
+    input_path,
+    input_sha256,
+    output_root,
+    compiler="cc",
+):
+    output_root = Path(output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    compiler = _resolve_compiler(compiler)
+    scratch = Path(tempfile.mkdtemp(prefix=".preflight-", dir=output_root))
+    try:
+        frozen = freeze_source(
+            source_root=source_root,
+            expected_commit=source_commit,
+            source_subdir=source_subdir,
+            input_path=input_path,
+            expected_input_sha256=input_sha256,
+            destination=scratch / "frozen",
+        )
+        probe = scratch / "lp64.c"
+        probe.write_text(
+            "#include <stdint.h>\n"
+            "int main(void) { return sizeof(long) == 8 && "
+            "sizeof(void *) == 8 && sizeof(int64_t) == 8 ? 0 : 1; }\n",
+            encoding="ascii",
+        )
+        binary = scratch / "lp64"
+        _run_checked(
+            (compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", probe,
+             "-o", binary),
+            cwd=scratch,
+            label="LP64 probe compile",
+        )
+        _run_checked((binary,), cwd=scratch, label="LP64 probe run")
+        disk = shutil.disk_usage(output_root).free
+        memory = _available_memory_bytes()
+        required_disk = max(1 << 30, frozen["input_bytes"] * 16384)
+        required_memory = max(512 << 20, frozen["input_bytes"] * 1024)
+        if disk < required_disk:
+            raise GenerationError(
+                "preflight: insufficient disk capacity: "
+                f"required={required_disk} available={disk}"
+            )
+        if memory < required_memory:
+            raise GenerationError(
+                "preflight: insufficient memory capacity: "
+                f"required={required_memory} available={memory}"
+            )
+        return {
+            "schema": 1,
+            "status": "ready",
+            "source_commit": frozen["source_commit"],
+            "source_tree_sha256": frozen["source_tree_sha256"],
+            "tracked_file_count": frozen["tracked_file_count"],
+            "input_sha256": frozen["input_sha256"],
+            "input_bytes": frozen["input_bytes"],
+            "lp64": True,
+            "compiler": _compiler_identity(compiler),
+            "available_disk_bytes": disk,
+            "required_disk_bytes": required_disk,
+            "available_memory_bytes": memory,
+            "required_memory_bytes": required_memory,
+        }
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _source_record(frozen):
+    return {
+        name: frozen[name]
+        for name in (
+            "schema",
+            "source_root",
+            "source_subdir",
+            "source_commit",
+            "source_tree_sha256",
+            "tracked_file_count",
+            "tracked_files",
+            "input",
+            "input_relative",
+            "input_sha256",
+            "input_bytes",
+        )
+    }
+
+
+def _attach_binary(run_root, binary):
+    run_root = Path(run_root)
+    binary = Path(binary)
+    shutil.copy2(binary, run_root / "native-mcf")
+    build_record = binary.parent / f"{binary.name}.build.json"
+    if not build_record.is_file():
+        raise GenerationError("native MCF build record is missing")
+    shutil.copy2(build_record, run_root / "native-mcf.build.json")
+
+
+def generate_evidence(
+    *,
+    source_root,
+    source_commit,
+    source_subdir,
+    input_path,
+    input_sha256,
+    output_root,
+    compiler="cc",
+):
+    output_root = Path(output_root).resolve()
+    readiness = preflight(
+        source_root=source_root,
+        source_commit=source_commit,
+        source_subdir=source_subdir,
+        input_path=input_path,
+        input_sha256=input_sha256,
+        output_root=output_root,
+        compiler=compiler,
+    )
+    compiler = _resolve_compiler(compiler)
+    work = Path(tempfile.mkdtemp(prefix=".generation-", dir=output_root))
+    try:
+        authority_frozen = freeze_source(
+            source_root=source_root,
+            expected_commit=source_commit,
+            source_subdir=source_subdir,
+            input_path=input_path,
+            expected_input_sha256=input_sha256,
+            destination=work / "authority-source",
+        )
+        authority_prepared = prepare_native_source(
+            frozen=authority_frozen, capture_enabled=False
+        )
+        authority_binary = build_native(
+            prepared=authority_prepared,
+            output=work / "bin/authority-mcf",
+            compiler=compiler,
+        )
+        authority_run = work / "authority-run"
+        run_native(
+            binary=authority_binary,
+            input_path=input_path,
+            output_root=authority_run,
+        )
+        _attach_binary(authority_run, authority_binary)
+
+        capture_frozen = freeze_source(
+            source_root=source_root,
+            expected_commit=source_commit,
+            source_subdir=source_subdir,
+            input_path=input_path,
+            expected_input_sha256=input_sha256,
+            destination=work / "capture-source",
+        )
+        capture_prepared = prepare_native_source(
+            frozen=capture_frozen, capture_enabled=True
+        )
+        capture_binary = build_native(
+            prepared=capture_prepared,
+            output=work / "bin/capture-mcf",
+            compiler=compiler,
+        )
+        primary_run = work / "capture-primary-run"
+        replay_run = work / "capture-replay-run"
+        for run_root in (primary_run, replay_run):
+            run_native(
+                binary=capture_binary,
+                input_path=input_path,
+                output_root=run_root,
+            )
+            _attach_binary(run_root, capture_binary)
+        identity = {
+            "source_commit": capture_prepared["source_commit"],
+            "source_tree_sha256": capture_prepared["source_tree_sha256"],
+            "input_sha256": input_sha256,
+            "common_patch_sha256": capture_prepared[
+                "common_patch_sha256"
+            ],
+            "capture_patch_sha256": capture_prepared[
+                "capture_patch_sha256"
+            ],
+            "compiler_sha256": readiness["compiler"]["sha256"],
+        }
+        source_record = work / "source.json"
+        _atomic_json(source_record, _source_record(capture_frozen))
+        result = generate_candidate(
+            authority_root=authority_run,
+            capture_primary_root=primary_run,
+            capture_replay_root=replay_run,
+            identity=identity,
+            evidence_root=output_root,
+            source_record=source_record,
+        )
+        shutil.rmtree(work)
+        return {**result, "status": "accepted", "preflight": readiness}
+    except Exception as error:
+        failure = {
+            "schema": 1,
+            "status": "failed_input",
+            "first_failed_gate": "generation",
+            "error": str(error),
+            "work_root": str(work),
+        }
+        _atomic_json(output_root / "failed-input.json", failure)
+        if isinstance(error, GenerationError):
+            raise
+        raise GenerationError(f"generation: {error}") from error
+
+
+def validate_candidate(path):
+    try:
+        from scripts import freeze_cross_system_inputs as freezer
+    except ImportError:
+        import freeze_cross_system_inputs as freezer
+    candidate = _read_json(path, "MCF candidate record")
+    if (
+        candidate.get("schema") != 1
+        or candidate.get("status") != "candidate"
+        or candidate.get("workload") != "mcf"
+    ):
+        raise GenerationError("MCF candidate record identity differs")
+    try:
+        freezer.validate_mcf_record(candidate.get("record"))
+    except freezer.InputError as error:
+        raise GenerationError(f"MCF candidate qualification failed: {error}") from error
+    return candidate["record"]
+
+
+def _verify_published_tree(root, rows, label):
+    if not isinstance(rows, list):
+        raise GenerationError(f"{label} artifact manifest is invalid")
+    actual = _tree_hashes(root)
+    if actual != rows:
+        raise GenerationError(f"{label} artifact tree differs")
+
+
+def verify_accepted(output_root):
+    output_root = Path(output_root).resolve()
+    roots = [
+        path for path in output_root.iterdir()
+        if path.is_dir()
+        and len(path.name) == 64
+        and all(character in "0123456789abcdef" for character in path.name)
+        and (path / "mcf.reg2").is_file()
+    ]
+    if len(roots) != 1:
+        raise GenerationError("accepted MCFREG2 root count differs")
+    root = roots[0]
+    package_sha256 = _sha256_file(root / "mcf.reg2")
+    if root.name != package_sha256:
+        raise GenerationError("accepted root/package SHA-256 differs")
+    try:
+        mcfreg2.read_package(root / "mcf.reg2")
+    except mcfreg2.FormatError as error:
+        raise GenerationError(f"accepted MCFREG2 package is invalid: {error}") from error
+    validation = _read_json(root / "validation.json", "MCF validation")
+    manifest = _read_json(root / "manifest.json", "MCF manifest")
+    if validation.get("schema") != 2 or validation.get("status") != "accepted":
+        raise GenerationError("accepted MCF validation identity differs")
+    if validation.get("package_sha256") != package_sha256:
+        raise GenerationError("accepted MCF validation package differs")
+    if manifest.get("identity") != validation.get("identity"):
+        raise GenerationError("accepted MCF manifest identity differs")
+    validate_candidate(root / "candidate-record.json")
+    published = manifest.get("published_runs", {})
+    _verify_published_tree(
+        root / "authority", published.get("authority"), "authority"
+    )
+    _verify_published_tree(
+        root / "capture-primary",
+        published.get("capture_primary"),
+        "capture-primary",
+    )
+    _verify_published_tree(
+        root / "capture-replay",
+        published.get("capture_replay"),
+        "capture-replay",
+    )
+    for directory, prefix in (
+        ("authority", "authority"),
+        ("capture-primary", "capture_primary"),
+        ("capture-replay", "capture_replay"),
+    ):
+        if _sha256_file(root / directory / "final.state") != validation.get(
+            f"{prefix}_final_state_sha256"
+        ):
+            raise GenerationError(f"{directory} final state differs")
+        if _sha256_file(root / directory / "mcf.out") != validation.get(
+            f"{prefix}_mcf_output_sha256"
+        ):
+            raise GenerationError(f"{directory} mcf.out differs")
+    replay_root = Path(
+        tempfile.mkdtemp(prefix=".verify-", dir=output_root)
+    )
+    try:
+        replay = _run_independent_replay(root / "mcf.reg2", replay_root)
+        if (
+            replay.get("boundary_mismatches") != 0
+            or replay.get("trace_sha256")
+            != validation.get("canonical_trace_sha256")
+        ):
+            raise GenerationError("independent verification replay differs")
+    finally:
+        shutil.rmtree(replay_root, ignore_errors=True)
+    return {
+        "schema": 1,
+        "status": "verified",
+        "accepted_root": str(root),
+        "package_sha256": package_sha256,
+        "validation_sha256": _sha256_file(root / "validation.json"),
+        "manifest_sha256": _sha256_file(root / "manifest.json"),
+        "peak_allocated_bytes": validation["peak_allocated_bytes"],
+        "pricing_calls": validation["pricing_calls"],
+        "price_out_calls": validation["price_out_calls"],
+        "event_count": validation["event_count"],
+        "boundary_mismatches": validation["boundary_mismatches"],
+    }
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def source_arguments(command):
+        command.add_argument("--source-root", type=Path, required=True)
+        command.add_argument("--source-commit", required=True)
+        command.add_argument("--source-subdir", required=True)
+        command.add_argument("--input", type=Path, required=True)
+        command.add_argument("--input-sha256", required=True)
+        command.add_argument("--output-root", type=Path, required=True)
+        command.add_argument("--compiler", default="cc")
+
+    source_arguments(subparsers.add_parser("preflight"))
+    source_arguments(subparsers.add_parser("generate"))
+    verify = subparsers.add_parser("verify")
+    verify.add_argument("--output-root", type=Path, required=True)
+    verify.add_argument("--accepted", action="store_true", required=True)
+    candidate = subparsers.add_parser("validate-candidate")
+    candidate.add_argument("--candidate", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    options = parse_args(argv)
+    try:
+        if options.command in ("preflight", "generate"):
+            arguments = {
+                "source_root": options.source_root,
+                "source_commit": options.source_commit,
+                "source_subdir": options.source_subdir,
+                "input_path": options.input,
+                "input_sha256": options.input_sha256,
+                "output_root": options.output_root,
+                "compiler": options.compiler,
+            }
+            result = (
+                preflight(**arguments)
+                if options.command == "preflight"
+                else generate_evidence(**arguments)
+            )
+            print(_canonical_json(result).decode("ascii"), end="")
+        elif options.command == "verify":
+            print(
+                _canonical_json(verify_accepted(options.output_root)).decode(
+                    "ascii"
+                ),
+                end="",
+            )
+        else:
+            record = validate_candidate(options.candidate)
+            print(
+                "MCF_CANDIDATE=validated "
+                f"package_sha256={record['input_sha256']}"
+            )
+        return 0
+    except (GenerationError, OSError) as error:
+        print(f"MCFREG2_FAILED error={error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
