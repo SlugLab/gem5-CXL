@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 REPO = Path(__file__).resolve().parents[1]
 MATCHED_ROOT = REPO / "util/amu/matched_workloads"
 COMMON_PATCH = MATCHED_ROOT / "spec_mcf_common.patch"
+CAPTURE_PATCH = MATCHED_ROOT / "spec_mcf_capture.patch"
 CAPTURE_RUNTIME = (
     MATCHED_ROOT / "mcf_capture.h",
     MATCHED_ROOT / "mcf_capture.c",
@@ -247,8 +248,6 @@ def prepare_native_source(*, frozen, capture_enabled):
     source_dir = copied_root / frozen["source_subdir"]
     if not source_dir.is_dir():
         raise GenerationError(f"frozen MCF source is missing: {source_dir}")
-    if capture_enabled:
-        raise GenerationError("capture event patch is not implemented")
     if not COMMON_PATCH.is_file():
         raise GenerationError(f"common MCF patch is missing: {COMMON_PATCH}")
     patch_sha256 = _sha256_file(COMMON_PATCH)
@@ -275,6 +274,30 @@ def prepare_native_source(*, frozen, capture_enabled):
         cwd=source_dir,
         label="common MCF patch apply",
     )
+    capture_patch_sha256 = None
+    if capture_enabled:
+        if not CAPTURE_PATCH.is_file():
+            raise GenerationError(
+                f"capture MCF patch is missing: {CAPTURE_PATCH}"
+            )
+        capture_patch_sha256 = _sha256_file(CAPTURE_PATCH)
+        capture_command = (
+            "git",
+            "apply",
+            "--unidiff-zero",
+            "--whitespace=error-all",
+            CAPTURE_PATCH,
+        )
+        _run_checked(
+            capture_command[:2] + ("--check",) + capture_command[2:],
+            cwd=source_dir,
+            label="capture MCF patch check",
+        )
+        _run_checked(
+            capture_command,
+            cwd=source_dir,
+            label="capture MCF patch apply",
+        )
     runtime_rows = []
     for source in CAPTURE_RUNTIME:
         if not source.is_file():
@@ -293,6 +316,10 @@ def prepare_native_source(*, frozen, capture_enabled):
         "capture_enabled": bool(capture_enabled),
         "common_patch": str(COMMON_PATCH.resolve()),
         "common_patch_sha256": patch_sha256,
+        "capture_patch": (
+            str(CAPTURE_PATCH.resolve()) if capture_enabled else None
+        ),
+        "capture_patch_sha256": capture_patch_sha256,
         "capture_runtime": runtime_rows,
     }
 

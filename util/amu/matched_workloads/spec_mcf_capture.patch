@@ -1,0 +1,61 @@
+--- a/main_wrapper.c
++++ b/main_wrapper.c
+@@ -26,0 +27,2 @@
++    int candidate;
++    long basket_slot = -1;
+@@ -29,0 +32 @@
++    candidate = ((red_cost < 0) && (arc->ident == AT_LOWER)) || ((red_cost > 0) && (arc->ident == AT_UPPER));
+@@ -40,0 +44 @@
++            basket_slot = *basket_size;
+@@ -45,0 +50,5 @@
++    if (mcf_capture_pricing_scan(arc, red_cost, candidate, basket_slot))
++    {
++        fprintf(stderr, "cannot capture MCF pricing scan\n");
++        exit(-1);
++    }
+--- a/pbeampp.c
++++ b/pbeampp.c
+@@ -28,0 +29 @@
++#include "mcf_capture.h"
+@@ -161,0 +163 @@
++    long initialize_in = initialize;
+@@ -199,0 +202,14 @@
++    if( mcf_capture_pricing_begin(
++            m, arcs, stop_arcs, (long)NR_GROUP_STATE,
++            (long)GROUP_POS_STATE, initialize_in, basket_size ) )
++    {
++        printf( "cannot capture MCF pricing begin\n" );
++        exit(-1);
++    }
++    for( i = 1; i <= basket_size; ++i )
++        if( mcf_capture_pricing_basket(
++                0, i, perm[i]->a, perm[i]->cost, perm[i]->abs_cost ) )
++        {
++            printf( "cannot capture MCF pricing live-in basket\n" );
++            exit(-1);
++        }
+@@ -225,0 +242,8 @@
++        if( mcf_capture_pricing_end(
++                (arc_t *)0, *red_cost_of_bea, arcs_priced,
++                (long)NR_GROUP_STATE, (long)GROUP_POS_STATE,
++                initialize, basket_size ) )
++        {
++            printf( "cannot capture MCF pricing end\n" );
++            exit(-1);
++        }
+@@ -234,0 +259,15 @@
++    for( i = 1; i <= basket_size; ++i )
++        if( mcf_capture_pricing_basket(
++                1, i, perm[i]->a, perm[i]->cost, perm[i]->abs_cost ) )
++        {
++            printf( "cannot capture MCF pricing live-out basket\n" );
++            exit(-1);
++        }
++    if( mcf_capture_pricing_end(
++            perm[1]->a, *red_cost_of_bea, arcs_priced,
++            (long)NR_GROUP_STATE, (long)GROUP_POS_STATE,
++            initialize, basket_size ) )
++    {
++        printf( "cannot capture MCF pricing end\n" );
++        exit(-1);
++    }

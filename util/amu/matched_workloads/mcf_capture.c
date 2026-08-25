@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,15 @@ static int capture_events;
 static unsigned roi_begin_count;
 static unsigned roi_end_count;
 static allocation_state_t allocation_state;
+static const network_t *capture_network;
+static FILE *pricing_stream;
+static uint64_t pricing_calls;
+static uint64_t pricing_scan_count;
+static long pricing_nr_group;
+static long pricing_live_in_expected;
+static long pricing_live_in_seen;
+static long pricing_live_out_seen;
+static int pricing_active;
 
 static char *
 copy_string(const char *value)
@@ -285,6 +295,11 @@ int
 mcf_capture_configure(
     const char *input, const char *output_root, int capture_enabled)
 {
+    char *pricing_path = NULL;
+    if (pricing_stream) {
+        fclose(pricing_stream);
+        pricing_stream = NULL;
+    }
     free(capture_input);
     free(capture_root);
     free(capture_output);
@@ -294,8 +309,27 @@ mcf_capture_configure(
     capture_events = capture_enabled ? 1 : 0;
     roi_begin_count = 0;
     roi_end_count = 0;
+    capture_network = NULL;
+    pricing_calls = 0;
+    pricing_scan_count = 0;
+    pricing_nr_group = 0;
+    pricing_live_in_expected = 0;
+    pricing_live_in_seen = 0;
+    pricing_live_out_seen = 0;
+    pricing_active = 0;
     memset(&allocation_state, 0, sizeof(allocation_state));
-    return capture_input && capture_root && capture_output ? 0 : -1;
+    if (!capture_input || !capture_root || !capture_output)
+        return -1;
+    if (capture_events) {
+        pricing_path = join_path(output_root, "pricing.jsonl");
+        if (!pricing_path)
+            return -1;
+        pricing_stream = fopen(pricing_path, "w");
+        free(pricing_path);
+        if (!pricing_stream)
+            return -1;
+    }
+    return 0;
 }
 
 int
@@ -358,6 +392,7 @@ mcf_capture_roi_begin(const network_t *net)
         return -1;
     if (write_network_state("initial.state", net))
         return -1;
+    capture_network = net;
     ++roi_begin_count;
     printf("MCF_CAPTURE_ROI_BEGIN=after_primal_start_artificial\n");
     fflush(stdout);
@@ -369,11 +404,174 @@ mcf_capture_roi_end(const network_t *net)
 {
     if (!net || roi_begin_count != 1 || roi_end_count != 0)
         return -1;
+    if (net != capture_network || pricing_active)
+        return -1;
     if (write_network_state("final.state", net))
         return -1;
     ++roi_end_count;
     printf("MCF_CAPTURE_ROI_END=after_global_opt\n");
     fflush(stdout);
+    return 0;
+}
+
+static int
+pricing_arc_index(const arc_t *arc, uint64_t *index)
+{
+    if (!capture_network || !index)
+        return -1;
+    return stable_index(
+        arc, capture_network->arcs, (uint64_t)capture_network->m,
+        sizeof(arc_t), index);
+}
+
+static int
+pricing_node_index(const node_t *node, uint64_t *index)
+{
+    if (!capture_network || !index)
+        return -1;
+    return stable_index(
+        node, capture_network->nodes, (uint64_t)capture_network->n + 1,
+        sizeof(node_t), index);
+}
+
+int
+mcf_capture_pricing_begin(
+    long m, const arc_t *arcs, const arc_t *stop_arcs, long nr_group,
+    long group_pos, long initialize, long basket_size)
+{
+    if (!capture_events)
+        return 0;
+    if (!pricing_stream || !capture_network || pricing_active || m < 0 ||
+        nr_group <= 0 || group_pos < 0 || group_pos >= nr_group ||
+        basket_size < 0 || m != capture_network->m ||
+        arcs != capture_network->arcs || stop_arcs != arcs + m)
+        return -1;
+    if (fprintf(
+            pricing_stream,
+            "{\"kind\":\"BEGIN\",\"call\":%" PRIu64
+            ",\"m\":%ld,\"nr_group\":%ld,\"group_pos\":%ld,"
+            "\"initialize\":%s,\"basket_size\":%ld}\n",
+            pricing_calls, m, nr_group, group_pos,
+            initialize ? "true" : "false", basket_size) < 0)
+        return -1;
+    pricing_active = 1;
+    pricing_scan_count = 0;
+    pricing_nr_group = nr_group;
+    pricing_live_in_expected = basket_size;
+    pricing_live_in_seen = 0;
+    pricing_live_out_seen = 0;
+    return 0;
+}
+
+int
+mcf_capture_pricing_basket(
+    int live_out, long slot, const arc_t *arc, cost_t cost,
+    cost_t abs_cost)
+{
+    uint64_t arc_id;
+    const char *phase;
+    if (!capture_events)
+        return 0;
+    if (!pricing_active || slot <= 0 || pricing_arc_index(arc, &arc_id))
+        return -1;
+    if (live_out) {
+        if (slot != ++pricing_live_out_seen)
+            return -1;
+        phase = "live_out";
+    } else {
+        if (slot != ++pricing_live_in_seen ||
+            pricing_live_in_seen > pricing_live_in_expected)
+            return -1;
+        phase = "live_in";
+    }
+    return fprintf(
+               pricing_stream,
+               "{\"kind\":\"BASKET\",\"call\":%" PRIu64
+               ",\"phase\":\"%s\",\"slot\":%ld,\"arc_id\":%" PRIu64
+               ",\"cost\":%ld,\"abs_cost\":%ld}\n",
+               pricing_calls, phase, slot, arc_id, (long)cost,
+               (long)abs_cost) < 0 ? -1 : 0;
+}
+
+int
+mcf_capture_pricing_scan(
+    const arc_t *arc, cost_t reduced_cost, int candidate,
+    long basket_slot)
+{
+    uint64_t arc_id;
+    uint64_t tail_id;
+    uint64_t head_id;
+    cost_t recomputed;
+    int expected_candidate;
+    if (!capture_events)
+        return 0;
+    if (!pricing_active || pricing_live_in_seen != pricing_live_in_expected ||
+        pricing_arc_index(arc, &arc_id) ||
+        pricing_node_index(arc->tail, &tail_id) ||
+        pricing_node_index(arc->head, &head_id))
+        return -1;
+    recomputed = arc->cost - arc->tail->potential + arc->head->potential;
+    expected_candidate =
+        ((recomputed < 0) && (arc->ident == AT_LOWER)) ||
+        ((recomputed > 0) && (arc->ident == AT_UPPER));
+    if (recomputed != reduced_cost || !!candidate != expected_candidate ||
+        (basket_slot >= 0 && (!candidate || basket_slot == 0)))
+        return -1;
+    if (fprintf(
+            pricing_stream,
+            "{\"kind\":\"SCAN\",\"call\":%" PRIu64
+            ",\"arc_id\":%" PRIu64 ",\"tail_id\":%" PRIu64
+            ",\"head_id\":%" PRIu64 ",\"arc_cost\":%ld,"
+            "\"tail_potential\":%ld,\"head_potential\":%ld,"
+            "\"ident\":%d,\"reduced_cost\":%ld,\"candidate\":%s,"
+            "\"basket_slot\":%ld,\"group_pos\":%" PRIu64 "}\n",
+            pricing_calls, arc_id, tail_id, head_id, (long)arc->cost,
+            (long)arc->tail->potential, (long)arc->head->potential,
+            arc->ident, (long)reduced_cost, candidate ? "true" : "false",
+            basket_slot, arc_id % (uint64_t)pricing_nr_group) < 0)
+        return -1;
+    ++pricing_scan_count;
+    return 0;
+}
+
+int
+mcf_capture_pricing_end(
+    const arc_t *selected, cost_t reduced_cost, long arcs_priced,
+    long nr_group, long group_pos, long initialize, long basket_size)
+{
+    uint64_t selected_id = UINT64_MAX;
+    long selected_json = -1;
+    if (!capture_events)
+        return 0;
+    if (!pricing_active || nr_group != pricing_nr_group || group_pos < 0 ||
+        group_pos >= nr_group || basket_size < 0 ||
+        pricing_live_in_seen != pricing_live_in_expected ||
+        pricing_live_out_seen != basket_size || arcs_priced < 0 ||
+        (uint64_t)arcs_priced != pricing_scan_count)
+        return -1;
+    if (selected) {
+        if (pricing_arc_index(selected, &selected_id) ||
+            selected_id > (uint64_t)LONG_MAX)
+            return -1;
+        selected_json = (long)selected_id;
+    } else if (basket_size != 0 || reduced_cost != 0) {
+        return -1;
+    }
+    if (fprintf(
+            pricing_stream,
+            "{\"kind\":\"END\",\"call\":%" PRIu64
+            ",\"selected_arc_id\":%ld,\"reduced_cost\":%ld,"
+            "\"arcs_priced\":%ld,\"nr_group\":%ld,"
+            "\"group_pos\":%ld,\"initialize\":%s,"
+            "\"basket_size\":%ld}\n",
+            pricing_calls, selected_json, (long)reduced_cost, arcs_priced,
+            nr_group, group_pos, initialize ? "true" : "false",
+            basket_size) < 0)
+        return -1;
+    if (fflush(pricing_stream) || ferror(pricing_stream))
+        return -1;
+    pricing_active = 0;
+    ++pricing_calls;
     return 0;
 }
 
@@ -385,8 +583,17 @@ mcf_capture_finish(const char *mcf_output)
     struct stat output_stat;
     int status = -1;
     if (!mcf_output || roi_begin_count != 1 || roi_end_count != 1 ||
+        pricing_active ||
         stat(mcf_output, &output_stat))
         return -1;
+    if (pricing_stream) {
+        if (fflush(pricing_stream) || ferror(pricing_stream) ||
+            fclose(pricing_stream)) {
+            pricing_stream = NULL;
+            return -1;
+        }
+        pricing_stream = NULL;
+    }
     path = join_path(capture_root, "run.json");
     if (!path)
         return -1;
@@ -411,6 +618,7 @@ mcf_capture_finish(const char *mcf_output)
             "  \"dummy_arcs_allocated_bytes\": %" PRIu64 ",\n"
             "  \"arcs_allocated_bytes\": %" PRIu64 ",\n"
             "  \"peak_allocated_bytes\": %" PRIu64 ",\n"
+            "  \"pricing_calls\": %" PRIu64 ",\n"
             "  \"mcf_output_bytes\": %" PRIu64 "\n}\n",
             capture_events ? "true" : "false",
             roi_begin_count,
@@ -419,6 +627,7 @@ mcf_capture_finish(const char *mcf_output)
             allocation_state.dummy_arcs,
             allocation_state.arcs,
             allocation_state.peak,
+            pricing_calls,
             (uint64_t)output_stat.st_size) < 0)
         goto done;
     if (fflush(stream) || ferror(stream))

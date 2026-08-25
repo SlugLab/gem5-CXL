@@ -139,7 +139,7 @@ class GenerateMCFREG2Test(unittest.TestCase):
                 destination=destination,
             )
 
-    def freeze_approved_source(self):
+    def freeze_approved_source(self, name="approved-frozen"):
         if not self.APPROVED_SOURCE.is_dir():
             self.skipTest("approved CXLMemUring source is unavailable")
         input_path = (
@@ -151,7 +151,7 @@ class GenerateMCFREG2Test(unittest.TestCase):
             source_subdir="bench/mcf",
             input_path=input_path,
             expected_input_sha256=self.APPROVED_INPUT_SHA256,
-            destination=self.root / "approved-frozen",
+            destination=self.root / name,
         )
 
     def test_common_patch_builds_and_runs_explicit_input(self):
@@ -294,6 +294,160 @@ int main(int argc, char **argv)
                     0,
                     completed.stdout + completed.stderr,
                 )
+
+    def test_pricing_capture_preserves_native_order_and_basket_state(self):
+        self.require_module()
+        if shutil.which("cc") is None:
+            self.skipTest("C compiler is unavailable")
+        tiny_input = self.root / "pricing.in"
+        tiny_input.write_text(
+            "2 2\n0 10\n2 12\n1 2 5\n2 1 7\n",
+            encoding="ascii",
+        )
+
+        capture_frozen = self.freeze_approved_source("capture-frozen")
+        capture_prepared = generator.prepare_native_source(
+            frozen=capture_frozen,
+            capture_enabled=True,
+        )
+        self.assertRegex(
+            capture_prepared["capture_patch_sha256"], r"^[0-9a-f]{64}$"
+        )
+        capture_binary = generator.build_native(
+            prepared=capture_prepared,
+            output=self.root / "mcf-capture",
+            compiler=shutil.which("cc"),
+        )
+        capture_root = self.root / "capture-run"
+        capture_run = generator.run_native(
+            binary=capture_binary,
+            input_path=tiny_input,
+            output_root=capture_root,
+        )
+
+        journal_path = capture_root / "pricing.jsonl"
+        self.assertTrue(journal_path.is_file())
+        rows = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+        calls = {}
+        for row in rows:
+            calls.setdefault(row["call"], []).append(row)
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(capture_run["pricing_calls"], len(calls))
+
+        previous_live_out = None
+        for call_id, frame in sorted(calls.items()):
+            self.assertEqual(frame[0]["kind"], "BEGIN")
+            self.assertEqual(frame[-1]["kind"], "END")
+            if call_id == 0:
+                self.assertTrue(frame[0]["initialize"])
+            scans = [row for row in frame if row["kind"] == "SCAN"]
+            live_in = [
+                row for row in frame
+                if row["kind"] == "BASKET" and row["phase"] == "live_in"
+            ]
+            live_out = [
+                row for row in frame
+                if row["kind"] == "BASKET" and row["phase"] == "live_out"
+            ]
+            self.assertEqual(frame[-1]["arcs_priced"], len(scans))
+            expected_arc_ids = []
+            group_pos = frame[0]["group_pos"]
+            while True:
+                expected_arc_ids.extend(
+                    range(
+                        group_pos,
+                        frame[0]["m"],
+                        frame[0]["nr_group"],
+                    )
+                )
+                group_pos = (group_pos + 1) % frame[0]["nr_group"]
+                if group_pos == frame[-1]["group_pos"]:
+                    break
+            self.assertEqual(
+                [scan["arc_id"] for scan in scans], expected_arc_ids
+            )
+            for scan in scans:
+                self.assertEqual(
+                    scan["reduced_cost"],
+                    scan["arc_cost"]
+                    - scan["tail_potential"]
+                    + scan["head_potential"],
+                )
+                expected_candidate = (
+                    scan["reduced_cost"] < 0 and scan["ident"] == 1
+                ) or (
+                    scan["reduced_cost"] > 0 and scan["ident"] == 2
+                )
+                self.assertEqual(scan["candidate"], expected_candidate)
+                self.assertEqual(
+                    scan["group_pos"],
+                    scan["arc_id"] % frame[0]["nr_group"],
+                )
+                if scan["basket_slot"] >= 0:
+                    self.assertTrue(scan["candidate"])
+                    self.assertGreater(scan["basket_slot"], 0)
+            self.assertEqual(
+                [row["slot"] for row in live_in],
+                list(range(1, len(live_in) + 1)),
+            )
+            self.assertEqual(
+                [row["slot"] for row in live_out],
+                list(range(1, len(live_out) + 1)),
+            )
+            self.assertEqual(
+                [row["abs_cost"] for row in live_out],
+                sorted(
+                    (row["abs_cost"] for row in live_out), reverse=True
+                ),
+            )
+            if live_out:
+                self.assertEqual(
+                    frame[-1]["selected_arc_id"], live_out[0]["arc_id"]
+                )
+                self.assertEqual(
+                    frame[-1]["reduced_cost"], live_out[0]["cost"]
+                )
+            else:
+                self.assertEqual(frame[-1]["selected_arc_id"], -1)
+                self.assertEqual(frame[-1]["reduced_cost"], 0)
+            if previous_live_out is not None:
+                retained_candidates = {
+                    row["arc_id"] for row in previous_live_out[1:]
+                }
+                self.assertTrue(
+                    {row["arc_id"] for row in live_in}.issubset(
+                        retained_candidates
+                    )
+                )
+            previous_live_out = live_out
+
+        authority_frozen = self.freeze_approved_source("authority-frozen")
+        authority_prepared = generator.prepare_native_source(
+            frozen=authority_frozen,
+            capture_enabled=False,
+        )
+        authority_binary = generator.build_native(
+            prepared=authority_prepared,
+            output=self.root / "mcf-authority-pricing",
+            compiler=shutil.which("cc"),
+        )
+        authority_root = self.root / "authority-pricing-run"
+        generator.run_native(
+            binary=authority_binary,
+            input_path=tiny_input,
+            output_root=authority_root,
+        )
+        self.assertEqual(
+            (capture_root / "final.state").read_bytes(),
+            (authority_root / "final.state").read_bytes(),
+        )
+        self.assertEqual(
+            (capture_root / "mcf.out").read_bytes(),
+            (authority_root / "mcf.out").read_bytes(),
+        )
 
 
 if __name__ == "__main__":
