@@ -26,6 +26,8 @@ class KernelTraceSink
 
 PricingDerivedOut replayPricing(
     const PricingLiveIn &liveIn, KernelTraceSink &trace);
+PriceOutDerivedOut replayPriceOut(
+    const PriceOutLiveIn &liveIn, KernelTraceSink &trace);
 
 } // namespace mcfreg2
 

@@ -323,33 +323,145 @@ class MCFREG2Test(unittest.TestCase):
             group_pos=0,
             initialize=False,
         )
+        null = mcfreg2.StableRef.null()
+        resize_price_out = mutation in {
+            "price-out-resize",
+            "price-out-resize-missing-remap",
+            "price-out-resize-stale-generation",
+        }
+        arc_count = 6 if resize_price_out else 3
+        nodes = tuple(
+            mcfreg2.ObjectState(
+                mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, index),
+                (0,) * 6,
+                (null,) * 8,
+            )
+            for index in range(3)
+        )
+        arcs = tuple(
+            mcfreg2.ObjectState(
+                mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 0, index),
+                (
+                    10 + index,
+                    -1 if mutation == "price-out-sparse-prefix" and
+                    index == 1 else 0,
+                    0,
+                    10 + index,
+                ),
+                (
+                    mcfreg2.StableRef(
+                        mcfreg2.OBJECT_NODE, 0, index % 2
+                    ),
+                    mcfreg2.StableRef(
+                        mcfreg2.OBJECT_NODE, 0, (index + 1) % 2
+                    ),
+                    null,
+                    null,
+                ),
+            )
+            for index in range(arc_count)
+        )
+        dummy_arcs = tuple(
+            mcfreg2.ObjectState(
+                mcfreg2.StableRef(mcfreg2.OBJECT_DUMMY_ARC, 0, index),
+                (0,) * 4,
+                (
+                    mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, index),
+                    mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 2),
+                    null,
+                    null,
+                ),
+            )
+            for index in range(2)
+        )
+        price_out_objects = nodes + arcs + dummy_arcs
+        price_out_words = (
+            2,
+            2 if resize_price_out else 1,
+            6 if resize_price_out else 4,
+            arc_count,
+            arc_count,
+            0,
+            2 if resize_price_out else 1,
+            2 if resize_price_out else 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0,
+            arc_count,
+        )
         price_out_live_in = mcfreg2.PriceOutLiveIn(
             ordinal=0,
-            network_words=(6, 16),
-            objects=(),
+            network_words=price_out_words,
+            objects=price_out_objects,
             arena_generation=0,
-            arena_capacity=16,
+            arena_capacity=6 if resize_price_out else 4,
             heap=(),
         )
+        observed_words = list(price_out_words)
+        observed_objects = price_out_objects
+        observed_generation = 0
+        observed_capacity = 4
+        if resize_price_out:
+            observed_words[2] = 8
+            observed_words[6] = 4
+            observed_generation = 1
+            observed_capacity = 8
+            resized_nodes = []
+            for index, node in enumerate(nodes):
+                links = list(node.links)
+                if index == 0:
+                    links[5] = mcfreg2.StableRef(
+                        mcfreg2.OBJECT_ARC, 1, 4
+                    )
+                    links[6] = mcfreg2.StableRef(
+                        mcfreg2.OBJECT_ARC, 1, 5
+                    )
+                elif index == 1:
+                    links[5] = mcfreg2.StableRef(
+                        mcfreg2.OBJECT_ARC, 1, 5
+                    )
+                    links[6] = mcfreg2.StableRef(
+                        mcfreg2.OBJECT_ARC, 1, 4
+                    )
+                resized_nodes.append(dataclasses.replace(
+                    node, links=tuple(links)
+                ))
+            resized_arcs = []
+            for index, arc in enumerate(arcs):
+                links = list(arc.links)
+                previous = (
+                    mcfreg2.StableRef(
+                        mcfreg2.OBJECT_ARC, 1, index - 2
+                    ) if index >= 2 else null
+                )
+                links[2] = previous
+                links[3] = previous
+                resized_arcs.append(mcfreg2.ObjectState(
+                    mcfreg2.StableRef(mcfreg2.OBJECT_ARC, 1, index),
+                    arc.words,
+                    tuple(links),
+                ))
+            observed_objects = (
+                tuple(resized_nodes) + tuple(resized_arcs) + dummy_arcs
+            )
+            if mutation == "price-out-resize-stale-generation":
+                stale = dataclasses.replace(
+                    observed_objects[3],
+                    reference=mcfreg2.StableRef(
+                        mcfreg2.OBJECT_ARC, 0, 0
+                    ),
+                )
+                observed_objects = (
+                    observed_objects[:3] + (stale,) +
+                    observed_objects[4:]
+                )
         price_out_observed = mcfreg2.PriceOutDerivedOut(
             ordinal=0,
-            network_words=(6, 16),
-            objects=(),
-            arena_generation=0,
-            arena_capacity=16,
+            network_words=tuple(observed_words),
+            objects=observed_objects,
+            arena_generation=observed_generation,
+            arena_capacity=observed_capacity,
             heap=(),
-            candidates=(mcfreg2.PriceOutCandidate(
-                candidate=0,
-                tail=mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 0),
-                head=mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 1),
-                cost=30,
-                reduced_cost=10,
-            ),),
-            decisions=(mcfreg2.PriceOutDecision(
-                candidate=0,
-                decision="NO_CHANGE",
-                reference=mcfreg2.StableRef.null(),
-            ),),
+            candidates=(),
+            decisions=(),
         )
         events = [
             {"kind": "CALL_BEGIN", "role": "live_in", "call": 0,
@@ -425,27 +537,133 @@ class MCFREG2Test(unittest.TestCase):
             "kind": "null", "generation": 0,
             "index": mcfreg2.UINT64_MAX,
         }
+        def ref_record(reference):
+            names = {
+                mcfreg2.OBJECT_NULL: "null",
+                mcfreg2.OBJECT_NODE: "node",
+                mcfreg2.OBJECT_ARC: "arc",
+                mcfreg2.OBJECT_DUMMY_ARC: "dummy_arc",
+            }
+            return {
+                "kind": names[reference.kind],
+                "generation": reference.generation,
+                "index": reference.object_id,
+            }
+
+        def object_record(obj):
+            return {
+                "reference": ref_record(obj.reference),
+                "words": list(obj.words),
+                "links": [ref_record(link) for link in obj.links],
+            }
+
+        price_out_live_state_record = {
+            "network_words": list(price_out_words),
+            "objects": [object_record(obj) for obj in price_out_objects],
+            "arena_generation": 0,
+            "arena_capacity": 6 if resize_price_out else 4,
+            "heap": [],
+        }
+        price_out_end_state_record = {
+            "network_words": list(observed_words),
+            "objects": [object_record(obj) for obj in observed_objects],
+            "arena_generation": observed_generation,
+            "arena_capacity": observed_capacity,
+            "heap": [],
+        }
+        remap_events = []
+        arc_final_events = []
+        if resize_price_out:
+            remap_events = [
+                {"kind": "REMAP_OBSERVED",
+                 "role": "observed_result", "call": 0,
+                 "old_reference": ref_record(arc.reference),
+                 "new_reference": ref_record(
+                     mcfreg2.StableRef(
+                         mcfreg2.OBJECT_ARC, 1, arc.reference.object_id
+                     )
+                 )}
+                for arc in arcs
+            ]
+            arc_final_events = [
+                {"kind": "ARC_FINAL_OBSERVED",
+                 "role": "observed_result", "call": 0,
+                 "reference": ref_record(arc.reference),
+                 "tail": ref_record(arc.links[0]),
+                 "head": ref_record(arc.links[1]),
+                 "cost": arc.words[0], "org_cost": arc.words[3],
+                 "flow": arc.words[2], "ident": arc.words[1],
+                 "nextout": ref_record(arc.links[2]),
+                 "nextin": ref_record(arc.links[3])}
+                for arc in observed_objects[3:3 + arc_count]
+            ]
         price_out_events = [
             {"kind": "CALL_BEGIN", "role": "live_in", "call": 0,
              "order": 1, "ordinal": 0, "phase": "price_out"},
             {"kind": "PRICE_OUT_STATE_LIVE_IN", "role": "live_in",
-             "call": 0, "network_words": [6, 16], "objects": [],
-             "arena_generation": 0, "arena_capacity": 16, "heap": []},
-            {"kind": "PRICE_OUT_CANDIDATE_OBSERVED",
-             "role": "observed_result", "call": 0, "candidate": 0,
-             "tail": {"kind": "node", "generation": 0, "index": 0},
-             "head": {"kind": "node", "generation": 0, "index": 1},
-             "cost": 30, "reduced_cost": 10},
-            {"kind": "PRICE_OUT_DECISION_OBSERVED",
-             "role": "observed_result", "call": 0, "candidate": 0,
-             "decision": "NO_CHANGE", "reference": null_ref},
+             "call": 0, **price_out_live_state_record},
+            *remap_events,
+            *arc_final_events,
+            *(
+                {"kind": "ADJACENCY_FINAL_OBSERVED",
+                 "role": "observed_result", "call": 0,
+                 "reference": ref_record(node.reference),
+                 "firstout": ref_record(node.links[5]),
+                 "firstin": ref_record(node.links[6])}
+                for node in observed_objects[:3]
+            ),
             {"kind": "PRICE_OUT_END_OBSERVED",
              "role": "observed_result", "call": 0,
-             "network_words": [6, 16], "objects": [],
-             "arena_generation": 0, "arena_capacity": 16, "heap": []},
+             **price_out_end_state_record},
             {"kind": "CALL_END", "role": "observed_result", "call": 0,
              "order": 1, "ordinal": 0, "phase": "price_out"},
         ]
+        if mutation == "price-out-coupled-candidate":
+            candidate = mcfreg2.PriceOutCandidate(
+                0,
+                mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 0),
+                mcfreg2.StableRef(mcfreg2.OBJECT_NODE, 0, 1),
+                30,
+                -1,
+            )
+            decision = mcfreg2.PriceOutDecision(
+                0, "NO_CHANGE", mcfreg2.StableRef.null()
+            )
+            price_out_observed = dataclasses.replace(
+                price_out_observed,
+                candidates=(candidate,),
+                decisions=(decision,),
+            )
+            price_out_events[2:2] = [
+                {"kind": "PRICE_OUT_CANDIDATE_OBSERVED",
+                 "role": "observed_result", "call": 0,
+                 "candidate": 0,
+                 "tail": ref_record(candidate.tail),
+                 "head": ref_record(candidate.head),
+                 "cost": 30, "reduced_cost": -1},
+                {"kind": "PRICE_OUT_DECISION_OBSERVED",
+                 "role": "observed_result", "call": 0,
+                 "candidate": 0, "decision": "NO_CHANGE",
+                 "reference": null_ref},
+            ]
+        elif mutation == "price-out-wrong-counter":
+            changed_words = list(price_out_words)
+            changed_words[5] = 1
+            price_out_observed = dataclasses.replace(
+                price_out_observed, network_words=tuple(changed_words)
+            )
+            next(
+                row for row in price_out_events
+                if row["kind"] == "PRICE_OUT_END_OBSERVED"
+            )["network_words"] = changed_words
+        elif mutation == "price-out-missing-adjacency":
+            del price_out_events[2]
+        elif mutation == "price-out-resize-missing-remap":
+            missing = next(
+                index for index, row in enumerate(price_out_events)
+                if row["kind"] == "REMAP_OBSERVED"
+            )
+            del price_out_events[missing]
         if not pricing_only:
             events.extend(price_out_events)
         boundary = {
@@ -526,13 +744,14 @@ class MCFREG2Test(unittest.TestCase):
         return package
 
     def write_strict_semantic_fixture(
-        self, name="strict-semantic.reg2", mutation=None
+        self, name="strict-semantic.reg2", mutation=None, *,
+        pricing_only=True
     ):
         path = self.root / name
         mcfreg2.write_package(
             path,
             self.strict_semantic_fixture(
-                mutation, pricing_only=True
+                mutation, pricing_only=pricing_only
             ),
         )
         return path
@@ -1040,6 +1259,103 @@ int main(int argc, char **argv)
         self.assertEqual(result["price_out_calls"], 0)
         self.assertGreater(result["operations"], 0)
         self.assertEqual(result["boundary_mismatches"], 0)
+
+    def test_price_out_replays_no_candidate_state_from_live_ins(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-no-candidate.reg2", pricing_only=False
+            ),
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["pricing_calls"], 1)
+        self.assertEqual(result["price_out_calls"], 1)
+        self.assertGreater(result["operations"], 0)
+        self.assertEqual(result["boundary_mismatches"], 0)
+
+    def test_price_out_rejects_coupled_candidate_and_decision(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-coupled-candidate.reg2",
+                "price-out-coupled-candidate",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("derived price-out result differs", completed.stderr)
+
+    def test_price_out_rejects_wrong_derived_counter(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-wrong-counter.reg2",
+                "price-out-wrong-counter",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("derived price-out result differs", completed.stderr)
+
+    def test_price_out_rejects_missing_adjacency_delta(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-missing-adjacency.reg2",
+                "price-out-missing-adjacency",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("adjacency deltas differ", completed.stderr)
+
+    def test_price_out_rejects_native_undefined_sparse_prefix(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-sparse-prefix.reg2",
+                "price-out-sparse-prefix",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("undefined native first_of_sparse_list", completed.stderr)
+
+    def test_price_out_replays_resize_and_complete_remap(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-resize.reg2",
+                "price-out-resize",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_price_out_rejects_omitted_resize_remap(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-resize-missing-remap.reg2",
+                "price-out-resize-missing-remap",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("remap deltas differ", completed.stderr)
+
+    def test_price_out_rejects_stale_generation_after_resize(self):
+        completed = self.run_cpp_replayer(
+            self.write_strict_semantic_fixture(
+                "price-out-resize-stale-generation.reg2",
+                "price-out-resize-stale-generation",
+                pricing_only=False,
+            ),
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("derived price-out result differs", completed.stderr)
 
     def test_pricing_live_in_change_requires_pre_boundary(self):
         completed = self.run_cpp_replayer(

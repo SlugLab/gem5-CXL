@@ -1238,13 +1238,78 @@ stableReference(const Json &value, const Package &package, const char *label)
             result.objectId >= package.header.nodes)
             throw Error(std::string("MCFREG2 ") + label + " node differs");
     } else if (result.kind == MCFREG2_OBJECT_ARC) {
-        if (result.objectId >= package.header.arenaCapacity)
-            throw Error(std::string("MCFREG2 ") + label + " arc differs");
+        // Arena generation/capacity is call-local and validated by the kernel.
     } else if (result.generation != 0U ||
                result.objectId >= package.header.dummyArcs) {
         throw Error(std::string("MCFREG2 ") + label + " dummy arc differs");
     }
     return result;
+}
+
+std::vector<int64_t>
+integerArray(const Json &value, const char *label)
+{
+    if (value.kind != Json::Kind::Array)
+        throw Error(std::string("MCFREG2 ") + label + " is not an array");
+    std::vector<int64_t> result;
+    result.reserve(value.array.size());
+    for (const auto &item : value.array) {
+        if (item.kind != Json::Kind::Number ||
+            (item.numberIsUnsigned && item.unsignedNumber >
+             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))
+            throw Error(std::string("MCFREG2 ") + label + " word differs");
+        result.push_back(item.number);
+    }
+    return result;
+}
+
+std::vector<McfStableRef>
+referenceArray(
+    const Json &value, const Package &package, const char *label)
+{
+    if (value.kind != Json::Kind::Array)
+        throw Error(std::string("MCFREG2 ") + label + " is not an array");
+    std::vector<McfStableRef> result;
+    result.reserve(value.array.size());
+    for (const auto &item : value.array)
+        result.push_back(stableReference(item, package, label));
+    return result;
+}
+
+std::vector<ObjectState>
+objectArray(const Json &value, const Package &package)
+{
+    if (value.kind != Json::Kind::Array)
+        throw Error("MCFREG2 price-out objects are not an array");
+    std::vector<ObjectState> result;
+    result.reserve(value.array.size());
+    for (const auto &item : value.array) {
+        requireKeys(item, {"reference", "words", "links"},
+                    "price-out object");
+        result.push_back(ObjectState{
+            stableReference(
+                field(item, "reference"), package, "object reference"),
+            integerArray(field(item, "words"), "object words"),
+            referenceArray(field(item, "links"), package, "object links"),
+        });
+    }
+    return result;
+}
+
+template<class T>
+void
+parsePriceOutCommon(const Json &event, const Package &package, T &state)
+{
+    state.networkWords = integerArray(
+        field(event, "network_words"), "price-out network words");
+    state.objects = objectArray(field(event, "objects"), package);
+    const uint64_t generation = nonnegative(event, "arena_generation");
+    if (generation > std::numeric_limits<uint32_t>::max())
+        throw Error("MCFREG2 price-out arena generation differs");
+    state.arenaGeneration = static_cast<uint32_t>(generation);
+    state.arenaCapacity = nonnegative(event, "arena_capacity");
+    state.heap = referenceArray(
+        field(event, "heap"), package, "price-out heap");
 }
 
 bool
@@ -1288,6 +1353,115 @@ samePricing(const PricingDerivedOut &left, const PricingDerivedOut &right)
     return true;
 }
 
+struct ArcFinalDelta
+{
+    McfStableRef reference{};
+    McfStableRef tail{};
+    McfStableRef head{};
+    int64_t cost = 0;
+    int64_t orgCost = 0;
+    int64_t flow = 0;
+    int64_t ident = 0;
+    McfStableRef nextout{};
+    McfStableRef nextin{};
+};
+
+struct RemapDelta
+{
+    McfStableRef oldReference{};
+    McfStableRef newReference{};
+};
+
+struct AdjacencyDelta
+{
+    McfStableRef reference{};
+    McfStableRef firstout{};
+    McfStableRef firstin{};
+};
+
+const ObjectState &
+findObject(
+    const std::vector<ObjectState> &objects, const McfStableRef &reference,
+    const char *label)
+{
+    const ObjectState *match = nullptr;
+    for (const auto &object : objects) {
+        if (!sameReference(object.reference, reference))
+            continue;
+        if (match)
+            throw Error(std::string("MCFREG2 ") + label + " is duplicated");
+        match = &object;
+    }
+    if (!match)
+        throw Error(std::string("MCFREG2 ") + label + " is missing");
+    return *match;
+}
+
+void
+validatePriceOutDeltas(
+    const PriceOutLiveIn &liveIn, const PriceOutDerivedOut &derived,
+    const std::vector<ArcFinalDelta> &arcFinals,
+    const std::vector<RemapDelta> &remaps,
+    const std::vector<AdjacencyDelta> &adjacency)
+{
+    if (liveIn.networkWords.size() != 23U ||
+        derived.networkWords.size() != 23U || liveIn.networkWords[3] < 0 ||
+        derived.networkWords[0] < 0 || derived.networkWords[3] < 0)
+        throw Error("MCFREG2 price-out delta state differs");
+    const uint64_t liveM = static_cast<uint64_t>(liveIn.networkWords[3]);
+    const uint64_t finalM = static_cast<uint64_t>(derived.networkWords[3]);
+    const bool remapped = derived.arenaGeneration != liveIn.arenaGeneration;
+    const uint64_t arcBegin = remapped ? 0U : liveM;
+    if (finalM < arcBegin || arcFinals.size() != finalM - arcBegin)
+        throw Error("MCFREG2 price-out final arc deltas differ");
+    for (uint64_t index = arcBegin; index < finalM; ++index) {
+        const auto &delta = arcFinals[static_cast<size_t>(index - arcBegin)];
+        const McfStableRef expected{
+            MCFREG2_OBJECT_ARC, derived.arenaGeneration, index};
+        if (!sameReference(delta.reference, expected))
+            throw Error("MCFREG2 price-out final arc order differs");
+        const auto &object = findObject(
+            derived.objects, expected, "derived final arc");
+        if (object.words.size() != 4U || object.links.size() != 4U ||
+            !sameReference(delta.tail, object.links[0]) ||
+            !sameReference(delta.head, object.links[1]) ||
+            delta.cost != object.words[0] || delta.ident != object.words[1] ||
+            delta.flow != object.words[2] ||
+            delta.orgCost != object.words[3] ||
+            !sameReference(delta.nextout, object.links[2]) ||
+            !sameReference(delta.nextin, object.links[3]))
+            throw Error("MCFREG2 price-out final arc delta differs");
+    }
+    const size_t expectedRemaps = remapped ? static_cast<size_t>(liveM) : 0U;
+    if (remaps.size() != expectedRemaps ||
+        (remapped && derived.arenaGeneration != liveIn.arenaGeneration + 1U))
+        throw Error("MCFREG2 price-out remap deltas differ");
+    for (uint64_t index = 0; remapped && index < liveM; ++index) {
+        const McfStableRef oldReference{
+            MCFREG2_OBJECT_ARC, liveIn.arenaGeneration, index};
+        const McfStableRef newReference{
+            MCFREG2_OBJECT_ARC, derived.arenaGeneration, index};
+        const auto &delta = remaps[static_cast<size_t>(index)];
+        if (!sameReference(delta.oldReference, oldReference) ||
+            !sameReference(delta.newReference, newReference))
+            throw Error("MCFREG2 price-out remap delta differs");
+    }
+    const uint64_t nodes = static_cast<uint64_t>(derived.networkWords[0]);
+    if (nodes == Uint64Max || adjacency.size() != nodes + 1U)
+        throw Error("MCFREG2 price-out adjacency deltas differ");
+    for (uint64_t index = 0; index <= nodes; ++index) {
+        const McfStableRef expected{MCFREG2_OBJECT_NODE, 0, index};
+        const auto &delta = adjacency[static_cast<size_t>(index)];
+        const auto &object = findObject(
+            derived.objects, expected, "derived adjacency node");
+        if (object.links.size() != 8U ||
+            !sameReference(delta.reference, expected) ||
+            !sameReference(delta.firstout, object.links[5]) ||
+            !sameReference(delta.firstin, object.links[6]))
+            throw Error("MCFREG2 price-out adjacency delta differs");
+    }
+}
+
 class PricingTraceAdapter final : public KernelTraceSink
 {
   public:
@@ -1311,12 +1485,10 @@ class PricingTraceAdapter final : public KernelTraceSink
 };
 
 ReplaySummary
-replayStrictPricing(
+replayStrict(
     const Package &package, std::FILE *canonicalTrace,
     const std::string &outputRoot)
 {
-    if (package.header.priceOutCalls != 0U)
-        throw Error("MCFREG2 independent price-out replay is not implemented");
     TraceSink trace(canonicalTrace);
     uint64_t sequence = 0;
     PricingTraceAdapter kernelTrace(trace, sequence);
@@ -1328,34 +1500,58 @@ replayStrictPricing(
     bool endingSeen = false;
     uint64_t expectedOrder = 0;
     uint64_t frameBegin = 0;
+    std::string activePhase;
     PricingLiveIn liveIn;
     PricingDerivedOut observed;
+    PriceOutLiveIn priceOutLiveIn;
+    PriceOutDerivedOut priceOutObserved;
+    bool priceOutStateSeen = false;
+    std::vector<ArcFinalDelta> arcFinals;
+    std::vector<RemapDelta> remaps;
+    std::vector<AdjacencyDelta> adjacency;
 
     Json event;
     while (events.next(event)) {
         const uint64_t eventIndex = events.count() - 1U;
         const std::string kind = stringField(event, "kind");
         if (kind == "CALL_BEGIN") {
-            requireKeys(
-                event,
-                {"kind", "role", "call", "order", "ordinal", "phase",
-                 "m", "nr_group", "group_pos", "initialize"},
-                "pricing call begin");
             if (active || stringField(event, "role") != "live_in" ||
-                stringField(event, "phase") != "pricing" ||
                 nonnegative(event, "order") != expectedOrder)
-                throw Error("MCFREG2 pricing call entry differs");
+                throw Error("MCFREG2 strict call entry differs");
+            activePhase = stringField(event, "phase");
             const uint64_t ordinal = nonnegative(event, "ordinal");
             if (nonnegative(event, "call") != ordinal)
-                throw Error("MCFREG2 pricing call ordinal differs");
-            liveIn = PricingLiveIn{};
-            observed = PricingDerivedOut{};
-            liveIn.ordinal = ordinal;
-            liveIn.m = nonnegative(event, "m");
-            liveIn.nrGroup = nonnegative(event, "nr_group");
-            liveIn.groupPos = nonnegative(event, "group_pos");
-            liveIn.initialize = boolField(event, "initialize");
-            observed.ordinal = ordinal;
+                throw Error("MCFREG2 strict call ordinal differs");
+            if (activePhase == "pricing") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "order", "ordinal", "phase",
+                     "m", "nr_group", "group_pos", "initialize"},
+                    "pricing call begin");
+                liveIn = PricingLiveIn{};
+                observed = PricingDerivedOut{};
+                liveIn.ordinal = ordinal;
+                liveIn.m = nonnegative(event, "m");
+                liveIn.nrGroup = nonnegative(event, "nr_group");
+                liveIn.groupPos = nonnegative(event, "group_pos");
+                liveIn.initialize = boolField(event, "initialize");
+                observed.ordinal = ordinal;
+            } else if (activePhase == "price_out") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "order", "ordinal", "phase"},
+                    "price-out call begin");
+                priceOutLiveIn = PriceOutLiveIn{};
+                priceOutObserved = PriceOutDerivedOut{};
+                priceOutLiveIn.ordinal = ordinal;
+                priceOutObserved.ordinal = ordinal;
+                priceOutStateSeen = false;
+                arcFinals.clear();
+                remaps.clear();
+                adjacency.clear();
+            } else {
+                throw Error("MCFREG2 strict call phase differs");
+            }
             frameBegin = eventIndex;
             endingSeen = false;
             active = true;
@@ -1365,6 +1561,212 @@ replayStrictPricing(
             throw Error("MCFREG2 pricing event has no call entry");
         if (endingSeen && kind != "CALL_END")
             throw Error("MCFREG2 pricing result follows call end state");
+        if (activePhase == "price_out") {
+            if (kind == "PRICE_OUT_STATE_LIVE_IN") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "network_words", "objects",
+                     "arena_generation", "arena_capacity", "heap"},
+                    "price-out state live-in");
+                if (priceOutStateSeen ||
+                    stringField(event, "role") != "live_in" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out live-in role differs");
+                parsePriceOutCommon(event, package, priceOutLiveIn);
+                priceOutStateSeen = true;
+            } else if (kind == "PRICE_OUT_CANDIDATE_OBSERVED") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "candidate", "tail", "head",
+                     "cost", "reduced_cost"},
+                    "price-out candidate observed");
+                if (!priceOutStateSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out candidate role differs");
+                priceOutObserved.candidates.push_back(PriceOutCandidate{
+                    nonnegative(event, "candidate"),
+                    stableReference(
+                        field(event, "tail"), package,
+                        "price-out candidate tail"),
+                    stableReference(
+                        field(event, "head"), package,
+                        "price-out candidate head"),
+                    integer(event, "cost"), integer(event, "reduced_cost"),
+                });
+            } else if (kind == "PRICE_OUT_DECISION_OBSERVED") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "candidate", "decision",
+                     "reference"},
+                    "price-out decision observed");
+                if (!priceOutStateSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out decision role differs");
+                const std::string name = stringField(event, "decision");
+                PriceOutDecisionKind decision;
+                if (name == "NO_CHANGE")
+                    decision = PriceOutDecisionKind::NoChange;
+                else if (name == "INSERT")
+                    decision = PriceOutDecisionKind::Insert;
+                else if (name == "REPLACE")
+                    decision = PriceOutDecisionKind::Replace;
+                else
+                    throw Error("MCFREG2 price-out decision differs");
+                priceOutObserved.decisions.push_back(PriceOutDecision{
+                    nonnegative(event, "candidate"), decision,
+                    stableReference(
+                        field(event, "reference"), package,
+                        "price-out decision reference"),
+                });
+            } else if (kind == "ARC_FINAL_OBSERVED") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "reference", "tail", "head",
+                     "cost", "org_cost", "flow", "ident", "nextout",
+                     "nextin"},
+                    "price-out final arc observed");
+                if (!priceOutStateSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out final arc role differs");
+                arcFinals.push_back(ArcFinalDelta{
+                    stableReference(
+                        field(event, "reference"), package,
+                        "price-out final arc reference"),
+                    stableReference(
+                        field(event, "tail"), package,
+                        "price-out final arc tail"),
+                    stableReference(
+                        field(event, "head"), package,
+                        "price-out final arc head"),
+                    integer(event, "cost"), integer(event, "org_cost"),
+                    integer(event, "flow"), integer(event, "ident"),
+                    stableReference(
+                        field(event, "nextout"), package,
+                        "price-out final arc nextout"),
+                    stableReference(
+                        field(event, "nextin"), package,
+                        "price-out final arc nextin"),
+                });
+            } else if (kind == "REMAP_OBSERVED") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "old_reference",
+                     "new_reference"},
+                    "price-out remap observed");
+                if (!priceOutStateSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out remap role differs");
+                remaps.push_back(RemapDelta{
+                    stableReference(
+                        field(event, "old_reference"), package,
+                        "price-out old remap reference"),
+                    stableReference(
+                        field(event, "new_reference"), package,
+                        "price-out new remap reference"),
+                });
+            } else if (kind == "ADJACENCY_FINAL_OBSERVED") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "reference", "firstout",
+                     "firstin"},
+                    "price-out adjacency observed");
+                if (!priceOutStateSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out adjacency role differs");
+                adjacency.push_back(AdjacencyDelta{
+                    stableReference(
+                        field(event, "reference"), package,
+                        "price-out adjacency reference"),
+                    stableReference(
+                        field(event, "firstout"), package,
+                        "price-out adjacency firstout"),
+                    stableReference(
+                        field(event, "firstin"), package,
+                        "price-out adjacency firstin"),
+                });
+            } else if (kind == "PRICE_OUT_END_OBSERVED") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "network_words", "objects",
+                     "arena_generation", "arena_capacity", "heap"},
+                    "price-out end observed");
+                if (!priceOutStateSeen || endingSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal)
+                    throw Error("MCFREG2 price-out end role differs");
+                parsePriceOutCommon(event, package, priceOutObserved);
+                endingSeen = true;
+            } else if (kind == "CALL_END") {
+                requireKeys(
+                    event,
+                    {"kind", "role", "call", "order", "ordinal", "phase"},
+                    "price-out call end");
+                if (!priceOutStateSeen || !endingSeen ||
+                    stringField(event, "role") != "observed_result" ||
+                    stringField(event, "phase") != "price_out" ||
+                    nonnegative(event, "call") != priceOutLiveIn.ordinal ||
+                    nonnegative(event, "ordinal") != priceOutLiveIn.ordinal ||
+                    nonnegative(event, "order") != expectedOrder)
+                    throw Error("MCFREG2 price-out call exit differs");
+                Json indexed;
+                if (!callRows.next(indexed))
+                    throw Error("MCFREG2 price-out call index is missing");
+                requireKeys(
+                    indexed,
+                    {"call", "order", "ordinal", "phase", "event_begin",
+                     "event_count"},
+                    "price-out call index");
+                if (nonnegative(indexed, "call") != priceOutLiveIn.ordinal ||
+                    nonnegative(indexed, "ordinal") !=
+                        priceOutLiveIn.ordinal ||
+                    nonnegative(indexed, "order") != expectedOrder ||
+                    stringField(indexed, "phase") != "price_out" ||
+                    nonnegative(indexed, "event_begin") != frameBegin ||
+                    nonnegative(indexed, "event_count") !=
+                        eventIndex - frameBegin + 1U)
+                    throw Error("MCFREG2 price-out call index differs");
+                Json boundary;
+                if (!boundaryRows.next(boundary))
+                    throw Error("MCFREG2 price-out boundary is missing");
+                requireKeys(
+                    boundary,
+                    {"call", "order", "phase", "pre_sha256",
+                     "post_sha256"},
+                    "price-out boundary");
+                if (nonnegative(boundary, "call") !=
+                        priceOutLiveIn.ordinal ||
+                    nonnegative(boundary, "order") != expectedOrder ||
+                    stringField(boundary, "phase") != "price_out" ||
+                    stringField(boundary, "pre_sha256") !=
+                        digestCallState(priceOutLiveIn))
+                    throw Error("MCFREG2 price-out pre-boundary differs");
+                const std::string post = stringField(
+                    boundary, "post_sha256");
+                if (post != digestCallState(priceOutObserved))
+                    throw Error("MCFREG2 price-out observed boundary differs");
+                const PriceOutDerivedOut derived = replayPriceOut(
+                    priceOutLiveIn, kernelTrace);
+                if (digestCallState(derived) != post)
+                    throw Error("MCFREG2 derived price-out result differs");
+                validatePriceOutDeltas(
+                    priceOutLiveIn, derived, arcFinals, remaps, adjacency);
+                emitTrace(
+                    trace, 2, matched_trace::Opcode::COMMIT,
+                    priceOutLiveIn.ordinal, sequence, 0, expectedOrder, 0,
+                    expectedOrder);
+                ++summary.priceOutCalls;
+                ++expectedOrder;
+                active = false;
+            } else {
+                throw Error("MCFREG2 strict price-out event kind differs");
+            }
+            continue;
+        }
         if (kind == "BASKET_LIVE_IN") {
             requireKeys(
                 event,
@@ -1515,8 +1917,9 @@ replayStrictPricing(
         }
     }
     if (active || events.count() != package.header.eventCount ||
-        summary.pricingCalls != package.header.pricingCalls)
-        throw Error("MCFREG2 strict pricing call count differs");
+        summary.pricingCalls != package.header.pricingCalls ||
+        summary.priceOutCalls != package.header.priceOutCalls)
+        throw Error("MCFREG2 strict call count differs");
     finishSectionRows(callRows, "call index");
     finishSectionRows(boundaryRows, "boundary");
     summary.operations = sequence;
@@ -1526,7 +1929,8 @@ replayStrictPricing(
     if (!validation)
         throw Error("cannot write MCFREG2 replay validation");
     validation << "{\"boundary_mismatches\":0,\"operations\":"
-               << summary.operations << ",\"price_out_calls\":0,"
+               << summary.operations << ",\"price_out_calls\":"
+               << summary.priceOutCalls << ","
                << "\"pricing_calls\":" << summary.pricingCalls
                << ",\"status\":\"verified\",\"trace_sha256\":\""
                << summary.traceSha256 << "\"}\n";
@@ -1548,7 +1952,7 @@ replay(
     constexpr uint64_t DeltaAddress = UINT64_C(0xa00000000);
     validateInitialState(package);
     if (directoryEntry(package, MCFREG2_EVENTS).schema == 3U)
-        return replayStrictPricing(package, canonicalTrace, outputRoot);
+        return replayStrict(package, canonicalTrace, outputRoot);
     TraceSink trace(canonicalTrace);
     JsonLineReader events(package, MCFREG2_EVENTS);
     SectionRowReader basketRows(package, MCFREG2_BASKET);
