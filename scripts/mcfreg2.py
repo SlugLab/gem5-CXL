@@ -242,6 +242,7 @@ def new_package(
     price_out_calls: int,
     event_count: int,
     sections: Mapping[str, bytes],
+    section_layouts: Mapping[str, tuple[int, int]] | None = None,
 ) -> Package:
     unknown = set(sections) - set(REQUIRED_SECTIONS)
     missing = set(REQUIRED_SECTIONS) - set(sections)
@@ -249,13 +250,19 @@ def new_package(
         raise FormatError(f"unknown MCFREG2 section name: {sorted(unknown)[0]}")
     if missing:
         raise FormatError(f"missing MCFREG2 section: {sorted(missing)[0]}")
+    layouts = dict(section_layouts or {})
+    unknown_layouts = set(layouts) - set(REQUIRED_SECTIONS)
+    if unknown_layouts:
+        raise FormatError(
+            f"unknown MCFREG2 section layout: {sorted(unknown_layouts)[0]}"
+        )
     values = tuple(
         Section(
             section_type=SECTION_TYPES[name],
             schema=1,
             flags=0,
-            element_count=1,
-            element_size=len(sections[name]),
+            element_count=layouts.get(name, (1, len(sections[name])))[0],
+            element_size=layouts.get(name, (1, len(sections[name])))[1],
             data=sections[name],
         )
         for name in REQUIRED_SECTIONS

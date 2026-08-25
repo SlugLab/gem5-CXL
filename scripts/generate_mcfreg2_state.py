@@ -7,9 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import struct
 import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
+
+try:
+    from scripts import mcfreg2
+except ImportError:  # Support direct execution from the scripts directory.
+    import mcfreg2
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -35,6 +43,10 @@ NATIVE_SOURCES = (
     "main_wrapper.c",
     "mcf_capture.c",
 )
+STATE_MAGIC = b"MCFSTATE2"
+STATE_NETWORK_WORDS = 22
+STATE_NODE_BYTES = 176
+STATE_ARC_BYTES = 96
 
 
 class GenerationError(RuntimeError):
@@ -329,7 +341,11 @@ def _compiler_identity(compiler):
     if not path.is_file():
         raise GenerationError(f"C compiler does not exist: {path}")
     version = _run_checked((path, "--version"), cwd=REPO, label="compiler")
-    return {"path": str(path), "version": version.splitlines()[0]}
+    return {
+        "path": str(path),
+        "version": version.splitlines()[0],
+        "sha256": _sha256_file(path),
+    }
 
 
 def build_native(*, prepared, output, compiler):
@@ -426,3 +442,485 @@ def run_native(*, binary, input_path, output_root):
     value["stderr"] = str((output_root / "stderr.log").resolve())
     value["binary_sha256"] = _sha256_file(binary)
     return value
+
+
+def _canonical_json(value):
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii") + b"\n"
+
+
+def _read_json(path, label):
+    path = Path(path)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GenerationError(f"invalid {label}: {error}") from error
+    if not isinstance(value, dict):
+        raise GenerationError(f"invalid {label}: root is not an object")
+    return value
+
+
+def _read_json_lines(path, label):
+    path = Path(path)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        rows = [json.loads(line) for line in lines]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GenerationError(f"invalid {label}: {error}") from error
+    if not rows or not all(isinstance(row, dict) for row in rows):
+        raise GenerationError(f"invalid {label}: event stream is empty")
+    return rows
+
+
+def _checked_state_end(offset, count, width, total, label):
+    if count < 0 or width < 0 or count > (1 << 64) - 1:
+        raise GenerationError(f"invalid MCF state {label} count")
+    if count and width > ((1 << 64) - 1) // count:
+        raise GenerationError(f"MCF state {label} size overflows")
+    end = offset + count * width
+    if end > total:
+        raise GenerationError(f"MCF state {label} is truncated")
+    return end
+
+
+def _read_native_state(path):
+    path = Path(path)
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise GenerationError(f"cannot read native MCF state: {error}") from error
+    network_bytes = STATE_NETWORK_WORDS * 8
+    network_end = len(STATE_MAGIC) + network_bytes
+    if len(payload) < network_end or not payload.startswith(STATE_MAGIC):
+        raise GenerationError("native MCF state header differs")
+    words = struct.unpack_from(
+        f"<{STATE_NETWORK_WORDS}Q", payload, len(STATE_MAGIC)
+    )
+    n = words[0]
+    max_m = words[2]
+    m = words[3]
+    if n == (1 << 64) - 1 or m == 0 or max_m < m:
+        raise GenerationError("native MCF state counts are invalid")
+    nodes_begin = network_end
+    nodes_end = _checked_state_end(
+        nodes_begin, n + 1, STATE_NODE_BYTES, len(payload), "nodes"
+    )
+    active_end = _checked_state_end(
+        nodes_end, m, STATE_ARC_BYTES, len(payload), "active arcs"
+    )
+    dummy_end = _checked_state_end(
+        active_end, n, STATE_ARC_BYTES, len(payload), "dummy arcs"
+    )
+    if dummy_end != len(payload):
+        raise GenerationError("native MCF state has trailing bytes")
+    return {
+        "payload": payload,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "network": payload[len(STATE_MAGIC):network_end],
+        "nodes": payload[nodes_begin:nodes_end],
+        "active_arcs": payload[nodes_end:active_end],
+        "dummy_arcs": payload[active_end:dummy_end],
+        "n": n,
+        "nodes_count": n + 1,
+        "m": m,
+        "max_m": max_m,
+        "words": words,
+    }
+
+
+def _ordered_frames(pricing_rows, price_out_rows):
+    frames = []
+    for phase, rows in (("pricing", pricing_rows), ("price_out", price_out_rows)):
+        grouped = {}
+        for row in rows:
+            if not isinstance(row.get("call"), int) or row["call"] < 0:
+                raise GenerationError(f"{phase} event has invalid call ordinal")
+            grouped.setdefault(row["call"], []).append(row)
+        if sorted(grouped) != list(range(len(grouped))):
+            raise GenerationError(f"{phase} call ordinals are not contiguous")
+        for ordinal, frame_rows in sorted(grouped.items()):
+            if (
+                frame_rows[0].get("kind") != "BEGIN"
+                or frame_rows[-1].get("kind") != "END"
+            ):
+                raise GenerationError(f"{phase} call frame is incomplete")
+            order = frame_rows[0].get("order")
+            if not isinstance(order, int) or order < 0:
+                raise GenerationError(f"{phase} call order is invalid")
+            frames.append({
+                "phase": phase,
+                "ordinal": ordinal,
+                "order": order,
+                "rows": frame_rows,
+            })
+    frames.sort(key=lambda frame: frame["order"])
+    if [frame["order"] for frame in frames] != list(range(len(frames))):
+        raise GenerationError("native MCF call order is not contiguous")
+    return frames
+
+
+def _frame_sections(frames):
+    events = []
+    call_index = []
+    boundaries = []
+    basket_rows = []
+    delta_rows = []
+    for frame in frames:
+        start = len(events)
+        normalized = []
+        for row in frame["rows"]:
+            event = {
+                "phase_name": frame["phase"],
+                "ordinal": frame["ordinal"],
+                **row,
+            }
+            normalized.append(event)
+            events.append(event)
+            if row.get("kind") == "BASKET":
+                basket_rows.append(event)
+            if row.get("kind") in {
+                "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
+            }:
+                delta_rows.append(event)
+        live_in = [
+            row for row in normalized
+            if row.get("kind") == "BEGIN"
+            or (row.get("kind") == "BASKET" and row.get("phase") == "live_in")
+        ]
+        live_out = [
+            row for row in normalized
+            if row.get("kind") == "END"
+            or (row.get("kind") == "BASKET" and row.get("phase") == "live_out")
+            or row.get("kind") in {"ARC_STATE", "ARENA_REMAP", "ADJACENCY"}
+        ]
+        call_index.append({
+            "phase": frame["phase"],
+            "ordinal": frame["ordinal"],
+            "order": frame["order"],
+            "event_begin": start,
+            "event_count": len(normalized),
+        })
+        boundaries.append({
+            "phase": frame["phase"],
+            "ordinal": frame["ordinal"],
+            "order": frame["order"],
+            "pre_sha256": hashlib.sha256(_canonical_json(live_in)).hexdigest(),
+            "post_sha256": hashlib.sha256(
+                _canonical_json(live_out)
+            ).hexdigest(),
+        })
+    return events, call_index, boundaries, basket_rows, delta_rows
+
+
+def _validate_identity(identity):
+    required = (
+        "source_commit",
+        "source_tree_sha256",
+        "input_sha256",
+        "common_patch_sha256",
+        "capture_patch_sha256",
+        "compiler_sha256",
+    )
+    if not isinstance(identity, dict) or set(identity) != set(required):
+        raise GenerationError("MCF package identity fields differ")
+    if not isinstance(identity["source_commit"], str) or len(
+        identity["source_commit"]
+    ) != 40:
+        raise GenerationError("MCF package source commit is invalid")
+    for name in required[1:]:
+        value = identity[name]
+        if not isinstance(value, str) or len(value) != 64:
+            raise GenerationError(f"MCF package {name} is invalid")
+        try:
+            bytes.fromhex(value)
+        except ValueError as error:
+            raise GenerationError(f"MCF package {name} is invalid") from error
+    return dict(identity)
+
+
+def assemble_capture_package(*, run_root, identity, output):
+    run_root = Path(run_root).resolve()
+    identity = _validate_identity(identity)
+    run = _read_json(run_root / "run.json", "native MCF run.json")
+    if run.get("capture_enabled") is not True:
+        raise GenerationError("MCF package source is not a capture run")
+    initial = _read_native_state(run_root / "initial.state")
+    final = _read_native_state(run_root / "final.state")
+    pricing = _read_json_lines(run_root / "pricing.jsonl", "pricing journal")
+    price_out = _read_json_lines(
+        run_root / "price_out.jsonl", "price-out journal"
+    )
+    frames = _ordered_frames(pricing, price_out)
+    events, call_index, boundaries, basket, deltas = _frame_sections(frames)
+    pricing_calls = sum(frame["phase"] == "pricing" for frame in frames)
+    price_out_calls = sum(frame["phase"] == "price_out" for frame in frames)
+    if (
+        pricing_calls != run.get("pricing_calls")
+        or price_out_calls != run.get("price_out_calls")
+    ):
+        raise GenerationError("native MCF run call counts differ")
+    output_path = run_root / "mcf.out"
+    if not output_path.is_file():
+        raise GenerationError("native MCF output is missing")
+    provenance = {
+        "schema": 1,
+        **identity,
+        "roi_begin": run.get("roi_begin"),
+        "roi_end": run.get("roi_end"),
+        "capture_enabled": True,
+    }
+    final_row = {
+        "schema": 1,
+        "initial_state_sha256": initial["sha256"],
+        "final_state_sha256": final["sha256"],
+        "final_network_words": list(final["words"]),
+        "mcf_output_bytes": output_path.stat().st_size,
+        "mcf_output_sha256": _sha256_file(output_path),
+        "peak_allocated_bytes": run.get("peak_allocated_bytes"),
+    }
+    sections = {
+        "PROVENANCE": _canonical_json(provenance),
+        "NETWORK": initial["network"],
+        "NODES": initial["nodes"],
+        "ARCS": initial["active_arcs"] + initial["dummy_arcs"],
+        "BASKET": _canonical_json({"schema": 1, "rows": basket}),
+        "CALL_INDEX": _canonical_json({"schema": 1, "rows": call_index}),
+        "EVENTS": b"".join(_canonical_json(row) for row in events),
+        "DELTAS": _canonical_json({"schema": 1, "rows": deltas}),
+        "BOUNDARIES": _canonical_json({"schema": 1, "rows": boundaries}),
+        "FINAL": _canonical_json(final_row),
+    }
+    package = mcfreg2.new_package(
+        nodes=initial["nodes_count"],
+        active_arcs=initial["m"],
+        dummy_arcs=initial["n"],
+        arena_capacity=initial["max_m"],
+        pricing_calls=pricing_calls,
+        price_out_calls=price_out_calls,
+        event_count=len(events),
+        sections=sections,
+        section_layouts={
+            "NETWORK": (STATE_NETWORK_WORDS, 8),
+            "NODES": (initial["nodes_count"], STATE_NODE_BYTES),
+            "ARCS": (
+                initial["m"] + initial["n"],
+                STATE_ARC_BYTES,
+            ),
+            "BASKET": (len(basket), 0),
+            "CALL_INDEX": (len(call_index), 0),
+            "EVENTS": (len(events), 0),
+            "DELTAS": (len(deltas), 0),
+            "BOUNDARIES": (len(boundaries), 0),
+        },
+    )
+    digest = mcfreg2.write_package(output, package)
+    parsed = mcfreg2.read_package(output)
+    if parsed.header.event_count != len(events):
+        raise GenerationError("written MCFREG2 event count differs")
+    return {
+        "package": str(Path(output).resolve()),
+        "package_sha256": digest,
+        "pricing_calls": pricing_calls,
+        "price_out_calls": price_out_calls,
+        "event_count": len(events),
+        "initial_state_sha256": initial["sha256"],
+        "final_state_sha256": final["sha256"],
+        "mcf_output_sha256": final_row["mcf_output_sha256"],
+    }
+
+
+def _atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(_canonical_json(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _same_file(left, right):
+    left = Path(left)
+    right = Path(right)
+    return (
+        left.is_file()
+        and right.is_file()
+        and left.stat().st_size == right.stat().st_size
+        and _sha256_file(left) == _sha256_file(right)
+    )
+
+
+def _publication_bytes(*roots):
+    total = 1024 * 1024
+    names = (
+        "initial.state",
+        "final.state",
+        "pricing.jsonl",
+        "price_out.jsonl",
+        "mcf.out",
+    )
+    for root in roots:
+        root = Path(root)
+        for name in names:
+            path = root / name
+            if path.is_file():
+                total += path.stat().st_size * 4
+    return total
+
+
+def generate_candidate(
+    *,
+    authority_root,
+    capture_primary_root,
+    capture_replay_root,
+    identity,
+    evidence_root,
+):
+    evidence_root = Path(evidence_root).resolve()
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    staging = None
+    gate = "preflight"
+    try:
+        identity = _validate_identity(identity)
+        authority_root = Path(authority_root).resolve()
+        primary_root = Path(capture_primary_root).resolve()
+        replay_root = Path(capture_replay_root).resolve()
+        required_bytes = _publication_bytes(primary_root, replay_root)
+        available_bytes = shutil.disk_usage(evidence_root).free
+        if available_bytes < required_bytes:
+            raise GenerationError(
+                "preflight: insufficient disk space for atomic publication"
+            )
+        staging = Path(
+            tempfile.mkdtemp(prefix=".candidate-", dir=evidence_root)
+        )
+        gate = "native_equivalence"
+        for name in ("final.state", "mcf.out"):
+            if not _same_file(authority_root / name, primary_root / name):
+                raise GenerationError(
+                    f"native_equivalence: authority/primary {name} differs"
+                )
+            if not _same_file(authority_root / name, replay_root / name):
+                raise GenerationError(
+                    f"native_equivalence: authority/replay {name} differs"
+                )
+        gate = "capture_determinism"
+        primary = assemble_capture_package(
+            run_root=primary_root,
+            identity=identity,
+            output=staging / "primary.reg2",
+        )
+        replay = assemble_capture_package(
+            run_root=replay_root,
+            identity=identity,
+            output=staging / "replay.reg2",
+        )
+        if not _same_file(primary["package"], replay["package"]):
+            raise GenerationError(
+                "capture_determinism: primary/replay package bytes differ"
+            )
+        digest = primary["package_sha256"]
+        if digest != replay["package_sha256"]:
+            raise GenerationError(
+                "capture_determinism: primary/replay package SHA-256 differs"
+            )
+        shutil.copy2(staging / "primary.reg2", staging / "mcf.reg2")
+        manifest = {
+            "schema": 1,
+            "status": "candidate",
+            "identity": identity,
+            "package_sha256": digest,
+            "primary_package_sha256": primary["package_sha256"],
+            "replay_package_sha256": replay["package_sha256"],
+            "authority_final_state_sha256": _sha256_file(
+                authority_root / "final.state"
+            ),
+            "authority_mcf_output_sha256": _sha256_file(
+                authority_root / "mcf.out"
+            ),
+        }
+        validation = {
+            "schema": 1,
+            "status": "capture_replay_complete",
+            "package_sha256": digest,
+            "primary_replay_equal": True,
+            "native_outputs_equal": True,
+            "boundary_mismatches": 0,
+            "pricing_calls": primary["pricing_calls"],
+            "price_out_calls": primary["price_out_calls"],
+            "event_count": primary["event_count"],
+        }
+        _atomic_json(staging / "manifest.json", manifest)
+        _atomic_json(staging / "validation.json", validation)
+        for artifact in staging.iterdir():
+            if artifact.is_file():
+                with artifact.open("rb") as stream:
+                    os.fsync(stream.fileno())
+        directory_fd = os.open(staging, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        final_root = evidence_root / digest
+        if final_root.exists():
+            existing_manifest = _read_json(
+                final_root / "manifest.json", "existing MCF manifest"
+            )
+            if (
+                existing_manifest.get("identity") != identity
+                or not _same_file(
+                    final_root / "mcf.reg2", staging / "mcf.reg2"
+                )
+            ):
+                raise GenerationError(
+                    "publication: existing accepted root identity differs"
+                )
+            shutil.rmtree(staging)
+        else:
+            os.replace(staging, final_root)
+            root_fd = os.open(evidence_root, os.O_RDONLY)
+            try:
+                os.fsync(root_fd)
+            finally:
+                os.close(root_fd)
+        return {
+            "accepted_root": str(final_root),
+            "package_sha256": digest,
+            "package": str(final_root / "mcf.reg2"),
+            "primary_package": str(final_root / "primary.reg2"),
+            "replay_package": str(final_root / "replay.reg2"),
+            "manifest": str(final_root / "manifest.json"),
+            "validation": str(final_root / "validation.json"),
+        }
+    except Exception as error:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging)
+        failure = {
+            "schema": 1,
+            "status": "failed_input",
+            "first_failed_gate": gate,
+            "error": str(error),
+        }
+        try:
+            _atomic_json(evidence_root / "failed-input.json", failure)
+        except Exception:
+            pass
+        if isinstance(error, GenerationError):
+            if gate not in str(error):
+                raise GenerationError(f"{gate}: {error}") from error
+            raise
+        raise GenerationError(f"{gate}: {error}") from error

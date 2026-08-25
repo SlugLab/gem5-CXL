@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 try:
@@ -661,6 +662,242 @@ int main(int argc, char **argv)
         )
         self.assertEqual(rows[-1]["new_arcs"], 1)
         self.assertEqual(rows[-1]["live_out_m"], 2)
+
+    def test_capture_packages_are_deterministic_and_publish_atomically(self):
+        self.require_module()
+        self.assertTrue(
+            hasattr(generator, "generate_candidate"),
+            "generate_candidate is missing",
+        )
+        if shutil.which("cc") is None:
+            self.skipTest("C compiler is unavailable")
+        tiny_input = self.root / "deterministic.in"
+        tiny_input.write_text(
+            "2 2\n0 10\n2 12\n1 2 5\n2 1 7\n",
+            encoding="ascii",
+        )
+        authority_frozen = self.freeze_approved_source("det-authority")
+        authority_prepared = generator.prepare_native_source(
+            frozen=authority_frozen,
+            capture_enabled=False,
+        )
+        authority_binary = generator.build_native(
+            prepared=authority_prepared,
+            output=self.root / "det-authority-bin",
+            compiler=shutil.which("cc"),
+        )
+        authority_root = self.root / "det-authority-run"
+        generator.run_native(
+            binary=authority_binary,
+            input_path=tiny_input,
+            output_root=authority_root,
+        )
+
+        capture_frozen = self.freeze_approved_source("det-capture")
+        capture_prepared = generator.prepare_native_source(
+            frozen=capture_frozen,
+            capture_enabled=True,
+        )
+        capture_binary = generator.build_native(
+            prepared=capture_prepared,
+            output=self.root / "det-capture-bin",
+            compiler=shutil.which("cc"),
+        )
+        primary_root = self.root / "det-primary-run"
+        replay_root = self.root / "det-replay-run"
+        generator.run_native(
+            binary=capture_binary,
+            input_path=tiny_input,
+            output_root=primary_root,
+        )
+        generator.run_native(
+            binary=capture_binary,
+            input_path=tiny_input,
+            output_root=replay_root,
+        )
+        identity = {
+            "source_commit": capture_prepared["source_commit"],
+            "source_tree_sha256": capture_prepared["source_tree_sha256"],
+            "input_sha256": sha256(tiny_input),
+            "common_patch_sha256": capture_prepared[
+                "common_patch_sha256"
+            ],
+            "capture_patch_sha256": capture_prepared[
+                "capture_patch_sha256"
+            ],
+            "compiler_sha256": sha256(Path(shutil.which("cc")).resolve()),
+        }
+        evidence_root = self.root / "accepted"
+        accepted = generator.generate_candidate(
+            authority_root=authority_root,
+            capture_primary_root=primary_root,
+            capture_replay_root=replay_root,
+            identity=identity,
+            evidence_root=evidence_root,
+        )
+        accepted_root = Path(accepted["accepted_root"])
+        self.assertEqual(accepted_root.name, accepted["package_sha256"])
+        self.assertEqual(
+            (accepted_root / "mcf.reg2").read_bytes(),
+            Path(accepted["replay_package"]).read_bytes(),
+        )
+        self.assertEqual(
+            sha256(accepted_root / "mcf.reg2"),
+            accepted["package_sha256"],
+        )
+        parsed_package = generator.mcfreg2.read_package(
+            accepted_root / "mcf.reg2"
+        )
+        directory = {
+            entry.section_type: entry for entry in parsed_package.directory
+        }
+        network_entry = directory[
+            generator.mcfreg2.SECTION_TYPES["NETWORK"]
+        ]
+        nodes_entry = directory[generator.mcfreg2.SECTION_TYPES["NODES"]]
+        arcs_entry = directory[generator.mcfreg2.SECTION_TYPES["ARCS"]]
+        events_entry = directory[
+            generator.mcfreg2.SECTION_TYPES["EVENTS"]
+        ]
+        self.assertEqual(
+            (network_entry.element_count, network_entry.element_size),
+            (generator.STATE_NETWORK_WORDS, 8),
+        )
+        self.assertEqual(
+            (nodes_entry.element_count, nodes_entry.element_size),
+            (parsed_package.header.nodes, generator.STATE_NODE_BYTES),
+        )
+        self.assertEqual(
+            (arcs_entry.element_count, arcs_entry.element_size),
+            (
+                parsed_package.header.active_arcs
+                + parsed_package.header.dummy_arcs,
+                generator.STATE_ARC_BYTES,
+            ),
+        )
+        self.assertEqual(
+            events_entry.element_count, parsed_package.header.event_count
+        )
+        self.assertEqual(events_entry.element_size, 0)
+        self.assertEqual(
+            json.loads(
+                (accepted_root / "validation.json").read_text(
+                    encoding="utf-8"
+                )
+            )["status"],
+            "capture_replay_complete",
+        )
+        accepted_again = generator.generate_candidate(
+            authority_root=authority_root,
+            capture_primary_root=primary_root,
+            capture_replay_root=replay_root,
+            identity=identity,
+            evidence_root=evidence_root,
+        )
+        self.assertEqual(accepted_again["accepted_root"], str(accepted_root))
+        self.assertEqual(
+            sha256(accepted_root / "mcf.reg2"),
+            accepted["package_sha256"],
+        )
+
+        fault_replay = self.root / "fault-replay"
+        shutil.copytree(replay_root, fault_replay)
+        pricing = fault_replay / "pricing.jsonl"
+        rows = [
+            json.loads(line)
+            for line in pricing.read_text(encoding="utf-8").splitlines()
+        ]
+        scan = next(row for row in rows if row["kind"] == "SCAN")
+        scan["reduced_cost"] += 1
+        pricing.write_text(
+            "".join(
+                json.dumps(row, sort_keys=True) + "\n" for row in rows
+            ),
+            encoding="utf-8",
+        )
+        failed_root = self.root / "failed-evidence"
+        with self.assertRaisesRegex(
+            generator.GenerationError, "capture_determinism"
+        ):
+            generator.generate_candidate(
+                authority_root=authority_root,
+                capture_primary_root=primary_root,
+                capture_replay_root=fault_replay,
+                identity=identity,
+                evidence_root=failed_root,
+            )
+        failure = json.loads(
+            (failed_root / "failed-input.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failure["status"], "failed_input")
+        self.assertEqual(
+            failure["first_failed_gate"], "capture_determinism"
+        )
+        self.assertNotIn("accepted_package", failure)
+        self.assertEqual(
+            list(path for path in failed_root.iterdir()
+                 if path.is_dir()),
+            [],
+        )
+
+        short_root = self.root / "short-write-evidence"
+        with mock.patch.object(
+            generator.mcfreg2,
+            "write_package",
+            side_effect=OSError("short write"),
+        ):
+            with self.assertRaisesRegex(
+                generator.GenerationError, "capture_determinism"
+            ):
+                generator.generate_candidate(
+                    authority_root=authority_root,
+                    capture_primary_root=primary_root,
+                    capture_replay_root=replay_root,
+                    identity=identity,
+                    evidence_root=short_root,
+                )
+        self.assertEqual(
+            json.loads(
+                (short_root / "failed-input.json").read_text(
+                    encoding="utf-8"
+                )
+            )["first_failed_gate"],
+            "capture_determinism",
+        )
+        self.assertFalse(any(path.is_dir() for path in short_root.iterdir()))
+
+    def test_publication_preflight_rejects_insufficient_disk(self):
+        self.require_module()
+        identity = {
+            "source_commit": "1" * 40,
+            "source_tree_sha256": "2" * 64,
+            "input_sha256": "3" * 64,
+            "common_patch_sha256": "4" * 64,
+            "capture_patch_sha256": "5" * 64,
+            "compiler_sha256": "6" * 64,
+        }
+        evidence_root = self.root / "no-space"
+        usage = mock.Mock(free=0)
+        with mock.patch.object(
+            generator.shutil, "disk_usage", return_value=usage
+        ):
+            with self.assertRaisesRegex(
+                generator.GenerationError, "insufficient disk"
+            ):
+                generator.generate_candidate(
+                    authority_root=self.root / "authority",
+                    capture_primary_root=self.root / "primary",
+                    capture_replay_root=self.root / "replay",
+                    identity=identity,
+                    evidence_root=evidence_root,
+                )
+        failure = json.loads(
+            (evidence_root / "failed-input.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(failure["first_failed_gate"], "preflight")
+        self.assertFalse(any(path.is_dir() for path in evidence_root.iterdir()))
 
 
 if __name__ == "__main__":

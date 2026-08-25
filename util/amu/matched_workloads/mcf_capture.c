@@ -37,11 +37,14 @@ static long pricing_live_in_expected;
 static long pricing_live_in_seen;
 static long pricing_live_out_seen;
 static int pricing_active;
+static uint64_t call_order;
+static uint64_t pricing_order;
 static FILE *price_out_stream;
 static uint64_t price_out_calls;
 static uint64_t price_out_candidates;
 static long price_out_live_in_m;
 static int price_out_active;
+static uint64_t price_out_order;
 static int price_out_candidate_pending;
 static const node_t *price_out_tail;
 static const node_t *price_out_head;
@@ -335,10 +338,13 @@ mcf_capture_configure(
     pricing_live_in_seen = 0;
     pricing_live_out_seen = 0;
     pricing_active = 0;
+    call_order = 0;
+    pricing_order = 0;
     price_out_calls = 0;
     price_out_candidates = 0;
     price_out_live_in_m = 0;
     price_out_active = 0;
+    price_out_order = 0;
     price_out_candidate_pending = 0;
     price_out_tail = NULL;
     price_out_head = NULL;
@@ -491,12 +497,14 @@ mcf_capture_pricing_begin(
     if (fprintf(
             pricing_stream,
             "{\"kind\":\"BEGIN\",\"call\":%" PRIu64
+            ",\"order\":%" PRIu64
             ",\"m\":%ld,\"nr_group\":%ld,\"group_pos\":%ld,"
             "\"initialize\":%s,\"basket_size\":%ld}\n",
-            pricing_calls, m, nr_group, group_pos,
+            pricing_calls, call_order, m, nr_group, group_pos,
             initialize ? "true" : "false", basket_size) < 0)
         return -1;
     pricing_active = 1;
+    pricing_order = call_order;
     pricing_scan_count = 0;
     pricing_nr_group = nr_group;
     pricing_live_in_expected = basket_size;
@@ -614,6 +622,9 @@ mcf_capture_pricing_end(
         return -1;
     pricing_active = 0;
     ++pricing_calls;
+    if (pricing_order != call_order)
+        return -1;
+    ++call_order;
     return 0;
 }
 
@@ -630,12 +641,14 @@ mcf_capture_price_out_begin(const network_t *net)
     if (fprintf(
             price_out_stream,
             "{\"kind\":\"BEGIN\",\"call\":%" PRIu64
+            ",\"order\":%" PRIu64
             ",\"live_in_m\":%ld,\"capacity\":%" PRIu64
             ",\"generation\":%u}\n",
-            price_out_calls, net->m, capture_arc_capacity,
+            price_out_calls, call_order, net->m, capture_arc_capacity,
             capture_arc_generation) < 0)
         return -1;
     price_out_active = 1;
+    price_out_order = call_order;
     price_out_candidate_pending = 0;
     price_out_candidates = 0;
     price_out_live_in_m = net->m;
@@ -844,6 +857,9 @@ mcf_capture_price_out_end(const network_t *net, long new_arcs)
         return -1;
     price_out_active = 0;
     ++price_out_calls;
+    if (price_out_order != call_order)
+        return -1;
+    ++call_order;
     return 0;
 }
 
