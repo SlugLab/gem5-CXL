@@ -771,10 +771,11 @@ class JsonLineReader
     bool next(Json &result)
     {
         while (true) {
-            const size_t newline = pending.find('\n');
+            const size_t newline = pending.find('\n', pendingOffset);
             if (newline != std::string::npos) {
-                const std::string line = pending.substr(0, newline);
-                pending.erase(0, newline + 1U);
+                const std::string line = pending.substr(
+                    pendingOffset, newline - pendingOffset);
+                pendingOffset = newline + 1U;
                 if (line.empty())
                     continue;
                 result = JsonParser(line).parse();
@@ -782,13 +783,17 @@ class JsonLineReader
                 return true;
             }
             if (finished) {
-                if (pending.empty())
+                if (pendingOffset == pending.size())
                     return false;
-                const std::string line = std::move(pending);
-                pending.clear();
+                const std::string line = pending.substr(pendingOffset);
+                pendingOffset = pending.size();
                 result = JsonParser(line).parse();
                 ++rows;
                 return true;
+            }
+            if (pendingOffset != 0U) {
+                pending.erase(0, pendingOffset);
+                pendingOffset = 0;
             }
             decompress();
         }
@@ -856,6 +861,7 @@ class JsonLineReader
     size_t inputOffset = 0;
     uint64_t rows = 0;
     std::string pending;
+    size_t pendingOffset = 0;
 };
 
 const Json &

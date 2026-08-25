@@ -521,6 +521,13 @@ int main(int argc, char **argv)
             mcfreg2.read_package(path).directory_json(),
         )
 
+    def test_cpp_jsonl_reader_uses_a_cursor_not_per_row_compaction(self):
+        implementation = (
+            self.repo / "util/amu/matched_workloads/mcfreg2.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pendingOffset", implementation)
+        self.assertNotIn("pending.erase(0, newline", implementation)
+
     def test_cpp_sha256_matches_standard_vectors(self):
         self.require_module()
         probe = self.compile_cpp_probe()
