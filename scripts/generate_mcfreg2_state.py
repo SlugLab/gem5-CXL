@@ -782,6 +782,73 @@ def _publication_bytes(*roots):
     return total
 
 
+def _run_independent_replay(package, staging):
+    cxx = shutil.which("g++")
+    if cxx is None:
+        raise GenerationError("independent_replay: g++ is unavailable")
+    cxx = str(Path(cxx).resolve())
+    binary = staging / "mcfreg2-replayer"
+    compile_command = (
+        cxx,
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I",
+        str(MATCHED_ROOT),
+        str(MATCHED_ROOT / "mcf_regions.cc"),
+        str(MATCHED_ROOT / "mcfreg2.cc"),
+        "-o",
+        str(binary),
+    )
+    compile_output = _run_checked(
+        compile_command, cwd=REPO, label="independent_replay compile"
+    )
+    output_root = staging / "replay-validation"
+    output_root.mkdir()
+    trace = output_root / "canonical.trace"
+    run_command = (
+        str(binary),
+        "--input",
+        str(package),
+        "--output-root",
+        str(output_root),
+        "--trace",
+        str(trace),
+    )
+    run_output = _run_checked(
+        run_command, cwd=REPO, label="independent_replay run"
+    )
+    replay_record = _read_json(
+        output_root / "mcfreg2-replay.json", "C++ replay validation"
+    )
+    if (
+        replay_record.get("status") != "verified"
+        or replay_record.get("boundary_mismatches") != 0
+    ):
+        raise GenerationError("independent_replay: validation differs")
+    return {
+        "compiler": {
+            "path": cxx,
+            "sha256": _sha256_file(cxx),
+            "version": _run_checked(
+                (cxx, "--version"), cwd=REPO, label="C++ compiler"
+            ).splitlines()[0],
+        },
+        "compile_command": list(compile_command),
+        "compile_stdout": compile_output,
+        "run_command": list(run_command),
+        "run_stdout": run_output,
+        "binary_sha256": _sha256_file(binary),
+        "trace_sha256": _sha256_file(trace),
+        "validation_sha256": _sha256_file(
+            output_root / "mcfreg2-replay.json"
+        ),
+        **replay_record,
+    }
+
+
 def generate_candidate(
     *,
     authority_root,
@@ -839,6 +906,10 @@ def generate_candidate(
                 "capture_determinism: primary/replay package SHA-256 differs"
             )
         shutil.copy2(staging / "primary.reg2", staging / "mcf.reg2")
+        gate = "independent_replay"
+        replay_validation = _run_independent_replay(
+            staging / "mcf.reg2", staging
+        )
         manifest = {
             "schema": 1,
             "status": "candidate",
@@ -852,17 +923,24 @@ def generate_candidate(
             "authority_mcf_output_sha256": _sha256_file(
                 authority_root / "mcf.out"
             ),
+            "independent_replay": replay_validation,
         }
         validation = {
             "schema": 1,
-            "status": "capture_replay_complete",
+            "status": "accepted",
             "package_sha256": digest,
             "primary_replay_equal": True,
             "native_outputs_equal": True,
-            "boundary_mismatches": 0,
+            "boundary_mismatches": replay_validation[
+                "boundary_mismatches"
+            ],
             "pricing_calls": primary["pricing_calls"],
             "price_out_calls": primary["price_out_calls"],
             "event_count": primary["event_count"],
+            "canonical_trace_sha256": replay_validation["trace_sha256"],
+            "replay_validation_sha256": replay_validation[
+                "validation_sha256"
+            ],
         }
         _atomic_json(staging / "manifest.json", manifest)
         _atomic_json(staging / "validation.json", validation)

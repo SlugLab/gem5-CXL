@@ -4,7 +4,10 @@
  */
 
 #include "canonical_trace.hh"
+#include "mcfreg2.hh"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +38,7 @@ constexpr uint64_t PricingOffsetsBase = 0x500000000ULL;
 constexpr uint64_t PricingIndexBase = 0x600000000ULL;
 constexpr uint64_t PriceOutIndexBase = 0x700000000ULL;
 constexpr char Magic[8] = {'M', 'C', 'F', 'R', 'E', 'G', '1', '\0'};
+constexpr char Reg2Magic[8] = {'M', 'C', 'F', 'R', 'E', 'G', '2', '\0'};
 
 #pragma pack(push, 1)
 struct Header
@@ -172,6 +176,19 @@ loadState(const std::string &path, Header &header)
         if (index >= header.arcs)
             throw std::runtime_error("MCF price-out index is out of bounds");
     return state;
+}
+
+std::array<char, 8>
+inputMagic(const std::string &path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+        throw std::runtime_error("cannot open MCF input: " + path);
+    std::array<char, 8> result{};
+    stream.read(result.data(), static_cast<std::streamsize>(result.size()));
+    if (!stream)
+        throw std::runtime_error("MCF input magic is truncated");
+    return result;
 }
 
 uint64_t
@@ -406,6 +423,44 @@ main(int argc, char **argv)
 {
     try {
         const Options options = parseOptions(argc, argv);
+        const auto magic = inputMagic(options.input);
+        if (std::equal(magic.begin(), magic.end(), std::begin(Reg2Magic))) {
+            const auto package = mcfreg2::readPackage(options.input);
+            std::FILE *trace = std::fopen(options.trace.c_str(), "wb");
+            if (trace == nullptr)
+                throw std::runtime_error(
+                    "cannot open trace: " +
+                    std::string(std::strerror(errno)));
+            mcfreg2::ReplaySummary summary;
+            try {
+                summary = mcfreg2::replay(
+                    package, trace, options.outputRoot);
+            } catch (...) {
+                std::fclose(trace);
+                throw;
+            }
+            if (std::fclose(trace) != 0)
+                throw std::runtime_error("trace close failed");
+            std::cout << "MATCHED_PHASE_WORK=pricing_kernel:"
+                      << package.header.pricingCalls << '\n'
+                      << "MATCHED_PHASE_WORK=price_out_impl:"
+                      << package.header.priceOutCalls << '\n'
+                      << "MATCHED_PHASE_INVOCATIONS=pricing_kernel:"
+                      << summary.pricingCalls << '\n'
+                      << "MATCHED_PHASE_INVOCATIONS=price_out_impl:"
+                      << summary.priceOutCalls << '\n'
+                      << "MATCHED_STATE_SHAPE=nodes:"
+                      << package.header.nodes << ",arcs:"
+                      << package.header.activeArcs
+                      << ",price_out_boundaries:"
+                      << summary.priceOutCalls << '\n';
+            return 0;
+        }
+        if (!std::equal(magic.begin(), magic.end(), std::begin(Magic)))
+            throw std::runtime_error("MCF input magic differs");
+#ifndef MATCHED_FIXTURE
+        throw std::runtime_error("formal MCFREG1 is forbidden");
+#endif
         Header header{};
         State state = loadState(options.input, header);
         std::FILE *trace = std::fopen(options.trace.c_str(), "wb");

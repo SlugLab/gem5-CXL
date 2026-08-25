@@ -785,7 +785,13 @@ int main(int argc, char **argv)
                     encoding="utf-8"
                 )
             )["status"],
-            "capture_replay_complete",
+            "accepted",
+        )
+        self.assertTrue(
+            (accepted_root / "replay-validation/mcfreg2-replay.json").is_file()
+        )
+        self.assertTrue(
+            (accepted_root / "replay-validation/canonical.trace").is_file()
         )
         accepted_again = generator.generate_candidate(
             authority_root=authority_root,

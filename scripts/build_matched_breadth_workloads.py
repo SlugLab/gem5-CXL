@@ -2878,9 +2878,10 @@ def _compile(cxx, workload, backend, output, *, fixture):
     ]
     if fixture:
         command.append("-DMATCHED_FIXTURE=1")
-    command.extend((
-        "-I", str(SOURCE_ROOT), str(source), "-o", str(output),
-    ))
+    command.extend(("-I", str(SOURCE_ROOT), str(source)))
+    if workload == "mcf":
+        command.append(str(SOURCE_ROOT / "mcfreg2.cc"))
+    command.extend(("-o", str(output)))
     completed = subprocess.run(
         command, cwd=REPO, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, check=False,

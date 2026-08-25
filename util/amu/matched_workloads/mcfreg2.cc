@@ -4,15 +4,21 @@
  */
 
 #include "mcfreg2.hh"
+#include "canonical_trace.hh"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <charconv>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace mcfreg2
 {
@@ -351,6 +357,906 @@ directoryJson(const Package &package)
     }
     output << ']';
     return output.str();
+}
+
+namespace
+{
+
+struct Json
+{
+    enum class Kind { Null, Boolean, Number, String, Array, Object };
+    Kind kind = Kind::Null;
+    bool boolean = false;
+    int64_t number = 0;
+    std::string string;
+    std::vector<Json> array;
+    std::map<std::string, Json> object;
+};
+
+class JsonParser
+{
+  public:
+    explicit JsonParser(std::string_view input) : input(input) {}
+
+    Json parse()
+    {
+        Json result = value();
+        whitespace();
+        if (position != input.size())
+            throw Error("MCFREG2 JSON has trailing bytes");
+        return result;
+    }
+
+  private:
+    std::string_view input;
+    size_t position = 0;
+
+    void whitespace()
+    {
+        while (position < input.size() &&
+               std::isspace(static_cast<unsigned char>(input[position])))
+            ++position;
+    }
+
+    char take()
+    {
+        if (position == input.size())
+            throw Error("MCFREG2 JSON is truncated");
+        return input[position++];
+    }
+
+    void expect(char expected)
+    {
+        if (take() != expected)
+            throw Error("MCFREG2 JSON token differs");
+    }
+
+    bool consume(std::string_view token)
+    {
+        if (input.substr(position, token.size()) != token)
+            return false;
+        position += token.size();
+        return true;
+    }
+
+    static unsigned hex(char value)
+    {
+        if (value >= '0' && value <= '9')
+            return static_cast<unsigned>(value - '0');
+        if (value >= 'a' && value <= 'f')
+            return static_cast<unsigned>(value - 'a' + 10);
+        if (value >= 'A' && value <= 'F')
+            return static_cast<unsigned>(value - 'A' + 10);
+        throw Error("MCFREG2 JSON unicode escape is invalid");
+    }
+
+    std::string parseString()
+    {
+        expect('"');
+        std::string result;
+        while (true) {
+            const char value = take();
+            if (value == '"')
+                return result;
+            if (static_cast<unsigned char>(value) < 0x20U)
+                throw Error("MCFREG2 JSON string has a control byte");
+            if (static_cast<unsigned char>(value) >= 0x80U)
+                throw Error("MCFREG2 JSON must be canonical ASCII");
+            if (value != '\\') {
+                result.push_back(value);
+                continue;
+            }
+            const char escape = take();
+            switch (escape) {
+              case '"': result.push_back('"'); break;
+              case '\\': result.push_back('\\'); break;
+              case '/': result.push_back('/'); break;
+              case 'b': result.push_back('\b'); break;
+              case 'f': result.push_back('\f'); break;
+              case 'n': result.push_back('\n'); break;
+              case 'r': result.push_back('\r'); break;
+              case 't': result.push_back('\t'); break;
+              case 'u': {
+                unsigned code = 0;
+                for (unsigned index = 0; index < 4; ++index)
+                    code = code * 16U + hex(take());
+                if (code > 0x7fU)
+                    throw Error("MCFREG2 JSON must be canonical ASCII");
+                result.push_back(static_cast<char>(code));
+                break;
+              }
+              default:
+                throw Error("MCFREG2 JSON escape is invalid");
+            }
+        }
+    }
+
+    Json number()
+    {
+        const size_t begin = position;
+        if (input[position] == '-')
+            ++position;
+        const size_t digits = position;
+        while (position < input.size() &&
+               std::isdigit(static_cast<unsigned char>(input[position])))
+            ++position;
+        if (digits == position || (position - digits > 1 && input[digits] == '0'))
+            throw Error("MCFREG2 JSON number is invalid");
+        int64_t result = 0;
+        const auto converted = std::from_chars(
+            input.data() + begin, input.data() + position, result);
+        if (converted.ec != std::errc{} ||
+            converted.ptr != input.data() + position)
+            throw Error("MCFREG2 JSON number is out of range");
+        Json value;
+        value.kind = Json::Kind::Number;
+        value.number = result;
+        return value;
+    }
+
+    Json array()
+    {
+        Json result;
+        result.kind = Json::Kind::Array;
+        expect('[');
+        whitespace();
+        if (position < input.size() && input[position] == ']') {
+            ++position;
+            return result;
+        }
+        while (true) {
+            result.array.push_back(value());
+            whitespace();
+            const char separator = take();
+            if (separator == ']')
+                return result;
+            if (separator != ',')
+                throw Error("MCFREG2 JSON array separator differs");
+        }
+    }
+
+    Json object()
+    {
+        Json result;
+        result.kind = Json::Kind::Object;
+        expect('{');
+        whitespace();
+        if (position < input.size() && input[position] == '}') {
+            ++position;
+            return result;
+        }
+        while (true) {
+            whitespace();
+            if (position == input.size() || input[position] != '"')
+                throw Error("MCFREG2 JSON object key is invalid");
+            std::string key = parseString();
+            whitespace();
+            expect(':');
+            if (!result.object.emplace(std::move(key), value()).second)
+                throw Error("MCFREG2 JSON object key is duplicated");
+            whitespace();
+            const char separator = take();
+            if (separator == '}')
+                return result;
+            if (separator != ',')
+                throw Error("MCFREG2 JSON object separator differs");
+        }
+    }
+
+    Json value()
+    {
+        whitespace();
+        if (position == input.size())
+            throw Error("MCFREG2 JSON is truncated");
+        if (input[position] == '{')
+            return object();
+        if (input[position] == '[')
+            return array();
+        if (input[position] == '"') {
+            Json result;
+            result.kind = Json::Kind::String;
+            result.string = parseString();
+            return result;
+        }
+        if (input[position] == '-' ||
+            std::isdigit(static_cast<unsigned char>(input[position])))
+            return number();
+        Json result;
+        if (consume("true")) {
+            result.kind = Json::Kind::Boolean;
+            result.boolean = true;
+            return result;
+        }
+        if (consume("false")) {
+            result.kind = Json::Kind::Boolean;
+            return result;
+        }
+        if (consume("null"))
+            return result;
+        throw Error("MCFREG2 JSON value is invalid");
+    }
+};
+
+const Json &
+field(const Json &object, const char *name)
+{
+    if (object.kind != Json::Kind::Object)
+        throw Error("MCFREG2 event is not an object");
+    const auto found = object.object.find(name);
+    if (found == object.object.end())
+        throw Error(std::string("MCFREG2 event field is missing: ") + name);
+    return found->second;
+}
+
+int64_t
+integer(const Json &object, const char *name)
+{
+    const Json &value = field(object, name);
+    if (value.kind != Json::Kind::Number)
+        throw Error(std::string("MCFREG2 event field is not integer: ") + name);
+    return value.number;
+}
+
+uint64_t
+nonnegative(const Json &object, const char *name)
+{
+    const int64_t value = integer(object, name);
+    if (value < 0)
+        throw Error(std::string("MCFREG2 event field is negative: ") + name);
+    return static_cast<uint64_t>(value);
+}
+
+std::string
+stringField(const Json &object, const char *name)
+{
+    const Json &value = field(object, name);
+    if (value.kind != Json::Kind::String)
+        throw Error(std::string("MCFREG2 event field is not string: ") + name);
+    return value.string;
+}
+
+bool
+boolField(const Json &object, const char *name)
+{
+    const Json &value = field(object, name);
+    if (value.kind != Json::Kind::Boolean)
+        throw Error(std::string("MCFREG2 event field is not boolean: ") + name);
+    return value.boolean;
+}
+
+std::string
+escapeJson(const std::string &input)
+{
+    std::ostringstream output;
+    output << '"';
+    for (const unsigned char value : input) {
+        switch (value) {
+          case '"': output << "\\\""; break;
+          case '\\': output << "\\\\"; break;
+          case '\b': output << "\\b"; break;
+          case '\f': output << "\\f"; break;
+          case '\n': output << "\\n"; break;
+          case '\r': output << "\\r"; break;
+          case '\t': output << "\\t"; break;
+          default:
+            if (value < 0x20U)
+                output << "\\u00" << std::hex << std::setfill('0')
+                       << std::setw(2) << static_cast<unsigned>(value)
+                       << std::dec;
+            else if (value < 0x80U)
+                output << static_cast<char>(value);
+            else
+                throw Error("MCFREG2 JSON must be canonical ASCII");
+        }
+    }
+    output << '"';
+    return output.str();
+}
+
+std::string
+canonicalJson(const Json &value)
+{
+    switch (value.kind) {
+      case Json::Kind::Null: return "null";
+      case Json::Kind::Boolean: return value.boolean ? "true" : "false";
+      case Json::Kind::Number: return std::to_string(value.number);
+      case Json::Kind::String: return escapeJson(value.string);
+      case Json::Kind::Array: {
+        std::string result = "[";
+        for (size_t index = 0; index < value.array.size(); ++index) {
+            if (index)
+                result += ',';
+            result += canonicalJson(value.array[index]);
+        }
+        return result + ']';
+      }
+      case Json::Kind::Object: {
+        std::string result = "{";
+        bool first = true;
+        for (const auto &[key, element] : value.object) {
+            if (!first)
+                result += ',';
+            first = false;
+            result += escapeJson(key) + ':' + canonicalJson(element);
+        }
+        return result + '}';
+      }
+    }
+    throw Error("MCFREG2 JSON kind is invalid");
+}
+
+std::string
+sectionText(const Package &package, uint16_t type)
+{
+    const auto found = package.sections.find(type);
+    if (found == package.sections.end())
+        throw Error("MCFREG2 replay section is missing");
+    return std::string(found->second.begin(), found->second.end());
+}
+
+std::vector<Json>
+eventLines(const Package &package)
+{
+    std::istringstream input(sectionText(package, MCFREG2_EVENTS));
+    std::vector<Json> result;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty())
+            result.push_back(JsonParser(line).parse());
+    }
+    if (result.size() != package.header.eventCount)
+        throw Error("MCFREG2 event count differs");
+    return result;
+}
+
+const Json &
+reference(const Json &event)
+{
+    const Json &value = field(event, "reference");
+    if (value.kind != Json::Kind::Object)
+        throw Error("MCFREG2 stable reference is not an object");
+    return value;
+}
+
+uint64_t
+referenceIndex(
+    const Json &event, uint64_t generation, uint64_t capacity,
+    bool required)
+{
+    const Json &value = reference(event);
+    if (value.object.empty()) {
+        if (required)
+            throw Error("MCFREG2 stable reference is absent");
+        return Uint64Max;
+    }
+    if (stringField(value, "kind") != "arc" ||
+        nonnegative(value, "generation") != generation)
+        throw Error("MCFREG2 stable reference generation differs");
+    const uint64_t index = nonnegative(value, "index");
+    if (index >= capacity)
+        throw Error("MCFREG2 stable reference index is out of range");
+    return index;
+}
+
+int64_t
+reducedCost(const Json &event)
+{
+    const __int128 result = static_cast<__int128>(integer(event, "arc_cost")) -
+                            integer(event, "tail_potential") +
+                            integer(event, "head_potential");
+    if (result < std::numeric_limits<int64_t>::min() ||
+        result > std::numeric_limits<int64_t>::max())
+        throw Error("MCFREG2 reduced cost overflows i64");
+    return static_cast<int64_t>(result);
+}
+
+int64_t
+checkedSubtract(int64_t left, int64_t right)
+{
+    const __int128 result =
+        static_cast<__int128>(left) - static_cast<__int128>(right);
+    if (result < std::numeric_limits<int64_t>::min() ||
+        result > std::numeric_limits<int64_t>::max())
+        throw Error("MCFREG2 reduced-cost partial overflows i64");
+    return static_cast<int64_t>(result);
+}
+
+uint64_t
+bits(int64_t value)
+{
+    return static_cast<uint64_t>(value);
+}
+
+uint64_t
+emitTrace(
+    std::FILE *trace, uint16_t phase, matched_trace::Opcode opcode,
+    uint64_t workItem, uint64_t &sequence, uint64_t address,
+    uint64_t operand0, uint64_t operand1, uint64_t result)
+{
+    const uint64_t current = sequence++;
+    matched_trace::emit(trace, matched_trace::TraceRecord{
+        phase, static_cast<uint16_t>(opcode), 0, workItem, current,
+        address, operand0, operand1, result,
+    });
+    return current;
+}
+
+struct BasketRow
+{
+    uint64_t slot;
+    uint64_t arc;
+    int64_t cost;
+    int64_t absolute;
+};
+
+Json
+jsonArray(const std::vector<Json> &values)
+{
+    Json result;
+    result.kind = Json::Kind::Array;
+    result.array = values;
+    return result;
+}
+
+std::map<uint64_t, std::pair<std::string, std::string>>
+boundaryDigests(const Package &package)
+{
+    const Json root = JsonParser(sectionText(package, MCFREG2_BOUNDARIES)).parse();
+    const Json &rows = field(root, "rows");
+    if (rows.kind != Json::Kind::Array)
+        throw Error("MCFREG2 boundaries rows are not an array");
+    std::map<uint64_t, std::pair<std::string, std::string>> result;
+    for (const Json &row : rows.array) {
+        const uint64_t order = nonnegative(row, "order");
+        if (!result.emplace(
+                order,
+                std::make_pair(
+                    stringField(row, "pre_sha256"),
+                    stringField(row, "post_sha256"))).second)
+            throw Error("MCFREG2 boundary order is duplicated");
+    }
+    return result;
+}
+
+std::vector<Json>
+sectionRows(const Package &package, uint16_t section)
+{
+    const Json root = JsonParser(sectionText(package, section)).parse();
+    const Json &rows = field(root, "rows");
+    if (rows.kind != Json::Kind::Array)
+        throw Error("MCFREG2 section rows are not an array");
+    return rows.array;
+}
+
+const McfReg2DirectoryEntry &
+directoryEntry(const Package &package, uint16_t section)
+{
+    const auto found = std::find_if(
+        package.directory.begin(), package.directory.end(),
+        [section](const auto &entry) { return entry.sectionType == section; });
+    if (found == package.directory.end())
+        throw Error("MCFREG2 replay directory entry is missing");
+    return *found;
+}
+
+void
+validateStableRef(
+    const McfStableRef &reference, const Package &package,
+    bool nodeOnly)
+{
+    if (reference.kind == MCFREG2_OBJECT_NULL) {
+        if (reference.generation != 0U || reference.objectId != Uint64Max)
+            throw Error("MCFREG2 null stable reference is malformed");
+        return;
+    }
+    if (reference.kind == MCFREG2_OBJECT_NODE) {
+        if (!nodeOnly || reference.generation != 0U ||
+            reference.objectId >= package.header.nodes)
+            throw Error("MCFREG2 node stable reference is out of range");
+        return;
+    }
+    if (nodeOnly)
+        throw Error("MCFREG2 node relationship kind differs");
+    if (reference.kind == MCFREG2_OBJECT_ARC) {
+        if (reference.generation != 0U ||
+            reference.objectId >= package.header.activeArcs)
+            throw Error("MCFREG2 arc stable reference is out of range");
+        return;
+    }
+    if (reference.kind == MCFREG2_OBJECT_DUMMY_ARC) {
+        if (reference.generation != 0U ||
+            reference.objectId >= package.header.dummyArcs)
+            throw Error("MCFREG2 dummy-arc reference is out of range");
+        return;
+    }
+    throw Error("MCFREG2 stable reference kind is unknown");
+}
+
+McfStableRef
+stableRefAt(const std::vector<uint8_t> &data, size_t offset)
+{
+    if (offset > data.size() || data.size() - offset < sizeof(McfStableRef))
+        throw Error("MCFREG2 stable reference is truncated");
+    McfStableRef result{};
+    std::memcpy(&result, data.data() + offset, sizeof(result));
+    return result;
+}
+
+void
+validateInitialState(const Package &package)
+{
+    constexpr uint64_t NetworkWords = 22U;
+    constexpr uint64_t NodeBytes = 176U;
+    constexpr uint64_t ArcBytes = 96U;
+    const auto &networkEntry = directoryEntry(package, MCFREG2_NETWORK);
+    const auto &nodeEntry = directoryEntry(package, MCFREG2_NODES);
+    const auto &arcEntry = directoryEntry(package, MCFREG2_ARCS);
+    if (networkEntry.elementCount != NetworkWords ||
+        networkEntry.elementSize != 8U ||
+        nodeEntry.elementCount != package.header.nodes ||
+        nodeEntry.elementSize != NodeBytes ||
+        arcEntry.elementCount !=
+            package.header.activeArcs + package.header.dummyArcs ||
+        arcEntry.elementSize != ArcBytes)
+        throw Error("MCFREG2 normalized state layout differs");
+    const auto &nodes = package.sections.at(MCFREG2_NODES);
+    const auto &arcs = package.sections.at(MCFREG2_ARCS);
+    for (uint64_t node = 0; node < package.header.nodes; ++node) {
+        const size_t base = static_cast<size_t>(node * NodeBytes);
+        for (size_t index = 0; index < 4; ++index)
+            validateStableRef(
+                stableRefAt(nodes, base + 16U + index * 16U),
+                package, true);
+        for (size_t index = 0; index < 4; ++index)
+            validateStableRef(
+                stableRefAt(nodes, base + 80U + index * 16U),
+                package, false);
+    }
+    const uint64_t arcCount =
+        package.header.activeArcs + package.header.dummyArcs;
+    for (uint64_t arc = 0; arc < arcCount; ++arc) {
+        const size_t base = static_cast<size_t>(arc * ArcBytes);
+        const McfStableRef tail = stableRefAt(arcs, base + 8U);
+        const McfStableRef head = stableRefAt(arcs, base + 24U);
+        validateStableRef(tail, package, true);
+        validateStableRef(head, package, true);
+        if (tail.kind == MCFREG2_OBJECT_NULL ||
+            head.kind == MCFREG2_OBJECT_NULL)
+            throw Error("MCFREG2 arc endpoint is null");
+        validateStableRef(stableRefAt(arcs, base + 48U), package, false);
+        validateStableRef(stableRefAt(arcs, base + 64U), package, false);
+    }
+}
+
+} // anonymous namespace
+
+ReplaySummary
+replay(
+    const Package &package, std::FILE *canonicalTrace,
+    const std::string &outputRoot)
+{
+    constexpr uint64_t ArcAddress = UINT64_C(0x800000000);
+    constexpr uint64_t PotentialAddress = UINT64_C(0x900000000);
+    constexpr uint64_t DeltaAddress = UINT64_C(0xa00000000);
+    if (canonicalTrace == nullptr)
+        throw Error("MCFREG2 canonical trace is null");
+    validateInitialState(package);
+    const std::vector<Json> events = eventLines(package);
+    const auto boundaries = boundaryDigests(package);
+    const std::vector<Json> callRows =
+        sectionRows(package, MCFREG2_CALL_INDEX);
+    std::map<uint64_t, Json> callIndex;
+    for (const Json &row : callRows) {
+        if (!callIndex.emplace(nonnegative(row, "order"), row).second)
+            throw Error("MCFREG2 call index order is duplicated");
+    }
+    const std::vector<Json> recordedBasket =
+        sectionRows(package, MCFREG2_BASKET);
+    const std::vector<Json> recordedDeltas =
+        sectionRows(package, MCFREG2_DELTAS);
+    std::vector<Json> expectedBasket;
+    std::vector<Json> expectedDeltas;
+    ReplaySummary summary;
+    uint64_t sequence = 0;
+    uint64_t expectedOrder = 0;
+    uint64_t generation = 0;
+    uint64_t capacity = package.header.arenaCapacity;
+    bool active = false;
+    bool candidatePending = false;
+    std::string activePhase;
+    uint64_t activeOrdinal = 0;
+    uint64_t pricingM = 0;
+    uint64_t pricingGroups = 0;
+    uint64_t pricingStartGroup = 0;
+    uint64_t priceOutLiveIn = 0;
+    uint64_t scans = 0;
+    uint64_t arcStates = 0;
+    uint64_t candidateId = 0;
+    uint64_t frameStart = 0;
+    int64_t candidateReduced = 0;
+    std::vector<uint64_t> scannedArcs;
+    std::vector<BasketRow> liveOutBasket;
+    std::vector<Json> frameRows;
+
+    for (uint64_t eventIndex = 0; eventIndex < events.size(); ++eventIndex) {
+        const Json &event = events[eventIndex];
+        const std::string kind = stringField(event, "kind");
+        const std::string phase = stringField(event, "phase_name");
+        if (kind == "BEGIN") {
+            if (active || nonnegative(event, "order") != expectedOrder)
+                throw Error("MCFREG2 call order differs");
+            active = true;
+            frameStart = eventIndex;
+            activePhase = phase;
+            activeOrdinal = nonnegative(event, "ordinal");
+            if (nonnegative(event, "call") != activeOrdinal)
+                throw Error("MCFREG2 call ordinal differs");
+            scans = 0;
+            arcStates = 0;
+            candidatePending = false;
+            scannedArcs.clear();
+            liveOutBasket.clear();
+            frameRows.clear();
+            if (phase == "pricing") {
+                pricingM = nonnegative(event, "m");
+                pricingGroups = nonnegative(event, "nr_group");
+                pricingStartGroup = nonnegative(event, "group_pos");
+                if (pricingGroups == 0 || pricingStartGroup >= pricingGroups)
+                    throw Error("MCFREG2 pricing group state differs");
+                (void)boolField(event, "initialize");
+            } else if (phase == "price_out") {
+                priceOutLiveIn = nonnegative(event, "live_in_m");
+                if (nonnegative(event, "generation") != generation ||
+                    nonnegative(event, "capacity") != capacity)
+                    throw Error("MCFREG2 price-out arena state differs");
+            } else {
+                throw Error("MCFREG2 call phase is unknown");
+            }
+            frameRows.push_back(event);
+            continue;
+        }
+        if (!active || phase != activePhase ||
+            nonnegative(event, "ordinal") != activeOrdinal)
+            throw Error("MCFREG2 event is outside its call frame");
+        frameRows.push_back(event);
+        if (kind == "BASKET")
+            expectedBasket.push_back(event);
+        if (kind == "ARC_STATE" || kind == "ARENA_REMAP" ||
+            kind == "ADJACENCY")
+            expectedDeltas.push_back(event);
+        if (phase == "pricing" && kind == "SCAN") {
+            const int64_t computed = reducedCost(event);
+            if (computed != integer(event, "reduced_cost"))
+                throw Error("MCFREG2 pricing reduced cost differs");
+            const int64_t ident = integer(event, "ident");
+            const bool expectedCandidate =
+                (computed < 0 && ident == 1) ||
+                (computed > 0 && ident == 2);
+            if (boolField(event, "candidate") != expectedCandidate)
+                throw Error("MCFREG2 pricing candidate differs");
+            const uint64_t arc = nonnegative(event, "arc_id");
+            if (arc >= pricingM ||
+                nonnegative(event, "group_pos") != arc % pricingGroups)
+                throw Error("MCFREG2 pricing scan group differs");
+            scannedArcs.push_back(arc);
+            ++scans;
+            emitTrace(
+                canonicalTrace, 1, matched_trace::Opcode::LOAD_U64,
+                eventIndex, sequence, ArcAddress + arc * 96U,
+                bits(integer(event, "arc_cost")), 0,
+                bits(integer(event, "arc_cost")));
+            emitTrace(
+                canonicalTrace, 1, matched_trace::Opcode::LOAD_U64,
+                eventIndex, sequence,
+                PotentialAddress + nonnegative(event, "tail_id") * 8U,
+                bits(integer(event, "tail_potential")), 0,
+                bits(integer(event, "tail_potential")));
+            emitTrace(
+                canonicalTrace, 1, matched_trace::Opcode::LOAD_U64,
+                eventIndex, sequence,
+                PotentialAddress + nonnegative(event, "head_id") * 8U,
+                bits(integer(event, "head_potential")), 0,
+                bits(integer(event, "head_potential")));
+            const int64_t tailPotential = integer(event, "tail_potential");
+            const int64_t partial = checkedSubtract(
+                integer(event, "arc_cost"), tailPotential);
+            emitTrace(
+                canonicalTrace, 1, matched_trace::Opcode::I64_ADD,
+                eventIndex, sequence, 0, bits(integer(event, "arc_cost")),
+                UINT64_C(0) - bits(tailPotential), bits(partial));
+            emitTrace(
+                canonicalTrace, 1, matched_trace::Opcode::I64_ADD,
+                eventIndex, sequence, 0, bits(partial),
+                bits(integer(event, "head_potential")), bits(computed));
+        } else if (phase == "pricing" && kind == "BASKET") {
+            if (stringField(event, "phase") == "live_out")
+                liveOutBasket.push_back(BasketRow{
+                    nonnegative(event, "slot"), nonnegative(event, "arc_id"),
+                    integer(event, "cost"), integer(event, "abs_cost"),
+                });
+        } else if (phase == "price_out" && kind == "CANDIDATE") {
+            if (candidatePending)
+                throw Error("MCFREG2 price-out candidate overlaps");
+            candidateId = nonnegative(event, "candidate");
+            candidateReduced = reducedCost(event);
+            if (candidateReduced != integer(event, "reduced_cost"))
+                throw Error("MCFREG2 price-out reduced cost differs");
+            candidatePending = true;
+            arcStates = 0;
+            emitTrace(
+                canonicalTrace, 2, matched_trace::Opcode::I64_ADD,
+                eventIndex, sequence, 0, bits(integer(event, "arc_cost")),
+                UINT64_C(0) - bits(integer(event, "tail_potential")),
+                bits(checkedSubtract(
+                    integer(event, "arc_cost"),
+                    integer(event, "tail_potential"))));
+            emitTrace(
+                canonicalTrace, 2, matched_trace::Opcode::I64_ADD,
+                eventIndex, sequence, 0,
+                bits(checkedSubtract(
+                    integer(event, "arc_cost"),
+                    integer(event, "tail_potential"))),
+                bits(integer(event, "head_potential")),
+                bits(candidateReduced));
+        } else if (phase == "price_out" && kind == "ARC_STATE") {
+            if (!candidatePending ||
+                nonnegative(event, "candidate") != candidateId)
+                throw Error("MCFREG2 arc delta has no candidate");
+            const uint64_t index =
+                referenceIndex(event, generation, capacity, true);
+            ++arcStates;
+            for (unsigned fieldIndex = 0; fieldIndex < 4; ++fieldIndex) {
+                const char *names[] = {"cost", "org_cost", "flow", "ident"};
+                emitTrace(
+                    canonicalTrace, 2, matched_trace::Opcode::STORE_U64,
+                    eventIndex, sequence,
+                    DeltaAddress + index * 96U + fieldIndex * 8U,
+                    bits(integer(event, names[fieldIndex])), 0,
+                    bits(integer(event, names[fieldIndex])));
+            }
+        } else if (phase == "price_out" && kind == "DECISION") {
+            if (!candidatePending ||
+                nonnegative(event, "candidate") != candidateId)
+                throw Error("MCFREG2 price-out decision has no candidate");
+            const std::string decision = stringField(event, "decision");
+            if (decision == "NO_CHANGE") {
+                referenceIndex(event, generation, capacity, false);
+            } else if (decision == "INSERT" || decision == "REPLACE") {
+                if (candidateReduced >= 0 || arcStates == 0)
+                    throw Error("MCFREG2 price-out mutation differs");
+                referenceIndex(event, generation, capacity, true);
+            } else {
+                throw Error("MCFREG2 price-out decision is unknown");
+            }
+            candidatePending = false;
+        } else if (phase == "price_out" && kind == "ARENA_REMAP") {
+            if (candidatePending ||
+                nonnegative(event, "old_generation") != generation ||
+                nonnegative(event, "new_generation") != generation + 1 ||
+                nonnegative(event, "old_capacity") != capacity ||
+                nonnegative(event, "new_capacity") <= capacity ||
+                nonnegative(event, "mapped_elements") > capacity)
+                throw Error("MCFREG2 arena remap differs");
+            ++generation;
+            capacity = nonnegative(event, "new_capacity");
+            emitTrace(
+                canonicalTrace, 2, matched_trace::Opcode::BARRIER,
+                eventIndex, sequence, 0, generation - 1, generation,
+                capacity);
+        } else if (phase == "price_out" && kind == "ADJACENCY") {
+            if (nonnegative(event, "node_id") >= package.header.nodes ||
+                nonnegative(event, "generation") != generation)
+                throw Error("MCFREG2 adjacency reference differs");
+        } else if (kind != "END") {
+            throw Error("MCFREG2 semantic event kind is unknown");
+        }
+
+        if (kind != "END")
+            continue;
+        if (candidatePending)
+            throw Error("MCFREG2 call ends with a pending candidate");
+        if (phase == "pricing") {
+            if (nonnegative(event, "arcs_priced") != scans ||
+                nonnegative(event, "nr_group") != pricingGroups)
+                throw Error("MCFREG2 pricing count differs");
+            const uint64_t endGroup = nonnegative(event, "group_pos");
+            std::vector<uint64_t> expected;
+            uint64_t group = pricingStartGroup;
+            for (uint64_t pass = 0; pass < pricingGroups; ++pass) {
+                for (uint64_t arc = group; arc < pricingM; arc += pricingGroups)
+                    expected.push_back(arc);
+                group = (group + 1U) % pricingGroups;
+                if (group == endGroup)
+                    break;
+            }
+            if (expected != scannedArcs)
+                throw Error("MCFREG2 pricing scan order differs");
+            for (size_t index = 0; index < liveOutBasket.size(); ++index) {
+                if (liveOutBasket[index].slot != index + 1U ||
+                    (index && liveOutBasket[index - 1U].absolute <
+                                  liveOutBasket[index].absolute))
+                    throw Error("MCFREG2 basket sort differs");
+            }
+            const int64_t selected = integer(event, "selected_arc_id");
+            if (liveOutBasket.empty()) {
+                if (selected != -1 || integer(event, "reduced_cost") != 0)
+                    throw Error("MCFREG2 selected arc differs");
+            } else if (selected < 0 ||
+                       static_cast<uint64_t>(selected) !=
+                           liveOutBasket.front().arc ||
+                       integer(event, "reduced_cost") !=
+                           liveOutBasket.front().cost) {
+                throw Error("MCFREG2 selected arc differs");
+            }
+            ++summary.pricingCalls;
+        } else {
+            const uint64_t newArcs = nonnegative(event, "new_arcs");
+            if (nonnegative(event, "live_out_m") != priceOutLiveIn + newArcs ||
+                nonnegative(event, "capacity") != capacity ||
+                nonnegative(event, "generation") != generation)
+                throw Error("MCFREG2 price-out live-out differs");
+            ++summary.priceOutCalls;
+        }
+        std::vector<Json> pre;
+        std::vector<Json> post;
+        for (const Json &row : frameRows) {
+            const std::string rowKind = stringField(row, "kind");
+            if (rowKind == "BEGIN" ||
+                (rowKind == "BASKET" &&
+                 stringField(row, "phase") == "live_in"))
+                pre.push_back(row);
+            if (rowKind == "END" || rowKind == "ARC_STATE" ||
+                rowKind == "ARENA_REMAP" || rowKind == "ADJACENCY" ||
+                (rowKind == "BASKET" &&
+                 stringField(row, "phase") == "live_out"))
+                post.push_back(row);
+        }
+        const auto boundary = boundaries.find(expectedOrder);
+        if (boundary == boundaries.end() ||
+            sha256Hex(canonicalJson(jsonArray(pre)) + "\n") !=
+                boundary->second.first ||
+            sha256Hex(canonicalJson(jsonArray(post)) + "\n") !=
+                boundary->second.second)
+            throw Error("MCFREG2 boundary digest differs");
+        const auto indexed = callIndex.find(expectedOrder);
+        if (indexed == callIndex.end() ||
+            stringField(indexed->second, "phase") != activePhase ||
+            nonnegative(indexed->second, "ordinal") != activeOrdinal ||
+            nonnegative(indexed->second, "event_begin") != frameStart ||
+            nonnegative(indexed->second, "event_count") !=
+                eventIndex - frameStart + 1U)
+            throw Error("MCFREG2 call index differs");
+        emitTrace(
+            canonicalTrace, phase == "pricing" ? 1 : 2,
+            matched_trace::Opcode::COMMIT, activeOrdinal, sequence, 0,
+            expectedOrder, 0, expectedOrder);
+        active = false;
+        ++expectedOrder;
+    }
+    if (active || summary.pricingCalls != package.header.pricingCalls ||
+        summary.priceOutCalls != package.header.priceOutCalls ||
+        expectedOrder != boundaries.size() ||
+        expectedOrder != callIndex.size())
+        throw Error("MCFREG2 replay call counts differ");
+    if (canonicalJson(jsonArray(expectedBasket)) !=
+            canonicalJson(jsonArray(recordedBasket)))
+        throw Error("MCFREG2 basket section differs from events");
+    if (canonicalJson(jsonArray(expectedDeltas)) !=
+            canonicalJson(jsonArray(recordedDeltas)))
+        throw Error("MCFREG2 delta section differs from events");
+    summary.operations = sequence;
+    std::filesystem::create_directories(outputRoot);
+    std::ofstream validation(outputRoot + "/mcfreg2-replay.json");
+    if (!validation)
+        throw Error("cannot write MCFREG2 replay validation");
+    validation << "{\"boundary_mismatches\":0,\"operations\":"
+               << summary.operations << ",\"price_out_calls\":"
+               << summary.priceOutCalls << ",\"pricing_calls\":"
+               << summary.pricingCalls << ",\"status\":\"verified\"}\n";
+    validation.flush();
+    if (!validation)
+        throw Error("cannot flush MCFREG2 replay validation");
+    return summary;
 }
 
 } // namespace mcfreg2

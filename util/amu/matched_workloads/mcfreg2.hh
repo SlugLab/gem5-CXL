@@ -8,6 +8,7 @@
 
 #include "mcfreg2_format.h"
 
+#include <cstdio>
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -31,9 +32,20 @@ struct Package
     std::map<uint16_t, std::vector<uint8_t>> sections;
 };
 
+struct ReplaySummary
+{
+    uint64_t pricingCalls = 0;
+    uint64_t priceOutCalls = 0;
+    uint64_t operations = 0;
+    uint64_t boundaryMismatches = 0;
+};
+
 Package readPackage(const std::string &path);
 std::string directoryJson(const Package &package);
 std::string sha256Hex(std::string_view value);
+ReplaySummary replay(
+    const Package &package, std::FILE *canonicalTrace,
+    const std::string &outputRoot);
 
 } // namespace mcfreg2
 
