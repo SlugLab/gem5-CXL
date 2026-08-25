@@ -77,7 +77,7 @@ sentinel, the maximum legal stable ID, and an out-of-range stable ID.
 
 - [ ] **Step 2: Run the test and verify the module is absent**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v`
 
 Expected: import failure for `scripts.mcfreg2`.
 
@@ -114,7 +114,7 @@ with `read_package()`, then uses `os.replace()`. It returns the final SHA-256.
 
 - [ ] **Step 4: Run the format tests**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v`
 
 Expected: all format and corruption tests pass.
 
@@ -150,7 +150,7 @@ def test_cpp_reader_matches_python_directory(self):
 
 - [ ] **Step 2: Run the focused test and verify compilation fails**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2.MCFREG2Test.test_cpp_reader_matches_python_directory -v`
+Run: `python3 tests/pyunit/cross_system/test_mcfreg2.py MCFREG2Test.test_cpp_reader_matches_python_directory -v`
 
 Expected: the C++ header/source do not exist.
 
@@ -190,7 +190,7 @@ do not shell out to another process.
 
 - [ ] **Step 4: Run all format/parity tests**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v`
 
 Expected: Python and C++ accept the same fixture and reject all corruptions.
 
@@ -232,7 +232,7 @@ exhaustion, and a patch that does not apply cleanly.
 
 - [ ] **Step 2: Run the module and verify the APIs are absent**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_generate_mcfreg2_state -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v`
 
 Expected: import or missing-function failure.
 
@@ -284,7 +284,7 @@ and `USE_MLIR=0`, and records commands and tool versions.
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_generate_mcfreg2_state -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v`
 
 Expected: unrelated dirt is ignored, path-local drift fails, explicit input is
 used, ROI markers are singular, and capacity/final-state evidence is valid.
@@ -324,7 +324,7 @@ arc count.
 
 - [ ] **Step 2: Run the focused test and verify call frames are missing**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_generate_mcfreg2_state.GenerateMCFREG2Test.test_pricing_capture_preserves_order_and_basket_state -v`
+Run: `python3 tests/pyunit/cross_system/test_generate_mcfreg2_state.py GenerateMCFREG2Test.test_pricing_capture_preserves_order_and_basket_state -v`
 
 Expected: the capture journal has no pricing frames.
 
@@ -350,7 +350,7 @@ basket mutation, sort, or return. Encode signed values as two's-complement
 
 - [ ] **Step 4: Run pricing and authority-equivalence tests**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_generate_mcfreg2_state -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v`
 
 Expected: native order matches and authority/capture final state plus
 `mcf.out` remain bit-exact.
@@ -390,7 +390,7 @@ def test_resize_remap_precedes_new_generation_references(self):
 
 - [ ] **Step 2: Run the four tests and verify typed events are absent**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_generate_mcfreg2_state -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v`
 
 Expected: failure on the first missing price-out event.
 
@@ -455,7 +455,7 @@ writes, insufficient disk, and a changed patch/compiler/input hash.
 
 - [ ] **Step 2: Run focused tests and verify deterministic packing is absent**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_generate_mcfreg2_state -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v`
 
 Expected: primary/replay package comparison cannot pass.
 
@@ -488,7 +488,12 @@ write `failed-input.json`; never delete or overwrite prior evidence.
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 tests.pyunit.cross_system.test_generate_mcfreg2_state -v`
+Run the two files:
+
+```bash
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v
+```
 
 Expected: deterministic bytes, strict resume, and atomic failure pass.
 
@@ -526,7 +531,7 @@ def test_cpp_replayer_rejects_changed_selected_arc(self):
 
 - [ ] **Step 2: Run tests and verify the semantic API is absent**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 -v`
+Run: `python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v`
 
 Expected: structural parsing succeeds but semantic replay is unavailable.
 
@@ -562,7 +567,12 @@ Route `MCFREG2\0` through `readPackage()` and `replay()`.
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 tests.pyunit.cross_system.test_matched_region_build -v`
+Run the two files:
+
+```bash
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_matched_region_build.py' -v
+```
 
 Expected: semantic fixtures pass, faults fail closed, and legacy fixture
 behavior remains valid.
@@ -618,7 +628,12 @@ def test_formal_mcfreg2_builds_verified_reference_bundle(self):
 
 - [ ] **Step 2: Run freezer/builder tests and observe current failures**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_freeze_cross_system_inputs tests.pyunit.cross_system.test_matched_region_build -v`
+Run the two files:
+
+```bash
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_freeze_cross_system_inputs.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_matched_region_build.py' -v
+```
 
 Expected: the old schema accepts too little and the deliberate formal-MCF stop
 blocks the verified package.
@@ -648,7 +663,13 @@ hashes in the prepared manifest.
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 tests.pyunit.cross_system.test_freeze_cross_system_inputs tests.pyunit.cross_system.test_matched_region_build -v`
+Run the three files:
+
+```bash
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_freeze_cross_system_inputs.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_matched_region_build.py' -v
+```
 
 Expected: MCFREG1 fixtures still pass; only qualified MCFREG2 enters formal
 mode; the formal bundle reports zero boundary mismatches.
@@ -668,7 +689,10 @@ git commit -m "feat: bind formal MCF to qualified MCFREG2"
 Run:
 
 ```bash
-python3 -m unittest tests.pyunit.cross_system.test_mcfreg2 tests.pyunit.cross_system.test_generate_mcfreg2_state tests.pyunit.cross_system.test_freeze_cross_system_inputs tests.pyunit.cross_system.test_matched_region_build -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_mcfreg2.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_generate_mcfreg2_state.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_freeze_cross_system_inputs.py' -v
+python3 -m unittest discover -s tests/pyunit/cross_system -p 'test_matched_region_build.py' -v
 python3 -m compileall -q scripts/mcfreg2.py scripts/generate_mcfreg2_state.py scripts/freeze_cross_system_inputs.py scripts/build_matched_breadth_workloads.py
 git diff --check
 ```
