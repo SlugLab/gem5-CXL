@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import hashlib
+import dataclasses
 import json
 import shutil
 import struct
@@ -373,6 +374,35 @@ class MCFREG2Test(unittest.TestCase):
         expected = hashlib.sha256(path.read_bytes()).hexdigest()
         self.assertEqual(actual, expected)
 
+    def test_file_backed_events_write_atomically_and_read_lazily(self):
+        self.require_module()
+        events = self.root / "events.jsonl.gz"
+        events.write_bytes(b"\x1f\x8b" + b"x" * (1024 * 1024))
+        package = self.fixture_package()
+        package = dataclasses.replace(
+            package,
+            sections=tuple(
+                dataclasses.replace(
+                    section,
+                    schema=2,
+                    element_size=0,
+                    data=events,
+                )
+                if section.section_type == mcfreg2.SECTION_TYPES["EVENTS"]
+                else section
+                for section in package.sections
+            ),
+        )
+        path = self.root / "file-backed.reg2"
+        digest = mcfreg2.write_package(path, package)
+        actual = mcfreg2.read_package(
+            path, lazy_section_names=("EVENTS",)
+        )
+        self.assertEqual(mcfreg2.sha256_file(path), digest)
+        self.assertEqual(actual.section("PROVENANCE"), b"provenance\n")
+        with self.assertRaisesRegex(mcfreg2.FormatError, "lazy"):
+            actual.section("EVENTS")
+
     def compile_cpp_probe(self):
         compiler = shutil.which("g++")
         if compiler is None:
@@ -440,6 +470,7 @@ int main(int argc, char **argv)
                 str(implementation),
                 "-o",
                 str(output),
+                "-lz",
             ],
             cwd=self.repo,
             text=True,
@@ -472,6 +503,7 @@ int main(int argc, char **argv)
                 ),
                 "-o",
                 str(output),
+                "-lz",
             ],
             check=True,
         )

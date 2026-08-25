@@ -182,7 +182,9 @@ def validate_mcf_record(row):
         row["validation"], row["validation_sha256"], "mcf validation"
     )
     try:
-        package = mcfreg2.read_package(package_path)
+        package = mcfreg2.read_package(
+            package_path, lazy_section_names=("EVENTS",)
+        )
     except mcfreg2.FormatError as error:
         raise InputError(f"mcf MCFREG2 package is invalid: {error}") from error
     validation = _read_json_file(validation_path, "mcf validation")

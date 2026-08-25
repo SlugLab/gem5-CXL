@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import os
+import shutil
 import struct
 import tempfile
 from pathlib import Path
@@ -87,11 +88,17 @@ class Section:
     flags: int
     element_count: int
     element_size: int
-    data: bytes
+    data: bytes | Path | None
 
     def __post_init__(self):
+        if self.data is None:
+            return
+        if isinstance(self.data, Path):
+            if not self.data.is_file():
+                raise TypeError("MCFREG2 file-backed section is missing")
+            return
         if not isinstance(self.data, bytes):
-            raise TypeError("MCFREG2 section data must be bytes")
+            raise TypeError("MCFREG2 section data must be bytes or a Path")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,6 +131,10 @@ class Package:
     def section_by_type(self, section_type: int) -> bytes:
         for section in self.sections:
             if section.section_type == section_type:
+                if not isinstance(section.data, bytes):
+                    raise FormatError(
+                        f"MCFREG2 section {section_type} data is lazy"
+                    )
                 return section.data
         raise FormatError(f"MCFREG2 section {section_type} is absent")
 
@@ -241,8 +252,9 @@ def new_package(
     pricing_calls: int,
     price_out_calls: int,
     event_count: int,
-    sections: Mapping[str, bytes],
+    sections: Mapping[str, bytes | Path],
     section_layouts: Mapping[str, tuple[int, int]] | None = None,
+    section_schemas: Mapping[str, int] | None = None,
 ) -> Package:
     unknown = set(sections) - set(REQUIRED_SECTIONS)
     missing = set(REQUIRED_SECTIONS) - set(sections)
@@ -251,18 +263,35 @@ def new_package(
     if missing:
         raise FormatError(f"missing MCFREG2 section: {sorted(missing)[0]}")
     layouts = dict(section_layouts or {})
+    schemas = dict(section_schemas or {})
     unknown_layouts = set(layouts) - set(REQUIRED_SECTIONS)
     if unknown_layouts:
         raise FormatError(
             f"unknown MCFREG2 section layout: {sorted(unknown_layouts)[0]}"
         )
+    unknown_schemas = set(schemas) - set(REQUIRED_SECTIONS)
+    if unknown_schemas:
+        raise FormatError(
+            f"unknown MCFREG2 section schema: {sorted(unknown_schemas)[0]}"
+        )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in schemas.values()
+    ):
+        raise FormatError("MCFREG2 section schema is invalid")
     values = tuple(
         Section(
             section_type=SECTION_TYPES[name],
-            schema=1,
+            schema=schemas.get(name, 1),
             flags=0,
-            element_count=layouts.get(name, (1, len(sections[name])))[0],
-            element_size=layouts.get(name, (1, len(sections[name])))[1],
+            element_count=(
+                layouts[name][0] if name in layouts else 1
+            ),
+            element_size=(
+                layouts[name][1]
+                if name in layouts
+                else _section_source_size(sections[name])
+            ),
             data=sections[name],
         )
         for name in REQUIRED_SECTIONS
@@ -278,6 +307,14 @@ def new_package(
         section_count=len(values),
     )
     return Package(header=header, directory=(), sections=values)
+
+
+def _section_source_size(data) -> int:
+    if isinstance(data, bytes):
+        return len(data)
+    if isinstance(data, Path) and data.is_file():
+        return data.stat().st_size
+    raise FormatError("MCFREG2 section source is invalid")
 
 
 def _validate_header(header: Header, file_size: int) -> int:
@@ -326,8 +363,14 @@ def _entry_from_values(values) -> DirectoryEntry:
     return DirectoryEntry(*values)
 
 
-def read_package(path) -> Package:
+def read_package(path, *, lazy_section_names=()) -> Package:
     path = Path(path)
+    lazy_types = set()
+    for name in lazy_section_names:
+        try:
+            lazy_types.add(SECTION_TYPES[name])
+        except KeyError as error:
+            raise FormatError(f"unknown lazy MCFREG2 section: {name}") from error
     try:
         file_size = path.stat().st_size
         with path.open("rb") as stream:
@@ -393,10 +436,23 @@ def read_package(path) -> Package:
                 if end > file_size:
                     raise FormatError("MCFREG2 section is truncated")
                 stream.seek(entry.offset)
-                data = stream.read(entry.stored_bytes)
-                if len(data) != entry.stored_bytes:
-                    raise FormatError("MCFREG2 section is truncated")
-                if hashlib.sha256(data).digest() != entry.sha256:
+                if entry.section_type in lazy_types:
+                    remaining = entry.stored_bytes
+                    digest = hashlib.sha256()
+                    while remaining:
+                        chunk = stream.read(min(remaining, 1024 * 1024))
+                        if not chunk:
+                            raise FormatError("MCFREG2 section is truncated")
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    data = None
+                    actual_digest = digest.digest()
+                else:
+                    data = stream.read(entry.stored_bytes)
+                    if len(data) != entry.stored_bytes:
+                        raise FormatError("MCFREG2 section is truncated")
+                    actual_digest = hashlib.sha256(data).digest()
+                if actual_digest != entry.sha256:
                     raise FormatError("MCFREG2 section SHA-256 differs")
                 sections.append(Section(
                     section_type=entry.section_type,
@@ -438,7 +494,27 @@ def _pack_header(header: Header, section_count: int) -> bytes:
     )
 
 
-def _encoded_package(package: Package) -> bytes:
+def _section_size(section: Section) -> int:
+    if isinstance(section.data, bytes):
+        return len(section.data)
+    if isinstance(section.data, Path):
+        return section.data.stat().st_size
+    raise FormatError("cannot write a lazy MCFREG2 section")
+
+
+def _section_sha256(section: Section) -> bytes:
+    if isinstance(section.data, bytes):
+        return hashlib.sha256(section.data).digest()
+    if isinstance(section.data, Path):
+        digest = hashlib.sha256()
+        with section.data.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.digest()
+    raise FormatError("cannot hash a lazy MCFREG2 section")
+
+
+def _package_entries(package: Package):
     sections = tuple(sorted(package.sections, key=lambda value: value.section_type))
     seen = set()
     for section in sections:
@@ -467,7 +543,8 @@ def _encoded_package(package: Package) -> bytes:
                 )
         elif section.flags != 0:
             raise FormatError("MCFREG2 required section flags differ")
-        if not section.data:
+        stored_bytes = _section_size(section)
+        if stored_bytes == 0:
             raise FormatError("MCFREG2 section is empty")
         if section.element_size:
             logical_bytes = _checked_mul(
@@ -475,19 +552,26 @@ def _encoded_package(package: Package) -> bytes:
                 section.element_size,
                 "section logical size",
             )
-            if logical_bytes != len(section.data):
+            if logical_bytes != stored_bytes:
                 raise FormatError("MCFREG2 section element size differs")
         entries.append(DirectoryEntry(
             section_type=section.section_type,
             schema=section.schema,
             flags=section.flags,
             offset=offset,
-            stored_bytes=len(section.data),
+            stored_bytes=stored_bytes,
             element_count=section.element_count,
             element_size=section.element_size,
-            sha256=hashlib.sha256(section.data).digest(),
+            sha256=_section_sha256(section),
         ))
-        offset = _checked_add(offset, len(section.data), "section end")
+        offset = _checked_add(offset, stored_bytes, "section end")
+    return sections, entries
+
+
+def _encoded_package(package: Package) -> bytes:
+    sections, entries = _package_entries(package)
+    if any(not isinstance(section.data, bytes) for section in sections):
+        raise FormatError("file-backed MCFREG2 requires streaming write")
     chunks = [_pack_header(package.header, len(entries))]
     chunks.extend(
         DIRECTORY.pack(
@@ -509,17 +593,36 @@ def _encoded_package(package: Package) -> bytes:
 def write_package(path, package: Package) -> str:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _encoded_package(package)
+    sections, entries = _package_entries(package)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
+            stream.write(_pack_header(package.header, len(entries)))
+            for entry in entries:
+                stream.write(DIRECTORY.pack(
+                    entry.section_type,
+                    entry.schema,
+                    entry.flags,
+                    entry.offset,
+                    entry.stored_bytes,
+                    entry.element_count,
+                    entry.element_size,
+                    entry.sha256,
+                ))
+            for section in sections:
+                if isinstance(section.data, bytes):
+                    stream.write(section.data)
+                elif isinstance(section.data, Path):
+                    with section.data.open("rb") as source:
+                        shutil.copyfileobj(source, stream, 1024 * 1024)
+                else:
+                    raise FormatError("cannot write a lazy MCFREG2 section")
             stream.flush()
             os.fsync(stream.fileno())
-        read_package(temporary)
+        read_package(temporary, lazy_section_names=("EVENTS",))
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:

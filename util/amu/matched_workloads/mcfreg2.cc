@@ -19,6 +19,7 @@
 #include <set>
 #include <sstream>
 #include <utility>
+#include <zlib.h>
 
 namespace mcfreg2
 {
@@ -694,20 +695,120 @@ sectionText(const Package &package, uint16_t type)
     return std::string(found->second.begin(), found->second.end());
 }
 
-std::vector<Json>
-eventLines(const Package &package)
+class EventReader
 {
-    std::istringstream input(sectionText(package, MCFREG2_EVENTS));
-    std::vector<Json> result;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (!line.empty())
-            result.push_back(JsonParser(line).parse());
+  public:
+    explicit EventReader(const Package &package)
+        : data(sectionData(package)), schema(sectionSchema(package))
+    {
+        if (schema == 1U) {
+            pending.assign(data.begin(), data.end());
+            finished = true;
+        } else if (schema == 2U) {
+            std::memset(&stream, 0, sizeof(stream));
+            if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK)
+                throw Error("MCFREG2 gzip event initialization failed");
+            initialized = true;
+        } else {
+            throw Error("MCFREG2 event section schema is unsupported");
+        }
     }
-    if (result.size() != package.header.eventCount)
-        throw Error("MCFREG2 event count differs");
-    return result;
-}
+
+    ~EventReader()
+    {
+        if (initialized)
+            inflateEnd(&stream);
+    }
+
+    bool next(Json &result)
+    {
+        while (true) {
+            const size_t newline = pending.find('\n');
+            if (newline != std::string::npos) {
+                const std::string line = pending.substr(0, newline);
+                pending.erase(0, newline + 1U);
+                if (line.empty())
+                    continue;
+                result = JsonParser(line).parse();
+                ++rows;
+                return true;
+            }
+            if (finished) {
+                if (pending.empty())
+                    return false;
+                const std::string line = std::move(pending);
+                pending.clear();
+                result = JsonParser(line).parse();
+                ++rows;
+                return true;
+            }
+            decompress();
+        }
+    }
+
+    uint64_t count() const { return rows; }
+
+  private:
+    static const std::vector<uint8_t> &
+    sectionData(const Package &package)
+    {
+        const auto found = package.sections.find(MCFREG2_EVENTS);
+        if (found == package.sections.end())
+            throw Error("MCFREG2 event section is missing");
+        return found->second;
+    }
+
+    static uint16_t
+    sectionSchema(const Package &package)
+    {
+        const auto found = std::find_if(
+            package.directory.begin(), package.directory.end(),
+            [](const auto &entry) {
+                return entry.sectionType == MCFREG2_EVENTS;
+            });
+        if (found == package.directory.end())
+            throw Error("MCFREG2 event directory entry is missing");
+        return found->schema;
+    }
+
+    void decompress()
+    {
+        if (stream.avail_in == 0U && inputOffset < data.size()) {
+            const size_t bytes = std::min(
+                data.size() - inputOffset,
+                static_cast<size_t>(std::numeric_limits<uInt>::max()));
+            stream.next_in = const_cast<Bytef *>(
+                reinterpret_cast<const Bytef *>(data.data() + inputOffset));
+            stream.avail_in = static_cast<uInt>(bytes);
+            inputOffset += bytes;
+        }
+        std::array<char, 1024 * 1024> output{};
+        stream.next_out = reinterpret_cast<Bytef *>(output.data());
+        stream.avail_out = static_cast<uInt>(output.size());
+        const int status = inflate(&stream, Z_NO_FLUSH);
+        const size_t produced = output.size() - stream.avail_out;
+        pending.append(output.data(), produced);
+        if (status == Z_STREAM_END) {
+            if (stream.avail_in != 0U || inputOffset != data.size())
+                throw Error("MCFREG2 gzip event stream has trailing bytes");
+            finished = true;
+        } else if (status != Z_OK) {
+            throw Error("MCFREG2 gzip event stream is invalid");
+        } else if (produced == 0U && stream.avail_in == 0U &&
+                   inputOffset == data.size()) {
+            throw Error("MCFREG2 gzip event stream is truncated");
+        }
+    }
+
+    const std::vector<uint8_t> &data;
+    uint16_t schema;
+    z_stream stream{};
+    bool initialized = false;
+    bool finished = false;
+    size_t inputOffset = 0;
+    uint64_t rows = 0;
+    std::string pending;
+};
 
 const Json &
 reference(const Json &event)
@@ -941,7 +1042,7 @@ replay(
     if (canonicalTrace == nullptr)
         throw Error("MCFREG2 canonical trace is null");
     validateInitialState(package);
-    const std::vector<Json> events = eventLines(package);
+    EventReader events(package);
     const auto boundaries = boundaryDigests(package);
     const std::vector<Json> callRows =
         sectionRows(package, MCFREG2_CALL_INDEX);
@@ -978,8 +1079,9 @@ replay(
     std::vector<BasketRow> liveOutBasket;
     std::vector<Json> frameRows;
 
-    for (uint64_t eventIndex = 0; eventIndex < events.size(); ++eventIndex) {
-        const Json &event = events[eventIndex];
+    Json event;
+    while (events.next(event)) {
+        const uint64_t eventIndex = events.count() - 1U;
         const std::string kind = stringField(event, "kind");
         const std::string phase = stringField(event, "phase_name");
         if (kind == "BEGIN") {
@@ -1018,7 +1120,12 @@ replay(
         if (!active || phase != activePhase ||
             nonnegative(event, "ordinal") != activeOrdinal)
             throw Error("MCFREG2 event is outside its call frame");
-        frameRows.push_back(event);
+        if (kind == "END" || kind == "ARC_STATE" ||
+            kind == "ARENA_REMAP" || kind == "ADJACENCY" ||
+            (kind == "BASKET" &&
+             (stringField(event, "phase") == "live_in" ||
+              stringField(event, "phase") == "live_out")))
+            frameRows.push_back(event);
         if (kind == "BASKET")
             expectedBasket.push_back(event);
         if (kind == "ARC_STATE" || kind == "ARENA_REMAP" ||
@@ -1233,6 +1340,8 @@ replay(
         active = false;
         ++expectedOrder;
     }
+    if (events.count() != package.header.eventCount)
+        throw Error("MCFREG2 event count differs");
     if (active || summary.pricingCalls != package.header.pricingCalls ||
         summary.priceOutCalls != package.header.priceOutCalls ||
         expectedOrder != boundaries.size() ||

@@ -1,6 +1,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
+import gzip
 import hashlib
 import json
 import shutil
@@ -298,6 +299,7 @@ int main(int argc, char **argv)
                 str(source_dir / "mcf_capture.c"),
                 "-o",
                 str(probe),
+                "-lz",
             ],
             check=True,
         )
@@ -347,23 +349,19 @@ int main(int argc, char **argv)
             output_root=capture_root,
         )
 
-        journal_path = capture_root / "pricing.jsonl"
+        journal_path = capture_root / "pricing.jsonl.gz"
         self.assertTrue(journal_path.is_file())
-        rows = [
-            json.loads(line)
-            for line in journal_path.read_text(encoding="utf-8").splitlines()
-        ]
+        with gzip.open(journal_path, "rt", encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream]
         calls = {}
         for row in rows:
             calls.setdefault(row["call"], []).append(row)
         self.assertGreater(len(calls), 1)
         self.assertEqual(capture_run["pricing_calls"], len(calls))
-        price_out_rows = [
-            json.loads(line)
-            for line in (capture_root / "price_out.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        ]
+        with gzip.open(
+            capture_root / "price_out.jsonl.gz", "rt", encoding="utf-8"
+        ) as stream:
+            price_out_rows = [json.loads(line) for line in stream]
         price_out_calls = {
             row["call"] for row in price_out_rows if "call" in row
         }
@@ -634,18 +632,17 @@ int main(int argc, char **argv)
                 str(source_dir / "mcf_capture.c"),
                 "-o",
                 str(probe),
+                "-lz",
             ],
             check=True,
         )
         output_root = self.root / "price-out-run"
         output_root.mkdir()
         subprocess.run([str(probe), str(output_root)], check=True)
-        rows = [
-            json.loads(line)
-            for line in (output_root / "price_out.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        ]
+        with gzip.open(
+            output_root / "price_out.jsonl.gz", "rt", encoding="utf-8"
+        ) as stream:
+            rows = [json.loads(line) for line in stream]
         self.assertEqual(rows[0]["kind"], "BEGIN")
         self.assertEqual(rows[-1]["kind"], "END")
         self.assertEqual(
@@ -808,6 +805,10 @@ int main(int argc, char **argv)
             events_entry.element_count, parsed_package.header.event_count
         )
         self.assertEqual(events_entry.element_size, 0)
+        self.assertEqual(events_entry.schema, 2)
+        self.assertEqual(
+            parsed_package.section("EVENTS")[:2], b"\x1f\x8b"
+        )
         validation = json.loads(
             (accepted_root / "validation.json").read_text(encoding="utf-8")
         )
@@ -874,19 +875,18 @@ int main(int argc, char **argv)
 
         fault_replay = self.root / "fault-replay"
         shutil.copytree(replay_root, fault_replay)
-        pricing = fault_replay / "pricing.jsonl"
-        rows = [
-            json.loads(line)
-            for line in pricing.read_text(encoding="utf-8").splitlines()
-        ]
+        pricing = fault_replay / "pricing.jsonl.gz"
+        with gzip.open(pricing, "rt", encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream]
         scan = next(row for row in rows if row["kind"] == "SCAN")
         scan["reduced_cost"] += 1
-        pricing.write_text(
-            "".join(
-                json.dumps(row, sort_keys=True) + "\n" for row in rows
-            ),
-            encoding="utf-8",
-        )
+        with pricing.open("wb") as raw:
+            with gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw, mtime=0
+            ) as stream:
+                stream.write("".join(
+                    json.dumps(row, sort_keys=True) + "\n" for row in rows
+                ).encode("utf-8"))
         failed_root = self.root / "failed-evidence"
         with self.assertRaisesRegex(
             generator.GenerationError, "capture_determinism"

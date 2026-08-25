@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -373,7 +374,7 @@ def build_native(*, prepared, output, compiler):
     if prepared["capture_enabled"]:
         command.append("-DMCF_CAPTURE_EVENTS=1")
     command.extend(str(source_dir / name) for name in NATIVE_SOURCES)
-    command.extend(("-o", str(output)))
+    command.extend(("-o", str(output), "-lz"))
     build_output = _run_checked(command, cwd=source_dir, label="native MCF build")
     if not output.is_file():
         raise GenerationError("native MCF build did not create its binary")
@@ -446,6 +447,16 @@ def run_native(*, binary, input_path, output_root):
     value["stdout"] = str((output_root / "stdout.log").resolve())
     value["stderr"] = str((output_root / "stderr.log").resolve())
     value["binary_sha256"] = _sha256_file(binary)
+    if value.get("capture_enabled") is True:
+        value["journals"] = {
+            name: {
+                "path": str((output_root / name).resolve()),
+                "bytes": (output_root / name).stat().st_size,
+                "sha256": _sha256_file(output_root / name),
+            }
+            for name in ("pricing.jsonl.gz", "price_out.jsonl.gz")
+        }
+    _atomic_json(record, value)
     return value
 
 
@@ -469,8 +480,9 @@ def _read_json(path, label):
 def _read_json_lines(path, label):
     path = Path(path)
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        rows = [json.loads(line) for line in lines]
+        opener = gzip.open if path.suffix == ".gz" else Path.open
+        with opener(path, "rt", encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream if line.strip()]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise GenerationError(f"invalid {label}: {error}") from error
     if not rows or not all(isinstance(row, dict) for row in rows):
@@ -618,6 +630,178 @@ def _frame_sections(frames):
     return events, call_index, boundaries, basket_rows, delta_rows
 
 
+class _JournalFrames:
+    def __init__(self, path, phase):
+        self.path = Path(path)
+        self.phase = phase
+        self.stream = gzip.open(self.path, "rt", encoding="utf-8")
+        self.pending = None
+        self.expected_ordinal = 0
+
+    def close(self):
+        self.stream.close()
+
+    def _read(self):
+        line = self.stream.readline()
+        if not line:
+            return None
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise GenerationError(
+                f"invalid {self.phase} journal: {error}"
+            ) from error
+        if not isinstance(row, dict):
+            raise GenerationError(
+                f"invalid {self.phase} journal: event is not an object"
+            )
+        return row
+
+    def begin(self):
+        if self.pending is None:
+            self.pending = self._read()
+        if self.pending is None:
+            return None
+        if (
+            self.pending.get("kind") != "BEGIN"
+            or self.pending.get("call") != self.expected_ordinal
+            or not isinstance(self.pending.get("order"), int)
+            or self.pending["order"] < 0
+        ):
+            raise GenerationError(f"{self.phase} call frame is invalid")
+        return self.pending
+
+    def rows(self):
+        begin = self.begin()
+        if begin is None:
+            raise GenerationError(f"{self.phase} call frame is absent")
+        call = self.expected_ordinal
+        self.pending = None
+        row = begin
+        while True:
+            if row.get("call") != call:
+                raise GenerationError(
+                    f"{self.phase} call frame changes ordinal"
+                )
+            yield row
+            if row.get("kind") == "END":
+                break
+            row = self._read()
+            if row is None:
+                raise GenerationError(f"{self.phase} call frame is incomplete")
+        self.expected_ordinal += 1
+
+
+def _stream_frame_sections(run_root, events_path):
+    run_root = Path(run_root)
+    readers = (
+        _JournalFrames(run_root / "pricing.jsonl.gz", "pricing"),
+        _JournalFrames(run_root / "price_out.jsonl.gz", "price_out"),
+    )
+    call_index = []
+    boundaries = []
+    basket_rows = []
+    delta_rows = []
+    event_count = 0
+    pricing_calls = 0
+    price_out_calls = 0
+    raw = Path(events_path).open("wb")
+    compressed = gzip.GzipFile(
+        filename="", mode="wb", fileobj=raw, compresslevel=1, mtime=0
+    )
+    try:
+        expected_order = 0
+        while True:
+            available = [
+                (reader.begin()["order"], reader)
+                for reader in readers
+                if reader.begin() is not None
+            ]
+            if not available:
+                break
+            order, reader = min(available, key=lambda item: item[0])
+            if order != expected_order:
+                raise GenerationError("native MCF call order is not contiguous")
+            ordinal = reader.expected_ordinal
+            start = event_count
+            live_in = []
+            live_out = []
+            last_kind = None
+            for row in reader.rows():
+                event = {
+                    "phase_name": reader.phase,
+                    "ordinal": ordinal,
+                    **row,
+                }
+                compressed.write(_canonical_json(event))
+                event_count += 1
+                last_kind = row.get("kind")
+                if last_kind == "BASKET":
+                    basket_rows.append(event)
+                if last_kind in {"ARC_STATE", "ARENA_REMAP", "ADJACENCY"}:
+                    delta_rows.append(event)
+                if last_kind == "BEGIN" or (
+                    last_kind == "BASKET" and row.get("phase") == "live_in"
+                ):
+                    live_in.append(event)
+                if (
+                    last_kind == "END"
+                    or (
+                        last_kind == "BASKET"
+                        and row.get("phase") == "live_out"
+                    )
+                    or last_kind in {
+                        "ARC_STATE", "ARENA_REMAP", "ADJACENCY"
+                    }
+                ):
+                    live_out.append(event)
+            if last_kind != "END":
+                raise GenerationError(f"{reader.phase} call frame is incomplete")
+            count = event_count - start
+            call_index.append({
+                "phase": reader.phase,
+                "ordinal": ordinal,
+                "order": order,
+                "event_begin": start,
+                "event_count": count,
+            })
+            boundaries.append({
+                "phase": reader.phase,
+                "ordinal": ordinal,
+                "order": order,
+                "pre_sha256": hashlib.sha256(
+                    _canonical_json(live_in)
+                ).hexdigest(),
+                "post_sha256": hashlib.sha256(
+                    _canonical_json(live_out)
+                ).hexdigest(),
+            })
+            if reader.phase == "pricing":
+                pricing_calls += 1
+            else:
+                price_out_calls += 1
+            expected_order += 1
+        if event_count == 0:
+            raise GenerationError("native MCF event stream is empty")
+    except (OSError, EOFError, gzip.BadGzipFile) as error:
+        raise GenerationError(f"invalid compressed MCF journal: {error}") from error
+    finally:
+        compressed.close()
+        raw.close()
+        for reader in readers:
+            reader.close()
+    return {
+        "events": Path(events_path),
+        "event_count": event_count,
+        "pricing_calls": pricing_calls,
+        "price_out_calls": price_out_calls,
+        "call_index": call_index,
+        "boundaries": boundaries,
+        "basket": basket_rows,
+        "deltas": delta_rows,
+    }
+
+
 def _validate_identity(identity):
     required = (
         "source_commit",
@@ -652,14 +836,14 @@ def assemble_capture_package(*, run_root, identity, output):
         raise GenerationError("MCF package source is not a capture run")
     initial = _read_native_state(run_root / "initial.state")
     final = _read_native_state(run_root / "final.state")
-    pricing = _read_json_lines(run_root / "pricing.jsonl", "pricing journal")
-    price_out = _read_json_lines(
-        run_root / "price_out.jsonl", "price-out journal"
-    )
-    frames = _ordered_frames(pricing, price_out)
-    events, call_index, boundaries, basket, deltas = _frame_sections(frames)
-    pricing_calls = sum(frame["phase"] == "pricing" for frame in frames)
-    price_out_calls = sum(frame["phase"] == "price_out" for frame in frames)
+    events_path = Path(output).with_name(f".{Path(output).name}.events.jsonl.gz")
+    streamed = _stream_frame_sections(run_root, events_path)
+    call_index = streamed["call_index"]
+    boundaries = streamed["boundaries"]
+    basket = streamed["basket"]
+    deltas = streamed["deltas"]
+    pricing_calls = streamed["pricing_calls"]
+    price_out_calls = streamed["price_out_calls"]
     if (
         pricing_calls != run.get("pricing_calls")
         or price_out_calls != run.get("price_out_calls")
@@ -691,7 +875,7 @@ def assemble_capture_package(*, run_root, identity, output):
         "ARCS": initial["active_arcs"] + initial["dummy_arcs"],
         "BASKET": _canonical_json({"schema": 1, "rows": basket}),
         "CALL_INDEX": _canonical_json({"schema": 1, "rows": call_index}),
-        "EVENTS": b"".join(_canonical_json(row) for row in events),
+        "EVENTS": streamed["events"],
         "DELTAS": _canonical_json({"schema": 1, "rows": deltas}),
         "BOUNDARIES": _canonical_json({"schema": 1, "rows": boundaries}),
         "FINAL": _canonical_json(final_row),
@@ -703,7 +887,7 @@ def assemble_capture_package(*, run_root, identity, output):
         arena_capacity=initial["max_m"],
         pricing_calls=pricing_calls,
         price_out_calls=price_out_calls,
-        event_count=len(events),
+        event_count=streamed["event_count"],
         sections=sections,
         section_layouts={
             "NETWORK": (STATE_NETWORK_WORDS, 8),
@@ -714,21 +898,25 @@ def assemble_capture_package(*, run_root, identity, output):
             ),
             "BASKET": (len(basket), 0),
             "CALL_INDEX": (len(call_index), 0),
-            "EVENTS": (len(events), 0),
+            "EVENTS": (streamed["event_count"], 0),
             "DELTAS": (len(deltas), 0),
             "BOUNDARIES": (len(boundaries), 0),
         },
+        section_schemas={"EVENTS": 2},
     )
-    digest = mcfreg2.write_package(output, package)
-    parsed = mcfreg2.read_package(output)
-    if parsed.header.event_count != len(events):
+    try:
+        digest = mcfreg2.write_package(output, package)
+    finally:
+        events_path.unlink(missing_ok=True)
+    parsed = mcfreg2.read_package(output, lazy_section_names=("EVENTS",))
+    if parsed.header.event_count != streamed["event_count"]:
         raise GenerationError("written MCFREG2 event count differs")
     return {
         "package": str(Path(output).resolve()),
         "package_sha256": digest,
         "pricing_calls": pricing_calls,
         "price_out_calls": price_out_calls,
-        "event_count": len(events),
+        "event_count": streamed["event_count"],
         "initial_state_sha256": initial["sha256"],
         "final_state_sha256": final["sha256"],
         "mcf_output_sha256": final_row["mcf_output_sha256"],
@@ -818,8 +1006,8 @@ def _publication_bytes(*roots):
     names = (
         "initial.state",
         "final.state",
-        "pricing.jsonl",
-        "price_out.jsonl",
+        "pricing.jsonl.gz",
+        "price_out.jsonl.gz",
         "mcf.out",
     )
     for root in roots:
@@ -850,6 +1038,7 @@ def _run_independent_replay(package, staging):
         str(MATCHED_ROOT / "mcfreg2.cc"),
         "-o",
         str(binary),
+        "-lz",
     )
     compile_output = _run_checked(
         compile_command, cwd=REPO, label="independent_replay compile"
@@ -964,6 +1153,11 @@ def generate_candidate(
                 "native_equivalence: authority/capture peak allocation differs"
             )
         gate = "capture_determinism"
+        for name in ("pricing.jsonl.gz", "price_out.jsonl.gz"):
+            if not _same_file(primary_root / name, replay_root / name):
+                raise GenerationError(
+                    f"capture_determinism: primary/replay {name} differs"
+                )
         primary = assemble_capture_package(
             run_root=primary_root,
             identity=identity,
@@ -983,7 +1177,9 @@ def generate_candidate(
             raise GenerationError(
                 "capture_determinism: primary/replay package SHA-256 differs"
             )
-        shutil.copy2(staging / "primary.reg2", staging / "mcf.reg2")
+        (staging / "replay.reg2").unlink()
+        _link_or_copy(staging / "primary.reg2", staging / "replay.reg2")
+        _link_or_copy(staging / "primary.reg2", staging / "mcf.reg2")
         gate = "independent_replay"
         replay_validation = _run_independent_replay(
             staging / "mcf.reg2", staging
@@ -1192,8 +1388,8 @@ def preflight(
         _run_checked((binary,), cwd=scratch, label="LP64 probe run")
         disk = shutil.disk_usage(output_root).free
         memory = _available_memory_bytes()
-        required_disk = max(1 << 30, frozen["input_bytes"] * 16384)
-        required_memory = max(512 << 20, frozen["input_bytes"] * 1024)
+        required_disk = max(1 << 30, frozen["input_bytes"] * 24576)
+        required_memory = max(512 << 20, frozen["input_bytes"] * 4096)
         if disk < required_disk:
             raise GenerationError(
                 "preflight: insufficient disk capacity: "

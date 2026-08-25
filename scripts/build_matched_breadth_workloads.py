@@ -2886,6 +2886,8 @@ def _compile(cxx, workload, backend, output, *, fixture):
     if workload == "mcf":
         command.append(str(SOURCE_ROOT / "mcfreg2.cc"))
     command.extend(("-o", str(output)))
+    if workload == "mcf":
+        command.append("-lz")
     completed = subprocess.run(
         command, cwd=REPO, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, check=False,
