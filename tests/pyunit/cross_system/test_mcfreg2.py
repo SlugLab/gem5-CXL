@@ -622,6 +622,33 @@ int main(int argc, char **argv)
             "MATCHED_PHASE_INVOCATIONS=price_out_impl:4",
             completed.stdout,
         )
+        materialized_sha256 = hashlib.sha256(
+            (output_root / "canonical.trace").read_bytes()
+        ).hexdigest()
+        hash_root = self.root / "regions-reg2-hash-only"
+        hash_root.mkdir()
+        hash_only = subprocess.run(
+            [
+                str(binary),
+                "--input",
+                str(self.root / "dispatch.reg2"),
+                "--output-root",
+                str(hash_root),
+                "--hash-only",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(hash_only.returncode, 0, hash_only.stderr)
+        self.assertFalse((hash_root / "canonical.trace").exists())
+        hash_validation = json.loads(
+            (hash_root / "mcfreg2-replay.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            hash_validation["trace_sha256"], materialized_sha256
+        )
         legacy = self.root / "legacy.reg1"
         legacy.write_bytes(b"MCFREG1\0")
         rejected = subprocess.run(

@@ -38,6 +38,7 @@ struct ReplaySummary
     uint64_t priceOutCalls = 0;
     uint64_t operations = 0;
     uint64_t boundaryMismatches = 0;
+    std::string traceSha256;
 };
 
 Package readPackage(const std::string &path);

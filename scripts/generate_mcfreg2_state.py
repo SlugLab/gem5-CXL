@@ -1046,15 +1046,19 @@ def _run_independent_replay(package, staging):
     output_root = staging / "replay-validation"
     output_root.mkdir()
     trace = output_root / "canonical.trace"
-    run_command = (
+    hash_only = Path(package).stat().st_size >= 1 << 30
+    run_command = [
         str(binary),
         "--input",
         str(package),
         "--output-root",
         str(output_root),
-        "--trace",
-        str(trace),
-    )
+    ]
+    if hash_only:
+        run_command.append("--hash-only")
+    else:
+        run_command.extend(("--trace", str(trace)))
+    run_command = tuple(run_command)
     run_output = _run_checked(
         run_command, cwd=REPO, label="independent_replay run"
     )
@@ -1064,8 +1068,12 @@ def _run_independent_replay(package, staging):
     if (
         replay_record.get("status") != "verified"
         or replay_record.get("boundary_mismatches") != 0
+        or not isinstance(replay_record.get("trace_sha256"), str)
+        or len(replay_record["trace_sha256"]) != 64
     ):
         raise GenerationError("independent_replay: validation differs")
+    if not hash_only and _sha256_file(trace) != replay_record["trace_sha256"]:
+        raise GenerationError("independent_replay: trace SHA-256 differs")
     return {
         "compiler": {
             "path": cxx,
@@ -1079,7 +1087,8 @@ def _run_independent_replay(package, staging):
         "run_command": list(run_command),
         "run_stdout": run_output,
         "binary_sha256": _sha256_file(binary),
-        "trace_sha256": _sha256_file(trace),
+        "trace_sha256": replay_record["trace_sha256"],
+        "trace_materialized": not hash_only,
         "validation_sha256": _sha256_file(
             output_root / "mcfreg2-replay.json"
         ),

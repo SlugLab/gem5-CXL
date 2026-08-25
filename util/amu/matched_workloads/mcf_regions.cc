@@ -81,6 +81,7 @@ struct Options
     std::string input;
     std::string outputRoot;
     std::string trace;
+    bool hashOnly = false;
 };
 
 std::string
@@ -104,11 +105,13 @@ parseOptions(int argc, char **argv)
                 argc, argv, position, "--output-root");
         else if (option == "--trace")
             options.trace = argument(argc, argv, position, "--trace");
+        else if (option == "--hash-only")
+            options.hashOnly = true;
         else
             throw std::runtime_error("unknown option: " + option);
     }
     if (options.input.empty() || options.outputRoot.empty() ||
-        options.trace.empty())
+        (!options.hashOnly && options.trace.empty()))
         throw std::runtime_error("input, output-root, and trace are required");
     return options;
 }
@@ -426,8 +429,9 @@ main(int argc, char **argv)
         const auto magic = inputMagic(options.input);
         if (std::equal(magic.begin(), magic.end(), std::begin(Reg2Magic))) {
             const auto package = mcfreg2::readPackage(options.input);
-            std::FILE *trace = std::fopen(options.trace.c_str(), "wb");
-            if (trace == nullptr)
+            std::FILE *trace = options.hashOnly
+                ? nullptr : std::fopen(options.trace.c_str(), "wb");
+            if (!options.hashOnly && trace == nullptr)
                 throw std::runtime_error(
                     "cannot open trace: " +
                     std::string(std::strerror(errno)));
@@ -436,10 +440,11 @@ main(int argc, char **argv)
                 summary = mcfreg2::replay(
                     package, trace, options.outputRoot);
             } catch (...) {
-                std::fclose(trace);
+                if (trace != nullptr)
+                    std::fclose(trace);
                 throw;
             }
-            if (std::fclose(trace) != 0)
+            if (trace != nullptr && std::fclose(trace) != 0)
                 throw std::runtime_error("trace close failed");
             std::cout << "MATCHED_PHASE_WORK=pricing_kernel:"
                       << package.header.pricingCalls << '\n'
@@ -453,7 +458,9 @@ main(int argc, char **argv)
                       << package.header.nodes << ",arcs:"
                       << package.header.activeArcs
                       << ",price_out_boundaries:"
-                      << summary.priceOutCalls << '\n';
+                      << summary.priceOutCalls << '\n'
+                      << "MATCHED_TRACE_SHA256="
+                      << summary.traceSha256 << '\n';
             return 0;
         }
         if (!std::equal(magic.begin(), magic.end(), std::begin(Magic)))
@@ -461,6 +468,8 @@ main(int argc, char **argv)
 #ifndef MATCHED_FIXTURE
         throw std::runtime_error("formal MCFREG1 is forbidden");
 #endif
+        if (options.hashOnly)
+            throw std::runtime_error("MCFREG1 hash-only mode is forbidden");
         Header header{};
         State state = loadState(options.input, header);
         std::FILE *trace = std::fopen(options.trace.c_str(), "wb");

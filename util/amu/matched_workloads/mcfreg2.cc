@@ -54,32 +54,72 @@ rotateRight(uint32_t value, unsigned count)
     return (value >> count) | (value << (32U - count));
 }
 
-std::array<uint8_t, 32>
-sha256(const uint8_t *data, size_t size)
+class Sha256
 {
-    if (size > (std::numeric_limits<uint64_t>::max() / 8U))
-        throw Error("MCFREG2 SHA-256 input is too large");
-    std::vector<uint8_t> message(data, data + size);
-    const uint64_t bitLength = static_cast<uint64_t>(size) * 8U;
-    message.push_back(0x80U);
-    while ((message.size() % 64U) != 56U)
-        message.push_back(0U);
-    for (int shift = 56; shift >= 0; shift -= 8)
-        message.push_back(static_cast<uint8_t>(bitLength >> shift));
+  public:
+    void update(const void *rawData, size_t size)
+    {
+        if (finalized)
+            throw Error("MCFREG2 SHA-256 update follows finalization");
+        if (size > std::numeric_limits<uint64_t>::max() - totalBytes)
+            throw Error("MCFREG2 SHA-256 input is too large");
+        totalBytes += size;
+        const auto *data = static_cast<const uint8_t *>(rawData);
+        while (size != 0U) {
+            const size_t bytes = std::min(size, buffer.size() - buffered);
+            std::memcpy(buffer.data() + buffered, data, bytes);
+            buffered += bytes;
+            data += bytes;
+            size -= bytes;
+            if (buffered == buffer.size()) {
+                process(buffer.data());
+                buffered = 0;
+            }
+        }
+    }
 
-    std::array<uint32_t, 8> state = {{
-        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
-        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
-    }};
-    for (size_t block = 0; block < message.size(); block += 64U) {
+    std::array<uint8_t, 32> finish()
+    {
+        if (finalized)
+            throw Error("MCFREG2 SHA-256 is finalized twice");
+        if (totalBytes > std::numeric_limits<uint64_t>::max() / 8U)
+            throw Error("MCFREG2 SHA-256 input is too large");
+        const uint64_t bitLength = totalBytes * 8U;
+        buffer[buffered++] = 0x80U;
+        if (buffered > 56U) {
+            std::fill(buffer.begin() + buffered, buffer.end(), 0U);
+            process(buffer.data());
+            buffered = 0;
+        }
+        std::fill(buffer.begin() + buffered, buffer.begin() + 56U, 0U);
+        for (unsigned index = 0; index < 8U; ++index)
+            buffer[56U + index] = static_cast<uint8_t>(
+                bitLength >> ((7U - index) * 8U));
+        process(buffer.data());
+        finalized = true;
+        std::array<uint8_t, 32> digest{};
+        for (size_t index = 0; index < state.size(); ++index) {
+            digest[index * 4U] = static_cast<uint8_t>(state[index] >> 24U);
+            digest[index * 4U + 1U] =
+                static_cast<uint8_t>(state[index] >> 16U);
+            digest[index * 4U + 2U] =
+                static_cast<uint8_t>(state[index] >> 8U);
+            digest[index * 4U + 3U] = static_cast<uint8_t>(state[index]);
+        }
+        return digest;
+    }
+
+  private:
+    void process(const uint8_t *block)
+    {
         std::array<uint32_t, 64> words{};
         for (size_t index = 0; index < 16U; ++index) {
-            const size_t offset = block + index * 4U;
+            const size_t offset = index * 4U;
             words[index] =
-                (static_cast<uint32_t>(message[offset]) << 24U) |
-                (static_cast<uint32_t>(message[offset + 1U]) << 16U) |
-                (static_cast<uint32_t>(message[offset + 2U]) << 8U) |
-                static_cast<uint32_t>(message[offset + 3U]);
+                (static_cast<uint32_t>(block[offset]) << 24U) |
+                (static_cast<uint32_t>(block[offset + 1U]) << 16U) |
+                (static_cast<uint32_t>(block[offset + 2U]) << 8U) |
+                static_cast<uint32_t>(block[offset + 3U]);
         }
         for (size_t index = 16U; index < words.size(); ++index) {
             const uint32_t s0 =
@@ -133,16 +173,22 @@ sha256(const uint8_t *data, size_t size)
         state[7] += h;
     }
 
-    std::array<uint8_t, 32> digest{};
-    for (size_t index = 0; index < state.size(); ++index) {
-        digest[index * 4U] = static_cast<uint8_t>(state[index] >> 24U);
-        digest[index * 4U + 1U] =
-            static_cast<uint8_t>(state[index] >> 16U);
-        digest[index * 4U + 2U] =
-            static_cast<uint8_t>(state[index] >> 8U);
-        digest[index * 4U + 3U] = static_cast<uint8_t>(state[index]);
-    }
-    return digest;
+    std::array<uint32_t, 8> state = {{
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
+    }};
+    std::array<uint8_t, 64> buffer{};
+    size_t buffered = 0;
+    uint64_t totalBytes = 0;
+    bool finalized = false;
+};
+
+std::array<uint8_t, 32>
+sha256(const uint8_t *data, size_t size)
+{
+    Sha256 digest;
+    digest.update(data, size);
+    return digest.finish();
 }
 
 std::string
@@ -868,14 +914,38 @@ bits(int64_t value)
     return static_cast<uint64_t>(value);
 }
 
+class TraceSink
+{
+  public:
+    explicit TraceSink(std::FILE *stream) : stream(stream) {}
+
+    void write(const matched_trace::TraceRecord &record)
+    {
+        if (stream != nullptr &&
+            std::fwrite(&record, sizeof(record), 1, stream) != 1)
+            throw Error("canonical trace write failed");
+        digest.update(&record, sizeof(record));
+    }
+
+    std::string finish()
+    {
+        const auto value = digest.finish();
+        return hexDigest(value.data(), value.size());
+    }
+
+  private:
+    std::FILE *stream;
+    Sha256 digest;
+};
+
 uint64_t
 emitTrace(
-    std::FILE *trace, uint16_t phase, matched_trace::Opcode opcode,
+    TraceSink &trace, uint16_t phase, matched_trace::Opcode opcode,
     uint64_t workItem, uint64_t &sequence, uint64_t address,
     uint64_t operand0, uint64_t operand1, uint64_t result)
 {
     const uint64_t current = sequence++;
-    matched_trace::emit(trace, matched_trace::TraceRecord{
+    trace.write(matched_trace::TraceRecord{
         phase, static_cast<uint16_t>(opcode), 0, workItem, current,
         address, operand0, operand1, result,
     });
@@ -1039,8 +1109,7 @@ replay(
     constexpr uint64_t ArcAddress = UINT64_C(0x800000000);
     constexpr uint64_t PotentialAddress = UINT64_C(0x900000000);
     constexpr uint64_t DeltaAddress = UINT64_C(0xa00000000);
-    if (canonicalTrace == nullptr)
-        throw Error("MCFREG2 canonical trace is null");
+    TraceSink trace(canonicalTrace);
     validateInitialState(package);
     EventReader events(package);
     const auto boundaries = boundaryDigests(package);
@@ -1148,18 +1217,18 @@ replay(
             scannedArcs.push_back(arc);
             ++scans;
             emitTrace(
-                canonicalTrace, 1, matched_trace::Opcode::LOAD_U64,
+                trace, 1, matched_trace::Opcode::LOAD_U64,
                 eventIndex, sequence, ArcAddress + arc * 96U,
                 bits(integer(event, "arc_cost")), 0,
                 bits(integer(event, "arc_cost")));
             emitTrace(
-                canonicalTrace, 1, matched_trace::Opcode::LOAD_U64,
+                trace, 1, matched_trace::Opcode::LOAD_U64,
                 eventIndex, sequence,
                 PotentialAddress + nonnegative(event, "tail_id") * 8U,
                 bits(integer(event, "tail_potential")), 0,
                 bits(integer(event, "tail_potential")));
             emitTrace(
-                canonicalTrace, 1, matched_trace::Opcode::LOAD_U64,
+                trace, 1, matched_trace::Opcode::LOAD_U64,
                 eventIndex, sequence,
                 PotentialAddress + nonnegative(event, "head_id") * 8U,
                 bits(integer(event, "head_potential")), 0,
@@ -1168,11 +1237,11 @@ replay(
             const int64_t partial = checkedSubtract(
                 integer(event, "arc_cost"), tailPotential);
             emitTrace(
-                canonicalTrace, 1, matched_trace::Opcode::I64_ADD,
+                trace, 1, matched_trace::Opcode::I64_ADD,
                 eventIndex, sequence, 0, bits(integer(event, "arc_cost")),
                 UINT64_C(0) - bits(tailPotential), bits(partial));
             emitTrace(
-                canonicalTrace, 1, matched_trace::Opcode::I64_ADD,
+                trace, 1, matched_trace::Opcode::I64_ADD,
                 eventIndex, sequence, 0, bits(partial),
                 bits(integer(event, "head_potential")), bits(computed));
         } else if (phase == "pricing" && kind == "BASKET") {
@@ -1191,14 +1260,14 @@ replay(
             candidatePending = true;
             arcStates = 0;
             emitTrace(
-                canonicalTrace, 2, matched_trace::Opcode::I64_ADD,
+                trace, 2, matched_trace::Opcode::I64_ADD,
                 eventIndex, sequence, 0, bits(integer(event, "arc_cost")),
                 UINT64_C(0) - bits(integer(event, "tail_potential")),
                 bits(checkedSubtract(
                     integer(event, "arc_cost"),
                     integer(event, "tail_potential"))));
             emitTrace(
-                canonicalTrace, 2, matched_trace::Opcode::I64_ADD,
+                trace, 2, matched_trace::Opcode::I64_ADD,
                 eventIndex, sequence, 0,
                 bits(checkedSubtract(
                     integer(event, "arc_cost"),
@@ -1215,7 +1284,7 @@ replay(
             for (unsigned fieldIndex = 0; fieldIndex < 4; ++fieldIndex) {
                 const char *names[] = {"cost", "org_cost", "flow", "ident"};
                 emitTrace(
-                    canonicalTrace, 2, matched_trace::Opcode::STORE_U64,
+                    trace, 2, matched_trace::Opcode::STORE_U64,
                     eventIndex, sequence,
                     DeltaAddress + index * 96U + fieldIndex * 8U,
                     bits(integer(event, names[fieldIndex])), 0,
@@ -1247,7 +1316,7 @@ replay(
             ++generation;
             capacity = nonnegative(event, "new_capacity");
             emitTrace(
-                canonicalTrace, 2, matched_trace::Opcode::BARRIER,
+                trace, 2, matched_trace::Opcode::BARRIER,
                 eventIndex, sequence, 0, generation - 1, generation,
                 capacity);
         } else if (phase == "price_out" && kind == "ADJACENCY") {
@@ -1334,7 +1403,7 @@ replay(
                 eventIndex - frameStart + 1U)
             throw Error("MCFREG2 call index differs");
         emitTrace(
-            canonicalTrace, phase == "pricing" ? 1 : 2,
+            trace, phase == "pricing" ? 1 : 2,
             matched_trace::Opcode::COMMIT, activeOrdinal, sequence, 0,
             expectedOrder, 0, expectedOrder);
         active = false;
@@ -1354,6 +1423,7 @@ replay(
             canonicalJson(jsonArray(recordedDeltas)))
         throw Error("MCFREG2 delta section differs from events");
     summary.operations = sequence;
+    summary.traceSha256 = trace.finish();
     std::filesystem::create_directories(outputRoot);
     std::ofstream validation(outputRoot + "/mcfreg2-replay.json");
     if (!validation)
@@ -1361,7 +1431,9 @@ replay(
     validation << "{\"boundary_mismatches\":0,\"operations\":"
                << summary.operations << ",\"price_out_calls\":"
                << summary.priceOutCalls << ",\"pricing_calls\":"
-               << summary.pricingCalls << ",\"status\":\"verified\"}\n";
+               << summary.pricingCalls << ",\"status\":\"verified\","
+               << "\"trace_sha256\":\"" << summary.traceSha256
+               << "\"}\n";
     validation.flush();
     if (!validation)
         throw Error("cannot flush MCFREG2 replay validation");
