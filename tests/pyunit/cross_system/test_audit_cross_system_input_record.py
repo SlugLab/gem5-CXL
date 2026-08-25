@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import audit_cross_system_input_record as audit
 from scripts import freeze_cross_system_inputs as freeze
@@ -83,13 +84,13 @@ def valid_record(root):
             "source_root": str(npb_root), "source_commit": commit,
             "parameter_file": str(cg_params),
             "parameter_sha256": sha256(cg_params),
-            "allocated_bytes": 12_000_000_000, "class": "C",
+            "allocated_bytes": 12_800_000_000, "class": "C",
         },
         "npb_mg": {
             "source_root": str(npb_root), "source_commit": commit,
             "parameter_file": str(mg_params),
             "parameter_sha256": sha256(mg_params),
-            "allocated_bytes": 12_000_000_000, "class": "C",
+            "allocated_bytes": 12_800_000_000, "class": "C",
         },
     }
 
@@ -107,7 +108,18 @@ class InputAuditTest(unittest.TestCase):
         self.assertEqual(value["pr_spmv"]["scale"], 20)
         self.assertEqual(value["mcf"]["synthetic"], False)
         self.assertEqual(value["amg_gather"]["allocated_bytes"], 1 << 30)
-        self.assertEqual(value["npb_cg"]["allocated_bytes"], 12_000_000_000)
+        self.assertEqual(value["npb_cg"]["allocated_bytes"], 12_800_000_000)
+
+    @mock.patch.object(audit.subprocess, "check_output", return_value="clean\n")
+    def test_git_inspection_scopes_safe_directory_to_source_root(self, check):
+        source = (self.root / "npb").resolve()
+        source.mkdir()
+        self.assertEqual(audit._git_output(source, "rev-parse", "HEAD"), "clean")
+        command = check.call_args.args[0]
+        self.assertEqual(command[:4], (
+            "git", "-c", f"safe.directory={source}", "-C",
+        ))
+        self.assertEqual(command[4:], (str(source), "rev-parse", "HEAD"))
 
     def test_incomplete_candidate_is_never_accepted(self):
         candidate = {"pr_spmv": {

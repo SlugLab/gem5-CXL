@@ -90,8 +90,8 @@ The strict paper record must bind these fields:
 | `mcf` | non-synthetic input path/hash, source path/hash, allocated bytes |
 | `amg_gather` | data path/hash, index path/hash, at least 1 GiB allocated |
 | `lulesh_scatter` | data path/hash, index path/hash, at least 1 GiB allocated |
-| `npb_cg` | clean source root, exact commit, parameter file/hash, class, at least 12 GB allocated |
-| `npb_mg` | clean source root, exact commit, parameter file/hash, class, at least 12 GB allocated |
+| `npb_cg` | clean source root, exact commit, parameter file/hash, class, at least 12.8 GB allocated |
+| `npb_mg` | clean source root, exact commit, parameter file/hash, class, at least 12.8 GB allocated |
 
 Discovery may inspect existing MCF and NPB candidates, but a source tree,
 binary, or similarly named file is not automatically formal paper input.

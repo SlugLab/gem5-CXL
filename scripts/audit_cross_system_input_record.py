@@ -64,7 +64,7 @@ def template_record():
             "source_commit": "REQUIRED_EXACT_COMMIT",
             "parameter_file": "REQUIRED_ABSOLUTE_PARAMETER_PATH",
             "parameter_sha256": "REQUIRED_SHA256",
-            "allocated_bytes": 12_000_000_000,
+            "allocated_bytes": 12_800_000_000,
             "class": "REQUIRED_CLASS",
         },
         "npb_mg": {
@@ -72,7 +72,7 @@ def template_record():
             "source_commit": "REQUIRED_EXACT_COMMIT",
             "parameter_file": "REQUIRED_ABSOLUTE_PARAMETER_PATH",
             "parameter_sha256": "REQUIRED_SHA256",
-            "allocated_bytes": 12_000_000_000,
+            "allocated_bytes": 12_800_000_000,
             "class": "REQUIRED_CLASS",
         },
     }
@@ -105,8 +105,12 @@ def _observe_file(value, workload, field, reasons):
 
 
 def _git_output(root, *arguments):
+    root = Path(root).resolve()
     return subprocess.check_output(
-        ("git", "-C", str(root), *arguments),
+        (
+            "git", "-c", f"safe.directory={root}",
+            "-C", str(root), *arguments,
+        ),
         text=True,
         stderr=subprocess.STDOUT,
     ).strip()

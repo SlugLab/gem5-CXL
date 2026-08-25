@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from scripts import freeze_cross_system_inputs as freeze
 
@@ -105,6 +106,34 @@ def valid_record(root):
 
 
 class FreezeInputTest(unittest.TestCase):
+    def test_npb_paper_minimum_is_12_8_gb(self):
+        self.assertEqual(
+            freeze.MINIMUM_ALLOCATED_BYTES["npb_cg"], 12_800_000_000
+        )
+        self.assertEqual(
+            freeze.MINIMUM_ALLOCATED_BYTES["npb_mg"], 12_800_000_000
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            value["npb_cg"]["allocated_bytes"] = 12_000_000_000
+            with self.assertRaisesRegex(freeze.InputError, "paper input size"):
+                freeze.validate_paper_record(value)
+
+    @mock.patch.object(freeze.subprocess, "check_output", return_value="clean\n")
+    def test_git_inspection_scopes_safe_directory_to_source_root(self, check):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve()
+            self.assertEqual(
+                freeze._git_output(source, "rev-parse", "HEAD"), "clean"
+            )
+            command = check.call_args.args[0]
+            self.assertEqual(command[:4], (
+                "git", "-c", f"safe.directory={source}", "-C",
+            ))
+            self.assertEqual(
+                command[4:], (str(source), "rev-parse", "HEAD")
+            )
+
     def test_missing_paper_record_fails_instead_of_inferring_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             options = SimpleNamespace(

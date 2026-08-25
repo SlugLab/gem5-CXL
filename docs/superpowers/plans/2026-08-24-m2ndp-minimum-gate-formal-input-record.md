@@ -351,7 +351,7 @@ def test_template_has_exact_six_workload_shape(self):
     self.assertEqual(value["pr_spmv"]["scale"], 20)
     self.assertEqual(value["mcf"]["synthetic"], False)
     self.assertEqual(value["amg_gather"]["allocated_bytes"], 1 << 30)
-    self.assertEqual(value["npb_cg"]["allocated_bytes"], 12_000_000_000)
+    self.assertEqual(value["npb_cg"]["allocated_bytes"], 12_800_000_000)
 
 def test_incomplete_candidate_is_never_accepted(self):
     candidate = {"pr_spmv": {
@@ -398,8 +398,8 @@ Expected: import failure because the audit module is absent.
     "mcf": 345_000_000,
     "amg_gather": 1 << 30,
     "lulesh_scatter": 1 << 30,
-    "npb_cg": 12_000_000_000,
-    "npb_mg": 12_000_000_000,
+    "npb_cg": 12_800_000_000,
+    "npb_mg": 12_800_000_000,
 }
 ```
 

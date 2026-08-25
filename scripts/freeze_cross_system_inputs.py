@@ -73,8 +73,8 @@ MINIMUM_ALLOCATED_BYTES = {
     "mcf": 345_000_000,
     "amg_gather": 1 << 30,
     "lulesh_scatter": 1 << 30,
-    "npb_cg": 12_000_000_000,
-    "npb_mg": 12_000_000_000,
+    "npb_cg": 12_800_000_000,
+    "npb_mg": 12_800_000_000,
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -158,9 +158,13 @@ def validate_paper_record(value):
 
 
 def _git_output(root, *arguments):
+    root = Path(root).resolve()
     try:
         return subprocess.check_output(
-            ("git", "-C", str(root), *arguments),
+            (
+                "git", "-c", f"safe.directory={root}",
+                "-C", str(root), *arguments,
+            ),
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()
