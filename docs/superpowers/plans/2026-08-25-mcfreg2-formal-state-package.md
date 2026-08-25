@@ -150,7 +150,7 @@ def test_cpp_reader_matches_python_directory(self):
 
 - [ ] **Step 2: Run the focused test and verify compilation fails**
 
-Run: `python3 tests/pyunit/cross_system/test_mcfreg2.py MCFREG2Test.test_cpp_reader_matches_python_directory -v`
+Run: `PYTHONPATH=. python3 tests/pyunit/cross_system/test_mcfreg2.py MCFREG2Test.test_cpp_reader_matches_python_directory -v`
 
 Expected: the C++ header/source do not exist.
 
@@ -324,7 +324,7 @@ arc count.
 
 - [ ] **Step 2: Run the focused test and verify call frames are missing**
 
-Run: `python3 tests/pyunit/cross_system/test_generate_mcfreg2_state.py GenerateMCFREG2Test.test_pricing_capture_preserves_order_and_basket_state -v`
+Run: `PYTHONPATH=. python3 tests/pyunit/cross_system/test_generate_mcfreg2_state.py GenerateMCFREG2Test.test_pricing_capture_preserves_order_and_basket_state -v`
 
 Expected: the capture journal has no pricing frames.
 
