@@ -157,6 +157,11 @@ class AsymmetricOffloadRunnerTest(unittest.TestCase):
         self.assertIn("A", candidate_command)
 
         self.options.resume = True
+        fresh = runner.command_for(g12, self.options)
+        self.assertNotIn("--resume", fresh)
+        child_root = runner.point_root(self.options.root, g12)
+        child_root.mkdir(parents=True)
+        (child_root / "status.json").write_text("{}\n")
         resumed = runner.command_for(g12, self.options)
         self.assertIn("--resume", resumed)
 

@@ -228,7 +228,7 @@ def command_for(entry, options):
         ]
         if entry.system == "vanilla":
             command.extend(("--stop-after", "gem5_baseline"))
-        if options.resume:
+        if options.resume and (root / "status.json").is_file():
             command.append("--resume")
         return command
     kind = "amu" if entry.system == "amu" else "cira"
