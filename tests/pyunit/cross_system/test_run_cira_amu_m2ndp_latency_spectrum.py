@@ -5,12 +5,14 @@ import hashlib
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from scripts import cross_system_contract as contract
 from scripts import run_cira_amu_m2ndp_latency_spectrum as spectrum
+from scripts import run_pr_asymmetric_offload as offload
 
 
 def sha(label):
@@ -27,6 +29,70 @@ def identity():
     )
 
 
+def qualification(calibration_sha256):
+    vanilla_ticks = 1_600_000
+    rows = {
+        "g12:vanilla": {
+            "scale": 12, "system": "vanilla", "sim_ticks": vanilla_ticks,
+        },
+        "g12:amu": {
+            "scale": 12, "system": "amu",
+            "sim_ticks": int(Decimal(vanilla_ticks) / Decimal("1.42")),
+        },
+        "g12:cira-few-shot": {
+            "scale": 12, "system": "cira-few-shot",
+            "sim_ticks": int(Decimal(vanilla_ticks) / Decimal("1.45")),
+            "selected_candidate": "B",
+        },
+        "g12:m2ndp": {
+            "scale": 12, "system": "m2ndp",
+            "ndpsim_cycles": int(
+                Decimal(vanilla_ticks) / Decimal("2.67")
+            ),
+            "ndpsim_core_period_seconds": "1e-12",
+        },
+    }
+    common = {
+        "profile": "pr-offload-4thread-1us",
+        "cxl_link_delay": "1us",
+        "workers": 4,
+        "iterations": 20,
+        "all_memory_cxl": True,
+        "verification": "pass",
+        "raw_sha256": sha("rank-bits"),
+        "worker_completions": [40, 40, 40, 40],
+        "pending": {"all": 0},
+    }
+    for row in rows.values():
+        row.update({key: value for key, value in common.items() if key not in row})
+    cira_ticks = rows["g12:cira-few-shot"]["sim_ticks"]
+    rows["g12:cira-few-shot"]["phases"] = {
+        "formation": 1,
+        "sampling": 1,
+        "selection": 1,
+        "jit": 1,
+        "execution": cira_ticks - 5,
+        "drain": 1,
+    }
+    rows["g12:cira-few-shot"]["phase_total_ns"] = cira_ticks
+    rows["g12:m2ndp"]["funcsim"] = {
+        "status": "pass",
+        "compared": 1 << 12,
+        "mismatched": 0,
+        "completed_at_seq": 1,
+    }
+    rows["g12:m2ndp"]["ndpsim_started_at_seq"] = 2
+    return {
+        "schema": 1,
+        "status": "passed",
+        "profile": "pr-offload-4thread-1us",
+        "identity": {"calibration_sha256": calibration_sha256},
+        "performance_gate": offload.qualification_gate(rows),
+        "primary": rows,
+        "replay": json.loads(json.dumps(rows)),
+    }
+
+
 class LatencySpectrumRunnerTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -41,6 +107,16 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
                 "path": str(path.resolve()),
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
+        self.qualification = self.root / "shared/qualification.json"
+        contract.atomic_write_json(
+            self.qualification,
+            qualification(self.shared["calibration"]["sha256"]),
+        )
+
+    def _qualification_record(self):
+        return spectrum.validate_qualification(
+            self.qualification, self.shared["calibration"]["sha256"]
+        )
 
     def test_matrix_is_four_latencies_by_six_workloads_by_four_systems(self):
         self.assertEqual(
@@ -55,9 +131,11 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
         self.assertEqual(len(spectrum.coordinates()), 96)
 
     def test_new_state_binds_verified_shared_objects_and_four_roots(self):
-        state = spectrum.new_state(self.shared, identity())
+        record = self._qualification_record()
+        state = spectrum.new_state(self.shared, record, identity())
         self.assertEqual(state["status"], "planned")
         self.assertEqual(set(state["shared"]), set(self.shared))
+        self.assertEqual(state["qualification"], record)
         self.assertEqual(
             state["latencies"],
             {
@@ -72,13 +150,37 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             spectrum.SpectrumError, "shared objects are not content-addressed"
         ):
-            spectrum.new_state(broken, identity())
+            spectrum.new_state(broken, self._qualification_record(), identity())
         broken = json.loads(json.dumps(self.shared))
         broken["prepared"]["sha256"] = sha("changed")
         with self.assertRaisesRegex(
             spectrum.SpectrumError, "shared objects are not content-addressed"
         ):
-            spectrum.new_state(broken, identity())
+            spectrum.new_state(broken, self._qualification_record(), identity())
+
+    def test_qualification_requires_passed_performance_gate(self):
+        value = qualification(self.shared["calibration"]["sha256"])
+        value["performance_gate"]["status"] = "failed"
+        contract.atomic_write_json(self.qualification, value)
+        with self.assertRaisesRegex(
+            spectrum.SpectrumError, "qualification performance gate"
+        ):
+            self._qualification_record()
+
+    def test_qualification_requires_matching_calibration(self):
+        with self.assertRaisesRegex(
+            spectrum.SpectrumError, "qualification calibration differs"
+        ):
+            spectrum.validate_qualification(self.qualification, sha("other"))
+
+    def test_qualification_requires_identical_primary_and_replay(self):
+        value = qualification(self.shared["calibration"]["sha256"])
+        value["replay"]["g12:amu"]["raw_sha256"] = sha("changed-rank")
+        contract.atomic_write_json(self.qualification, value)
+        with self.assertRaisesRegex(
+            spectrum.SpectrumError, "qualification replay differs"
+        ):
+            self._qualification_record()
 
     def _child(self, label, *, status="complete", parent=None):
         parent = self.root if parent is None else Path(parent)
@@ -129,6 +231,7 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
             inputs=Path(self.shared["inputs"]["path"]),
             calibration=Path(self.shared["calibration"]["path"]),
             prepared=Path(self.shared["prepared"]["path"]),
+            qualification=self.qualification,
             root=campaign,
             resume=False,
         )
@@ -149,6 +252,10 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
                 command[command.index("--calibration") + 1],
                 self.shared["calibration"]["path"],
             )
+        self.assertEqual(
+            complete["qualification"]["sha256"],
+            hashlib.sha256(self.qualification.read_bytes()).hexdigest(),
+        )
 
     def test_latency_root_with_different_bound_identity_is_rejected(self):
         child, _ = self._child("500ns")
@@ -176,7 +283,9 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
             spectrum.validate_child(child, "2us", self.shared)
 
     def test_aggregate_requires_all_four_valid_children(self):
-        state = spectrum.new_state(self.shared, identity())
+        state = spectrum.new_state(
+            self.shared, self._qualification_record(), identity()
+        )
         for label in ("200ns", "500ns", "1us"):
             child, _ = self._child(label)
             spectrum.record_child(state, label, child, ["breadth", label])

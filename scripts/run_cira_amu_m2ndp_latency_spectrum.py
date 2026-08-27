@@ -17,10 +17,12 @@ try:
     from scripts import cross_system_contract as contract
     from scripts import cxl_latency_spectrum as latency
     from scripts import run_cira_amu_m2ndp_breadth as breadth
+    from scripts import run_pr_asymmetric_offload as offload
 except ImportError:
     import cross_system_contract as contract
     import cxl_latency_spectrum as latency
     import run_cira_amu_m2ndp_breadth as breadth
+    import run_pr_asymmetric_offload as offload
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -80,8 +82,70 @@ def validate_shared(shared):
     }
 
 
-def new_state(shared, identity):
+def validate_qualification(path, calibration_sha256):
+    path = Path(path).resolve()
+    value = _load_json(path, "g12 qualification")
+    if (
+        value.get("schema") != 1
+        or value.get("status") != "passed"
+        or value.get("profile") != "pr-offload-4thread-1us"
+    ):
+        raise SpectrumError("qualification is not a formal PASS")
+    identity = value.get("identity")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("calibration_sha256") != calibration_sha256
+    ):
+        raise SpectrumError("qualification calibration differs")
+    primary = value.get("primary")
+    replay = value.get("replay")
+    expected_keys = tuple(
+        f"g12:{system}" for system in offload.contract.PRIMARY_SYSTEMS
+    )
+    if (
+        not isinstance(primary, dict)
+        or not isinstance(replay, dict)
+        or set(primary) != set(expected_keys)
+        or set(replay) != set(expected_keys)
+    ):
+        raise SpectrumError("qualification point set differs")
+    ordered_primary = {key: primary[key] for key in expected_keys}
+    ordered_replay = {key: replay[key] for key in expected_keys}
+    try:
+        expected_gate = offload.qualification_gate(ordered_primary)
+    except (offload.OffloadError, KeyError, TypeError, ValueError) as error:
+        raise SpectrumError(
+            f"qualification primary evidence differs: {error}"
+        ) from error
+    if (
+        expected_gate.get("status") != "passed"
+        or expected_gate.get("offenders")
+        or value.get("performance_gate") != expected_gate
+    ):
+        raise SpectrumError("qualification performance gate differs")
+    try:
+        offload.validate_replay(ordered_primary, ordered_replay)
+    except (offload.OffloadError, KeyError, TypeError, ValueError) as error:
+        raise SpectrumError(f"qualification replay differs: {error}") from error
+    if primary != replay:
+        raise SpectrumError("qualification replay differs from primary")
+    return {"path": str(path), "sha256": _sha256_file(path)}
+
+
+def _validate_qualification_record(record, calibration_sha256):
+    if not contract.verify_named_hashes({"qualification": record}):
+        raise SpectrumError("qualification record is not content-addressed")
+    current = validate_qualification(record["path"], calibration_sha256)
+    if current != record:
+        raise SpectrumError("qualification record differs")
+    return current
+
+
+def new_state(shared, qualification, identity):
     shared = validate_shared(shared)
+    qualification = _validate_qualification_record(
+        qualification, shared["calibration"]["sha256"]
+    )
     if not isinstance(identity, contract.ExperimentIdentity):
         raise SpectrumError("aggregate identity has the wrong type")
     return {
@@ -90,6 +154,7 @@ def new_state(shared, identity):
         "identity": dataclasses.asdict(identity),
         "identity_sha256": identity.digest(),
         "shared": shared,
+        "qualification": qualification,
         "latencies": {
             label: {"status": "pending", "root": f"latency/{label}"}
             for label in latency.LABELS
@@ -210,7 +275,10 @@ def complete_state(state, root):
         state.get("latencies", {})
     ) != set(latency.LABELS):
         raise SpectrumError("aggregate state is invalid")
-    validate_shared(state.get("shared"))
+    shared = validate_shared(state.get("shared"))
+    _validate_qualification_record(
+        state.get("qualification"), shared["calibration"]["sha256"]
+    )
     if any(
         state["latencies"][label].get("status") != "complete"
         for label in latency.LABELS
@@ -241,7 +309,7 @@ def _record(path):
     return {"path": str(path), "sha256": _sha256_file(path)}
 
 
-def _aggregate_identity(shared):
+def _aggregate_identity(shared, qualification):
     code_paths = (
         Path(__file__).resolve(),
         Path(breadth.__file__).resolve(),
@@ -254,6 +322,7 @@ def _aggregate_identity(shared):
         "latencies": latency.LABELS,
         "workloads": WORKLOADS,
         "systems": SYSTEMS,
+        "qualification_sha256": qualification["sha256"],
     })).hexdigest()
     return contract.ExperimentIdentity(
         code_sha256=code_sha256,
@@ -305,7 +374,10 @@ def run(options):
         "calibration": _record(options.calibration),
         "prepared": _record(options.prepared),
     })
-    identity = _aggregate_identity(shared)
+    qualification = validate_qualification(
+        options.qualification, shared["calibration"]["sha256"]
+    )
+    identity = _aggregate_identity(shared, qualification)
     identity_path = root / "identity.json"
     state_path = root / "state.json"
     if options.resume:
@@ -319,6 +391,10 @@ def run(options):
         if (
             state.get("identity_sha256") != identity.digest()
             or validate_shared(state.get("shared")) != shared
+            or _validate_qualification_record(
+                state.get("qualification"),
+                shared["calibration"]["sha256"],
+            ) != qualification
             or state.get("status") != "planned"
         ):
             raise SpectrumError("resume aggregate identity differs")
@@ -329,7 +405,7 @@ def run(options):
             contract.bind_root(root, identity)
         except contract.ContractError as error:
             raise SpectrumError(str(error)) from error
-        state = new_state(shared, identity)
+        state = new_state(shared, qualification, identity)
         contract.atomic_write_json(state_path, state)
     for label in latency.LABELS:
         row = state["latencies"][label]
@@ -375,6 +451,7 @@ def parse_args(argv=None):
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--prepared", type=Path, required=True)
+    parser.add_argument("--qualification", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
