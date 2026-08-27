@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,6 +124,113 @@ class FormalSpatterExpansionTest(unittest.TestCase):
         self.assertGreater(len(set(observed)), 90)
         for bits in observed:
             self.assertEqual(bits & 0x7f800000, 0x3f000000)
+
+
+class FormalSpatterArtifactTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source.json"
+        self.source.write_text(json.dumps([
+            {"kernel": "Gather", "count": 2, "delta": 10,
+             "pattern": [0, 2]},
+            {"kernel": "Gather", "count": 1, "delta": 1,
+             "pattern": [1, 3]},
+        ]) + "\n", encoding="utf-8")
+
+    def spec(self, *, workload="amg_gather", mode="gather"):
+        return generator.GenerationSpec(
+            workload=workload,
+            mode=mode,
+            selected_kernel="Gather",
+            source_trace=self.source.resolve(),
+            source_trace_sha256=sha256(self.source),
+            source_commit="a" * 40,
+            minimum_bytes=1,
+        )
+
+    def validation(self, artifacts):
+        return {
+            "schema": 1,
+            "status": "accepted",
+            "workload": artifacts.workload,
+            "values_sha256": artifacts.values_sha256,
+            "index_sha256": artifacts.index_sha256,
+            "destination_sha256": "d" * 64,
+            "reference_binary_sha256": "b" * 64,
+        }
+
+    def test_generate_once_writes_exact_little_endian_streams(self):
+        artifacts = generator.generate_once(self.spec(), self.root / "once")
+        expected_index = (0, 2, 10, 12, 14, 16)
+        expected_values = tuple(generator.value_bits(i) for i in range(17))
+        self.assertEqual(
+            artifacts.index_path.read_bytes(),
+            struct.pack("<6Q", *expected_index),
+        )
+        self.assertEqual(
+            artifacts.values_path.read_bytes(),
+            struct.pack("<17I", *expected_values),
+        )
+        self.assertEqual(artifacts.epochs, 1)
+        self.assertEqual(artifacts.index_count, 6)
+        self.assertEqual(artifacts.values_count, 17)
+        self.assertEqual(artifacts.maximum_index, 16)
+        self.assertEqual(artifacts.resident_bytes, 140)
+
+    def test_two_independent_generations_have_identical_identity(self):
+        first = generator.generate_once(self.spec(), self.root / "first")
+        second = generator.generate_once(self.spec(), self.root / "second")
+        generator.compare_generations(first, second)
+        self.assertEqual(first.values_sha256, second.values_sha256)
+        self.assertEqual(first.index_sha256, second.index_sha256)
+
+    def test_compare_generations_rejects_post_generation_tampering(self):
+        first = generator.generate_once(self.spec(), self.root / "first")
+        second = generator.generate_once(self.spec(), self.root / "second")
+        second.values_path.write_bytes(b"changed")
+        with self.assertRaisesRegex(generator.GenerationError, "regeneration"):
+            generator.compare_generations(first, second)
+
+    def test_generate_twice_keeps_primary_and_removes_replay(self):
+        verified = generator.generate_twice(self.spec(), self.root / "stage")
+        self.assertTrue(verified.artifacts.values_path.is_file())
+        self.assertFalse((self.root / "stage/replay").exists())
+        self.assertEqual(
+            verified.provenance["independent_regeneration"]["status"],
+            "pass",
+        )
+
+    def test_promotion_requires_accepted_matching_validation(self):
+        verified = generator.generate_twice(self.spec(), self.root / "stage")
+        with self.assertRaisesRegex(generator.GenerationError, "validation"):
+            generator.promote_validated(
+                verified, {"status": "failed"}, self.root / "published"
+            )
+        self.assertFalse((self.root / "published/amg_gather").exists())
+
+    def test_promotion_is_content_addressed_and_rejects_conflict(self):
+        verified = generator.generate_twice(self.spec(), self.root / "stage")
+        published = generator.promote_validated(
+            verified, self.validation(verified.artifacts),
+            self.root / "published",
+        )
+        self.assertEqual(published.name, verified.artifact_id)
+        self.assertTrue((published / "values.f32le").is_file())
+        self.assertTrue((published / "index.u64le").is_file())
+        self.assertTrue((published / "provenance.json").is_file())
+        self.assertTrue((published / "validation.json").is_file())
+
+        (published / "values.f32le").write_bytes(b"conflict")
+        replacement = generator.generate_twice(
+            self.spec(), self.root / "replacement"
+        )
+        with self.assertRaisesRegex(generator.GenerationError, "conflict"):
+            generator.promote_validated(
+                replacement, self.validation(replacement.artifacts),
+                self.root / "published",
+            )
 
 
 if __name__ == "__main__":
