@@ -214,16 +214,38 @@ must be clean or non-overlapping before integration; existing untracked PDFs
 and GAPBS evidence files are preserved.
 
 The current g4-only table, figure, caption, and associated claims are replaced
-only after the aggregate manifest passes. The new publication package contains:
+only after the aggregate manifest passes. The selected layout is a 2-by-3
+small-multiple figure: one panel per workload, ordered by graph, optimization,
+gather/scatter, and scientific categories. Every panel plots CXL link latency
+on the x-axis and speedup over the latency-matched Vanilla execution on the
+y-axis. AMU, CIRA, and M2NDP use fixed colors plus distinct markers and line
+styles, paired 95% confidence intervals, and a visible 1.0x reference. Axes
+and styling are consistent across panels so the reader can compare latency
+sensitivity directly.
+
+The new publication package contains:
 
 1. a grouped comparison at 1 us with six workloads on the x-axis and AMU,
    CIRA, and M2NDP speedup bars with paired 95% confidence intervals;
-2. six latency-sensitivity small multiples covering 200 ns through 2 us, with
-   consistent colors and a visible 1.0x reference;
+2. the selected 2-by-3 latency-sensitivity small-multiple figure covering
+   200 ns through 2 us;
 3. a compact table containing exact 1-us end-to-end latency and speedup plus
    latency-spectrum geometric means; and
-4. canonical CSV, JSON, PDF, SVG, and LaTeX generated from the same validated
-   rows.
+4. six standalone dual-panel benchmark figures, each showing absolute
+   end-to-end latency for all four systems above speedup over matched Vanilla
+   below; and
+5. canonical CSV, normalized JSON, PDF, SVG, PNG, and LaTeX generated from the
+   same validated rows.
+
+Absolute-latency panels use a shared unit within each workload and start at
+zero. Speedup panels use the same ordered latency positions, include the
+Vanilla 1.0x reference, and never interpolate across a missing or
+inconclusive coordinate. The grouped 1-us figure and the composite latency
+figure are sized for the paper column layout; every standalone figure is also
+exported at a presentation-readable size. Plot generation is deterministic,
+records every output hash, and consumes only the complete publication
+manifest. Diagnostic plots are written to a separate path and cannot replace
+the tracked paper artifacts.
 
 The evaluation text identifies PageRank as g20 with 2^20 vertices and limits
 the breadth claim to six matched regions spanning graph traversal, network
