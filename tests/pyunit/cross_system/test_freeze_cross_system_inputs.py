@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from scripts import build_matched_breadth_workloads as builder
 from scripts import cross_system_contract as contract
 from scripts import freeze_cross_system_inputs as freeze
 from scripts import generate_formal_spatter_inputs as spatter
@@ -384,6 +385,52 @@ class FreezeInputTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(freeze.InputError, "paper input record"):
                 freeze.freeze_inputs(options)
+
+    def test_frozen_output_is_consumable_by_formal_npb_builder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paper = write(root / "paper.json", b"{}\n")
+            graph_paths = tuple(
+                write(root / f"g{scale}.json", b"{}\n")
+                for scale in (4, 12, 14, 20)
+            )
+            rows = {
+                name: {
+                    "source_root": str(root / "npb"),
+                    "source_commit": "a" * 40,
+                    "parameter_file": str(root / f"{short}.params"),
+                    "parameter_sha256": "b" * 64,
+                    "allocated_bytes": 12_800_000_000,
+                    "class": "D",
+                }
+                for short, name in (("cg", "npb_cg"), ("mg", "npb_mg"))
+            }
+            graphs = tuple(
+                SimpleNamespace(
+                    scale=scale,
+                    graph=str(root / f"g{scale}.sg"),
+                    graph_sha256=f"{scale:064x}",
+                    num_nodes=1 << scale,
+                    directed_edges=scale,
+                )
+                for scale in (4, 12, 14, 20)
+            )
+            options = SimpleNamespace(
+                paper_input_record=paper,
+                graph_manifests=graph_paths,
+            )
+            with mock.patch.object(
+                freeze, "validate_bound_inputs", return_value=rows,
+            ), mock.patch.object(
+                freeze.profiles, "load_scaling_graphs", return_value=graphs,
+            ):
+                frozen = freeze.freeze_inputs(options)
+            frozen_path = root / "inputs.json"
+            frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
+
+            loaded, _digest = builder.load_frozen_npb_inputs(frozen_path)
+
+            self.assertEqual(set(loaded), {"cg", "mg"})
 
     def test_npb_requires_parameter_hash_and_allocated_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:

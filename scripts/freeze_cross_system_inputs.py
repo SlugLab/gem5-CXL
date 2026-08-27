@@ -821,9 +821,14 @@ def freeze_inputs(options):
         graphs = profiles.load_scaling_graphs(graph_paths)
     except profiles.ProfileError as error:
         raise InputError(str(error)) from error
+    try:
+        from scripts import build_matched_breadth_workloads as builder
+    except ImportError:
+        import build_matched_breadth_workloads as builder
     return {
         "schema": 1,
         "status": "accepted",
+        "semantic_identity": builder._npb_semantic_identity(),
         "paper_input_record": str(paper_path.resolve()),
         "paper_input_record_sha256": _sha256_file(paper_path),
         "workloads": workloads,
