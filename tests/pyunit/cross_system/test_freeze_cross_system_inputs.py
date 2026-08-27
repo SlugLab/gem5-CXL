@@ -4,6 +4,7 @@
 import dataclasses
 import hashlib
 import json
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -11,7 +12,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from scripts import cross_system_contract as contract
 from scripts import freeze_cross_system_inputs as freeze
+from scripts import generate_formal_spatter_inputs as spatter
 from scripts import generate_mcfreg2_state as generator
 from scripts import mcfreg2
 from test_mcfreg2 import MCFREG2Test
@@ -50,6 +53,118 @@ def make_git_source(root):
         ["git", "rev-parse", "HEAD"], cwd=source, text=True
     ).strip()
     return source.resolve(), commit, cg, mg
+
+
+def make_spatter_record(root, workload):
+    root = Path(root)
+    mode = "gather" if workload == "amg_gather" else "scatter"
+    kernel = "Gather" if mode == "gather" else "Scatter"
+    trace_path = write(
+        root / f"{workload}.source.json",
+        (json.dumps([
+            {"kernel": kernel, "count": 1, "delta": 1,
+             "pattern": [0, 3]},
+        ]) + "\n").encode("utf-8"),
+    )
+    values_count = 4 if mode == "gather" else 2
+    values = struct.pack(
+        f"<{values_count}I",
+        *(spatter.value_bits(index) for index in range(values_count)),
+    )
+    index = struct.pack("<2Q", 0, 3)
+    values_sha = hashlib.sha256(values).hexdigest()
+    index_sha = hashlib.sha256(index).hexdigest()
+    identity = {
+        "schema": 1,
+        "source_kind": "official_spatter_application_trace",
+        "workload": workload,
+        "mode": mode,
+        "selected_kernel": kernel,
+        "source_trace": str(trace_path),
+        "source_trace_sha256": sha256(trace_path),
+        "source_commit": "a" * 40,
+        "generator_sha256": sha256(Path(spatter.__file__)),
+        "expansion_version": spatter.EXPANSION_VERSION,
+        "selection_rule": f"all {kernel} records in source order",
+        "minimum_bytes": 1,
+        "epochs": 1,
+        "values_count": values_count,
+        "index_count": 2,
+        "maximum_index": 3,
+        "resident_bytes": 40,
+        "values_sha256": values_sha,
+        "index_sha256": index_sha,
+    }
+    artifact_id = hashlib.sha256(contract.canonical_json(identity)).hexdigest()
+    artifact = root / workload / artifact_id
+    artifact.mkdir(parents=True)
+    values_path = write(artifact / "values.f32le", values)
+    index_path = write(artifact / "index.u64le", index)
+    binary = write(root / "spatter-reference", b"reference binary")
+    matched = Path(freeze.__file__).resolve().parents[1] / "util/amu/matched_workloads"
+    validation = {
+        "schema": 1,
+        "status": "accepted",
+        "workload": workload,
+        "mode": mode,
+        "values_sha256": values_sha,
+        "index_sha256": index_sha,
+        "destination_sha256": "d" * 64,
+        "output_words": 2 if mode == "gather" else 4,
+        "reference_binary": str(binary),
+        "reference_binary_sha256": sha256(binary),
+        "reference_source_sha256": sha256(matched / "spatter_regions.cc"),
+        "trace_abi_sha256": sha256(matched / "canonical_trace.hh"),
+        "command_sha256": "1" * 64,
+        "stdout_sha256": "2" * 64,
+    }
+    validation_path = artifact / "validation.json"
+    contract.atomic_write_json(validation_path, validation)
+    provenance = {
+        **identity,
+        "status": "accepted",
+        "artifact_id": artifact_id,
+        "artifacts": {
+            "values": {
+                "name": "values.f32le", "sha256": values_sha,
+                "size_bytes": len(values),
+            },
+            "index": {
+                "name": "index.u64le", "sha256": index_sha,
+                "size_bytes": len(index),
+            },
+        },
+        "independent_regeneration": {
+            "status": "pass", "values_sha256": values_sha,
+            "index_sha256": index_sha,
+        },
+        "validation": {
+            "name": "validation.json", "sha256": sha256(validation_path),
+        },
+    }
+    provenance_path = artifact / "provenance.json"
+    contract.atomic_write_json(provenance_path, provenance)
+    return {
+        "input": str(values_path),
+        "input_sha256": values_sha,
+        "index": str(index_path),
+        "index_sha256": index_sha,
+        "allocated_bytes": 1 << 30,
+        "synthetic": False,
+        "provenance": str(provenance_path.resolve()),
+        "provenance_sha256": sha256(provenance_path),
+        "validation": str(validation_path.resolve()),
+        "validation_sha256": sha256(validation_path),
+        "artifact_id": artifact_id,
+    }
+
+
+def use_fixture_spatter_capacity(value):
+    for workload in ("amg_gather", "lulesh_scatter"):
+        provenance = json.loads(
+            Path(value[workload]["provenance"]).read_text(encoding="utf-8")
+        )
+        value[workload]["allocated_bytes"] = provenance["resident_bytes"]
 
 
 def valid_record(root):
@@ -126,10 +241,8 @@ def valid_record(root):
         root / "validation.json",
         generator._canonical_json(validation),
     )
-    amg_input = write(root / "amg.values", b"amg values")
-    amg_index = write(root / "amg.index", b"amg index")
-    lulesh_input = write(root / "lulesh.values", b"lulesh values")
-    lulesh_index = write(root / "lulesh.index", b"lulesh index")
+    amg = make_spatter_record(root, "amg_gather")
+    lulesh = make_spatter_record(root, "lulesh_scatter")
     npb_root, commit, cg_params, mg_params = make_git_source(root)
     return {
         "pr_spmv": {
@@ -151,20 +264,8 @@ def valid_record(root):
             "validation_sha256": sha256(validation_path),
             "synthetic": False,
         },
-        "amg_gather": {
-            "input": str(amg_input),
-            "input_sha256": sha256(amg_input),
-            "index": str(amg_index),
-            "index_sha256": sha256(amg_index),
-            "allocated_bytes": 1 << 30,
-        },
-        "lulesh_scatter": {
-            "input": str(lulesh_input),
-            "input_sha256": sha256(lulesh_input),
-            "index": str(lulesh_index),
-            "index_sha256": sha256(lulesh_index),
-            "allocated_bytes": 1 << 30,
-        },
+        "amg_gather": amg,
+        "lulesh_scatter": lulesh,
         "npb_cg": {
             "source_root": str(npb_root),
             "source_commit": commit,
@@ -352,10 +453,49 @@ class FreezeInputTest(unittest.TestCase):
             ):
                 freeze.validate_paper_record(value)
 
+    def test_spatter_rejects_provenance_source_hash_tampering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            path = Path(value["amg_gather"]["provenance"])
+            provenance = json.loads(path.read_text(encoding="utf-8"))
+            provenance["source_trace_sha256"] = "0" * 64
+            contract.atomic_write_json(path, provenance)
+            value["amg_gather"]["provenance_sha256"] = sha256(path)
+            with self.assertRaisesRegex(freeze.InputError, "provenance|source"):
+                freeze.validate_bound_inputs(value)
+
+    def test_spatter_rejects_failed_reference_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            path = Path(value["lulesh_scatter"]["validation"])
+            validation = json.loads(path.read_text(encoding="utf-8"))
+            validation["status"] = "failed"
+            contract.atomic_write_json(path, validation)
+            value["lulesh_scatter"]["validation_sha256"] = sha256(path)
+            use_fixture_spatter_capacity(value)
+            with mock.patch.dict(
+                freeze.MINIMUM_ALLOCATED_BYTES,
+                {"amg_gather": 1, "lulesh_scatter": 1},
+            ):
+                with self.assertRaisesRegex(freeze.InputError, "validation"):
+                    freeze.validate_bound_inputs(value)
+
+    def test_spatter_rejects_declared_allocation_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = valid_record(Path(tmp))
+            value["amg_gather"]["allocated_bytes"] = (1 << 30) + 1
+            with self.assertRaisesRegex(freeze.InputError, "allocated"):
+                freeze.validate_bound_inputs(value)
+
     def test_bound_record_verifies_files_hashes_and_npb_commit(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = valid_record(Path(tmp))
-            result = freeze.validate_bound_inputs(value)
+            use_fixture_spatter_capacity(value)
+            with mock.patch.dict(
+                freeze.MINIMUM_ALLOCATED_BYTES,
+                {"amg_gather": 1, "lulesh_scatter": 1},
+            ):
+                result = freeze.validate_bound_inputs(value)
             self.assertEqual(tuple(result), freeze.WORKLOADS)
             self.assertEqual(result["npb_cg"]["source_commit"], value["npb_cg"]["source_commit"])
             self.assertEqual(result["amg_gather"]["index"], value["amg_gather"]["index"])

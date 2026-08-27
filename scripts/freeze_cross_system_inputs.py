@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -16,10 +17,12 @@ from pathlib import Path
 try:
     from scripts import cross_system_contract as contract
     from scripts import gapbs_pr_experiment_profiles as profiles
+    from scripts import generate_formal_spatter_inputs as formal_spatter
     from scripts import mcfreg2
 except ImportError:
     import cross_system_contract as contract
     import gapbs_pr_experiment_profiles as profiles
+    import generate_formal_spatter_inputs as formal_spatter
     import mcfreg2
 
 
@@ -52,6 +55,12 @@ REQUIRED = {
         "index",
         "index_sha256",
         "allocated_bytes",
+        "synthetic",
+        "provenance",
+        "provenance_sha256",
+        "validation",
+        "validation_sha256",
+        "artifact_id",
     },
     "lulesh_scatter": {
         "input",
@@ -59,6 +68,12 @@ REQUIRED = {
         "index",
         "index_sha256",
         "allocated_bytes",
+        "synthetic",
+        "provenance",
+        "provenance_sha256",
+        "validation",
+        "validation_sha256",
+        "artifact_id",
     },
     "npb_cg": {
         "source_root",
@@ -89,6 +104,15 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MCF_SOURCE_ROOT = _REPO_ROOT / "util/amu/matched_workloads"
+_SPATTER_SOURCE = _MCF_SOURCE_ROOT / "spatter_regions.cc"
+_SPATTER_TRACE_ABI = _MCF_SOURCE_ROOT / "canonical_trace.hh"
+_SPATTER_IDENTITY_FIELDS = (
+    "schema", "source_kind", "workload", "mode", "selected_kernel",
+    "source_trace", "source_trace_sha256", "source_commit",
+    "generator_sha256", "expansion_version", "selection_rule",
+    "minimum_bytes", "epochs", "values_count", "index_count",
+    "maximum_index", "resident_bytes", "values_sha256", "index_sha256",
+)
 
 
 class InputError(RuntimeError):
@@ -148,6 +172,220 @@ def _read_json_file(path, label):
     if not isinstance(value, dict):
         raise InputError(f"{label} must be an object")
     return value
+
+
+def _spatter_identity(provenance):
+    identity = {
+        name: provenance.get(name) for name in _SPATTER_IDENTITY_FIELDS
+    }
+    if "source_root" in provenance:
+        identity["source_root"] = provenance["source_root"]
+    return identity
+
+
+def _scan_u64(path):
+    count = 0
+    maximum = 0
+    with Path(path).open("rb") as stream:
+        for payload in iter(lambda: stream.read(1 << 20), b""):
+            if len(payload) % 8:
+                raise InputError("Spatter index is not aligned u64")
+            for (value,) in struct.iter_unpack("<Q", payload):
+                count += 1
+                maximum = max(maximum, value)
+    if count == 0:
+        raise InputError("Spatter index is empty")
+    return count, maximum
+
+
+def _scan_f32(path):
+    count = 0
+    with Path(path).open("rb") as stream:
+        for payload in iter(lambda: stream.read(1 << 20), b""):
+            if len(payload) % 4:
+                raise InputError("Spatter values are not aligned f32")
+            for (bits,) in struct.iter_unpack("<I", payload):
+                if bits & 0x7F800000 != 0x3F000000:
+                    raise InputError("Spatter value is not a finite normal input")
+                count += 1
+    if count == 0:
+        raise InputError("Spatter values are empty")
+    return count
+
+
+def validate_spatter_record(workload, row):
+    expected = {
+        "amg_gather": ("gather", "Gather"),
+        "lulesh_scatter": ("scatter", "Scatter"),
+    }
+    if workload not in expected or not isinstance(row, dict):
+        raise InputError("Spatter workload record is invalid")
+    if row.get("synthetic") is not False:
+        raise InputError(f"{workload}.synthetic must be false")
+    values_path = _verify_file(
+        row.get("input"), row.get("input_sha256"), f"{workload} values"
+    )
+    index_path = _verify_file(
+        row.get("index"), row.get("index_sha256"), f"{workload} index"
+    )
+    provenance_path = _verify_file(
+        row.get("provenance"), row.get("provenance_sha256"),
+        f"{workload} provenance",
+    )
+    validation_path = _verify_file(
+        row.get("validation"), row.get("validation_sha256"),
+        f"{workload} validation",
+    )
+    artifact_root = provenance_path.parent
+    if (
+        values_path != artifact_root / "values.f32le"
+        or index_path != artifact_root / "index.u64le"
+        or validation_path != artifact_root / "validation.json"
+    ):
+        raise InputError(f"{workload} artifact paths differ")
+    provenance = _read_json_file(provenance_path, f"{workload} provenance")
+    validation = _read_json_file(validation_path, f"{workload} validation")
+    mode, kernel = expected[workload]
+    artifact_id = hashlib.sha256(
+        contract.canonical_json(_spatter_identity(provenance))
+    ).hexdigest()
+    if (
+        provenance.get("schema") != 1
+        or provenance.get("status") != "accepted"
+        or provenance.get("source_kind")
+        != "official_spatter_application_trace"
+        or provenance.get("workload") != workload
+        or provenance.get("mode") != mode
+        or provenance.get("selected_kernel") != kernel
+        or provenance.get("selection_rule")
+        != f"all {kernel} records in source order"
+        or provenance.get("expansion_version")
+        != formal_spatter.EXPANSION_VERSION
+        or provenance.get("artifact_id") != artifact_id
+        or row.get("artifact_id") != artifact_id
+        or artifact_root.name != artifact_id
+    ):
+        raise InputError(f"{workload} provenance identity differs")
+    source_trace = _verify_file(
+        provenance.get("source_trace"), provenance.get("source_trace_sha256"),
+        f"{workload} source trace",
+    )
+    if provenance.get("generator_sha256") != _sha256_file(
+        Path(formal_spatter.__file__).resolve()
+    ):
+        raise InputError(f"{workload} generator identity differs")
+    source_root = provenance.get("source_root")
+    if source_root is not None:
+        root = Path(source_root)
+        if (
+            not root.is_absolute() or root.resolve() != root
+            or not root.is_dir()
+            or _git_output(root, "rev-parse", "HEAD")
+            != provenance.get("source_commit")
+        ):
+            raise InputError(f"{workload} source commit differs")
+        try:
+            source_trace.relative_to(root)
+        except ValueError as error:
+            raise InputError(f"{workload} source trace is outside source root") from error
+    values_count = _scan_f32(values_path)
+    index_count, maximum_index = _scan_u64(index_path)
+    integers = {
+        "epochs": provenance.get("epochs"),
+        "minimum_bytes": provenance.get("minimum_bytes"),
+        "resident_bytes": provenance.get("resident_bytes"),
+        "values_count": provenance.get("values_count"),
+        "index_count": provenance.get("index_count"),
+        "maximum_index": provenance.get("maximum_index"),
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in integers.values()
+    ) or integers["epochs"] == 0 or integers["minimum_bytes"] == 0:
+        raise InputError(f"{workload} provenance counts are invalid")
+    if (
+        values_count != integers["values_count"]
+        or index_count != integers["index_count"]
+        or maximum_index != integers["maximum_index"]
+        or provenance.get("values_sha256") != row.get("input_sha256")
+        or provenance.get("index_sha256") != row.get("index_sha256")
+    ):
+        raise InputError(f"{workload} artifact counts or hashes differ")
+    if mode == "gather":
+        if maximum_index + 1 != values_count:
+            raise InputError("amg_gather values do not span the gathered index")
+        allocated = 4 * values_count + 12 * index_count
+        output_words = index_count
+    else:
+        if values_count != index_count:
+            raise InputError("lulesh_scatter value/index counts differ")
+        allocated = 12 * index_count + 4 * (maximum_index + 1)
+        output_words = maximum_index + 1
+    if (
+        allocated != integers["resident_bytes"]
+        or allocated != row.get("allocated_bytes")
+        or allocated < MINIMUM_ALLOCATED_BYTES[workload]
+        or integers["minimum_bytes"] < MINIMUM_ALLOCATED_BYTES[workload]
+    ):
+        raise InputError(f"{workload} allocated bytes differ")
+    artifact_rows = provenance.get("artifacts", {})
+    for name, path, digest, width, count in (
+        ("values", values_path, row["input_sha256"], 4, values_count),
+        ("index", index_path, row["index_sha256"], 8, index_count),
+    ):
+        artifact = artifact_rows.get(name, {})
+        if (
+            artifact.get("name") != path.name
+            or artifact.get("sha256") != digest
+            or artifact.get("size_bytes") != width * count
+        ):
+            raise InputError(f"{workload} provenance artifact differs")
+    replay = provenance.get("independent_regeneration", {})
+    if (
+        replay.get("status") != "pass"
+        or replay.get("values_sha256") != row["input_sha256"]
+        or replay.get("index_sha256") != row["index_sha256"]
+    ):
+        raise InputError(f"{workload} independent regeneration differs")
+    validation_link = provenance.get("validation", {})
+    if (
+        validation_link.get("name") != validation_path.name
+        or validation_link.get("sha256") != row["validation_sha256"]
+        or validation.get("schema") != 1
+        or validation.get("status") != "accepted"
+        or validation.get("workload") != workload
+        or validation.get("mode") != mode
+        or validation.get("values_sha256") != row["input_sha256"]
+        or validation.get("index_sha256") != row["index_sha256"]
+        or validation.get("output_words") != output_words
+    ):
+        raise InputError(f"{workload} reference validation differs")
+    for name in (
+        "destination_sha256", "reference_binary_sha256",
+        "reference_source_sha256", "trace_abi_sha256", "command_sha256",
+        "stdout_sha256",
+    ):
+        _require_sha256(validation.get(name), f"{workload} validation {name}")
+    binary = _verify_file(
+        validation.get("reference_binary"),
+        validation.get("reference_binary_sha256"),
+        f"{workload} reference binary",
+    )
+    if (
+        validation.get("reference_source_sha256")
+        != _sha256_file(_SPATTER_SOURCE)
+        or validation.get("trace_abi_sha256")
+        != _sha256_file(_SPATTER_TRACE_ABI)
+    ):
+        raise InputError(f"{workload} reference source identity differs")
+    return {
+        "provenance": provenance,
+        "validation": validation,
+        "values_path": values_path,
+        "index_path": index_path,
+        "binary_path": binary,
+        "resident_bytes": allocated,
+    }
 
 
 def _require_equal_hashes(value, names, label):
@@ -554,16 +792,7 @@ def validate_bound_inputs(value):
     )
     validate_mcf_record(value["mcf"])
     for workload in ("amg_gather", "lulesh_scatter"):
-        _verify_file(
-            value[workload]["input"],
-            value[workload]["input_sha256"],
-            f"{workload} input",
-        )
-        _verify_file(
-            value[workload]["index"],
-            value[workload]["index_sha256"],
-            f"{workload} index",
-        )
+        validate_spatter_record(workload, value[workload])
     for workload in ("npb_cg", "npb_mg"):
         _validate_npb_source(workload, value[workload])
     return {

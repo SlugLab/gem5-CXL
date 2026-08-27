@@ -2938,11 +2938,8 @@ def load_formal_inputs(path):
     if value.get("schema") != 1 or value.get("status") != "accepted":
         raise BuildError("formal inputs manifest is not accepted schema 1")
     workloads = value.get("workloads", {})
-    for workload, minimum in (
-        ("mcf", 345_000_000),
-        ("amg_gather", 1 << 30),
-        ("lulesh_scatter", 1 << 30),
-    ):
+    for workload in ("mcf", "amg_gather", "lulesh_scatter"):
+        minimum = freezer.MINIMUM_ALLOCATED_BYTES[workload]
         allocated = workloads.get(workload, {}).get("allocated_bytes")
         if (
             not isinstance(allocated, int)
@@ -2958,6 +2955,16 @@ def load_formal_inputs(path):
         qualified_mcf = freezer.validate_mcf_record(workloads.get("mcf", {}))
     except freezer.InputError as error:
         raise BuildError(f"formal mcf qualification failed: {error}") from error
+    qualified_spatter = {}
+    for workload in ("amg_gather", "lulesh_scatter"):
+        try:
+            qualified_spatter[workload] = freezer.validate_spatter_record(
+                workload, workloads.get(workload, {})
+            )
+        except freezer.InputError as error:
+            raise BuildError(
+                f"formal {workload} qualification failed: {error}"
+            ) from error
     records = {
         "mcf": (workloads.get("mcf", {}).get("input"),
                 workloads.get("mcf", {}).get("input_sha256")),
@@ -2974,6 +2981,18 @@ def load_formal_inputs(path):
         "mcf_validation": (workloads.get("mcf", {}).get("validation"),
                            workloads.get("mcf", {}).get("validation_sha256")),
     }
+    for prefix, workload in (
+        ("amg", "amg_gather"),
+        ("lulesh", "lulesh_scatter"),
+    ):
+        records[f"{prefix}_provenance"] = (
+            workloads[workload].get("provenance"),
+            workloads[workload].get("provenance_sha256"),
+        )
+        records[f"{prefix}_validation"] = (
+            workloads[workload].get("validation"),
+            workloads[workload].get("validation_sha256"),
+        )
     result = {
         name: _formal_file(path_value, expected, name)
         for name, (path_value, expected) in records.items()
@@ -3016,6 +3035,31 @@ def load_formal_inputs(path):
         result[f"{prefix}_values"]["allocated_bytes"] = workloads[
             workload
         ]["allocated_bytes"]
+        qualified = qualified_spatter[workload]
+        provenance = qualified["provenance"]
+        validation = qualified["validation"]
+        binding = {
+            "provenance_path": result[f"{prefix}_provenance"]["path"],
+            "provenance_sha256": result[f"{prefix}_provenance"]["sha256"],
+            "validation_path": result[f"{prefix}_validation"]["path"],
+            "validation_sha256": result[f"{prefix}_validation"]["sha256"],
+            "artifact_id": provenance["artifact_id"],
+            "source_trace_sha256": provenance["source_trace_sha256"],
+            "generator_sha256": provenance["generator_sha256"],
+            "epochs": provenance["epochs"],
+            "maximum_index": provenance["maximum_index"],
+            "resident_bytes": qualified["resident_bytes"],
+            "reference_binary_sha256": validation[
+                "reference_binary_sha256"
+            ],
+            "reference_source_sha256": validation[
+                "reference_source_sha256"
+            ],
+            "trace_abi_sha256": validation["trace_abi_sha256"],
+            "destination_sha256": validation["destination_sha256"],
+        }
+        result[f"{prefix}_values"].update(binding)
+        result[f"{prefix}_index"].update(binding)
     return result, _sha256_file(path)
 
 

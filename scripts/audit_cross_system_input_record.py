@@ -21,8 +21,8 @@ except ImportError:
 FILE_FIELDS = {
     "pr_spmv": ("input",),
     "mcf": ("input", "source"),
-    "amg_gather": ("input", "index"),
-    "lulesh_scatter": ("input", "index"),
+    "amg_gather": ("input", "index", "provenance", "validation"),
+    "lulesh_scatter": ("input", "index", "provenance", "validation"),
     "npb_cg": ("parameter_file",),
     "npb_mg": ("parameter_file",),
 }
@@ -56,6 +56,12 @@ def template_record():
             "index": "REQUIRED_ABSOLUTE_INDEX_PATH",
             "index_sha256": "REQUIRED_SHA256",
             "allocated_bytes": 1 << 30,
+            "synthetic": False,
+            "provenance": "REQUIRED_ABSOLUTE_PROVENANCE_PATH",
+            "provenance_sha256": "REQUIRED_SHA256",
+            "validation": "REQUIRED_ABSOLUTE_VALIDATION_PATH",
+            "validation_sha256": "REQUIRED_SHA256",
+            "artifact_id": "REQUIRED_CONTENT_ADDRESS",
         },
         "lulesh_scatter": {
             "input": "REQUIRED_ABSOLUTE_DATA_PATH",
@@ -63,6 +69,12 @@ def template_record():
             "index": "REQUIRED_ABSOLUTE_INDEX_PATH",
             "index_sha256": "REQUIRED_SHA256",
             "allocated_bytes": 1 << 30,
+            "synthetic": False,
+            "provenance": "REQUIRED_ABSOLUTE_PROVENANCE_PATH",
+            "provenance_sha256": "REQUIRED_SHA256",
+            "validation": "REQUIRED_ABSOLUTE_VALIDATION_PATH",
+            "validation_sha256": "REQUIRED_SHA256",
+            "artifact_id": "REQUIRED_CONTENT_ADDRESS",
         },
         "npb_cg": {
             "source_root": "REQUIRED_ABSOLUTE_CLEAN_GIT_ROOT",

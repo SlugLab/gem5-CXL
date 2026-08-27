@@ -8,11 +8,15 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import build_matched_breadth_workloads as builder
 from scripts import canonical_work_trace as trace
 from scripts import generate_mcfreg2_state as generator
 from scripts import mcfreg2
+from test_freeze_cross_system_inputs import (
+    make_spatter_record, use_fixture_spatter_capacity,
+)
 from test_mcfreg2 import MCFREG2Test
 
 
@@ -96,14 +100,6 @@ class MatchedRegionBuildTest(unittest.TestCase):
         validation_path = self.root / "formal-validation.json"
         validation_path.write_bytes(generator._canonical_json(validation))
 
-        files = {}
-        for name in (
-            "amg_values", "amg_index", "lulesh_values", "lulesh_index",
-        ):
-            path = self.root / name
-            path.write_bytes(b"\x00" * (16 if "index" in name else 8))
-            files[name] = path.resolve()
-
         def digest(path):
             return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -124,25 +120,25 @@ class MatchedRegionBuildTest(unittest.TestCase):
                     "validation": str(validation_path.resolve()),
                     "validation_sha256": digest(validation_path),
                 },
-                "amg_gather": {
-                    "input": str(files["amg_values"]),
-                    "input_sha256": digest(files["amg_values"]),
-                    "index": str(files["amg_index"]),
-                    "index_sha256": digest(files["amg_index"]),
-                    "allocated_bytes": 1 << 30,
-                },
-                "lulesh_scatter": {
-                    "input": str(files["lulesh_values"]),
-                    "input_sha256": digest(files["lulesh_values"]),
-                    "index": str(files["lulesh_index"]),
-                    "index_sha256": digest(files["lulesh_index"]),
-                    "allocated_bytes": 1 << 30,
-                },
+                "amg_gather": make_spatter_record(
+                    self.root, "amg_gather"
+                ),
+                "lulesh_scatter": make_spatter_record(
+                    self.root, "lulesh_scatter"
+                ),
             },
         }
+        use_fixture_spatter_capacity(record["workloads"])
         manifest = self.root / "formal-inputs.json"
         manifest.write_text(json.dumps(record) + "\n", encoding="utf-8")
         return manifest
+
+    def load_fixture_formal_inputs(self, manifest):
+        with mock.patch.dict(
+            builder.freezer.MINIMUM_ALLOCATED_BYTES,
+            {"amg_gather": 1, "lulesh_scatter": 1},
+        ):
+            return builder.load_formal_inputs(manifest)
 
     def test_fixture_builds_strict_four_backend_manifest(self):
         manifest = builder.build_fixture_suite(self.root / "build")
@@ -348,20 +344,22 @@ class MatchedRegionBuildTest(unittest.TestCase):
 
     def test_formal_inputs_require_mcfreg2_and_paper_allocations(self):
         manifest = self.make_verified_formal_record()
-        inputs, digest = builder.load_formal_inputs(manifest)
+        inputs, digest = self.load_fixture_formal_inputs(manifest)
 
         self.assertEqual(inputs["mcf"]["format"], "MCFREG2")
         self.assertEqual(inputs["mcf"]["boundary_mismatches"], 0)
+        self.assertRegex(inputs["amg_values"]["provenance_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(inputs["lulesh_values"]["validation_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(digest, r"^[0-9a-f]{64}$")
         record = json.loads(manifest.read_text(encoding="utf-8"))
         record["workloads"]["amg_gather"]["allocated_bytes"] = 1024
         manifest.write_text(json.dumps(record) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(builder.BuildError, "amg_gather.*allocated"):
-            builder.load_formal_inputs(manifest)
+            self.load_fixture_formal_inputs(manifest)
 
     def test_formal_mcfreg2_builds_verified_reference_bundle(self):
         record = self.make_verified_formal_record()
-        inputs, digest = builder.load_formal_inputs(record)
+        inputs, digest = self.load_fixture_formal_inputs(record)
         manifest = builder.build_suite(
             self.root / "formal-build",
             inputs=inputs,

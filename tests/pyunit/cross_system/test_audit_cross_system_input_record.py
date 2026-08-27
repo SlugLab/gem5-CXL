@@ -14,6 +14,9 @@ from scripts import audit_cross_system_input_record as audit
 from scripts import freeze_cross_system_inputs as freeze
 from scripts import generate_mcfreg2_state as generator
 from scripts import mcfreg2
+from test_freeze_cross_system_inputs import (
+    make_spatter_record, use_fixture_spatter_capacity,
+)
 from test_mcfreg2 import MCFREG2Test
 
 
@@ -126,10 +129,8 @@ def valid_record(root):
         root / "validation.json",
         generator._canonical_json(validation),
     )
-    amg_input = write(root / "amg.values", b"amg values")
-    amg_index = write(root / "amg.index", b"amg index")
-    lulesh_input = write(root / "lulesh.values", b"lulesh values")
-    lulesh_index = write(root / "lulesh.index", b"lulesh index")
+    amg = make_spatter_record(root, "amg_gather")
+    lulesh = make_spatter_record(root, "lulesh_scatter")
     npb_root, commit, cg_params, mg_params = make_git_source(root)
     return {
         "pr_spmv": {
@@ -148,18 +149,8 @@ def valid_record(root):
             "validation_sha256": sha256(validation_path),
             "synthetic": False,
         },
-        "amg_gather": {
-            "input": str(amg_input), "input_sha256": sha256(amg_input),
-            "index": str(amg_index), "index_sha256": sha256(amg_index),
-            "allocated_bytes": 1 << 30,
-        },
-        "lulesh_scatter": {
-            "input": str(lulesh_input),
-            "input_sha256": sha256(lulesh_input),
-            "index": str(lulesh_index),
-            "index_sha256": sha256(lulesh_index),
-            "allocated_bytes": 1 << 30,
-        },
+        "amg_gather": amg,
+        "lulesh_scatter": lulesh,
         "npb_cg": {
             "source_root": str(npb_root), "source_commit": commit,
             "parameter_file": str(cg_params),
@@ -195,6 +186,13 @@ class InputAuditTest(unittest.TestCase):
             set(audit.template_record()["mcf"]), freeze.REQUIRED["mcf"]
         )
 
+    def test_template_spatter_shapes_match_formal_required_shape(self):
+        for workload in ("amg_gather", "lulesh_scatter"):
+            self.assertEqual(
+                set(audit.template_record()[workload]),
+                freeze.REQUIRED[workload],
+            )
+
     @mock.patch.object(audit.subprocess, "check_output", return_value="clean\n")
     def test_git_inspection_scopes_safe_directory_to_source_root(self, check):
         source = (self.root / "npb").resolve()
@@ -223,13 +221,18 @@ class InputAuditTest(unittest.TestCase):
 
     def test_complete_live_candidate_is_ready_but_not_accepted(self):
         candidate = valid_record(self.root)
-        result = audit.audit_record(candidate)
-        self.assertEqual(result["status"], "ready_for_freeze")
-        self.assertNotEqual(result["status"], "accepted")
-        self.assertEqual(
-            freeze.validate_bound_inputs(candidate)["npb_cg"]["source_commit"],
-            candidate["npb_cg"]["source_commit"],
-        )
+        use_fixture_spatter_capacity(candidate)
+        with mock.patch.dict(
+            freeze.MINIMUM_ALLOCATED_BYTES,
+            {"amg_gather": 1, "lulesh_scatter": 1},
+        ):
+            result = audit.audit_record(candidate)
+            self.assertEqual(result["status"], "ready_for_freeze")
+            self.assertNotEqual(result["status"], "accepted")
+            self.assertEqual(
+                freeze.validate_bound_inputs(candidate)["npb_cg"]["source_commit"],
+                candidate["npb_cg"]["source_commit"],
+            )
 
     def test_cli_writes_both_nonaccepted_records_for_missing_candidate(self):
         discovery = self.root / "discovery.json"
