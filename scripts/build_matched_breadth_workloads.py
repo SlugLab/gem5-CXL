@@ -2903,6 +2903,23 @@ def _compile(cxx, workload, backend, output, *, fixture):
     return command
 
 
+def build_spatter_reference_binary(cxx, output):
+    """Build the strict non-fixture Spatter reference adapter."""
+    output = Path(output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = _compile(
+        cxx, "spatter", "reference", output, fixture=False
+    )
+    return {
+        "path": str(output),
+        "sha256": _sha256_file(output),
+        "source_sha256": _sha256_file(SOURCES["spatter"]),
+        "trace_abi_sha256": _sha256_file(TRACE_ABI),
+        "compiler": _compiler_identity(cxx),
+        "command": [str(item) for item in command],
+    }
+
+
 def _formal_file(path_value, digest_value, label):
     path = Path(path_value or "")
     if not path.is_absolute() or path.resolve() != path or not path.is_file():

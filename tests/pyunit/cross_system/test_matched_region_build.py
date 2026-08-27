@@ -183,6 +183,21 @@ class MatchedRegionBuildTest(unittest.TestCase):
             {"mcf", "amg_gather", "lulesh_scatter"},
         )
 
+    def test_builds_strict_non_fixture_spatter_reference_binary(self):
+        row = builder.build_spatter_reference_binary(
+            "g++", self.root / "bin/spatter-reference"
+        )
+        self.assertTrue(Path(row["path"]).is_file())
+        for field in (
+            "sha256", "source_sha256", "trace_abi_sha256",
+        ):
+            self.assertRegex(row[field], r"^[0-9a-f]{64}$")
+        self.assertRegex(row["compiler"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("-DMATCHED_BACKEND=0", row["command"])
+        self.assertIn("-ffp-contract=off", row["command"])
+        self.assertIn("-fno-fast-math", row["command"])
+        self.assertNotIn("-DMATCHED_FIXTURE=1", row["command"])
+
     def test_latency_action_layout_shares_functional_and_templates_timing(self):
         layout = builder.latency_action_layout("mcf", ("pricing",))
         for system, action in layout["functional"].items():
