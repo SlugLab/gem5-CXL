@@ -1,5 +1,8 @@
 # Six-Workload CXL Latency Spectrum and Paper Update Implementation Plan
 
+Revised: 2026-08-27 to select layout A, bind the fresh qualification manifest,
+and add six standalone absolute-latency/speedup figures plus PNG exports.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and run a fail-closed 96-point Vanilla/AMU/CIRA/M2NDP latency-spectrum campaign over six matched workloads, publish validated raw data and figures, and update the CIRA paper.
@@ -22,7 +25,7 @@
 - Modify `scripts/build_matched_breadth_workloads.py`: include latency templates and shared-object records in the prepared manifest.
 - Modify `scripts/run_cira_amu_m2ndp_breadth.py`: record latency in state, commands, checkpoints, and evidence validation.
 - Create `scripts/run_cira_amu_m2ndp_latency_spectrum.py`: orchestrate four immutable campaigns and shared artifacts.
-- Create `scripts/generate_cira_amu_m2ndp_latency_spectrum.py`: validate 96 coordinates and generate raw CSV/JSON, figures, and LaTeX.
+- Create `scripts/generate_cira_amu_m2ndp_latency_spectrum.py`: validate 96 coordinates and generate raw CSV/JSON, the selected 2-by-3 figure, six standalone dual-panel figures, PNG previews, and LaTeX.
 - Modify `scripts/generate_cira_amu_m2ndp_comparison.py`: reuse shared row/label/color helpers without accepting stale 1-us breadth data.
 - Add focused tests under `tests/pyunit/m2ndp/` and `tests/pyunit/cross_system/`.
 - Modify the independent paper repository's `sections/evaluation.tex` and `gapbs-vtune-cxl-table.tex` only after complete evidence exists.
@@ -214,7 +217,7 @@ git commit -m "fix: validate phase-parallel M2NDP timing"
 
 **Files:**
 - No source changes expected
-- Output: `/mnt/disk0/gem5-CXL-eval/pr-offload-m2ndp-grouped-<commit>/`
+- Output: `/mnt/disk0/gem5-CXL-eval/pr-offload-m2ndp-grouped-diagnostic-r1/`
 
 - [ ] **Step 1: Build the current simulator and M5 library**
 
@@ -500,8 +503,10 @@ self.assertEqual(len(spectrum.coordinates()), 96)
 ```
 
 Add tests that reject a non-content-addressed shared object, a latency root
-whose identity differs, a missing complete manifest, and an aggregate attempt
-containing one inconclusive campaign.
+whose identity differs, a missing complete manifest, an aggregate attempt
+containing one inconclusive campaign, and a qualification manifest whose
+performance gate is not `passed`. The accepted qualification fixture must
+contain zero offenders and primary/replay rows for all four g12 systems.
 
 - [ ] **Step 2: Run the new test and confirm module import failure**
 
@@ -517,12 +522,13 @@ Expected: the spectrum orchestrator module is missing.
 Use this immutable top-level shape:
 
 ```python
-def new_state(shared, identity):
+def new_state(shared, qualification, identity):
     return {
         "schema": 1,
         "status": "planned",
         "identity": identity,
         "shared": shared,
+        "qualification": qualification,
         "latencies": {
             label: {"status": "pending", "root": f"latency/{label}"}
             for label in latency.LABELS
@@ -530,10 +536,16 @@ def new_state(shared, identity):
     }
 ```
 
-For each label, invoke `run_cira_amu_m2ndp_breadth.py` with the same accepted
-inputs, calibration authority, shared prepared manifest, and that label.
-Record command hashes and child `complete.json` hashes. Resume only a child
-whose identity matches. Write aggregate `complete.json` only after all four
+Implement `validate_qualification(path, calibration_sha256)` to require
+`performance_gate.status == "passed"`, an empty offender list, all four
+primary and replay g12 rows with `verification == "pass"`, and the exact
+calibration hash already bound by `shared["calibration"]`. Add required CLI
+argument `--qualification`; bind its absolute path and SHA-256 into aggregate
+state and identity. For each latency, invoke
+`run_cira_amu_m2ndp_breadth.py` with the same accepted inputs, calibration
+authority, shared prepared manifest, and that label. Record command hashes and
+child `complete.json` hashes. Resume only a child whose identity and bound
+qualification hash match. Write aggregate `complete.json` only after all four
 children are complete.
 
 - [ ] **Step 4: Run orchestrator tests**
@@ -556,7 +568,7 @@ git commit -m "feat: orchestrate workload latency spectrum"
 ### Task 8: Run fresh g12 qualification and stop on any offender
 
 **Files:**
-- Output: `/mnt/disk0/gem5-CXL-eval/pr-offload-formal-<commit>-r5/`
+- Output: `/mnt/disk0/gem5-CXL-eval/pr-offload-formal-latency-spectrum-r1/`
 
 - [ ] **Step 1: Run the full focused test gate**
 
@@ -574,9 +586,10 @@ Use the existing frozen inputs, calibration, policy, and variant build roots,
 but a new output root bound to the current source hash:
 
 ```bash
+PATH=/mnt/disk0/gem5-CXL-eval/toolchains/m2ndp-conan1/bin:/opt/miniconda3/envs/infer_machine/bin:$PATH \
 python3 scripts/run_pr_asymmetric_offload.py \
-  --inputs /mnt/disk0/gem5-CXL-eval/pr-scaling-120b389653d8/inputs.json \
-  --root /mnt/disk0/gem5-CXL-eval/pr-offload-formal-current-r5 \
+  --inputs /mnt/disk0/gem5-CXL-eval/pr-scaling-5ed1d7369b-bitexact/inputs.json \
+  --root /mnt/disk0/gem5-CXL-eval/pr-offload-formal-latency-spectrum-r1 \
   --gem5 build/X86/gem5.opt \
   --m5-library util/m5/build/x86/out/libm5.a \
   --config configs/example/gem5_library/x86-gapbs-amu-se.py \
@@ -598,11 +611,11 @@ Extract exact additive ROI phases and mechanism counters from the primary
 summary:
 
 ```bash
-jq . /mnt/disk0/gem5-CXL-eval/pr-offload-formal-current-r5/diagnostic-performance-hold.json
+jq . /mnt/disk0/gem5-CXL-eval/pr-offload-formal-latency-spectrum-r1/diagnostic-performance-hold.json
 python3 - <<'PY'
 import csv
 from pathlib import Path
-root = Path('/mnt/disk0/gem5-CXL-eval/pr-offload-formal-current-r5/qualification/primary')
+root = Path('/mnt/disk0/gem5-CXL-eval/pr-offload-formal-latency-spectrum-r1/qualification/primary')
 for system in ('amu', 'cira-few-shot', 'm2ndp'):
     row = next(csv.DictReader((root / system / 'summary.csv').open(newline='')))
     print(system, {key: row.get(key) for key in (
@@ -634,17 +647,20 @@ different identity.
 
 - [ ] **Step 1: Prove current input availability before building**
 
-Locate and hash the six exact sources named by the paper. The accepted record
-must satisfy `freeze_cross_system_inputs.validate_bound_inputs`: g20 PR,
-non-synthetic 345 MB MCF, 1 GiB AMG values/index, 1 GiB LULESH values/index,
-and clean NPB CG/MG source trees with parameter files allocating at least
-12 GB each.
+Validate the current candidate registry at
+`/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/paper-input-candidates.json`.
+The accepted record must satisfy
+`freeze_cross_system_inputs.validate_bound_inputs`: g20 PR, non-synthetic
+MCFREG2, 1 GiB AMG values/index, 1 GiB LULESH values/index, and clean NPB
+CG/MG source trees whose parameter records bind their allocated-byte counts.
 
-Current inspection found none of the required MCF/Spatter/NPB data files or
-NPB source trees under `/home/victoryang00`, `/root/ia780i_type2_delay_buffer_new`,
-or `/mnt/disk0`; only hardware logs and a small `mcf_cira` executable were
-present. If the authoritative files remain unavailable, write `failed_input`
-and stop this task without generating substitute data.
+The 2026-08-27 registry already binds PR g20, the accepted MCFREG2 package
+`4230e0db55829be687247021c2936e20eba475160e85bf58e4da6b0613572620`,
+and NPB CG/MG class-E source/parameter paths. AMG and LULESH remain empty, and
+the NPB records still need validated allocation capacity and clean-tree
+identity. Resolve those four record gaps from authoritative workload files;
+if any remain unavailable, write `failed-input.json` and stop without
+generating values, indexes, parameters, or substitute data.
 
 - [ ] **Step 2: Freeze the authoritative files**
 
@@ -664,15 +680,15 @@ python3 scripts/freeze_cross_system_inputs.py \
 Expected: exit 0 and `status=accepted`; any missing/hash-drift/size mismatch
 produces terminal `failed-input.json`.
 
-- [ ] **Step 3: Remove the deliberate formal-MCF stop only after its real path is tested**
+- [ ] **Step 3: Validate the accepted MCFREG2 path and finish the remaining formal builders**
 
-Write a failing formal builder test that supplies a frozen non-synthetic MCF
-source/input and asserts a verified manifest. Replace the current unconditional
-`formal MCF is failed_input` branch with calls that compile the bound source,
-run the complete reference, compare every declared boundary, and record source,
-input, binary, trace, and output hashes. The implementation must call existing
-`build_suite`, `_run_mcf_reference`, Spatter reference, and formal NPB builders;
-it must not reuse fixture inputs.
+Keep the already qualified MCFREG2 package and its validation hash immutable.
+Write formal builder tests that consume that package, authoritative AMG and
+LULESH value/index files, and clean NPB class-E records. Assert a verified
+six-workload manifest with source, input, binary, trace, capacity, and output
+hashes. The implementation must call the existing MCFREG2 replay, Spatter
+reference, and formal NPB builders; it must not reuse fixture inputs or
+regenerate the accepted MCF package.
 
 - [ ] **Step 4: Run input and builder tests**
 
@@ -726,8 +742,8 @@ shared records match their hashes. Do not automatically delete older roots.
 python3 scripts/run_cira_amu_m2ndp_latency_spectrum.py \
   --inputs /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/inputs.json \
   --prepared /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/prepared/manifest.json \
-  --qualification /mnt/disk0/gem5-CXL-eval/pr-offload-formal-current-r5/qualification.json \
-  --calibration-root /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/calibration \
+  --qualification /mnt/disk0/gem5-CXL-eval/pr-offload-formal-latency-spectrum-r1/qualification.json \
+  --calibration /mnt/disk0/gem5-CXL-eval/pr-offload-calibration-cae49a9b50/amu-cira.json \
   --root /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum
 ```
 
@@ -740,8 +756,8 @@ timing states; aggregate completion is absent until all four are complete.
 python3 scripts/run_cira_amu_m2ndp_latency_spectrum.py \
   --inputs /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/inputs.json \
   --prepared /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/prepared/manifest.json \
-  --qualification /mnt/disk0/gem5-CXL-eval/pr-offload-formal-current-r5/qualification.json \
-  --calibration-root /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/calibration \
+  --qualification /mnt/disk0/gem5-CXL-eval/pr-offload-formal-latency-spectrum-r1/qualification.json \
+  --calibration /mnt/disk0/gem5-CXL-eval/pr-offload-calibration-cae49a9b50/amu-cira.json \
   --root /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum \
   --resume
 ```
@@ -781,7 +797,10 @@ self.assertEqual(
 
 Add one-bit output-hash corruption, missing latency, duplicate coordinate,
 wrong speedup, wrong CI, and mixed identity cases; each must raise
-`PublicationError` before writing any PDF/CSV.
+`PublicationError` before writing any PDF/CSV. Assert the accepted fixture
+creates exactly these logical chart products: `workloads-1us`,
+`latency-spectrum`, and the six named `standalone` workload products. Each
+chart product must have PDF, SVG, and PNG records.
 
 - [ ] **Step 2: Run the new publisher test and confirm module import failure**
 
@@ -820,14 +839,44 @@ raw/cira-amu-m2ndp-latency-spectrum.json
 raw/cira-amu-m2ndp-latency-spectrum-manifest.json
 fig/cira-amu-m2ndp-workloads-1us.pdf
 fig/cira-amu-m2ndp-workloads-1us.svg
+fig/cira-amu-m2ndp-workloads-1us.png
 fig/cira-amu-m2ndp-latency-spectrum.pdf
 fig/cira-amu-m2ndp-latency-spectrum.svg
+fig/cira-amu-m2ndp-latency-spectrum.png
+fig/standalone/pr_spmv-latency-spectrum.{pdf,svg,png}
+fig/standalone/mcf-latency-spectrum.{pdf,svg,png}
+fig/standalone/amg_gather-latency-spectrum.{pdf,svg,png}
+fig/standalone/lulesh_scatter-latency-spectrum.{pdf,svg,png}
+fig/standalone/npb_cg-latency-spectrum.{pdf,svg,png}
+fig/standalone/npb_mg-latency-spectrum.{pdf,svg,png}
 tex/cira-amu-m2ndp-latency-table-data.tex
 ```
 
-The workload figure uses grouped AMU/CIRA/M2NDP bars at 1 us with CI whiskers.
-The spectrum figure uses six small multiples, fixed system colors/linestyles,
-and a visible 1.0x line. Never truncate regressions below 1.0x.
+The workload figure uses grouped AMU/CIRA/M2NDP bars at 1 us with paired 95%
+confidence-interval whiskers.
+The selected spectrum figure uses 2-by-3 small multiples, fixed system colors,
+markers and linestyles, paired CI whiskers, and a visible 1.0x line. Each
+standalone workload figure has two vertically aligned panels: absolute
+end-to-end latency for Vanilla/AMU/CIRA/M2NDP above and normalized speedup for
+AMU/CIRA/M2NDP below. Implement the renderer boundary as:
+
+```python
+def render_composite(rows, output_stem):
+    """Render the six-panel normalized latency spectrum."""
+
+def render_standalone(workload, rows, output_stem):
+    """Render absolute latency and normalized speedup for one workload."""
+
+def save_formats(figure, output_stem):
+    for suffix in ("pdf", "svg", "png"):
+        figure.savefig(output_stem.with_suffix(f".{suffix}"),
+                       bbox_inches="tight", dpi=300)
+```
+
+Use ordered x positions for `200ns`, `500ns`, `1us`, and `2us`; label them as
+`200 ns`, `500 ns`, `1 us`, and `2 us`. Absolute-latency axes start at zero.
+Normalized axes include every accepted value and never truncate regressions
+below 1.0x. Do not connect through missing or inconclusive coordinates.
 
 - [ ] **Step 4: Run publisher and existing comparison tests**
 
@@ -849,7 +898,24 @@ python3 scripts/generate_cira_amu_m2ndp_latency_spectrum.py \
 
 Expected: publication manifest is complete and binds every generated hash.
 
-- [ ] **Step 6: Commit the publisher**
+- [ ] **Step 6: Inspect every exported chart before publication**
+
+```bash
+mkdir -p /tmp/cxl-spectrum-preview
+for pdf in \
+  /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/publication/fig/*.pdf \
+  /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/publication/fig/standalone/*.pdf; do
+  pdftoppm -png -singlefile -r 150 "$pdf" \
+    "/tmp/cxl-spectrum-preview/$(basename "${pdf%.pdf}")"
+done
+```
+
+Inspect all eight PNG previews at original detail. Reject clipped labels,
+inconsistent system colors, unreadable confidence intervals, non-zero absolute
+latency baselines, missing 1.0x references, or a legend that depends on color
+alone.
+
+- [ ] **Step 7: Commit the publisher**
 
 ```bash
 git add scripts/generate_cira_amu_m2ndp_latency_spectrum.py \
@@ -867,6 +933,7 @@ git commit -m "feat: publish CXL latency spectrum evidence"
 - Create: `/home/victoryang00/gem5-CXL/6472666535e6f359942ddac6/data/cira-amu-m2ndp-latency-spectrum.json`
 - Create: `/home/victoryang00/gem5-CXL/6472666535e6f359942ddac6/fig/cira-amu-m2ndp-workloads-1us.pdf`
 - Create: `/home/victoryang00/gem5-CXL/6472666535e6f359942ddac6/fig/cira-amu-m2ndp-latency-spectrum.pdf`
+- Create: `/home/victoryang00/gem5-CXL/6472666535e6f359942ddac6/fig/latency-spectrum/` with six standalone PDF/SVG/PNG figure sets
 
 - [ ] **Step 1: Verify the nested paper repository before copying**
 
@@ -880,8 +947,9 @@ Expected: tracked files are clean. Preserve the existing untracked
 - [ ] **Step 2: Copy only hash-validated publication files**
 
 Use the publication manifest to verify each source hash before copying the
-two PDF figures, canonical CSV/JSON, and generated table data into the paper
-repository. Abort if any hash differs.
+two composite PDF figures, their SVG/PNG exports, all six standalone
+PDF/SVG/PNG figure sets, canonical CSV/JSON, and generated table data into the
+paper repository. Abort if any hash differs.
 
 - [ ] **Step 3: Replace the g4-only evaluation text and figure**
 
@@ -923,7 +991,12 @@ git -C /home/victoryang00/gem5-CXL/6472666535e6f359942ddac6 add \
   data/cira-amu-m2ndp-latency-spectrum.csv \
   data/cira-amu-m2ndp-latency-spectrum.json \
   fig/cira-amu-m2ndp-workloads-1us.pdf \
-  fig/cira-amu-m2ndp-latency-spectrum.pdf
+  fig/cira-amu-m2ndp-workloads-1us.svg \
+  fig/cira-amu-m2ndp-workloads-1us.png \
+  fig/cira-amu-m2ndp-latency-spectrum.pdf \
+  fig/cira-amu-m2ndp-latency-spectrum.svg \
+  fig/cira-amu-m2ndp-latency-spectrum.png \
+  fig/latency-spectrum
 git -C /home/victoryang00/gem5-CXL/6472666535e6f359942ddac6 commit \
   -m "eval: add cross-system CXL latency spectrum"
 ```
