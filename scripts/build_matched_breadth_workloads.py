@@ -1461,6 +1461,54 @@ def validate_npb_formal_source(
     return True
 
 
+def _install_frozen_npb_parameters(source_root, destination_root, rows):
+    """Restore the exact frozen parameter files after the copied-tree clean."""
+    source_root = Path(source_root).resolve()
+    destination_root = Path(destination_root).resolve()
+    for workload in ("cg", "mg"):
+        try:
+            row = rows[workload]
+            parameter = Path(row["parameter_file"]).resolve()
+            expected = row["parameter_sha256"]
+        except (KeyError, TypeError) as error:
+            raise BuildError(
+                f"formal NPB {workload} frozen parameter record is incomplete"
+            ) from error
+        try:
+            relative = parameter.relative_to(source_root)
+        except ValueError as error:
+            raise BuildError(
+                f"formal NPB {workload} parameter file is outside source root"
+            ) from error
+        if not parameter.is_file() or _sha256_file(parameter) != expected:
+            raise BuildError(
+                f"formal NPB {workload} frozen parameter SHA-256 differs"
+            )
+        installed = destination_root / relative
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(parameter, installed)
+        _validate_built_npb_parameter(destination_root, workload, expected)
+
+
+def _validate_built_npb_parameter(source, workload, expected_sha256):
+    parameter = Path(source).resolve() / workload.upper() / "npbparams.h"
+    if not parameter.is_file() or _sha256_file(parameter) != expected_sha256:
+        raise BuildError(
+            f"formal NPB {workload} built parameter SHA-256 differs"
+        )
+    return parameter
+
+
+def _prepare_npb_binary_directory(source):
+    binary_directory = Path(source).resolve() / "bin"
+    try:
+        binary_directory.mkdir()
+    except FileExistsError:
+        if not binary_directory.is_dir():
+            raise BuildError("NPB binary output path is not a directory")
+    return binary_directory.resolve()
+
+
 def compare_npb_raw_boundaries(reference, actual):
     expected = _read_words(reference, 64)
     observed = _read_words(actual, 64)
@@ -2075,6 +2123,7 @@ def _build_npb(source, workload, hook_object, npb_class):
     if not isinstance(npb_class, str) or not re.fullmatch(r"[SWABCDEF]", npb_class):
         raise BuildError(f"NPB {workload} class is invalid: {npb_class!r}")
     flags = "-O3 -fopenmp -g -fallow-invalid-boz -ffp-contract=off -fno-fast-math"
+    _prepare_npb_binary_directory(source)
     directory = source / workload.upper()
     command = [
         "make", f"CLASS={npb_class}", f"FFLAGS={flags}",
@@ -2601,6 +2650,7 @@ def build_and_run_npb_formal(inputs_path, outdir):
     source = outdir / "source"
     shutil.copytree(source_root, source)
     _run_checked(["make", "clean"], cwd=source, label="formal NPB clean")
+    _install_frozen_npb_parameters(source_root, source, rows)
     for workload in rows:
         _transform_npb_source(source_root, workload, source)
     hook_object = outdir / "npb_trace_hooks.o"
@@ -2624,6 +2674,9 @@ def build_and_run_npb_formal(inputs_path, outdir):
     for workload, row in rows.items():
         binary, command = _build_npb(
             source, workload, hook_object, row["class"]
+        )
+        built_parameter = _validate_built_npb_parameter(
+            source, workload, row["parameter_sha256"]
         )
         capture_path, _, allocated, run_identity = _run_npb_binary(
             binary, workload, outdir, "formal"
@@ -2680,6 +2733,8 @@ def build_and_run_npb_formal(inputs_path, outdir):
             ),
             "measured_allocated_bytes": allocated,
             "parameter_sha256": row["parameter_sha256"],
+            "built_parameter_file": str(built_parameter),
+            "built_parameter_sha256": _sha256_file(built_parameter),
             "config_sha256": row["parameter_sha256"],
             "binary_sha256": binary_sha256,
             "binary_file": str(binary),

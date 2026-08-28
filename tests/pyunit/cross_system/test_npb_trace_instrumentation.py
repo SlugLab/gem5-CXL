@@ -437,6 +437,51 @@ class NpbTraceInstrumentationTest(unittest.TestCase):
                     },
                 )
 
+    def test_formal_parameters_are_restored_exactly_and_build_drift_rejected(self):
+        source = self.root / "source"
+        copied = self.root / "copied"
+        rows = {}
+        for workload in ("cg", "mg"):
+            parameter = source / workload.upper() / "npbparams.h"
+            parameter.parent.mkdir(parents=True)
+            parameter.write_text(
+                f"c frozen Class D {workload} parameters\n", encoding="ascii"
+            )
+            rows[workload] = {
+                "parameter_file": str(parameter.resolve()),
+                "parameter_sha256": builder._sha256_file(parameter),
+            }
+            (copied / workload.upper()).mkdir(parents=True)
+
+        builder._install_frozen_npb_parameters(source, copied, rows)
+        for workload, row in rows.items():
+            installed = copied / workload.upper() / "npbparams.h"
+            self.assertEqual(
+                builder._sha256_file(installed), row["parameter_sha256"]
+            )
+            builder._validate_built_npb_parameter(
+                copied, workload, row["parameter_sha256"]
+            )
+
+        (copied / "CG/npbparams.h").write_text(
+            "c regenerated with a different compile date\n", encoding="ascii"
+        )
+        with self.assertRaisesRegex(
+            builder.BuildError, "formal NPB cg built parameter SHA-256 differs"
+        ):
+            builder._validate_built_npb_parameter(
+                copied, "cg", rows["cg"]["parameter_sha256"]
+            )
+
+    def test_formal_copy_recreates_untracked_binary_directory(self):
+        copied = self.root / "copied"
+        copied.mkdir()
+
+        binary_directory = builder._prepare_npb_binary_directory(copied)
+
+        self.assertEqual(binary_directory, (copied / "bin").resolve())
+        self.assertTrue(binary_directory.is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()
