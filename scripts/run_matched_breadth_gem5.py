@@ -25,7 +25,7 @@ try:
     from scripts import cross_system_contract as contract
     from scripts import cxl_latency_spectrum as latency
     from scripts import lazy_work_trace as lazy
-    from scripts import npb_lazy_trace as npb
+    from scripts import lazy_workload_registry as lazy_registry
     from scripts import stratified_timing as timing
 except ImportError:
     import canonical_work_trace as canonical
@@ -33,7 +33,7 @@ except ImportError:
     import cross_system_contract as contract
     import cxl_latency_spectrum as latency
     import lazy_work_trace as lazy
-    import npb_lazy_trace as npb
+    import lazy_workload_registry as lazy_registry
     import stratified_timing as timing
 
 
@@ -48,17 +48,6 @@ _ALLOCATION = re.compile(
     r"^TRACE_REPLAY_ALLOCATION logical_bytes=([0-9]+) "
     r"allocated_bytes=([0-9]+) all_memory_cxl=(true|false)$"
 )
-_NPB_PHASE_NAMES = {
-    101: "cg_spmv",
-    102: "cg_vector_update",
-    103: "cg_dot",
-    104: "cg_conj_grad",
-    201: "mg_psinv",
-    202: "mg_resid",
-    203: "mg_rprj3",
-    204: "mg_interp",
-    205: "mg_norm2u3",
-}
 _STREAM_MAGIC = b"MTRCV2\0\0"
 _STREAM_HEADER = struct.Struct("<8sQQ")
 _STREAM_CHUNK_RECORDS = 4096
@@ -134,9 +123,10 @@ def _eager_phase_identity(bundle, phase):
 
 
 def _lazy_phase_identity(bundle, phase):
-    name = _NPB_PHASE_NAMES.get(phase)
-    if name is None:
-        raise ReplayError("selected lazy phase has no canonical name")
+    try:
+        name = lazy_registry.phase_name(bundle, phase)
+    except lazy.LazyTraceError as error:
+        raise ReplayError(str(error)) from error
     count = sum(
         invocation.work_items
         for invocation in bundle.invocations
@@ -445,8 +435,8 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
             with lazy.MappedState(source) as mapped:
                 for invocation in source.invocations:
                     try:
-                        expander = npb.EXPANDERS[invocation.kernel]
-                    except KeyError as error:
+                        expander = lazy_registry.expander(invocation)
+                    except lazy.LazyTraceError as error:
                         raise ReplayError(
                             f"unknown lazy replay kernel {invocation.kernel}"
                         ) from error
@@ -696,7 +686,9 @@ def _emit_lazy_replay_stream(trace, stream):
 
     with lazy.MappedState(bundle) as state:
         for invocation in bundle.invocations:
-            for operation in npb.EXPANDERS[invocation.kernel](state, invocation, 1024):
+            for operation in lazy_registry.expander(invocation)(
+                state, invocation, 1024
+            ):
                 lazy._validate_expanded_operation(bundle, invocation, operation)
                 operation = dataclasses.replace(operation, sequence=total_records)
                 payload = canonical.TRACE_STRUCT.pack(
@@ -1004,14 +996,18 @@ def _write_lazy_boundary_map(bundle, path):
     with lazy.MappedState(bundle) as state:
         for invocation in bundle.invocations:
             commit = None
-            for operation in npb.EXPANDERS[invocation.kernel](state, invocation, 1024):
+            for operation in lazy_registry.expander(invocation)(
+                state, invocation, 1024
+            ):
                 lazy._validate_expanded_operation(bundle, invocation, operation)
                 if operation.opcode == canonical.Opcode.COMMIT:
                     commit = sequence
                 sequence += 1
             if commit is None:
                 raise ReplayError("lazy invocation has no COMMIT")
-            for name, bits, count, base in npb.invocation_boundary_specs(bundle, invocation):
+            for name, bits, count, base in lazy_registry.boundary_specs(
+                bundle, invocation
+            ):
                 if name not in commitments:
                     continue
                 if name in selected:

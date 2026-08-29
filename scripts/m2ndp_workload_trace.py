@@ -22,14 +22,14 @@ try:
     from scripts import cxl_latency_spectrum as latency
     from scripts import m2ndp_artifacts as artifact_helpers
     from scripts import lazy_work_trace as lazy
-    from scripts import npb_lazy_trace as npb
+    from scripts import lazy_workload_registry as lazy_registry
 except ImportError:
     import canonical_work_trace as canonical
     import cross_system_contract as contract
     import cxl_latency_spectrum as latency
     import m2ndp_artifacts as artifact_helpers
     import lazy_work_trace as lazy
-    import npb_lazy_trace as npb
+    import lazy_workload_registry as lazy_registry
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -1037,8 +1037,8 @@ def _lower_lazy_bundle(trace_root, outdir, provenance):
     ):
         for launch, invocation in enumerate(bundle.invocations):
             try:
-                expander = npb.EXPANDERS[invocation.kernel]
-            except KeyError as error:
+                expander = lazy_registry.expander(invocation)
+            except lazy.LazyTraceError as error:
                 raise TraceTranslationError(
                     f"unknown lazy kernel {invocation.kernel}"
                 ) from error
@@ -1096,7 +1096,7 @@ def _lower_lazy_bundle(trace_root, outdir, provenance):
                     raise TraceTranslationError(
                         f"lazy invocation {launch} has no COMMIT"
                     )
-                for name, bits, count, base in npb.invocation_boundary_specs(
+                for name, bits, count, base in lazy_registry.boundary_specs(
                     bundle, invocation
                 ):
                     if name not in commitments:
