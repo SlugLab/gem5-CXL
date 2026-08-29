@@ -599,6 +599,7 @@ class Accessor
     explicit Accessor(Memory &memory) : memory(memory) {}
     virtual ~Accessor() = default;
     virtual Request load(uint64_t address, uint32_t bytes, uint64_t slot) = 0;
+    virtual void prepareCollects(const std::vector<Request> &) {}
     virtual uint64_t collect(Request request) = 0;
     virtual void store(uint64_t address, uint32_t bytes, uint64_t bits)
     {
@@ -686,6 +687,74 @@ class AmuAccessor : public Accessor
 #endif
     }
 
+    void prepareCollects(const std::vector<Request> &requests) override
+    {
+#ifndef TRACE_REPLAY_NATIVE
+        constexpr unsigned countBits = 3;
+        constexpr unsigned tokenBits = 15;
+        constexpr size_t batchSize = 4;
+        constexpr uint64_t tokenMask = (UINT64_C(1) << tokenBits) - 1;
+        std::unordered_set<uint64_t> handles;
+        handles.reserve(requests.size());
+        for (const auto &request : requests) {
+            if (request.handle == 0 || request.handle > slots.size() ||
+                !handles.insert(request.handle).second) {
+                throw std::runtime_error(
+                    "AMU collect batch has an invalid or duplicate handle");
+            }
+        }
+
+        const auto readyCount = [&]() -> size_t {
+            return static_cast<size_t>(std::count_if(
+                requests.begin(), requests.end(), [&](const Request &request) {
+                    return slots[request.handle - 1].ready;
+                }));
+        };
+        while (readyCount() != requests.size()) {
+            const uint64_t packed = m5_amu_getfin_batch();
+            const size_t count = packed & 0x7;
+            if (count == 0) {
+                m5_amu_waitfin();
+                continue;
+            }
+            if (count > batchSize)
+                throw std::runtime_error("AMU completion batch is oversized");
+            for (size_t index = 0; index < count; ++index) {
+                const uint64_t token =
+                    (packed >> (countBits + index * tokenBits)) & tokenMask;
+                bool matched = false;
+                for (auto &entry : slots) {
+                    if (entry.id != 0 &&
+                        (entry.id & tokenMask) == token) {
+                        if (entry.ready)
+                            throw std::runtime_error(
+                                "AMU completion token is duplicate");
+                        entry.ready = true;
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched)
+                    throw std::runtime_error(
+                        "AMU completion token is unknown or stale");
+            }
+        }
+
+        // Invalidate every completed SPM line first, then use one fence for
+        // the entire asynchronous batch.  This prevents speculative CPU
+        // reads from retaining the previous ring traversal without adding a
+        // completion wait or fence to each value consumer.
+        for (const auto &request : requests) {
+            auto &entry = slots[request.handle - 1];
+            __asm__ volatile("clflush (%0)" : : "r"(entry.spm.data())
+                             : "memory");
+        }
+        __asm__ volatile("mfence" : : : "memory");
+#else
+        (void)requests;
+#endif
+    }
+
     uint64_t collect(Request request) override
     {
 #ifdef TRACE_REPLAY_NATIVE
@@ -698,21 +767,9 @@ class AmuAccessor : public Accessor
         if (request.handle == 0 || request.handle > slots.size())
             throw std::runtime_error("AMU request handle is invalid");
         auto &wanted = slots[request.handle - 1];
-        while (!wanted.ready) {
-            const uint64_t id = amu_getfin();
-            if (id == 0)
-                continue;
-            bool matched = false;
-            for (auto &entry : slots) {
-                if (entry.id == id) {
-                    entry.ready = true;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched)
-                throw std::runtime_error("AMU completion id is unknown");
-        }
+        if (!wanted.ready)
+            throw std::runtime_error(
+                "AMU slot consumed before its completion batch");
         const uint64_t bits = loadRaw(wanted.spm.data(), wanted.bytes);
         wanted.id = 0;
         wanted.ready = false;
@@ -858,6 +915,17 @@ evaluate(const TraceRecord &record)
             std::to_string(record.opcode) + " sequence=" +
             std::to_string(record.sequence));
     }
+}
+
+[[noreturn]] void
+throwBitExactMismatch(const TraceRecord &record, uint64_t observed)
+{
+    std::ostringstream message;
+    message << "bit-exact result differs at canonical sequence "
+            << record.sequence << " address=0x" << std::hex
+            << record.address << " expected=0x" << record.result
+            << " observed=0x" << observed;
+    throw std::runtime_error(message.str());
 }
 
 std::vector<TraceRecord>
@@ -1255,6 +1323,7 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                 ++end;
             }
             if (!requests.empty()) {
+                accessor.prepareCollects(requests);
                 size_t requestIndex = 0;
                 for (size_t position = begin; position < end; ++position) {
                     const auto *operation =
@@ -1267,11 +1336,8 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                     } else {
                         observed = evaluate(*operation);
                     }
-                    if (observed != operation->result) {
-                        throw std::runtime_error(
-                            "bit-exact result differs at canonical sequence " +
-                            std::to_string(operation->sequence));
-                    }
+                    if (observed != operation->result)
+                        throwBitExactMismatch(*operation, observed);
                     dependencies.publish(operation->sequence);
                 }
                 index = end;
@@ -1296,11 +1362,8 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
                     Commit{record->sequence, record->address, observed};
             }
         }
-        if (!Memory::isStore(opcode) && observed != record->result) {
-            throw std::runtime_error(
-                "bit-exact result differs at canonical sequence " +
-                std::to_string(record->sequence));
-        }
+        if (!Memory::isStore(opcode) && observed != record->result)
+            throwBitExactMismatch(*record, observed);
         dependencies.publish(record->sequence);
         if (boundaryProbes) {
             const auto probes = boundaryProbes->find(record->sequence);
@@ -1398,6 +1461,7 @@ executeAmuWavefront(
         }
 
         if (!requests.empty()) {
+            accessor.prepareCollects(requests);
             for (const auto &segment : segments) {
                 const auto &group = groups[firstGroup + segment.lane];
                 size_t requestIndex = segment.requestBegin;
@@ -1411,11 +1475,8 @@ executeAmuWavefront(
                         observed = accessor.collect(requests[requestIndex++]);
                     else
                         observed = evaluate(*record);
-                    if (observed != record->result) {
-                        throw std::runtime_error(
-                            "bit-exact result differs at canonical sequence " +
-                            std::to_string(record->sequence));
-                    }
+                    if (observed != record->result)
+                        throwBitExactMismatch(*record, observed);
                     dependencies.publish(record->sequence);
                 }
                 cursors[segment.lane] = segment.end;
@@ -1445,11 +1506,8 @@ executeAmuWavefront(
                 memory.publishStore(record->address, record->sequence);
             } else {
                 const uint64_t observed = evaluate(*record);
-                if (observed != record->result) {
-                    throw std::runtime_error(
-                        "bit-exact result differs at canonical sequence " +
-                        std::to_string(record->sequence));
-                }
+                if (observed != record->result)
+                    throwBitExactMismatch(*record, observed);
                 if (opcode == Opcode::COMMIT) {
                     const auto found = commitSlots.find(record->sequence);
                     if (found == commitSlots.end())

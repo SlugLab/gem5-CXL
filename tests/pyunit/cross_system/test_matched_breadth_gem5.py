@@ -576,7 +576,11 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
            timeout=5)
         self.assertEqual(completed.returncode, 2, completed.stderr)
-        self.assertIn("bit-exact result differs", completed.stderr)
+        self.assertIn(
+            "bit-exact result differs at canonical sequence 0 "
+            "address=0xa800 expected=0x6 observed=0x5",
+            completed.stderr,
+        )
 
     def test_native_replay_preserves_logical_cache_line_layout(self):
         operations = (
@@ -1212,6 +1216,36 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertIn("2 * spmPackets", source)
         self.assertIn("windowSlots", source)
         self.assertNotIn("active >= slots.size()", source)
+
+    def test_amu_batches_completion_wait_and_slot_invalidation(self):
+        source = replay.SOURCE.read_text(encoding="utf-8")
+        amu = source[
+            source.index("class AmuAccessor"):
+            source.index("class CiraAccessor")
+        ]
+        prepare = amu[
+            amu.index("void prepareCollects("):
+            amu.index("uint64_t collect(")
+        ]
+        collect = amu[
+            amu.index("uint64_t collect("):
+            amu.index("void drain(")
+        ]
+        self.assertIn("m5_amu_getfin_batch()", prepare)
+        self.assertIn("m5_amu_waitfin()", prepare)
+        self.assertIn('__asm__ volatile("clflush (%0)"', prepare)
+        self.assertEqual(prepare.count('__asm__ volatile("mfence"'), 1)
+        self.assertNotIn("amu_getfin()", collect)
+        self.assertNotIn("clflush", collect)
+        self.assertNotIn("mfence", collect)
+
+        wavefront = source[
+            source.index("executeAmuWavefront("):
+            source.index("bool\nrequiresOrderedAmuBlocks")
+        ]
+        prepare_call = wavefront.index("accessor.prepareCollects(requests)")
+        collect_call = wavefront.index("accessor.collect(", prepare_call)
+        self.assertLess(prepare_call, collect_call)
 
     def test_replay_flushes_initialized_state_before_roi(self):
         source = replay.SOURCE.read_text(encoding="utf-8")
