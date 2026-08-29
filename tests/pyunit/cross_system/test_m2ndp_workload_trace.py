@@ -157,6 +157,98 @@ REGIONS = {
 
 
 class M2NDPWorkloadTraceTest(unittest.TestCase):
+    def test_sparse_window_memory_map_is_derived_from_operation_operands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace_root = root / "trace"
+            operations = (
+                operation(
+                    canonical.Opcode.LOAD_U64, 0,
+                    address=0x1000, left=7, right=0, result=7,
+                ),
+                operation(
+                    canonical.Opcode.STORE_U64, 1,
+                    address=0x2000, left=9, right=0, result=9,
+                ),
+            )
+            canonical.write_bundle(
+                trace_root,
+                {
+                    "schema": 1, "workload": "amg_gather",
+                    "input_sha256": digest("input"),
+                    "source_sha256": digest("source"),
+                    "binary_sha256": digest("binary"),
+                    "config_sha256": digest("config"),
+                    "phases": [{"id": 3}],
+                    "output_boundaries": {},
+                },
+                operations, {}, initial_memory={},
+            )
+            package = root / "package"
+            package.mkdir()
+            initial, target, images = m2ndp._write_memory_map(
+                canonical.read_bundle(trace_root), trace_root, package
+            )
+            initial_text = initial.read_text(encoding="utf-8")
+            target_text = target.read_text(encoding="utf-8")
+        self.assertEqual(images, [])
+        self.assertIn("0x1000 7 0 0 0", initial_text)
+        self.assertIn("0x2000 0 0 0 0", initial_text)
+        self.assertIn("0x2000 9 0 0 0", target_text)
+
+    def test_prepared_window_provenance_is_retained_by_lowering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace_root = root / "trace"
+            operations = (
+                operation(
+                    canonical.Opcode.LOAD_U64, 0,
+                    address=0x1000, left=7, right=0, result=7,
+                ),
+            )
+            canonical.write_bundle(
+                trace_root,
+                {
+                    "schema": 1, "workload": "amg_gather",
+                    "input_sha256": digest("input"),
+                    "source_sha256": digest("source"),
+                    "binary_sha256": digest("binary"),
+                    "config_sha256": digest("config"),
+                    "phases": [{"id": 3}],
+                    "output_boundaries": {},
+                    "prepared_window": {
+                        "source_schema": 3,
+                        "source_trace_sha256": digest("formal-trace"),
+                        "phase": 3,
+                        "phase_name": "amg_gather",
+                        "warmup_items": 8,
+                        "measured_items": 8,
+                        "measure_start_item": 8,
+                        "fixed_event_records": 2,
+                        "fixed_trace_sha256": digest("fixed"),
+                        "window_index": 0,
+                        "warmup_start": 0,
+                        "measure_start": 8,
+                        "measure_stop": 16,
+                    },
+                },
+                operations, {}, initial_memory={},
+            )
+            bundle = canonical.read_bundle(trace_root)
+            package = m2ndp.lower_bundle(
+                trace_root, root / "package",
+                provenance=provenance(root, bundle),
+            )
+            manifest = json.loads(package.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["functional_gate"], "operation_results")
+        self.assertEqual(manifest["derived_window"], {
+            "source_trace_sha256": digest("formal-trace"),
+            "window_index": 0,
+            "warmup_start": 0,
+            "measure_start": 8,
+            "measure_stop": 16,
+        })
+
     def test_lowering_table_covers_every_canonical_opcode(self):
         self.assertEqual(set(m2ndp.LOWERING), set(canonical.Opcode))
 

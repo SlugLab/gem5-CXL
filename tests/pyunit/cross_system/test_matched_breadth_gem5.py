@@ -37,10 +37,10 @@ def _meta(name, records, output_boundaries=None):
     }
 
 
-def _op(opcode, sequence, *, work_item=0, address=0, left=0, right=0,
-        result=0):
+def _op(opcode, sequence, *, phase=0, work_item=0, address=0, left=0,
+        right=0, result=0):
     return canonical.Operation(
-        phase=0,
+        phase=phase,
         opcode=opcode,
         work_item=work_item,
         sequence=sequence,
@@ -171,6 +171,35 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 self.assertIs(reference["bit_exact"], True)
                 self.assertEqual(reference["mismatched_words"], 0)
                 self.assertEqual(reference["nonfinite_words"], 0)
+
+    def test_native_replay_initializes_sparse_window_from_load_operands(self):
+        operations = (
+            _op(
+                canonical.Opcode.LOAD_U64, 0, work_item=0,
+                address=0x1000, left=7, result=7,
+            ),
+            _op(
+                canonical.Opcode.LOAD_U64, 1, work_item=1,
+                address=0x100000000, left=11, result=11,
+            ),
+            _op(
+                canonical.Opcode.STORE_U64, 2, work_item=1,
+                address=0x200000000, left=18, result=18,
+            ),
+        )
+        trace = self.root / "sparse-window"
+        canonical.write_bundle(
+            trace, _meta("sparse_window", 2), operations, {},
+            initial_memory={},
+        )
+        binary = replay.build_replay_binary(
+            self.root / "sparse-window-build", native=True
+        )
+        result = replay.run_native_replay(
+            binary, system="vanilla", trace=trace,
+            outdir=self.root / "sparse-window-run",
+        )
+        self.assertEqual(result["verification"], "pass")
 
     def test_actual_fixture_bundles_pass_all_three_backends(self):
         manifest = builder.build_fixture_suite(self.root / "actual-build")
@@ -1479,6 +1508,103 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             "--window-index", "7",
         ])
         self.assertEqual(window.window_index, 7)
+
+    def test_cli_accepts_prepared_dynamic_and_fixed_window_pair(self):
+        options = replay.parse_args([
+            "--mode", "window", "--system", "vanilla",
+            "--trace", "dynamic", "--fixed-trace", "fixed",
+            "--binary", "trace_replay", "--gem5", "gem5.opt",
+            "--config", "config.py", "--calibration", "calibration.json",
+            "--outdir", "out",
+        ])
+        self.assertEqual(options.fixed_trace, Path("fixed"))
+        self.assertIsNone(options.window_manifest)
+
+    def test_load_prepared_window_requires_hash_bound_fixed_pair(self):
+        dynamic = self.root / "prepared-dynamic"
+        fixed = self.root / "prepared-fixed"
+        fixed_operations = (
+            _op(canonical.Opcode.BARRIER, 0, phase=4, work_item=8),
+        )
+        canonical.write_bundle(
+            fixed,
+            {
+                **_meta("prepared", 16),
+                "phases": [{
+                    "id": 4, "name": "lulesh_scatter", "work_items": 16,
+                }],
+                "fixed_component": True,
+                "source_trace_sha256": _digest("formal-source"),
+            },
+            fixed_operations, {}, initial_memory=_initial_memory(fixed_operations),
+        )
+        fixed_identity = canonical.read_bundle(fixed).meta["trace_sha256"]
+        dynamic_operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, work_item=0,
+                phase=4, address=0x1000, left=7, result=7),
+        )
+        canonical.write_bundle(
+            dynamic,
+            {
+                **_meta("prepared", 16),
+                "phases": [{
+                    "id": 4, "name": "lulesh_scatter", "work_items": 16,
+                }],
+                "prepared_window": {
+                    "source_schema": 3,
+                    "source_trace_sha256": _digest("formal-source"),
+                    "phase": 4,
+                    "phase_name": "lulesh_scatter",
+                    "warmup_items": 8,
+                    "measured_items": 8,
+                    "measure_start_item": 8,
+                    "fixed_event_records": 1,
+                    "fixed_trace_sha256": fixed_identity,
+                    "window_index": 0,
+                    "warmup_start": 0,
+                    "measure_start": 8,
+                    "measure_stop": 16,
+                },
+            },
+            dynamic_operations, {},
+            initial_memory=_initial_memory(dynamic_operations),
+        )
+        observed = replay.load_prepared_window_trace(dynamic, fixed)
+        self.assertEqual(observed.source_schema, 3)
+        self.assertEqual(observed.phase, 4)
+        self.assertEqual(observed.fixed_root, fixed.resolve())
+        serialized = replay.materialized_trace_record(observed)
+        json.dumps(serialized)
+        self.assertEqual(serialized["root"], str(dynamic.resolve()))
+        self.assertEqual(serialized["fixed_root"], str(fixed.resolve()))
+        metadata_path = dynamic / "trace.meta.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["prepared_window"]["measure_stop"] = 17
+        metadata_path.write_text(
+            json.dumps(metadata) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(replay.ReplayError, "shape"):
+            replay.load_prepared_window_trace(dynamic, fixed)
+        metadata["prepared_window"]["measure_stop"] = 16
+        metadata_path.write_text(
+            json.dumps(metadata) + "\n", encoding="utf-8"
+        )
+        (fixed / "trace.bin").write_bytes(b"tampered")
+        with self.assertRaisesRegex(
+            (replay.ReplayError, canonical.TraceError), "trace|SHA-256"
+        ):
+            replay.load_prepared_window_trace(dynamic, fixed)
+
+    def test_cli_rejects_mixed_prepared_and_canonical_window_selection(self):
+        with self.assertRaises(SystemExit):
+            replay.parse_args([
+                "--mode", "window", "--system", "vanilla",
+                "--trace", "dynamic", "--fixed-trace", "fixed",
+                "--window-manifest", "windows.json", "--phase", "3",
+                "--window-index", "7", "--binary", "trace_replay",
+                "--gem5", "gem5.opt", "--config", "config.py",
+                "--calibration", "calibration.json", "--outdir", "out",
+            ])
 
 
 if __name__ == "__main__":

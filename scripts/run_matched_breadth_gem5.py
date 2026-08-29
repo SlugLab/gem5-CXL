@@ -61,7 +61,8 @@ _STREAM_MAGIC = b"MTRCV2\0\0"
 _STREAM_HEADER = struct.Struct("<8sQQ")
 _STREAM_CHUNK_RECORDS = 4096
 _BOUNDARY_MAGIC = "MTRBND2"
-_INITIAL_MEMORY_MAGIC = "MTRINI1"
+_INITIAL_MEMORY_IMAGE_MAGIC = "MTRINI1"
+_INITIAL_MEMORY_SPARSE_MAGIC = "MTRINI2"
 
 
 class ReplayError(RuntimeError):
@@ -557,6 +558,102 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
     )
 
 
+def load_prepared_window_trace(dynamic_root, fixed_root):
+    """Validate a bounded category adapter's dynamic/fixed trace pair."""
+
+    dynamic_root = Path(dynamic_root).resolve()
+    fixed_root = Path(fixed_root).resolve()
+    dynamic = canonical.read_bundle(dynamic_root)
+    fixed = canonical.read_bundle(fixed_root)
+    record = dynamic.meta.get("prepared_window")
+    required = {
+        "source_schema", "source_trace_sha256", "phase", "phase_name",
+        "warmup_items", "measured_items", "measure_start_item",
+        "fixed_event_records", "fixed_trace_sha256",
+        "window_index", "warmup_start", "measure_start", "measure_stop",
+    }
+    if not isinstance(record, dict) or set(record) != required:
+        raise ReplayError("prepared window metadata fields differ")
+    source_sha256 = record["source_trace_sha256"]
+    if (
+        not isinstance(source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+    ):
+        raise ReplayError("prepared window source SHA-256 is invalid")
+    if (
+        fixed.meta.get("fixed_component") is not True
+        or fixed.meta.get("source_trace_sha256") != source_sha256
+        or fixed.meta.get("trace_sha256") != record["fixed_trace_sha256"]
+    ):
+        raise ReplayError("prepared fixed trace identity differs")
+    integer_fields = (
+        "source_schema", "phase", "warmup_items", "measured_items",
+        "measure_start_item", "fixed_event_records",
+        "window_index", "warmup_start", "measure_start", "measure_stop",
+    )
+    for name in integer_fields:
+        value = record[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ReplayError(f"prepared window {name} is invalid")
+    if (
+        record["source_schema"] == 0
+        or record["measured_items"] == 0
+        or record["fixed_event_records"] == 0
+        or record["measure_start_item"] != record["warmup_items"]
+        or not (
+            record["warmup_start"] <= record["measure_start"]
+            < record["measure_stop"]
+        )
+        or not isinstance(record["phase_name"], str)
+        or not record["phase_name"]
+    ):
+        raise ReplayError("prepared window shape is invalid")
+    selected_items = record["warmup_items"] + record["measured_items"]
+    phases = dynamic.meta.get("phases")
+    expected_phase = {
+        "id": record["phase"],
+        "name": record["phase_name"],
+        "work_items": selected_items,
+    }
+    if (
+        record["warmup_items"]
+        != record["measure_start"] - record["warmup_start"]
+        or record["measured_items"]
+        != record["measure_stop"] - record["measure_start"]
+        or phases != [expected_phase]
+        or not dynamic.operations
+        or any(operation.phase != record["phase"]
+               or operation.work_item >= selected_items
+               for operation in dynamic.operations)
+        or len(fixed.operations) != record["fixed_event_records"]
+        or any(operation.phase != record["phase"]
+               for operation in fixed.operations)
+    ):
+        raise ReplayError("prepared window shape is invalid")
+    return MaterializedTrace(
+        dynamic_root,
+        fixed_root,
+        record["source_schema"],
+        source_sha256,
+        record["phase"],
+        record["phase_name"],
+        record["warmup_items"],
+        record["measured_items"],
+        record["measure_start_item"],
+        record["fixed_event_records"],
+    )
+
+
+def materialized_trace_record(materialized):
+    if not isinstance(materialized, MaterializedTrace):
+        raise ReplayError("materialized trace evidence has the wrong type")
+    return {
+        **dataclasses.asdict(materialized),
+        "root": str(materialized.root),
+        "fixed_root": str(materialized.fixed_root),
+    }
+
+
 def _emit_lazy_replay_stream(trace, stream):
     bundle = lazy.read_bundle(trace)
     operation_digest = hashlib.sha256()
@@ -798,18 +895,49 @@ def _write_initial_memory_map(bundle, root, path):
     records = bundle.meta.get("initial_memory")
     if not isinstance(records, dict):
         raise ReplayError("canonical initial memory images are missing")
-    memory_operations = any(
-        operation.opcode in {
-            canonical.Opcode.LOAD_U32, canonical.Opcode.LOAD_U64,
-            canonical.Opcode.LOAD_F32, canonical.Opcode.LOAD_F64,
-            canonical.Opcode.STORE_U32, canonical.Opcode.STORE_U64,
-            canonical.Opcode.STORE_F32, canonical.Opcode.STORE_F64,
-        }
-        for operation in bundle.operations
-    )
-    if memory_operations and not records:
-        raise ReplayError("canonical initial memory images are missing")
-    lines = [_INITIAL_MEMORY_MAGIC, str(len(records))]
+    widths = {
+        canonical.Opcode.LOAD_U32: 32,
+        canonical.Opcode.LOAD_F32: 32,
+        canonical.Opcode.STORE_U32: 32,
+        canonical.Opcode.STORE_F32: 32,
+        canonical.Opcode.LOAD_U64: 64,
+        canonical.Opcode.LOAD_F64: 64,
+        canonical.Opcode.STORE_U64: 64,
+        canonical.Opcode.STORE_F64: 64,
+    }
+    occupied = []
+    for record in records.values():
+        start = record["logical_base"]
+        occupied.append((start, start + record["byte_count"]))
+    sparse = {}
+    for operation in bundle.operations:
+        bits = widths.get(operation.opcode)
+        if bits is None:
+            continue
+        address = operation.address
+        width = bits // 8
+        if any(start <= address and address + width <= stop
+               for start, stop in occupied):
+            continue
+        overlaps = [
+            prior for prior, (prior_bits, _value) in sparse.items()
+            if address < prior + prior_bits // 8
+            and prior < address + width
+        ]
+        if overlaps and address not in sparse:
+            raise ReplayError("sparse initial memory words overlap")
+        if address not in sparse:
+            initial = (
+                operation.operand0
+                if operation.opcode.name.startswith("LOAD_") else 0
+            )
+            sparse[address] = (bits, initial)
+        elif sparse[address][0] != bits:
+            raise ReplayError("sparse initial memory width changes")
+    lines = [
+        _INITIAL_MEMORY_SPARSE_MAGIC,
+        f"{len(records)} {len(sparse)}",
+    ]
     for name in sorted(records):
         record = records[name]
         image_path = (Path(root) / record["path"]).resolve()
@@ -817,6 +945,10 @@ def _write_initial_memory_map(bundle, root, path):
             str(record["logical_base"]), str(record["word_bits"]),
             str(record["count"]), image_path.as_posix(),
         )))
+    lines.extend(
+        f"{address} {bits} {value}"
+        for address, (bits, value) in sorted(sparse.items())
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
     return path
@@ -836,7 +968,7 @@ def _write_lazy_initial_memory_map(bundle, path):
         image = scalar_root / f"{name}.u64"
         image.write_bytes(struct.pack("<Q", bundle.meta["initial_scalars"][name]))
         rows.append((bundle.meta["scalar_addresses"][name], 64, 1, image))
-    lines = [_INITIAL_MEMORY_MAGIC, str(len(rows))]
+    lines = [_INITIAL_MEMORY_IMAGE_MAGIC, str(len(rows))]
     lines.extend(" ".join(map(str, row)) for row in rows)
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
     return path
@@ -1536,6 +1668,7 @@ def parse_args(argv=None):
     parser.add_argument("--mode", choices=("functional", "window"), required=True)
     parser.add_argument("--system", choices=SYSTEMS, required=True)
     parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument("--fixed-trace", type=Path)
     parser.add_argument("--window-manifest", type=Path)
     parser.add_argument("--phase", type=int)
     parser.add_argument("--window-index", type=int)
@@ -1549,13 +1682,30 @@ def parse_args(argv=None):
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
     options = parser.parse_args(argv)
-    selected = (
+    canonical_selection = (
         options.window_manifest, options.phase, options.window_index
     )
-    if options.mode == "functional" and any(value is not None for value in selected):
+    if options.mode == "functional" and (
+        options.fixed_trace is not None
+        or any(value is not None for value in canonical_selection)
+    ):
         parser.error("functional replay may not select a timing window")
-    if options.mode == "window" and any(value is None for value in selected):
-        parser.error("window replay requires manifest, phase, and index")
+    if options.mode == "window":
+        canonical_complete = all(
+            value is not None for value in canonical_selection
+        )
+        canonical_absent = all(
+            value is None for value in canonical_selection
+        )
+        prepared_complete = options.fixed_trace is not None
+        if not (
+            (canonical_complete and not prepared_complete)
+            or (canonical_absent and prepared_complete)
+        ):
+            parser.error(
+                "window replay requires either manifest/phase/index or "
+                "a prepared fixed trace"
+            )
     if options.phase is not None and options.phase < 0:
         parser.error("--phase must be nonnegative")
     if options.window_index is not None and options.window_index < 0:
@@ -1584,13 +1734,18 @@ def run(options):
     initial_memory_map = None
     replay_trace = trace
     if options.mode == "window":
-        materialized = materialize_window_trace(
-            trace,
-            manifest=Path(options.window_manifest).resolve(),
-            phase=options.phase,
-            window_index=options.window_index,
-            outdir=outdir.with_name(outdir.name + ".input"),
-        )
+        if getattr(options, "fixed_trace", None) is not None:
+            materialized = load_prepared_window_trace(
+                trace, options.fixed_trace
+            )
+        else:
+            materialized = materialize_window_trace(
+                trace,
+                manifest=Path(options.window_manifest).resolve(),
+                phase=options.phase,
+                window_index=options.window_index,
+                outdir=outdir.with_name(outdir.name + ".input"),
+            )
         replay_trace = materialized.root
         materialized_bundle = canonical.read_bundle(replay_trace)
         initial_memory_map = _write_initial_memory_map(
@@ -1624,9 +1779,10 @@ def run(options):
             outdir.with_name(outdir.name + ".initial-memory-map.txt"),
         )
     if options.mode == "window":
-        manifest = Path(options.window_manifest).resolve()
-        if not manifest.is_file():
-            raise ReplayError(f"window manifest is missing: {manifest}")
+        if options.window_manifest is not None:
+            manifest = Path(options.window_manifest).resolve()
+            if not manifest.is_file():
+                raise ReplayError(f"window manifest is missing: {manifest}")
     run_options = argparse.Namespace(**vars(options))
     if lazy_bundle is not None:
         pipe_read, pipe_write = os.pipe()
@@ -1765,8 +1921,7 @@ def run(options):
     }
     if materialized is not None:
         evidence["materialized_window"] = {
-            **dataclasses.asdict(materialized),
-            "root": str(materialized.root),
+            **materialized_trace_record(materialized),
             "trace_sha256": _sha256_file(replay_trace / "trace.bin"),
         }
         evidence["fixed_replay"] = {

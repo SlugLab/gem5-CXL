@@ -268,6 +268,20 @@ class Memory
             throw std::runtime_error("initial memory image is oversized");
     }
 
+    void initializeWord(uint64_t logical, uint32_t bits, uint64_t value)
+    {
+        if (bits != 32 && bits != 64)
+            throw std::runtime_error("initial memory word width differs");
+        const uint32_t bytes = bits / 8;
+        const uint64_t line = lineAddress(logical);
+        if (lineIndices.count(line) == 0) {
+            lineIndices.emplace(line, lineAddresses.size());
+            lineAddresses.push_back(line);
+            lines.push_back(std::make_unique<DataLine>());
+        }
+        storeRaw(pointer(logical), bytes, value);
+    }
+
     static bool isLoad(Opcode opcode)
     {
         return opcode == Opcode::LOAD_U32 || opcode == Opcode::LOAD_U64 ||
@@ -833,10 +847,14 @@ readInitialMemoryMap(const std::string &path, Memory &memory)
         throw std::runtime_error("canonical initial memory map is missing");
     std::ifstream stream(path);
     std::string magic;
-    uint64_t count = 0;
-    if (!(stream >> magic >> count) || magic != "MTRINI1")
+    uint64_t imageCount = 0;
+    uint64_t sparseCount = 0;
+    if (!(stream >> magic >> imageCount) ||
+        (magic != "MTRINI1" && magic != "MTRINI2"))
         throw std::runtime_error("canonical initial memory map header differs");
-    for (uint64_t index = 0; index < count; ++index) {
+    if (magic == "MTRINI2" && !(stream >> sparseCount))
+        throw std::runtime_error("canonical sparse memory count differs");
+    for (uint64_t index = 0; index < imageCount; ++index) {
         uint64_t base = 0, wordBits = 0, words = 0;
         std::string imagePath;
         if (!(stream >> base >> wordBits >> words >> imagePath) ||
@@ -845,6 +863,16 @@ readInitialMemoryMap(const std::string &path, Memory &memory)
             throw std::runtime_error("canonical initial memory image differs");
         }
         memory.initialize(base, imagePath, words * (wordBits / 8));
+    }
+    for (uint64_t index = 0; index < sparseCount; ++index) {
+        uint64_t address = 0, wordBits = 0, value = 0;
+        if (!(stream >> address >> wordBits >> value) ||
+            (wordBits != 32 && wordBits != 64) ||
+            (wordBits == 32 && value > UINT32_MAX)) {
+            throw std::runtime_error(
+                "canonical sparse initial memory word differs");
+        }
+        memory.initializeWord(address, uint32_t(wordBits), value);
     }
     std::string trailing;
     if (stream >> trailing)

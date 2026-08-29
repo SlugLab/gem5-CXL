@@ -353,6 +353,16 @@ def _write_memory_map(bundle, trace_root, outdir):
         }
         for address, packet in packets.items()
     }
+    memory_widths = {
+        canonical.Opcode.LOAD_U32: 32,
+        canonical.Opcode.LOAD_F32: 32,
+        canonical.Opcode.STORE_U32: 32,
+        canonical.Opcode.STORE_F32: 32,
+        canonical.Opcode.LOAD_U64: 64,
+        canonical.Opcode.LOAD_F64: 64,
+        canonical.Opcode.STORE_U64: 64,
+        canonical.Opcode.STORE_F64: 64,
+    }
     store_widths = {
         canonical.Opcode.STORE_U32: 32,
         canonical.Opcode.STORE_F32: 32,
@@ -360,6 +370,31 @@ def _write_memory_map(bundle, trace_root, outdir):
         canonical.Opcode.STORE_F64: 64,
     }
     for operation in bundle.operations:
+        memory_bits = memory_widths.get(operation.opcode)
+        if memory_bits is not None:
+            width = memory_bits // 8
+            address = operation.address
+            packet_base = address - address % 32
+            packet = packets.get(packet_base)
+            index = (address - packet_base) // width
+            initialized = (
+                packet is not None
+                and packet["bits"] == memory_bits
+                and index in packet["used"]
+            )
+            if not initialized:
+                initial = (
+                    operation.operand0
+                    if operation.opcode.name.startswith("LOAD_") else 0
+                )
+                _insert_packet_word(
+                    packets, address, memory_bits, initial,
+                    "canonical sparse initial memory",
+                )
+                _insert_packet_word(
+                    target_packets, address, memory_bits, initial,
+                    "canonical sparse target memory",
+                )
         bits = store_widths.get(operation.opcode)
         if bits is None:
             continue
@@ -1171,6 +1206,21 @@ def _lower_lazy_bundle(trace_root, outdir, provenance):
     return manifest_path
 
 
+def _derived_window_record(meta):
+    required = (
+        "source_trace_sha256", "window_index", "warmup_start",
+        "measure_start", "measure_stop",
+    )
+    prepared = meta.get("prepared_window")
+    if isinstance(prepared, dict) and all(
+        field in prepared for field in required
+    ):
+        return {field: prepared[field] for field in required}
+    if all(field in meta for field in required):
+        return {field: meta[field] for field in required}
+    return None
+
+
 def lower_bundle(trace_root, outdir, *, provenance):
     if not isinstance(provenance, PackageProvenance):
         raise TraceTranslationError("M2NDP package provenance is invalid")
@@ -1261,6 +1311,7 @@ def lower_bundle(trace_root, outdir, *, provenance):
     ).name
     if _sha256_tree(timing_config_root) != provenance.ndpsim_config_tree_sha256:
         raise TraceTranslationError("packaged NDPSim config tree differs")
+    derived_window = _derived_window_record(bundle.meta)
     manifest_path = outdir / "package.json"
     contract.atomic_write_json(manifest_path, {
         "schema": 1,
@@ -1316,20 +1367,8 @@ def lower_bundle(trace_root, outdir, *, provenance):
         "functional_gate": (
             "boundary_words" if bundle.outputs else "operation_results"
         ),
-        **({
-            "derived_window": {
-                "source_trace_sha256": bundle.meta["source_trace_sha256"],
-                "window_index": bundle.meta["window_index"],
-                "warmup_start": bundle.meta["warmup_start"],
-                "measure_start": bundle.meta["measure_start"],
-                "measure_stop": bundle.meta["measure_stop"],
-            }
-        } if not bundle.outputs and all(
-            field in bundle.meta for field in (
-                "source_trace_sha256", "window_index", "warmup_start",
-                "measure_start", "measure_stop",
-            )
-        ) else {}),
+        **({"derived_window": derived_window}
+           if not bundle.outputs and derived_window is not None else {}),
         "provenance": provenance.as_dict(),
     })
     return manifest_path
