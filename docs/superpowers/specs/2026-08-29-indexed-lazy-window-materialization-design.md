@@ -46,11 +46,15 @@ prepared manifest, resolves exactly one requested action, and dispatches to
 the existing reference, FuncSim, gem5, or NDPSim implementation. It does not
 implement workload arithmetic or simulator behavior.
 
-The materialization layer has workload-specific index producers behind one
+The materialization layer has workload-specific bounded selectors behind one
 interface:
 
-- MCF indexes `.mcfreg2` section and event offsets and seeks directly to the
-  requested phase and safe window boundary.
+- MCF validates the `.mcfreg2` directory, then performs one ordered streaming
+  inflate of its single gzip `EVENTS` section. Because the complete canonical
+  timing plan is known first, the selector retains only records in the union
+  of selected warmup/measurement intervals and builds a coordinate-to-window
+  index over those retained records. It never writes the fully decompressed
+  section and does not claim arbitrary seek within the original gzip stream.
 - NPB indexes invocation primitive counts using closed-form kernel cardinality
   functions. Prefix counts locate a requested global primitive with binary
   search rather than expanding preceding invocations.
@@ -87,6 +91,12 @@ functional outputs are immutable; timing output remains latency-local.
 - legal cut points that do not split a reduction, sparse row, stencil update,
   barrier, or commit.
 
+For MCF, invocation segments are the selected call/phase ranges observed by
+the single streaming inflate. Each entry additionally records the source
+event ordinal and its offset in the compressed retained-window package. The
+index is created only after the stream reaches the declared final event count
+and the original `EVENTS` section digest verifies.
+
 Segments must be strictly ordered, non-overlapping, and cover the declared
 primitive range exactly. Every count is an integer derived from a checked
 kernel-cardinality function. Unknown kernels or arithmetic overflow fail.
@@ -122,10 +132,11 @@ Missing or duplicate values, overlapping logical addresses, a changed native
 boundary commitment, or an unrecognized data-dependent address rejects the
 window.
 
-The total indexes, sparse states, and materialized windows for one workload
-have a default 512 MiB retained-storage limit. Temporary files count toward
-the limit. Exceeding it fails preparation and never falls back to full-state
-copying or eager trace expansion.
+The total indexes, sparse states, and compressed retained-window packages for
+one workload have a default 512 MiB retained-storage limit. At most one
+uncompressed materialized window is temporary at a time, and that temporary
+file also counts toward the limit. Exceeding it fails preparation and never
+falls back to full-state copying or eager trace expansion.
 
 ### Materialized window
 
@@ -153,7 +164,8 @@ simulator execution of the Class D operation stream.
 For `window`, the driver:
 
 1. validates the prepared manifest and exact action command;
-2. loads or atomically creates the workload index;
+2. loads or atomically creates the NPB lazy index or MCF selected-window
+   package and coordinate index;
 3. resolves the requested coordinate to legal cut points;
 4. loads sparse native state committed by the single preparation capture;
 5. materializes and validates the dynamic/fixed trace pair;
