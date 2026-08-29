@@ -744,6 +744,48 @@ class M2NDPWorkloadTraceTest(unittest.TestCase):
                 )
             )
 
+    def test_fixed_component_uses_operation_result_funcsim_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace_root = root / "trace"
+            canonical.write_bundle(
+                trace_root,
+                {
+                    "schema": 1, "workload": "amg_gather",
+                    "input_sha256": digest("fixed-input"),
+                    "source_sha256": digest("fixed-source"),
+                    "binary_sha256": digest("fixed-binary"),
+                    "config_sha256": digest("fixed-config"),
+                    "phases": [{"id": 3, "name": "amg_gather",
+                                "work_items": 1}],
+                    "output_boundaries": {}, "fixed_component": True,
+                    "source_trace_sha256": digest("full-trace"),
+                },
+                (operation(canonical.Opcode.COMMIT, 0, phase=3),),
+                {},
+            )
+            bundle = canonical.read_bundle(trace_root)
+            package = m2ndp.lower_bundle(
+                trace_root, root / "package",
+                provenance=provenance(
+                    root, bundle,
+                    funcsim_body=(
+                        "#!/bin/sh\n"
+                        "echo M2NDP_CANONICAL_MODE=1\n"
+                        "echo M2NDP_CANONICAL_LAUNCHES=1\n"
+                        "echo M2NDP_CANONICAL_BOUNDARIES=0\n"
+                        "echo M2NDP_CANONICAL_OPERATIONS=1\n"
+                        "echo M2NDP_CANONICAL_MATCH=PASS\n"
+                    ),
+                ),
+            )
+            manifest = json.loads(package.read_text())
+            self.assertTrue(manifest["fixed_component"])
+            self.assertEqual(manifest["functional_gate"], "operation_results")
+            evidence = m2ndp.run_funcsim_package(package)
+            self.assertEqual(evidence["status"], "pass")
+            self.assertEqual(evidence["compared_operations"], 1)
+
     def test_ndpsim_requires_memory_match_and_exact_launch_count(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

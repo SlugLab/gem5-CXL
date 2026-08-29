@@ -545,15 +545,24 @@ def _verify_output_boundaries(manifest):
         raise TraceTranslationError("M2NDP output boundaries are missing")
     if not boundaries:
         derivation = manifest.get("derived_window")
+        derived_gate = (
+            isinstance(derivation, dict)
+            and _SHA256.fullmatch(
+                str(derivation.get("source_trace_sha256", ""))
+            ) is not None
+            and isinstance(derivation.get("window_index"), int)
+            and not isinstance(derivation.get("window_index"), bool)
+            and derivation["window_index"] >= 0
+        )
+        fixed_gate = (
+            manifest.get("fixed_component") is True
+            and _SHA256.fullmatch(
+                str(manifest.get("source_trace_sha256", ""))
+            ) is not None
+        )
         if (
             manifest.get("functional_gate") != "operation_results"
-            or not isinstance(derivation, dict)
-            or _SHA256.fullmatch(
-                str(derivation.get("source_trace_sha256", ""))
-            ) is None
-            or not isinstance(derivation.get("window_index"), int)
-            or isinstance(derivation.get("window_index"), bool)
-            or derivation["window_index"] < 0
+            or not (derived_gate or fixed_gate)
         ):
             raise TraceTranslationError("M2NDP output boundaries are missing")
         return boundaries
@@ -1372,6 +1381,10 @@ def lower_bundle(trace_root, outdir, *, provenance):
         ),
         **({"derived_window": derived_window}
            if not bundle.outputs and derived_window is not None else {}),
+        **({
+            "fixed_component": True,
+            "source_trace_sha256": bundle.meta.get("source_trace_sha256"),
+        } if bundle.meta.get("fixed_component") is True else {}),
         "provenance": provenance.as_dict(),
     })
     return manifest_path
