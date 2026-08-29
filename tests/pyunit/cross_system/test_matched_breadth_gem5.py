@@ -1306,19 +1306,30 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             ):
                 replay.validate_mechanism("vanilla", {**clean, **change})
 
-    def _write_config(self, *, delay=1_000_000, direct_memory=False):
+    def _write_config(
+        self, *, delay=1_000_000, direct_memory=False, switchable=False,
+    ):
         path = self.root / "config.ini"
-        cores = "\n".join(
-            f"[board.processor.cores{core}.core]\ntype=TimingSimpleCPU\n"
-            for core in range(4)
-        )
+        if switchable:
+            cores = "\n".join(
+                f"[board.processor.start{core}.core]\n"
+                "type=AtomicSimpleCPU\nswitched_out=false\n"
+                f"[board.processor.switch{core}.core]\n"
+                "type=TimingSimpleCPU\nswitched_out=true\n"
+                for core in range(4)
+            )
+        else:
+            cores = "\n".join(
+                f"[board.processor.cores{core}.core]\ntype=TimingSimpleCPU\n"
+                for core in range(4)
+            )
         memory_port = (
             " board.memory.mem_ctrl.port" if direct_memory else ""
         )
         path.write_text(
             "[board]\n"
             "type=System\n"
-            "mem_mode=timing\n"
+            f"mem_mode={'atomic' if switchable else 'timing'}\n"
             "mem_ranges=0:4294967296\n"
             "[board.cache_hierarchy.membus]\n"
             "type=CoherentXBar\n"
@@ -1347,6 +1358,10 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             self._write_config(delay=200_000), cxl_link_delay="200ns"
         )
         self.assertEqual(evidence["cxl_link_delay_ticks"], 200_000)
+        switched = replay.validate_config_ini(
+            self._write_config(switchable=True)
+        )
+        self.assertTrue(switched["fast_forward_setup"])
         with self.assertRaisesRegex(replay.ReplayError, "campaign identity"):
             replay.validate_config_ini(self._write_config(delay=500_000))
         with self.assertRaisesRegex(replay.ReplayError, "bypasses CXL"):

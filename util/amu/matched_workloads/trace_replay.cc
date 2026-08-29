@@ -372,6 +372,7 @@ class Memory
     explicit Memory(const std::vector<TraceRecord> &records)
     {
         prepare(records);
+        incrementalPreparation = false;
     }
 
     void prepare(const std::vector<TraceRecord> &records)
@@ -385,13 +386,25 @@ class Memory
                     lineAddresses.push_back(line);
                     lines.push_back(std::make_unique<DataLine>());
                 }
-                if (trackerIndices.count(record.address) == 0) {
+                if (
+                    seenStoreAddresses.count(record.address) != 0
+                    && trackerIndices.count(record.address) == 0
+                ) {
+                    uint64_t initial = NoStore;
+                    const auto published = lastPublishedStores.find(
+                        record.address);
+                    if (published != lastPublishedStores.end()) {
+                        initial = published->second;
+                        lastPublishedStores.erase(published);
+                    }
                     trackerIndices.emplace(
                         record.address, trackerAddresses.size());
                     trackerAddresses.push_back(record.address);
                     trackers.push_back(
-                        std::make_unique<std::atomic<uint64_t>>(NoStore));
+                        std::make_unique<std::atomic<uint64_t>>(initial));
                 }
+                if (isStore(opcode))
+                    seenStoreAddresses.insert(record.address);
             }
         }
     }
@@ -534,7 +547,12 @@ class Memory
 
     void publishStore(uint64_t logical, uint64_t sequence)
     {
-        trackerFor(logical).store(sequence, std::memory_order_release);
+        const auto found = trackerIndices.find(logical);
+        if (found != trackerIndices.end()) {
+            trackers[found->second]->store(sequence, std::memory_order_release);
+        } else if (incrementalPreparation) {
+            lastPublishedStores[logical] = sequence;
+        }
     }
 
     static constexpr uint64_t NoStore = ~uint64_t(0);
@@ -569,6 +587,9 @@ class Memory
     std::vector<uint64_t> trackerAddresses;
     std::unordered_map<uint64_t, size_t> trackerIndices;
     std::vector<std::unique_ptr<std::atomic<uint64_t>>> trackers;
+    std::unordered_set<uint64_t> seenStoreAddresses;
+    std::unordered_map<uint64_t, uint64_t> lastPublishedStores;
+    bool incrementalPreparation = true;
     std::unordered_set<size_t> preparedLines;
 };
 
@@ -1588,6 +1609,20 @@ selectGroups(const std::vector<Phase> &phases, uint64_t measureStart,
     return selected;
 }
 
+#ifndef TRACE_REPLAY_NATIVE
+void
+warmWorkerThreads()
+{
+    std::array<bool, 4> workers{};
+#pragma omp parallel num_threads(4)
+    {
+        workers[size_t(omp_get_thread_num())] = true;
+    }
+    if (std::find(workers.begin(), workers.end(), false) != workers.end())
+        throw std::runtime_error("replay worker warmup did not use four threads");
+}
+#endif
+
 void
 writeResult(const std::string &path, const std::string &system,
             size_t traceRecords,
@@ -1882,6 +1917,7 @@ main(int argc, char **argv)
                 throw std::runtime_error("window measured range is empty");
 #ifndef TRACE_REPLAY_NATIVE
             m5_work_begin(selectedPhase, windowIndex);
+            warmWorkerThreads();
 #endif
             if (!warmup.empty()) {
                 executeTrace(system, warmup, records, memory, dependencies,

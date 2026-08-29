@@ -42,6 +42,8 @@ SOURCE = REPO / "util/amu/matched_workloads/trace_replay.cc"
 M5_LIBRARY = REPO / "util/m5/build/x86/out/libm5.a"
 SYSTEMS = ("vanilla", "amu", "cira")
 _CORE_SECTION = re.compile(r"^board\.processor\.cores([0-9]+)\.core$")
+_START_CORE_SECTION = re.compile(r"^board\.processor\.start([0-9]+)\.core$")
+_SWITCH_CORE_SECTION = re.compile(r"^board\.processor\.switch([0-9]+)\.core$")
 _ALLOCATION = re.compile(
     r"^TRACE_REPLAY_ALLOCATION logical_bytes=([0-9]+) "
     r"allocated_bytes=([0-9]+) all_memory_cxl=(true|false)$"
@@ -1269,22 +1271,49 @@ def validate_config_ini(path, *, cxl_link_delay="1us"):
         raise ReplayError(f"cannot parse gem5 config.ini: {error}") from error
     if not parser.has_section("board"):
         raise ReplayError("gem5 config has no board section")
-    if parser.get("board", "mem_mode", fallback="") != "timing":
-        raise ReplayError("matched replay requires timing memory mode")
-
-    cores = []
+    mem_mode = parser.get("board", "mem_mode", fallback="")
+    core_sets = {"cores": [], "start": [], "switch": []}
+    patterns = {
+        "cores": _CORE_SECTION,
+        "start": _START_CORE_SECTION,
+        "switch": _SWITCH_CORE_SECTION,
+    }
     for section in parser.sections():
-        match = _CORE_SECTION.fullmatch(section)
-        if match is not None:
-            cores.append(int(match.group(1)))
-    if sorted(cores) != [0, 1, 2, 3]:
-        raise ReplayError("gem5 config does not contain exactly four cores")
-    for core in cores:
+        for name, pattern in patterns.items():
+            match = pattern.fullmatch(section)
+            if match is not None:
+                core_sets[name].append(int(match.group(1)))
+    normal = sorted(core_sets["cores"]) == [0, 1, 2, 3]
+    switched = (
+        sorted(core_sets["start"]) == [0, 1, 2, 3]
+        and sorted(core_sets["switch"]) == [0, 1, 2, 3]
+        and not core_sets["cores"]
+    )
+    if not ((normal and mem_mode == "timing") or
+            (switched and mem_mode == "atomic")):
+        raise ReplayError(
+            "matched replay requires timing or switched timing memory mode"
+        )
+    measured_prefix = "switch" if switched else "cores"
+    for core in range(4):
         cpu_type = parser.get(
-            f"board.processor.cores{core}.core", "type", fallback=""
+            f"board.processor.{measured_prefix}{core}.core",
+            "type", fallback="",
         )
         if "Timing" not in cpu_type and "O3" not in cpu_type:
-            raise ReplayError("gem5 config core is not a timing CPU")
+            raise ReplayError("gem5 measured core is not a timing CPU")
+    if switched:
+        for core in range(4):
+            section = f"board.processor.start{core}.core"
+            if (
+                "Atomic" not in parser.get(section, "type", fallback="")
+                or parser.get(section, "switched_out", fallback="") != "false"
+                or parser.get(
+                    f"board.processor.switch{core}.core",
+                    "switched_out", fallback="",
+                ) != "true"
+            ):
+                raise ReplayError("gem5 fast-forward core contract differs")
 
     board_ranges = parser.get("board", "mem_ranges", fallback="").split()
     links = []
@@ -1343,6 +1372,7 @@ def validate_config_ini(path, *, cxl_link_delay="1us"):
     return {
         "threads": 4,
         "all_memory_cxl": True,
+        "fast_forward_setup": switched,
         "cxl_link_delay_ticks": expected_ticks,
         "cxl_links": links,
         "memory_ranges": board_ranges,
