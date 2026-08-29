@@ -16,9 +16,11 @@ from pathlib import Path
 try:
     from scripts import cross_system_contract as contract
     from scripts import gap_bc_lazy_trace as bc
+    from scripts import stratified_timing as timing
 except ImportError:
     import cross_system_contract as contract
     import gap_bc_lazy_trace as bc
+    import stratified_timing as timing
 
 
 SOURCE = Path(__file__).resolve()
@@ -61,6 +63,34 @@ def config_identity(source, *, threads, iterations):
         "trace_order": "gap-serial-verifier",
     }
     return hashlib.sha256(contract.canonical_json(value)).hexdigest()
+
+
+def write_sampling_plans(bundle, root, descriptor_sha256):
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    records = {}
+    for phase_id, phase_name in (
+        (bc.PHASE_BFS, "bc_bfs"),
+        (bc.PHASE_REVERSE, "bc_reverse"),
+    ):
+        work_items = sum(
+            invocation.work_items for invocation in bundle.invocations
+            if invocation.phase == phase_id
+        )
+        plan = timing.make_plan(
+            descriptor_sha256, phase_name, work_items
+        )
+        path = root / f"{phase_name}.json"
+        timing.write_plan(path, plan)
+        records[phase_name] = {
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "phase_id": phase_id,
+            "work_items": work_items,
+            "window_length": plan.length,
+            "window_count": len(plan.windows),
+        }
+    return records
 
 
 def _atomic_text(path, value):
@@ -136,6 +166,10 @@ def prepare(options):
         config_sha256=configuration_sha256,
     )
     descriptor = trace_root / "trace.v2.json"
+    descriptor_sha256 = sha256_file(descriptor)
+    sampling_plans = write_sampling_plans(
+        bundle, root / "windows", descriptor_sha256
+    )
     record = {
         "schema": 1,
         "status": "passed",
@@ -159,11 +193,12 @@ def prepare(options):
         "csr_root": str(csr_root),
         "csr_meta_sha256": sha256_file(csr_root / "graph.meta.json"),
         "trace": str(trace_root),
-        "trace_descriptor_sha256": sha256_file(descriptor),
+        "trace_descriptor_sha256": descriptor_sha256,
         "trace_input_sha256": bundle.meta["input_sha256"],
         "trace_primitive_records": bundle.dynamic_work["primitive_records"],
         "trace_invocations": len(bundle.invocations),
         "boundary_commitments": bundle.meta["boundary_commitments"],
+        "sampling_plans": sampling_plans,
         "config_sha256": configuration_sha256,
         "builder_source_sha256": sha256_file(SOURCE),
         "trace_source_sha256": sha256_file(bc.__file__),
