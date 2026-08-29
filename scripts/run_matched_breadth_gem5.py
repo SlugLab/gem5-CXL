@@ -920,8 +920,10 @@ def _write_initial_memory_map(bundle, root, path):
                for start, stop in occupied):
             continue
         overlaps = [
-            prior for prior, (prior_bits, _value) in sparse.items()
-            if address < prior + prior_bits // 8
+            prior
+            for prior in range(max(0, address - 7), address + width)
+            if prior in sparse
+            and address < prior + sparse[prior][0] // 8
             and prior < address + width
         ]
         if overlaps and address not in sparse:

@@ -50,6 +50,10 @@ class NativeVerifiedWindowTraceTest(unittest.TestCase):
                 binary, system="vanilla", trace=materialized.root,
                 outdir=root / "native-dynamic",
             )
+            amu_result = replay.run_native_replay(
+                binary, system="amu", trace=materialized.root,
+                outdir=root / "native-dynamic-amu",
+            )
             fixed_result = replay.run_native_replay(
                 binary, system="vanilla", trace=materialized.fixed_root,
                 outdir=root / "native-fixed",
@@ -74,6 +78,8 @@ class NativeVerifiedWindowTraceTest(unittest.TestCase):
             [canonical.Opcode.BARRIER, canonical.Opcode.COMMIT],
         )
         self.assertEqual(dynamic_result["verification"], "pass")
+        self.assertEqual(amu_result["verification"], "pass")
+        self.assertGreater(amu_result["max_observed_outstanding"], 1)
         self.assertEqual(fixed_result["verification"], "pass")
 
     def test_spatter_window_rejects_out_of_range_coordinate(self):

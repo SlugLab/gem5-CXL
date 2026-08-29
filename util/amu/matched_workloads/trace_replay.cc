@@ -89,6 +89,15 @@ class DependencyTracker
         ready.notify_all();
     }
 
+    bool complete(uint64_t sequence)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (cancelled)
+            throw std::runtime_error("canonical dependency cancelled: " +
+                                     cancellationReason);
+        return sequence < frontier || outOfOrder.count(sequence) != 0;
+    }
+
     void cancel(const std::string &reason)
     {
         {
@@ -1161,6 +1170,163 @@ executeGroup(const WorkGroup &group, const std::vector<TraceRecord> &records,
     }
 }
 
+void
+executeAmuWavefront(
+    const std::vector<WorkGroup> &groups, size_t firstGroup,
+    size_t lastGroup, const std::vector<TraceRecord> &records,
+    Accessor &accessor, Memory &memory, DependencyTracker &dependencies,
+    const std::unordered_map<uint64_t, uint64_t> &previousStore,
+    const std::unordered_map<uint64_t, size_t> &commitSlots,
+    std::vector<Commit> &commits)
+{
+    if (firstGroup >= lastGroup || lastGroup > groups.size() ||
+        lastGroup - firstGroup > 32) {
+        throw std::runtime_error("AMU wavefront group range is invalid");
+    }
+    std::vector<size_t> cursors(lastGroup - firstGroup, 0);
+    const auto waitForPreviousStore = [&](const TraceRecord &operation) {
+        const auto found = previousStore.find(operation.sequence);
+        memory.waitForStore(
+            operation.address,
+            found == previousStore.end() ? Memory::NoStore : found->second);
+    };
+
+    struct Segment
+    {
+        size_t lane;
+        size_t begin;
+        size_t end;
+        size_t requestBegin;
+    };
+
+    while (true) {
+        bool unfinished = false;
+        bool progressed = false;
+        uint64_t blocked = std::numeric_limits<uint64_t>::max();
+        std::unordered_set<uint64_t> pending;
+        std::vector<Request> requests;
+        std::vector<Segment> segments;
+
+        for (size_t lane = 0; lane < cursors.size(); ++lane) {
+            const auto &group = groups[firstGroup + lane];
+            const size_t begin = cursors[lane];
+            size_t end = begin;
+            const size_t requestBegin = requests.size();
+            if (begin < group.recordIndices.size())
+                unfinished = true;
+            while (end < group.recordIndices.size()) {
+                const auto *record = &records[group.recordIndices[end]];
+                const auto opcode = static_cast<Opcode>(record->opcode);
+                if (Memory::isStore(opcode) || opcode == Opcode::BARRIER ||
+                    opcode == Opcode::COMMIT) {
+                    break;
+                }
+                if (Memory::isLoad(opcode)) {
+                    if (requests.size() == 32)
+                        break;
+                    const uint64_t dependency = dependencySequence(*record);
+                    if (dependency != std::numeric_limits<uint64_t>::max() &&
+                        (pending.count(dependency) != 0 ||
+                         !dependencies.complete(dependency))) {
+                        blocked = dependency;
+                        break;
+                    }
+                    const auto prior = previousStore.find(record->sequence);
+                    if (prior != previousStore.end() &&
+                        !dependencies.complete(prior->second)) {
+                        blocked = prior->second;
+                        break;
+                    }
+                    waitForPreviousStore(*record);
+                    requests.push_back(accessor.load(
+                        record->address, Memory::width(opcode),
+                        record->sequence));
+                }
+                pending.insert(record->sequence);
+                ++end;
+            }
+            if (requests.size() != requestBegin) {
+                segments.push_back(
+                    Segment{lane, begin, end, requestBegin});
+            }
+        }
+
+        if (!requests.empty()) {
+            for (const auto &segment : segments) {
+                const auto &group = groups[firstGroup + segment.lane];
+                size_t requestIndex = segment.requestBegin;
+                for (size_t position = segment.begin;
+                     position < segment.end; ++position) {
+                    const auto *record =
+                        &records[group.recordIndices[position]];
+                    const auto opcode = static_cast<Opcode>(record->opcode);
+                    uint64_t observed = record->result;
+                    if (Memory::isLoad(opcode))
+                        observed = accessor.collect(requests[requestIndex++]);
+                    else
+                        observed = evaluate(*record);
+                    if (observed != record->result) {
+                        throw std::runtime_error(
+                            "bit-exact result differs at canonical sequence " +
+                            std::to_string(record->sequence));
+                    }
+                    dependencies.publish(record->sequence);
+                }
+                cursors[segment.lane] = segment.end;
+            }
+            continue;
+        }
+
+        for (size_t lane = 0; lane < cursors.size(); ++lane) {
+            const auto &group = groups[firstGroup + lane];
+            auto &cursor = cursors[lane];
+            if (cursor >= group.recordIndices.size())
+                continue;
+            const auto *record = &records[group.recordIndices[cursor]];
+            const auto opcode = static_cast<Opcode>(record->opcode);
+            if (Memory::isLoad(opcode))
+                continue;
+            if (Memory::isStore(opcode)) {
+                const auto prior = previousStore.find(record->sequence);
+                if (prior != previousStore.end() &&
+                    !dependencies.complete(prior->second)) {
+                    blocked = prior->second;
+                    continue;
+                }
+                waitForPreviousStore(*record);
+                accessor.store(
+                    record->address, Memory::width(opcode), record->operand0);
+                memory.publishStore(record->address, record->sequence);
+            } else {
+                const uint64_t observed = evaluate(*record);
+                if (observed != record->result) {
+                    throw std::runtime_error(
+                        "bit-exact result differs at canonical sequence " +
+                        std::to_string(record->sequence));
+                }
+                if (opcode == Opcode::COMMIT) {
+                    const auto found = commitSlots.find(record->sequence);
+                    if (found == commitSlots.end())
+                        throw std::runtime_error("commit slot is missing");
+                    commits[found->second] = Commit{
+                        record->sequence, record->address, observed};
+                }
+            }
+            dependencies.publish(record->sequence);
+            ++cursor;
+            progressed = true;
+        }
+        if (!unfinished)
+            break;
+        if (!progressed) {
+            if (blocked == std::numeric_limits<uint64_t>::max()) {
+                throw std::runtime_error("AMU wavefront made no progress");
+            }
+            dependencies.wait(blocked);
+        }
+    }
+}
+
 ReplayStats
 executeTrace(const std::string &system, const std::vector<Phase> &phases,
              const std::vector<TraceRecord> &records, Memory &memory,
@@ -1182,30 +1348,52 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
             const int core = omp_get_thread_num();
             threadStats[core].workerThreads[core] = true;
             auto accessor = makeAccessor(system, memory);
-#pragma omp for ordered schedule(static)
-            for (size_t group = 0; group < phase.groups.size(); ++group) {
-                if (failed.load(std::memory_order_relaxed))
-                    continue;
-                try {
-                    if (boundaryProbes) {
-#pragma omp ordered
-                        executeGroup(
-                            phase.groups[group], records, *accessor, memory,
-                            dependencies,
-                            previousStore, commitSlots, commits,
-                            boundaryProbes);
-                    } else {
-                        executeGroup(
-                            phase.groups[group], records, *accessor, memory,
-                            dependencies,
-                            previousStore, commitSlots, commits, nullptr);
+            if (system == "amu" && boundaryProbes == nullptr) {
+                const size_t blockCount = (phase.groups.size() + 31) / 32;
+#pragma omp for schedule(dynamic, 1)
+                for (size_t block = 0; block < blockCount; ++block) {
+                    if (failed.load(std::memory_order_relaxed))
+                        continue;
+                    try {
+                        const size_t first = block * 32;
+                        executeAmuWavefront(
+                            phase.groups, first,
+                            std::min(first + 32, phase.groups.size()),
+                            records, *accessor, memory, dependencies,
+                            previousStore, commitSlots, commits);
+                    } catch (const std::exception &error) {
+                        dependencies.cancel(error.what());
+                        failed.store(true, std::memory_order_relaxed);
+                        std::lock_guard<std::mutex> guard(failureMutex);
+                        if (failure.empty())
+                            failure = error.what();
                     }
-                } catch (const std::exception &error) {
-                    dependencies.cancel(error.what());
-                    failed.store(true, std::memory_order_relaxed);
-                    std::lock_guard<std::mutex> guard(failureMutex);
-                    if (failure.empty())
-                        failure = error.what();
+                }
+            } else {
+#pragma omp for ordered schedule(static)
+                for (size_t group = 0; group < phase.groups.size(); ++group) {
+                    if (failed.load(std::memory_order_relaxed))
+                        continue;
+                    try {
+                        if (boundaryProbes) {
+#pragma omp ordered
+                            executeGroup(
+                                phase.groups[group], records, *accessor,
+                                memory, dependencies, previousStore,
+                                commitSlots, commits, boundaryProbes);
+                        } else {
+                            executeGroup(
+                                phase.groups[group], records, *accessor,
+                                memory, dependencies, previousStore,
+                                commitSlots, commits, nullptr);
+                        }
+                    } catch (const std::exception &error) {
+                        dependencies.cancel(error.what());
+                        failed.store(true, std::memory_order_relaxed);
+                        std::lock_guard<std::mutex> guard(failureMutex);
+                        if (failure.empty())
+                            failure = error.what();
+                    }
                 }
             }
             try {
