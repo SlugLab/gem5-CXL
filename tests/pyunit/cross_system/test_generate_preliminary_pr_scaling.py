@@ -98,6 +98,13 @@ class PreliminaryPageRankScalingTest(unittest.TestCase):
                 "publication-manifest.json",
             ):
                 self.assertGreater((output / name).stat().st_size, 0)
+            self.assertNotIn(
+                b"\r\n", (output / "pagerank-scaling-preliminary.csv").read_bytes()
+            )
+            svg_lines = (output / "pagerank-scaling-preliminary.svg").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertTrue(all(line == line.rstrip() for line in svg_lines))
 
 
 if __name__ == "__main__":

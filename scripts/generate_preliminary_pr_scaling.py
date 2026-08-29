@@ -189,7 +189,9 @@ def _write_csv(path, rows):
     path = Path(path)
     temporary = path.with_name(f".{path.name}.tmp")
     with temporary.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=tuple(rows[0]))
+        writer = csv.DictWriter(
+            stream, fieldnames=tuple(rows[0]), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(path)
@@ -246,6 +248,12 @@ def _render(rows, output_stem):
         kwargs = {"dpi": 220} if suffix == "png" else {}
         fig.savefig(f"{output_stem}.{suffix}", **kwargs)
     plt.close(fig)
+    svg_path = Path(f"{output_stem}.svg")
+    svg_text = svg_path.read_text(encoding="utf-8")
+    _atomic_text(
+        svg_path,
+        "\n".join(line.rstrip() for line in svg_text.splitlines()) + "\n",
+    )
 
 
 def publish(g4_csv, campaign_state, outdir):
