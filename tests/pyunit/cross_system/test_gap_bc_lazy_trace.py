@@ -13,6 +13,8 @@ from scripts import canonical_work_trace as canonical
 from scripts import gap_bc_lazy_trace as bc
 from scripts import lazy_work_trace as lazy
 from scripts import m2ndp_workload_trace as m2ndp
+from scripts import run_matched_breadth_gem5 as replay
+from scripts import stratified_timing as timing
 
 
 def digest(label):
@@ -245,6 +247,63 @@ class GapBCLazyTraceTest(unittest.TestCase):
                     binary_sha256=digest("binary"),
                     config_sha256=digest("config"),
                 )
+
+    def test_compact_level_slices_preserve_whole_vertex_operation_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._build(Path(temporary) / "bc", compact=True)
+            target = next(
+                row for row in bundle.invocations
+                if row.kernel == "gap_bc_bfs_level"
+                and row.work_items == 2
+            )
+
+            def prefix(state):
+                for invocation in bundle.invocations[:target.ordinal]:
+                    tuple(bc.EXPANDERS[invocation.kernel](state, invocation, 8))
+
+            with lazy.MappedState(bundle) as full_state:
+                prefix(full_state)
+                full = tuple(
+                    bc.EXPANDERS[target.kernel](full_state, target, 8)
+                )
+            with lazy.MappedState(bundle) as sliced_state:
+                prefix(sliced_state)
+                left = tuple(
+                    bc.expand_slice(
+                        sliced_state, target, 0, 1,
+                        include_controls=False,
+                    )
+                )
+                right = tuple(
+                    bc.expand_slice(
+                        sliced_state, target, 1, 2,
+                        include_controls=True,
+                    )
+                )
+        self.assertEqual(left + right, full)
+
+    def test_bc_window_partition_stops_after_selected_complete_vertices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._build(Path(temporary) / "bc", compact=True)
+            state = {"fixed": 0}
+            rows = tuple(replay._partition_bc_lazy_window(
+                bundle, bc.PHASE_BFS,
+                timing.TimingWindow(
+                    stratum=0, warmup_start=0,
+                    measure_start=1, measure_stop=2,
+                ),
+                state,
+            ))
+        dynamic = [operation for fixed, operation in rows if not fixed]
+        fixed = [operation for is_fixed, operation in rows if is_fixed]
+        self.assertTrue(dynamic)
+        self.assertEqual({row.work_item for row in dynamic}, {0, 1})
+        self.assertEqual(len(fixed), 6)
+        self.assertEqual(state["phase_items"], 4)
+        self.assertEqual(state["expansion_mode"], "bounded-gap-bc")
+        self.assertLess(
+            state["expanded"], bundle.dynamic_work["primitive_records"]
+        )
 
 
 if __name__ == "__main__":

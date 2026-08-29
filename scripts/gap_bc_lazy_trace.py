@@ -447,36 +447,58 @@ def expand_reverse_vertex(state, invocation, _batch_work_items):
     yield from _finish(invocation, operations)
 
 
-def expand_bfs_level(state, invocation, _batch_work_items):
+def _expand_bfs_level_range(
+    state, invocation, first, stop, *, include_controls,
+):
     parameters = invocation.parameters
     queue_start = parameters.get("queue_start")
     queue_stop = parameters.get("queue_stop")
-    next_queue_slot = parameters.get("next_queue_start")
     expected_queue_stop = parameters.get("next_queue_stop")
-    if invocation.work_items != queue_stop - queue_start:
+    if (
+        invocation.work_items != queue_stop - queue_start
+        or not 0 <= first < stop <= invocation.work_items
+    ):
         raise BCTraceError("BC BFS level work count differs")
-    operations = []
-    for local_item, queue_position in enumerate(range(queue_start, queue_stop)):
+    if first == 0:
+        next_queue_slot = parameters.get("next_queue_start")
+        state.store_scalar("bc_next_queue", next_queue_slot)
+    else:
+        next_queue_slot = state.load_scalar("bc_next_queue")
+    count = 0
+
+    def emit(operation):
+        nonlocal count
+        count += 1
+        return operation
+
+    for local_item in range(first, stop):
+        queue_position = queue_start + local_item
         queue_address, vertex = state.load_raw("queue", queue_position)
         start_address, row_start = state.load_raw("offsets", vertex)
         stop_address, row_stop = state.load_raw("offsets", vertex + 1)
         depth_u = state.load_raw("depths", vertex)[1]
-        operations.extend((
-            _load(invocation, canonical.Opcode.LOAD_U32, local_item,
-                  queue_address, vertex),
-            _load(invocation, canonical.Opcode.LOAD_U64, local_item,
-                  start_address, row_start),
-            _load(invocation, canonical.Opcode.LOAD_U64, local_item,
-                  stop_address, row_stop),
+        yield emit(_load(
+            invocation, canonical.Opcode.LOAD_U32, local_item,
+            queue_address, vertex,
+        ))
+        yield emit(_load(
+            invocation, canonical.Opcode.LOAD_U64, local_item,
+            start_address, row_start,
+        ))
+        yield emit(_load(
+            invocation, canonical.Opcode.LOAD_U64, local_item,
+            stop_address, row_stop,
         ))
         for edge in range(row_start, row_stop):
             neighbor_address, neighbor = state.load_raw("neighbors", edge)
             depth_address, depth_v = state.load_raw("depths", neighbor)
-            operations.extend((
-                _load(invocation, canonical.Opcode.LOAD_U32, local_item,
-                      neighbor_address, neighbor),
-                _load(invocation, canonical.Opcode.LOAD_U32, local_item,
-                      depth_address, depth_v, dependency=1),
+            yield emit(_load(
+                invocation, canonical.Opcode.LOAD_U32, local_item,
+                neighbor_address, neighbor,
+            ))
+            yield emit(_load(
+                invocation, canonical.Opcode.LOAD_U32, local_item,
+                depth_address, depth_v, dependency=1,
             ))
             if depth_v == 0xFFFFFFFF:
                 depth_v = depth_u + 1
@@ -486,11 +508,13 @@ def expand_bfs_level(state, invocation, _batch_work_items):
                 state.store_raw("depths", neighbor, depth_v)
                 state.store_raw("queue", next_queue_slot, neighbor)
                 next_queue_slot += 1
-                operations.extend((
-                    _store_raw(invocation, canonical.Opcode.STORE_U32,
-                               local_item, depth_address, depth_v),
-                    _store_raw(invocation, canonical.Opcode.STORE_U32,
-                               local_item, queue_out_address, neighbor),
+                yield emit(_store_raw(
+                    invocation, canonical.Opcode.STORE_U32,
+                    local_item, depth_address, depth_v,
+                ))
+                yield emit(_store_raw(
+                    invocation, canonical.Opcode.STORE_U32,
+                    local_item, queue_out_address, neighbor,
                 ))
             if depth_v == depth_u + 1:
                 path_u_address, path_u = state.load_float(
@@ -501,34 +525,68 @@ def expand_bfs_level(state, invocation, _batch_work_items):
                 )
                 updated = f64(path_v + path_u)
                 state.store_float("path_counts", neighbor, updated)
-                operations.extend((
-                    _load(invocation, canonical.Opcode.LOAD_F64, local_item,
-                          path_u_address, raw_f64(path_u)),
-                    _load(invocation, canonical.Opcode.LOAD_F64, local_item,
-                          path_v_address, raw_f64(path_v)),
-                    _binary_f64(invocation, canonical.Opcode.F64_ADD,
-                                local_item, path_v, path_u, updated),
-                    _store_raw(invocation, canonical.Opcode.STORE_F64,
-                               local_item, path_v_address, raw_f64(updated)),
+                yield emit(_load(
+                    invocation, canonical.Opcode.LOAD_F64, local_item,
+                    path_u_address, raw_f64(path_u),
                 ))
-    if next_queue_slot != expected_queue_stop:
+                yield emit(_load(
+                    invocation, canonical.Opcode.LOAD_F64, local_item,
+                    path_v_address, raw_f64(path_v),
+                ))
+                yield emit(_binary_f64(
+                    invocation, canonical.Opcode.F64_ADD,
+                    local_item, path_v, path_u, updated,
+                ))
+                yield emit(_store_raw(
+                    invocation, canonical.Opcode.STORE_F64,
+                    local_item, path_v_address, raw_f64(updated),
+                ))
+    state.store_scalar("bc_next_queue", next_queue_slot)
+    if stop == invocation.work_items and next_queue_slot != expected_queue_stop:
         raise BCTraceError("BC BFS level discovery cardinality differs")
-    yield from _finish(invocation, operations)
+    if include_controls:
+        yield emit(_control(invocation, canonical.Opcode.BARRIER))
+        yield emit(_control(invocation, canonical.Opcode.COMMIT))
+    if first == 0 and stop == invocation.work_items and include_controls:
+        expected = invocation.parameters["record_count"]
+        if count != expected:
+            raise BCTraceError(
+                f"{invocation.kernel} primitive count {count} != {expected}"
+            )
 
 
-def expand_reverse_level(state, invocation, _batch_work_items):
+def expand_bfs_level(state, invocation, _batch_work_items):
+    yield from _expand_bfs_level_range(
+        state, invocation, 0, invocation.work_items,
+        include_controls=True,
+    )
+
+
+def _expand_reverse_level_range(
+    state, invocation, first, stop, *, include_controls,
+):
     parameters = invocation.parameters
     queue_start = parameters.get("queue_start")
     queue_stop = parameters.get("queue_stop")
-    if invocation.work_items != queue_stop - queue_start:
+    if (
+        invocation.work_items != queue_stop - queue_start
+        or not 0 <= first < stop <= invocation.work_items
+    ):
         raise BCTraceError("BC reverse level work count differs")
-    operations = []
-    for local_item, queue_position in enumerate(range(queue_start, queue_stop)):
+    count = 0
+
+    def emit(operation):
+        nonlocal count
+        count += 1
+        return operation
+
+    for local_item in range(first, stop):
+        queue_position = queue_start + local_item
         queue_address, vertex = state.load_raw("queue", queue_position)
         start_address, row_start = state.load_raw("offsets", vertex)
         stop_address, row_stop = state.load_raw("offsets", vertex + 1)
         depth_address, depth_u = state.load_raw("depths", vertex)
-        operations.extend((
+        for operation in (
             _load(invocation, canonical.Opcode.LOAD_U32, local_item,
                   queue_address, vertex),
             _load(invocation, canonical.Opcode.LOAD_U64, local_item,
@@ -537,16 +595,19 @@ def expand_reverse_level(state, invocation, _batch_work_items):
                   stop_address, row_stop),
             _load(invocation, canonical.Opcode.LOAD_U32, local_item,
                   depth_address, depth_u),
-        ))
+        ):
+            yield emit(operation)
         delta = f32(0.0)
         for edge in range(row_start, row_stop):
             neighbor_address, neighbor = state.load_raw("neighbors", edge)
             depth_v_address, depth_v = state.load_raw("depths", neighbor)
-            operations.extend((
-                _load(invocation, canonical.Opcode.LOAD_U32, local_item,
-                      neighbor_address, neighbor),
-                _load(invocation, canonical.Opcode.LOAD_U32, local_item,
-                      depth_v_address, depth_v, dependency=1),
+            yield emit(_load(
+                invocation, canonical.Opcode.LOAD_U32, local_item,
+                neighbor_address, neighbor,
+            ))
+            yield emit(_load(
+                invocation, canonical.Opcode.LOAD_U32, local_item,
+                depth_v_address, depth_v, dependency=1,
             ))
             if depth_v != depth_u + 1:
                 continue
@@ -561,7 +622,7 @@ def expand_reverse_level(state, invocation, _batch_work_items):
             plus_one = f64(1.0 + float(delta_v))
             term = f64(ratio * plus_one)
             sum_double = f64(float(delta) + term)
-            operations.extend((
+            for operation in (
                 _load(invocation, canonical.Opcode.LOAD_F64, local_item,
                       path_u_address, raw_f64(path_u)),
                 _load(invocation, canonical.Opcode.LOAD_F64, local_item,
@@ -576,14 +637,15 @@ def expand_reverse_level(state, invocation, _batch_work_items):
                             local_item, ratio, plus_one, term),
                 _binary_f64(invocation, canonical.Opcode.F64_ADD,
                             local_item, float(delta), term, sum_double),
-            ))
+            ):
+                yield emit(operation)
             delta = f32(sum_double)
         delta_address, _ = state.load_float("deltas", vertex)
         score_address, score = state.load_float("scores", vertex)
         updated_score = f32(score + delta)
         state.store_float("deltas", vertex, delta)
         state.store_float("scores", vertex, updated_score)
-        operations.extend((
+        for operation in (
             _store_raw(invocation, canonical.Opcode.STORE_F32, local_item,
                        delta_address, raw_f32(delta)),
             _load(invocation, canonical.Opcode.LOAD_F32, local_item,
@@ -592,8 +654,24 @@ def expand_reverse_level(state, invocation, _batch_work_items):
                         score, delta, updated_score),
             _store_raw(invocation, canonical.Opcode.STORE_F32, local_item,
                        score_address, raw_f32(updated_score)),
-        ))
-    yield from _finish(invocation, operations)
+        ):
+            yield emit(operation)
+    if include_controls:
+        yield emit(_control(invocation, canonical.Opcode.BARRIER))
+        yield emit(_control(invocation, canonical.Opcode.COMMIT))
+    if first == 0 and stop == invocation.work_items and include_controls:
+        expected = invocation.parameters["record_count"]
+        if count != expected:
+            raise BCTraceError(
+                f"{invocation.kernel} primitive count {count} != {expected}"
+            )
+
+
+def expand_reverse_level(state, invocation, _batch_work_items):
+    yield from _expand_reverse_level_range(
+        state, invocation, 0, invocation.work_items,
+        include_controls=True,
+    )
 
 
 def expand_normalize(state, invocation, _batch_work_items):
@@ -628,6 +706,19 @@ EXPANDERS = {
 }
 
 
+def fixed_controls(invocation):
+    if invocation.kernel not in {
+        "gap_bc_bfs_level", "gap_bc_reverse_level"
+    }:
+        raise BCTraceError(
+            f"GAP BC fixed controls are not defined for {invocation.kernel}"
+        )
+    return (
+        _control(invocation, canonical.Opcode.BARRIER),
+        _control(invocation, canonical.Opcode.COMMIT),
+    )
+
+
 def primitive_count(invocation):
     if invocation.kernel not in EXPANDERS:
         raise BCTraceError(f"unknown GAP BC kernel {invocation.kernel}")
@@ -644,7 +735,22 @@ def invocation_boundary_specs(bundle, invocation):
     return (("scores.final", 32, scores.count, scores.logical_base),)
 
 
-def expand_slice(state, invocation, first, stop, batch_work_items=1024):
+def expand_slice(
+    state, invocation, first, stop, batch_work_items=1024,
+    *, include_controls=True,
+):
+    if invocation.kernel == "gap_bc_bfs_level":
+        yield from _expand_bfs_level_range(
+            state, invocation, first, stop,
+            include_controls=include_controls,
+        )
+        return
+    if invocation.kernel == "gap_bc_reverse_level":
+        yield from _expand_reverse_level_range(
+            state, invocation, first, stop,
+            include_controls=include_controls,
+        )
+        return
     if first != 0 or stop != invocation.work_items:
         raise lazy.LazyTraceError(
             f"partial GAP BC slice is not proved; require whole vertex for {invocation.kernel}"
@@ -858,7 +964,7 @@ def build_bundle(
         "source_sha256": source_sha256,
         "binary_sha256": binary_sha256,
         "config_sha256": config_sha256,
-        "initial_scalars": {},
+        "initial_scalars": {"bc_next_queue": 0},
         "nodes": nodes,
         "directed_edges": len(neighbors),
         "source_vertex": source,

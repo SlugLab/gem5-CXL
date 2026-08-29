@@ -46,11 +46,31 @@ def boundary_specs(bundle, invocation):
     return module.invocation_boundary_specs(bundle, invocation)
 
 
-def expand_slice(state, invocation, first, stop, batch_work_items=1024):
+def expand_slice(
+    state, invocation, first, stop, batch_work_items=1024,
+    *, include_controls=True,
+):
     module = module_for_kernel(invocation.kernel)
-    return module.expand_slice(
-        state, invocation, first, stop, batch_work_items
-    )
+    if module is gap_bc:
+        return module.expand_slice(
+            state, invocation, first, stop, batch_work_items,
+            include_controls=include_controls,
+        )
+    if not include_controls:
+        raise lazy.LazyTraceError(
+            "control-free slicing is not defined for this lazy workload"
+        )
+    return module.expand_slice(state, invocation, first, stop, batch_work_items)
+
+
+def fixed_controls(invocation):
+    module = module_for_kernel(invocation.kernel)
+    function = getattr(module, "fixed_controls", None)
+    if function is None:
+        raise lazy.LazyTraceError(
+            f"fixed controls are not defined for {invocation.kernel}"
+        )
+    return function(invocation)
 
 
 def phase_name(bundle, phase):

@@ -159,6 +159,109 @@ def _window_coordinates(manifest, *, trace_sha256, phase_name, work_items,
     return plan.windows[window_index]
 
 
+def _partition_bc_lazy_window(source, phase, window, state):
+    """Yield one BC vertex window after only the causally required prefix."""
+
+    if source.meta.get("workload") != "gap_bc":
+        raise ReplayError("bounded GAP BC partition received another workload")
+    phase_invocations = tuple(
+        invocation for invocation in source.invocations
+        if invocation.phase == phase
+    )
+    if not phase_invocations or any(
+        invocation.kernel not in {
+            "gap_bc_bfs_level", "gap_bc_reverse_level"
+        }
+        for invocation in phase_invocations
+    ):
+        raise ReplayError("bounded GAP BC phase is not depth compact")
+    phase_items = sum(row.work_items for row in phase_invocations)
+    if not (
+        0 <= window.warmup_start < window.measure_start
+        < window.measure_stop <= phase_items
+    ):
+        raise ReplayError("bounded GAP BC window coordinates are invalid")
+    dynamic_initial = {}
+    fixed_initial = {}
+    expanded = 0
+    phase_base = 0
+    first_phase_ordinal = phase_invocations[0].ordinal
+
+    def consume(mapped, invocation, operations, *, selected, base=0):
+        nonlocal expanded
+        for operation in operations:
+            lazy._validate_expanded_operation(source, invocation, operation)
+            operation = dataclasses.replace(operation, sequence=expanded)
+            expanded += 1
+            if selected:
+                global_item = phase_base + operation.work_item
+                _remember_initial(dynamic_initial, operation)
+                yield False, dataclasses.replace(
+                    operation,
+                    work_item=global_item - window.warmup_start,
+                )
+
+    with lazy.MappedState(source) as mapped:
+        for invocation in source.invocations[:first_phase_ordinal]:
+            operations = lazy_registry.expander(invocation)(
+                mapped, invocation, 1024
+            )
+            yield from consume(
+                mapped, invocation, operations, selected=False
+            )
+        for invocation in phase_invocations:
+            invocation_start = phase_base
+            invocation_stop = phase_base + invocation.work_items
+            if invocation_stop <= window.warmup_start:
+                operations = lazy_registry.expand_slice(
+                    mapped, invocation, 0, invocation.work_items, 1024,
+                    include_controls=False,
+                )
+                yield from consume(
+                    mapped, invocation, operations, selected=False
+                )
+            elif invocation_start < window.measure_stop:
+                local_start = max(
+                    0, window.warmup_start - invocation_start
+                )
+                local_stop = min(
+                    invocation.work_items,
+                    window.measure_stop - invocation_start,
+                )
+                if local_start:
+                    operations = lazy_registry.expand_slice(
+                        mapped, invocation, 0, local_start, 1024,
+                        include_controls=False,
+                    )
+                    yield from consume(
+                        mapped, invocation, operations, selected=False
+                    )
+                operations = lazy_registry.expand_slice(
+                    mapped, invocation, local_start, local_stop, 1024,
+                    include_controls=False,
+                )
+                yield from consume(
+                    mapped, invocation, operations, selected=True
+                )
+            phase_base = invocation_stop
+            if phase_base >= window.measure_stop:
+                break
+
+        for invocation in phase_invocations:
+            for operation in lazy_registry.fixed_controls(invocation):
+                lazy._validate_expanded_operation(source, invocation, operation)
+                operation = dataclasses.replace(operation, sequence=expanded)
+                expanded += 1
+                state["fixed"] += 1
+                _remember_initial(fixed_initial, operation)
+                yield True, operation
+    state["expanded"] = expanded
+    state["phase_items"] = phase_items
+    state["dynamic_initial"] = dynamic_initial
+    state["fixed_initial"] = fixed_initial
+    state["expansion_mode"] = "bounded-gap-bc"
+
+
 def _write_segment_payload(root, operations, *, label="selected timing window"):
     root = Path(root).resolve()
     if root.exists():
@@ -427,62 +530,75 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
             work_items=phase_items, window_index=window_index,
         )
 
-        def partitioned_operations():
-            phase_base = 0
-            expanded = 0
-            dynamic_initial = {}
-            fixed_initial = {}
-            with lazy.MappedState(source) as mapped:
-                for invocation in source.invocations:
-                    try:
-                        expander = lazy_registry.expander(invocation)
-                    except lazy.LazyTraceError as error:
-                        raise ReplayError(
-                            f"unknown lazy replay kernel {invocation.kernel}"
-                        ) from error
-                    for operation in expander(mapped, invocation, 1024):
-                        lazy._validate_expanded_operation(
-                            source, invocation, operation
-                        )
-                        expanded += 1
-                        operation = dataclasses.replace(
-                            operation, sequence=expanded - 1
-                        )
-                        if invocation.phase != phase:
-                            continue
-                        if operation.opcode in {
-                            canonical.Opcode.BARRIER,
-                            canonical.Opcode.COMMIT,
-                        }:
-                            state["fixed"] += 1
-                            _remember_initial(fixed_initial, operation)
-                            yield True, operation
-                            continue
-                        if operation.work_item >= invocation.work_items:
-                            state["fixed"] += 1
-                            _remember_initial(fixed_initial, operation)
-                            yield True, dataclasses.replace(
-                                operation,
-                                work_item=phase_base + operation.work_item,
+        if source.meta.get("workload") == "gap_bc":
+            def partitioned_operations():
+                yield from _partition_bc_lazy_window(
+                    source, phase, window, state
+                )
+        else:
+            def partitioned_operations():
+                phase_base = 0
+                expanded = 0
+                dynamic_initial = {}
+                fixed_initial = {}
+                with lazy.MappedState(source) as mapped:
+                    for invocation in source.invocations:
+                        try:
+                            expander = lazy_registry.expander(invocation)
+                        except lazy.LazyTraceError as error:
+                            raise ReplayError(
+                                f"unknown lazy replay kernel {invocation.kernel}"
+                            ) from error
+                        for operation in expander(mapped, invocation, 1024):
+                            lazy._validate_expanded_operation(
+                                source, invocation, operation
                             )
-                            continue
-                        global_item = phase_base + operation.work_item
-                        if window.warmup_start <= global_item < window.measure_stop:
-                            _remember_initial(dynamic_initial, operation)
-                            yield False, dataclasses.replace(
-                                operation,
-                                work_item=global_item - window.warmup_start,
+                            expanded += 1
+                            operation = dataclasses.replace(
+                                operation, sequence=expanded - 1
                             )
-                    if invocation.phase == phase:
-                        phase_base += invocation.work_items
-            state["expanded"] = expanded
-            state["phase_items"] = phase_base
-            if expanded != source.dynamic_work["primitive_records"]:
-                raise ReplayError("lazy dynamic primitive count differs")
-            if phase_base != phase_items:
-                raise ReplayError("lazy phase work count changed during expansion")
-            state["dynamic_initial"] = dynamic_initial
-            state["fixed_initial"] = fixed_initial
+                            if invocation.phase != phase:
+                                continue
+                            if operation.opcode in {
+                                canonical.Opcode.BARRIER,
+                                canonical.Opcode.COMMIT,
+                            }:
+                                state["fixed"] += 1
+                                _remember_initial(fixed_initial, operation)
+                                yield True, operation
+                                continue
+                            if operation.work_item >= invocation.work_items:
+                                state["fixed"] += 1
+                                _remember_initial(fixed_initial, operation)
+                                yield True, dataclasses.replace(
+                                    operation,
+                                    work_item=phase_base + operation.work_item,
+                                )
+                                continue
+                            global_item = phase_base + operation.work_item
+                            if (
+                                window.warmup_start <= global_item
+                                < window.measure_stop
+                            ):
+                                _remember_initial(dynamic_initial, operation)
+                                yield False, dataclasses.replace(
+                                    operation,
+                                    work_item=(
+                                        global_item - window.warmup_start
+                                    ),
+                                )
+                        if invocation.phase == phase:
+                            phase_base += invocation.work_items
+                state["expanded"] = expanded
+                state["phase_items"] = phase_base
+                if expanded != source.dynamic_work["primitive_records"]:
+                    raise ReplayError("lazy dynamic primitive count differs")
+                if phase_base != phase_items:
+                    raise ReplayError(
+                        "lazy phase work count changed during expansion"
+                    )
+                state["dynamic_initial"] = dynamic_initial
+                state["fixed_initial"] = fixed_initial
 
         source_meta = source.meta
         operations = partitioned_operations()
