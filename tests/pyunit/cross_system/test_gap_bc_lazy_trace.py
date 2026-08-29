@@ -6,6 +6,7 @@ import json
 import struct
 import tempfile
 import unittest
+from array import array
 from pathlib import Path
 
 from scripts import canonical_work_trace as canonical
@@ -22,7 +23,7 @@ class GapBCLazyTraceTest(unittest.TestCase):
     OFFSETS = (0, 2, 3, 4, 4)
     NEIGHBORS = (1, 2, 3, 3)
 
-    def _build(self, root):
+    def _build(self, root, *, compact=False):
         return bc.build_bundle(
             root,
             offsets=self.OFFSETS,
@@ -31,6 +32,7 @@ class GapBCLazyTraceTest(unittest.TestCase):
             source_sha256=digest("bc-source"),
             binary_sha256=digest("bc-binary"),
             config_sha256=digest("bc-config"),
+            compact=compact,
         )
 
     def test_small_diamond_preserves_bfs_and_reverse_vertex_order(self):
@@ -180,6 +182,69 @@ class GapBCLazyTraceTest(unittest.TestCase):
             bundle.dynamic_work["primitive_records"],
         )
         self.assertEqual(manifest["dynamic_launches"], len(bundle.invocations))
+
+    def test_compact_depth_invocations_match_vertex_trace_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vertex = self._build(root / "vertex")
+            compact = self._build(root / "compact", compact=True)
+            vertex_evidence = bc.expanded_evidence(vertex)
+            compact_evidence = bc.expanded_evidence(compact)
+            vertex_size = (vertex.root / "trace.v2.json").stat().st_size
+            compact_size = (compact.root / "trace.v2.json").stat().st_size
+        self.assertEqual(
+            [row.kernel for row in compact.invocations],
+            [
+                "gap_bc_reset", "gap_bc_source_init",
+                "gap_bc_bfs_level", "gap_bc_bfs_level",
+                "gap_bc_bfs_level", "gap_bc_reverse_level",
+                "gap_bc_reverse_level", "gap_bc_reverse_level",
+                "gap_bc_normalize",
+            ],
+        )
+        self.assertEqual(
+            compact_evidence["boundaries"], vertex_evidence["boundaries"]
+        )
+        self.assertLess(compact_size, vertex_size)
+
+    def test_csr_file_builder_requires_undirected_hash_bound_graph(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csr = root / "csr"
+            csr.mkdir()
+            with (csr / "in_offsets.u64").open("wb") as stream:
+                array("Q", self.OFFSETS).tofile(stream)
+            with (csr / "in_neighbors.i32").open("wb") as stream:
+                array("i", self.NEIGHBORS).tofile(stream)
+            graph_sha256 = digest("g20.sg")
+            meta = {
+                "schema": 1, "directed": False,
+                "graph_sha256": graph_sha256,
+                "num_nodes": 4, "num_directed_edges": 4,
+            }
+            (csr / "graph.meta.json").write_text(
+                json.dumps(meta), encoding="utf-8"
+            )
+            bundle = bc.build_bundle_from_csr(
+                root / "formal", csr_root=csr, source=0,
+                graph_sha256=graph_sha256,
+                source_sha256=digest("source"),
+                binary_sha256=digest("binary"),
+                config_sha256=digest("config"),
+            )
+            self.assertEqual(len(bundle.invocations), 9)
+            meta["directed"] = True
+            (csr / "graph.meta.json").write_text(
+                json.dumps(meta), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(bc.BCTraceError, "undirected"):
+                bc.build_bundle_from_csr(
+                    root / "directed", csr_root=csr, source=0,
+                    graph_sha256=graph_sha256,
+                    source_sha256=digest("source"),
+                    binary_sha256=digest("binary"),
+                    config_sha256=digest("config"),
+                )
 
 
 if __name__ == "__main__":
