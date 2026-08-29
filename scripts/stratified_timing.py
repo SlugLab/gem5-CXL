@@ -18,6 +18,8 @@ except ImportError:
 
 LEVELS = (8, 16, 32, 64)
 BOOTSTRAP_RESAMPLES = 10_000
+GAP_BC_VERTEX_WINDOW = 4
+GAP_BC_PHASES = frozenset(("bc_bfs", "bc_reverse"))
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -104,11 +106,16 @@ def make_plan(trace_sha256, phase, count):
         raise TimingError("phase name is invalid")
     _require_positive_count(count)
     length = min(65_536, count // 128)
+    bounded_gap_bc = phase in GAP_BC_PHASES and count >= 128 * (
+        2 * GAP_BC_VERTEX_WINDOW
+    )
+    if bounded_gap_bc:
+        length = GAP_BC_VERTEX_WINDOW
     seed = int(
         hashlib.sha256(f"{trace_sha256}:{phase}".encode("utf-8")).hexdigest()[:16],
         16,
     )
-    if length < 1_024:
+    if length < 1_024 and not bounded_gap_bc:
         return SamplingPlan(
             trace_sha256,
             phase,

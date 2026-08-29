@@ -967,6 +967,10 @@ def build_bundle(
         "initial_scalars": {"bc_next_queue": 0},
         "nodes": nodes,
         "directed_edges": len(neighbors),
+        "max_degree": max(
+            offsets[vertex + 1] - offsets[vertex]
+            for vertex in range(nodes)
+        ),
         "source_vertex": source,
         "phase_names": PHASE_NAMES,
         "correctness_policy": "native-verified",

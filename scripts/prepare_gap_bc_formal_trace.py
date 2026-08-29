@@ -179,6 +179,7 @@ def prepare(options):
         "graph_sha256": manifest["graph_sha256"],
         "nodes": bundle.meta["nodes"],
         "directed_edges": bundle.meta["directed_edges"],
+        "max_degree": bundle.meta["max_degree"],
         "source_vertex": source,
         "threads": 4,
         "iterations": 1,

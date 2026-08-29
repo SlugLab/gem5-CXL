@@ -11,6 +11,17 @@ from scripts import stratified_timing as timing
 
 
 class StratifiedTimingTest(unittest.TestCase):
+    def test_gap_bc_uses_four_vertex_windows_for_degree_skew_budget(self):
+        plan = timing.make_plan("d" * 64, "bc_bfs", 645_268)
+        self.assertFalse(plan.full_phase)
+        self.assertEqual(plan.length, 4)
+        self.assertEqual(len(plan.windows), 64)
+        self.assertTrue(all(
+            row.measure_start - row.warmup_start == 4
+            and row.measure_stop - row.measure_start == 4
+            for row in plan.windows
+        ))
+
     def test_windows_are_nested_evenly_distributed_and_have_equal_warmup(self):
         plan = timing.make_plan("a" * 64, "pricing", 20_000_000)
         self.assertEqual(plan.length, 65_536)
