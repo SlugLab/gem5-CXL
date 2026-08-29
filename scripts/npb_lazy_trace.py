@@ -584,17 +584,22 @@ def expand_cg_update_zr(state, invocation, _batch_work_items):
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
-def expand_cg_update_p(state, invocation, batch_work_items):
+def _expand_cg_update_p_range(
+    state, invocation, batch_work_items, item_first, item_stop, controls
+):
     _require_parameters(invocation, (
         "r", "p", "beta", "boundaries", "boundary_counts",
     ))
     parameters = invocation.parameters
     beta = f64_from_raw(state.load_scalar(parameters["beta"]))
-    yield _control(
-        invocation, canonical.Opcode.BARRIER, invocation.work_items
-    )
-    for first in range(0, invocation.work_items, batch_work_items):
-        last = min(first + batch_work_items, invocation.work_items)
+    if not (0 <= item_first < item_stop <= invocation.work_items):
+        raise lazy.LazyTraceError("CG update-p slice is invalid")
+    if controls:
+        yield _control(
+            invocation, canonical.Opcode.BARRIER, invocation.work_items
+        )
+    for first in range(item_first, item_stop, batch_work_items):
+        last = min(first + batch_work_items, item_stop)
         for index in range(first, last):
             r_address, r = state.load_float(parameters["r"], index)
             p_address, p = state.load_float(parameters["p"], index)
@@ -618,7 +623,19 @@ def expand_cg_update_p(state, invocation, batch_work_items):
             )
             state.store_float(parameters["p"], index, result)
             yield _store(invocation, index, p_address, result)
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_cg_update_p(state, invocation, batch_work_items):
+    yield from _expand_cg_update_p_range(
+        state,
+        invocation,
+        batch_work_items,
+        0,
+        invocation.work_items,
+        True,
+    )
 
 
 def expand_cg_residual_norm(state, invocation, _batch_work_items):
@@ -677,16 +694,21 @@ def expand_cg_residual_norm(state, invocation, _batch_work_items):
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
-def expand_cg_init(state, invocation, batch_work_items):
+def _expand_cg_init_range(
+    state, invocation, batch_work_items, item_first, item_stop, controls
+):
     _require_parameters(
         invocation, ("x", "q", "z", "r", "p", "boundaries")
     )
     parameters = invocation.parameters
-    yield _control(
-        invocation, canonical.Opcode.BARRIER, invocation.work_items
-    )
-    for first in range(0, invocation.work_items, batch_work_items):
-        last = min(first + batch_work_items, invocation.work_items)
+    if not (0 <= item_first < item_stop <= invocation.work_items):
+        raise lazy.LazyTraceError("CG init slice is invalid")
+    if controls:
+        yield _control(
+            invocation, canonical.Opcode.BARRIER, invocation.work_items
+        )
+    for first in range(item_first, item_stop, batch_work_items):
+        last = min(first + batch_work_items, item_stop)
         for index in range(first, last):
             q_address, _q = state.load_float(parameters["q"], index)
             z_address, _z = state.load_float(parameters["z"], index)
@@ -710,7 +732,19 @@ def expand_cg_init(state, invocation, batch_work_items):
             p_address, _p = state.load_float(parameters["p"], index)
             state.store_float(parameters["p"], index, r)
             yield _store(invocation, index, p_address, r)
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_cg_init(state, invocation, batch_work_items):
+    yield from _expand_cg_init_range(
+        state,
+        invocation,
+        batch_work_items,
+        0,
+        invocation.work_items,
+        True,
+    )
 
 
 def _finish_merge(generator):
@@ -869,6 +903,38 @@ def expand_cg_normalize(state, invocation, batch_work_items):
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
+def _expand_cg_normalize_items(
+    state, invocation, batch_work_items, item_first, item_stop
+):
+    _require_parameters(invocation, (
+        "z", "x", "norm1", "norm2", "norm3", "shift", "zeta",
+        "write_zeta", "boundaries", "boundary_counts", "results",
+    ))
+    if not (0 <= item_first < item_stop <= invocation.work_items):
+        raise lazy.LazyTraceError("CG normalize slice is invalid")
+    parameters = invocation.parameters
+    norm2 = f64_from_raw(state.load_scalar(parameters["norm2"]))
+    if norm2 <= 0.0:
+        raise lazy.LazyTraceError("CG normalization norm is not positive")
+    norm3 = f64(1.0 / f64(math.sqrt(norm2)))
+    for first in range(item_first, item_stop, batch_work_items):
+        last = min(first + batch_work_items, item_stop)
+        for index in range(first, last):
+            z_address, z = state.load_float(parameters["z"], index)
+            yield _load(
+                invocation, canonical.Opcode.LOAD_F64,
+                index, z_address, raw_f64(z),
+            )
+            value = f64(norm3 * z)
+            yield _binary(
+                invocation, canonical.Opcode.F64_MUL,
+                index, norm3, z, value,
+            )
+            x_address, _x = state.load_float(parameters["x"], index)
+            state.store_float(parameters["x"], index, value)
+            yield _store(invocation, index, x_address, value)
+
+
 def expand_cg_prepare_iteration(state, invocation, _batch_work_items):
     _require_parameters(
         invocation, ("source", "snapshot", "zero", "results")
@@ -1004,7 +1070,9 @@ def _comm3(state, invocation, name, dimensions):
             yield from copy((i1, i2, n3 - 1), (i1, i2, 1))
 
 
-def expand_mg_resid(state, invocation, _batch_work_items):
+def _expand_mg_resid_items(
+    state, invocation, item_first, item_stop, controls, include_comm3
+):
     _require_parameters(invocation, (
         "u", "v", "r", "n1", "n2", "n3", "a_raw", "boundaries",
     ))
@@ -1019,12 +1087,24 @@ def expand_mg_resid(state, invocation, _batch_work_items):
     if len(parameters["a_raw"]) != 4:
         raise lazy.LazyTraceError("MG resid coefficient count differs")
     coefficients = [f64_from_raw(value) for value in parameters["a_raw"]]
-    yield _control(
-        invocation, canonical.Opcode.BARRIER, invocation.work_items
-    )
+    row_width = n1 - 2
+    if (
+        not (0 <= item_first < item_stop <= invocation.work_items)
+        or item_first % row_width
+        or item_stop % row_width
+    ):
+        raise lazy.LazyTraceError("MG resid slice splits an x-row")
+    row_first = item_first // row_width
+    row_stop = item_stop // row_width
+    if controls:
+        yield _control(
+            invocation, canonical.Opcode.BARRIER, invocation.work_items
+        )
     for i3 in range(1, n3 - 1):
         for i2 in range(1, n2 - 1):
             row_work = (i3 - 1) * (n2 - 2) + (i2 - 1)
+            if row_work < row_first or row_work >= row_stop:
+                continue
             u1 = []
             u2 = []
             for i1 in range(n1):
@@ -1129,8 +1209,21 @@ def expand_mg_resid(state, invocation, _batch_work_items):
                     state, invocation, parameters["r"], i1, i2, i3,
                     dimensions, work_item, result,
                 )
-    yield from _comm3(state, invocation, parameters["r"], dimensions)
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if include_comm3:
+        yield from _comm3(state, invocation, parameters["r"], dimensions)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_mg_resid(state, invocation, _batch_work_items):
+    yield from _expand_mg_resid_items(
+        state,
+        invocation,
+        0,
+        invocation.work_items,
+        True,
+        True,
+    )
 
 
 def _merge_max4(invocation, lanes, work_item):
@@ -1255,7 +1348,9 @@ def expand_mg_norm2u3(state, invocation, _batch_work_items):
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
-def expand_mg_psinv(state, invocation, _batch_work_items):
+def _expand_mg_psinv_items(
+    state, invocation, item_first, item_stop, controls, include_comm3
+):
     _require_parameters(invocation, (
         "r", "u", "n1", "n2", "n3", "c_raw", "boundaries",
     ))
@@ -1270,12 +1365,24 @@ def expand_mg_psinv(state, invocation, _batch_work_items):
     if len(parameters["c_raw"]) != 4:
         raise lazy.LazyTraceError("MG psinv coefficient count differs")
     coefficients = [f64_from_raw(value) for value in parameters["c_raw"]]
-    yield _control(
-        invocation, canonical.Opcode.BARRIER, invocation.work_items
-    )
+    row_width = n1 - 2
+    if (
+        not (0 <= item_first < item_stop <= invocation.work_items)
+        or item_first % row_width
+        or item_stop % row_width
+    ):
+        raise lazy.LazyTraceError("MG psinv slice splits an x-row")
+    row_first = item_first // row_width
+    row_stop = item_stop // row_width
+    if controls:
+        yield _control(
+            invocation, canonical.Opcode.BARRIER, invocation.work_items
+        )
     for i3 in range(1, n3 - 1):
         for i2 in range(1, n2 - 1):
             row_work = (i3 - 1) * (n2 - 2) + (i2 - 1)
+            if row_work < row_first or row_work >= row_stop:
+                continue
             r1 = []
             r2 = []
             for i1 in range(n1):
@@ -1394,11 +1501,26 @@ def expand_mg_psinv(state, invocation, _batch_work_items):
                     state, invocation, parameters["u"], i1, i2, i3,
                     dimensions, work_item, result,
                 )
-    yield from _comm3(state, invocation, parameters["u"], dimensions)
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if include_comm3:
+        yield from _comm3(state, invocation, parameters["u"], dimensions)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
 
 
-def expand_mg_rprj3(state, invocation, _batch_work_items):
+def expand_mg_psinv(state, invocation, _batch_work_items):
+    yield from _expand_mg_psinv_items(
+        state,
+        invocation,
+        0,
+        invocation.work_items,
+        True,
+        True,
+    )
+
+
+def _expand_mg_rprj3_items(
+    state, invocation, item_first, item_stop, controls, include_comm3
+):
     _require_parameters(invocation, (
         "r", "s", "m1k", "m2k", "m3k", "m1j", "m2j", "m3j",
         "boundaries",
@@ -1423,14 +1545,26 @@ def expand_mg_rprj3(state, invocation, _batch_work_items):
             fine_dims, work_item,
         )
 
-    yield _control(
-        invocation, canonical.Opcode.BARRIER, invocation.work_items
-    )
+    row_width = m1j - 2
+    if (
+        not (0 <= item_first < item_stop <= invocation.work_items)
+        or item_first % row_width
+        or item_stop % row_width
+    ):
+        raise lazy.LazyTraceError("MG rprj3 slice splits an x-row")
+    row_first = item_first // row_width
+    row_stop = item_stop // row_width
+    if controls:
+        yield _control(
+            invocation, canonical.Opcode.BARRIER, invocation.work_items
+        )
     for j3 in range(2, m3j):
         for j2 in range(2, m2j):
             i3 = 2 * j3 - d3
             i2 = 2 * j2 - d2
             row_work = (j3 - 2) * (m2j - 2) + (j2 - 2)
+            if row_work < row_first or row_work >= row_stop:
+                continue
             x1 = {}
             y1 = {}
             for j1 in range(2, m1j + 1):
@@ -1577,8 +1711,21 @@ def expand_mg_rprj3(state, invocation, _batch_work_items):
                     j1 - 1, j2 - 1, j3 - 1, coarse_dims,
                     work_item, result,
                 )
-    yield from _comm3(state, invocation, parameters["s"], coarse_dims)
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if include_comm3:
+        yield from _comm3(state, invocation, parameters["s"], coarse_dims)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_mg_rprj3(state, invocation, _batch_work_items):
+    yield from _expand_mg_rprj3_items(
+        state,
+        invocation,
+        0,
+        invocation.work_items,
+        True,
+        True,
+    )
 
 
 def _mg_weighted_update(state, invocation, name, coordinate, dimensions,
@@ -1854,7 +2001,17 @@ class DependencyClosure:
 
 _EXACT_ITEM_SLICE_KERNELS = frozenset({
     "npb_cg_spmv",
+    "npb_cg_update_p",
+    "npb_cg_init",
+    "npb_cg_normalize",
     "npb_mg_zero3",
+})
+_LANE_SLICE_KERNELS = frozenset({
+    "npb_cg_dot",
+    "npb_cg_update_zr",
+    "npb_cg_residual_norm",
+    "npb_cg_outer_dots",
+    "npb_mg_norm2u3",
 })
 
 
@@ -1888,11 +2045,35 @@ def safe_work_item_range(
         raise lazy.LazyTraceError("NPB slice exceeds invocation work")
     if stratum_first >= stratum_stop:
         raise lazy.LazyTraceError("NPB stratum is empty")
-    realized = (
-        (first, stop)
-        if invocation.kernel in _EXACT_ITEM_SLICE_KERNELS
-        else (0, invocation.work_items)
-    )
+    if invocation.kernel in _EXACT_ITEM_SLICE_KERNELS:
+        realized = (first, stop)
+    elif invocation.kernel in _LANE_SLICE_KERNELS:
+        ranges = tuple(
+            pair for pair in _validate_lanes(invocation)
+            if pair[0] < pair[1]
+            and pair[1] > first and pair[0] < stop
+        )
+        if not ranges:
+            raise lazy.LazyTraceError("NPB reduction slice is empty")
+        realized = (ranges[0][0], ranges[-1][1])
+    elif invocation.kernel in {
+        "npb_mg_resid", "npb_mg_psinv", "npb_mg_rprj3"
+    }:
+        width_name = (
+            "m1j" if invocation.kernel == "npb_mg_rprj3" else "n1"
+        )
+        width = invocation.parameters[width_name] - 2
+        if width <= 0:
+            raise lazy.LazyTraceError("MG x-row width is invalid")
+        realized = (
+            first // width * width,
+            min(
+                invocation.work_items,
+                ((stop + width - 1) // width) * width,
+            ),
+        )
+    else:
+        realized = (0, invocation.work_items)
     if realized[0] < stratum_first or realized[1] > stratum_stop:
         raise lazy.LazyTraceError("safe NPB range leaves its stratum")
     return realized
@@ -1954,6 +2135,180 @@ def _mg_resid_dependency_closure(invocation, first, stop):
     return DependencyClosure(tuple(sorted(words)), (), True)
 
 
+def _mg_psinv_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    n1, n2, n3 = (
+        parameters["n1"], parameters["n2"], parameters["n3"]
+    )
+    x_items = n1 - 2
+    y_items = n2 - 2
+    words = set()
+    for item in range(first, stop):
+        i3 = 1 + item // (x_items * y_items)
+        remainder = item % (x_items * y_items)
+        i2 = 1 + remainder // x_items
+        i1 = 1 + remainder % x_items
+        center = f_index(i1, i2, i3, n1, n2, n3)
+        words.add((parameters["u"], center))
+        for z in range(i3 - 1, i3 + 2):
+            for y in range(i2 - 1, i2 + 2):
+                for x in range(i1 - 1, i1 + 2):
+                    words.add((
+                        parameters["r"], f_index(x, y, z, n1, n2, n3)
+                    ))
+    return DependencyClosure(tuple(sorted(words)), (), True)
+
+
+def _mg_rprj3_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    fine = tuple(parameters[name] for name in ("m1k", "m2k", "m3k"))
+    coarse = tuple(parameters[name] for name in ("m1j", "m2j", "m3j"))
+    width = coarse[0] - 2
+    y_items = coarse[1] - 2
+    d1 = 2 if fine[0] == 3 else 1
+    d2 = 2 if fine[1] == 3 else 1
+    d3 = 2 if fine[2] == 3 else 1
+    words = set()
+    for item in range(first, stop):
+        j3 = 1 + item // (width * y_items)
+        remainder = item % (width * y_items)
+        j2 = 1 + remainder // width
+        j1 = 1 + remainder % width
+        words.add((
+            parameters["s"], f_index(j1, j2, j3, *coarse)
+        ))
+        center = (2 * (j1 + 1) - d1 - 1,
+                  2 * (j2 + 1) - d2 - 1,
+                  2 * (j3 + 1) - d3 - 1)
+        for z in range(max(0, center[2] - 2), min(fine[2], center[2] + 3)):
+            for y in range(max(0, center[1] - 2), min(fine[1], center[1] + 3)):
+                for x in range(max(0, center[0] - 2), min(fine[0], center[0] + 3)):
+                    words.add((parameters["r"], f_index(x, y, z, *fine)))
+    if first == 0 and stop == invocation.work_items:
+        words.update(
+            (parameters["s"], index)
+            for index in range(coarse[0] * coarse[1] * coarse[2])
+        )
+    return DependencyClosure(tuple(sorted(words)), (), True)
+
+
+def _cg_update_p_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    words = {
+        (name, index)
+        for index in range(first, stop)
+        for name in (parameters["r"], parameters["p"])
+    }
+    return DependencyClosure(
+        tuple(sorted(words)), (parameters["beta"],), False
+    )
+
+
+def _cg_init_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    names = tuple(parameters[name] for name in ("x", "q", "z", "r", "p"))
+    words = {
+        (name, index)
+        for index in range(first, stop)
+        for name in names
+    }
+    return DependencyClosure(tuple(sorted(words)), (), False)
+
+
+def _mg_zero3_dependency_closure(invocation, first, stop):
+    name = invocation.parameters["u"]
+    return DependencyClosure(
+        tuple((name, index) for index in range(first, stop)), (), False
+    )
+
+
+def _cg_normalize_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    words = {
+        (name, index)
+        for index in range(first, stop)
+        for name in (parameters["z"], parameters["x"])
+    }
+    return DependencyClosure(
+        tuple(sorted(words)), (parameters["norm2"],), False
+    )
+
+
+def _cg_lane_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    names = {
+        "npb_cg_dot": ("left", "right"),
+        "npb_cg_update_zr": ("z", "p", "r", "q"),
+        "npb_cg_residual_norm": ("x", "r"),
+        "npb_cg_outer_dots": ("x", "z"),
+    }[invocation.kernel]
+    words = {
+        (parameters[name], index)
+        for index in range(first, stop)
+        for name in names
+    }
+    scalars = (
+        (parameters["alpha"],)
+        if invocation.kernel == "npb_cg_update_zr" else ()
+    )
+    return DependencyClosure(tuple(sorted(words)), scalars, False)
+
+
+def _mg_norm_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    n1, n2, n3 = (
+        parameters["n1"], parameters["n2"], parameters["n3"]
+    )
+    width = n1 - 2
+    y_items = n2 - 2
+    words = []
+    for item in range(first, stop):
+        i3 = 1 + item // (width * y_items)
+        remainder = item % (width * y_items)
+        i2 = 1 + remainder // width
+        i1 = 1 + remainder % width
+        words.append((parameters["r"], f_index(i1, i2, i3, n1, n2, n3)))
+    return DependencyClosure(tuple(sorted(set(words))), (), False)
+
+
+def _scalar_dependency_closure(invocation):
+    parameters = invocation.parameters
+    if invocation.kernel == "npb_cg_divide":
+        names = (
+            parameters["numerator"], parameters["denominator"],
+            parameters["result"],
+        )
+    elif invocation.kernel == "npb_cg_prepare_iteration":
+        names = (
+            parameters["source"], parameters["snapshot"],
+            *parameters["zero"],
+        )
+    else:
+        raise lazy.LazyTraceError(
+            f"NPB scalar resolver is absent for {invocation.kernel}"
+        )
+    return DependencyClosure((), tuple(sorted(set(names))), False)
+
+
+def _mg_interp_dependency_closure(invocation, first, stop):
+    if first != 0 or stop != invocation.work_items:
+        raise lazy.LazyTraceError(
+            "partial MG interp dependency closure is not proved"
+        )
+    parameters = invocation.parameters
+    coarse_count = (
+        parameters["mm1"] * parameters["mm2"] * parameters["mm3"]
+    )
+    fine_count = parameters["n1"] * parameters["n2"] * parameters["n3"]
+    words = tuple(
+        sorted(
+            tuple((parameters["z"], index) for index in range(coarse_count))
+            + tuple((parameters["u"], index) for index in range(fine_count))
+        )
+    )
+    return DependencyClosure(words, (), True)
+
+
 def dependency_closure(invocation, first, stop, *, state=None):
     """Resolve the exact/superset raw words needed by a proved slice."""
 
@@ -1965,9 +2320,224 @@ def dependency_closure(invocation, first, stop, *, state=None):
         return _cg_spmv_dependency_closure(invocation, first, stop, state)
     if invocation.kernel == "npb_mg_resid":
         return _mg_resid_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_mg_psinv":
+        return _mg_psinv_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_mg_rprj3":
+        return _mg_rprj3_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_cg_update_p":
+        return _cg_update_p_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_cg_init":
+        return _cg_init_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_mg_zero3":
+        return _mg_zero3_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_cg_normalize":
+        return _cg_normalize_dependency_closure(invocation, first, stop)
+    if invocation.kernel == "npb_mg_norm2u3":
+        return _mg_norm_dependency_closure(invocation, first, stop)
+    if invocation.kernel in {
+        "npb_cg_divide", "npb_cg_prepare_iteration"
+    }:
+        return _scalar_dependency_closure(invocation)
+    if invocation.kernel == "npb_mg_interp":
+        return _mg_interp_dependency_closure(invocation, first, stop)
+    if invocation.kernel in _LANE_SLICE_KERNELS:
+        return _cg_lane_dependency_closure(invocation, first, stop)
     raise lazy.LazyTraceError(
         f"NPB dependency resolver is absent for {invocation.kernel}"
     )
+
+
+def _slice_lanes(invocation, first, stop):
+    ranges = tuple(
+        tuple(pair) for pair in _validate_lanes(invocation)
+        if pair[0] < pair[1]
+    )
+    selected = tuple(
+        pair for pair in ranges if first <= pair[0] and pair[1] <= stop
+    )
+    if (
+        not selected
+        or selected[0][0] != first
+        or selected[-1][1] != stop
+    ):
+        raise lazy.LazyTraceError(
+            "NPB reduction slice does not follow lane boundaries"
+        )
+    return selected
+
+
+def _expand_cg_dot_lanes(state, invocation, first, stop):
+    _require_parameters(invocation, ("left", "right", "result", "lanes"))
+    parameters = invocation.parameters
+    for lane_first, lane_stop in _slice_lanes(invocation, first, stop):
+        total = 0.0
+        for index in range(lane_first, lane_stop):
+            left_address, left = state.load_float(parameters["left"], index)
+            right_address, right = state.load_float(parameters["right"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, left_address, raw_f64(left))
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, right_address, raw_f64(right))
+            product = f64(left * right)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, left, right, product)
+            updated = f64(total + product)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          index, total, product, updated)
+            total = updated
+
+
+def _expand_cg_residual_norm_lanes(state, invocation, first, stop):
+    _require_parameters(invocation, ("x", "r", "result", "lanes"))
+    parameters = invocation.parameters
+    for lane_first, lane_stop in _slice_lanes(invocation, first, stop):
+        total = 0.0
+        for index in range(lane_first, lane_stop):
+            x_address, x = state.load_float(parameters["x"], index)
+            r_address, r = state.load_float(parameters["r"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, x_address, raw_f64(x))
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, r_address, raw_f64(r))
+            difference = f64(x - r)
+            yield _binary(invocation, canonical.Opcode.F64_SUB,
+                          index, x, r, difference)
+            square = f64(difference * difference)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, difference, difference, square)
+            updated = f64(total + square)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          index, total, square, updated)
+            total = updated
+
+
+def _expand_cg_outer_dots_lanes(state, invocation, first, stop):
+    _require_parameters(invocation, (
+        "x", "z", "result_xz", "result_zz", "results", "lanes",
+    ))
+    parameters = invocation.parameters
+    for lane_first, lane_stop in _slice_lanes(invocation, first, stop):
+        total_xz = 0.0
+        total_zz = 0.0
+        for index in range(lane_first, lane_stop):
+            x_address, x = state.load_float(parameters["x"], index)
+            z_address, z = state.load_float(parameters["z"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, x_address, raw_f64(x))
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, z_address, raw_f64(z))
+            product_xz = f64(x * z)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, x, z, product_xz)
+            next_xz = f64(total_xz + product_xz)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          index, total_xz, product_xz, next_xz)
+            z_address, z_left = state.load_float(parameters["z"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, z_address, raw_f64(z_left))
+            z_address, z_right = state.load_float(parameters["z"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, z_address, raw_f64(z_right))
+            product_zz = f64(z_left * z_right)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, z_left, z_right, product_zz)
+            next_zz = f64(total_zz + product_zz)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          index, total_zz, product_zz, next_zz)
+            total_xz = next_xz
+            total_zz = next_zz
+
+
+def _expand_cg_update_zr_lanes(state, invocation, first, stop):
+    _require_parameters(invocation, (
+        "z", "p", "r", "q", "alpha", "result", "boundaries",
+        "boundary_counts", "lanes",
+    ))
+    parameters = invocation.parameters
+    alpha = f64_from_raw(state.load_scalar(parameters["alpha"]))
+    for lane_first, lane_stop in _slice_lanes(invocation, first, stop):
+        total = 0.0
+        for index in range(lane_first, lane_stop):
+            z_address, z = state.load_float(parameters["z"], index)
+            p_address, p = state.load_float(parameters["p"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, z_address, raw_f64(z))
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, p_address, raw_f64(p))
+            alpha_p = f64(alpha * p)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, alpha, p, alpha_p)
+            new_z = f64(z + alpha_p)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          index, z, alpha_p, new_z)
+            state.store_float(parameters["z"], index, new_z)
+            yield _store(invocation, index, z_address, new_z)
+            r_address, r = state.load_float(parameters["r"], index)
+            q_address, q = state.load_float(parameters["q"], index)
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, r_address, raw_f64(r))
+            yield _load(invocation, canonical.Opcode.LOAD_F64,
+                        index, q_address, raw_f64(q))
+            alpha_q = f64(alpha * q)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, alpha, q, alpha_q)
+            new_r = f64(r - alpha_q)
+            yield _binary(invocation, canonical.Opcode.F64_SUB,
+                          index, r, alpha_q, new_r)
+            state.store_float(parameters["r"], index, new_r)
+            yield _store(invocation, index, r_address, new_r)
+            square = f64(new_r * new_r)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          index, new_r, new_r, square)
+            updated = f64(total + square)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          index, total, square, updated)
+            total = updated
+
+
+def _expand_mg_norm_lanes(state, invocation, first, stop):
+    _require_parameters(invocation, (
+        "r", "n1", "n2", "n3", "dn_raw", "rnm2", "rnmu",
+        "results", "lanes",
+    ))
+    parameters = invocation.parameters
+    dimensions = tuple(parameters[name] for name in ("n1", "n2", "n3"))
+    n1, n2, n3 = dimensions
+    coordinates = [
+        (i1, i2, i3)
+        for i3 in range(1, n3 - 1)
+        for i2 in range(1, n2 - 1)
+        for i1 in range(1, n1 - 1)
+    ]
+    for lane_first, lane_stop in _slice_lanes(invocation, first, stop):
+        total = 0.0
+        maximum = 0.0
+        for work_item in range(lane_first, lane_stop):
+            coordinate = coordinates[work_item]
+            value, operation = _grid_load(
+                state, invocation, parameters["r"], *coordinate,
+                dimensions, work_item,
+            )
+            yield operation
+            square = f64(value * value)
+            yield _binary(invocation, canonical.Opcode.F64_MUL,
+                          work_item, value, value, square)
+            updated = f64(total + square)
+            yield _binary(invocation, canonical.Opcode.F64_ADD,
+                          work_item, total, square, updated)
+            total = updated
+            value_again, operation = _grid_load(
+                state, invocation, parameters["r"], *coordinate,
+                dimensions, work_item,
+            )
+            yield operation
+            absolute = f64(abs(value_again))
+            yield _unary(invocation, canonical.Opcode.F64_ABS,
+                         work_item, value_again, absolute)
+            updated_max = max(maximum, absolute)
+            yield _binary(invocation, canonical.Opcode.F64_MAX,
+                          work_item, maximum, absolute, updated_max)
+            maximum = updated_max
 
 
 def expand_slice(
@@ -1989,6 +2559,21 @@ def expand_slice(
             ) from error
         yield from expander(state, invocation, batch_work_items)
         return
+    if invocation.kernel == "npb_mg_resid":
+        yield from _expand_mg_resid_items(
+            state, invocation, first, stop, False, False
+        )
+        return
+    if invocation.kernel == "npb_mg_psinv":
+        yield from _expand_mg_psinv_items(
+            state, invocation, first, stop, False, False
+        )
+        return
+    if invocation.kernel == "npb_mg_rprj3":
+        yield from _expand_mg_rprj3_items(
+            state, invocation, first, stop, False, False
+        )
+        return
     if invocation.kernel == "npb_cg_spmv":
         yield from _expand_cg_spmv_rows(
             state, invocation, batch_work_items, first, stop, False
@@ -1997,6 +2582,33 @@ def expand_slice(
     if invocation.kernel == "npb_mg_zero3":
         yield from _expand_mg_zero3_range(
             state, invocation, batch_work_items, first, stop, False
+        )
+        return
+    if invocation.kernel == "npb_cg_update_p":
+        yield from _expand_cg_update_p_range(
+            state, invocation, batch_work_items, first, stop, False
+        )
+        return
+    if invocation.kernel == "npb_cg_init":
+        yield from _expand_cg_init_range(
+            state, invocation, batch_work_items, first, stop, False
+        )
+        return
+    if invocation.kernel == "npb_cg_normalize":
+        yield from _expand_cg_normalize_items(
+            state, invocation, batch_work_items, first, stop
+        )
+        return
+    lane_expanders = {
+        "npb_cg_dot": _expand_cg_dot_lanes,
+        "npb_cg_update_zr": _expand_cg_update_zr_lanes,
+        "npb_cg_residual_norm": _expand_cg_residual_norm_lanes,
+        "npb_cg_outer_dots": _expand_cg_outer_dots_lanes,
+        "npb_mg_norm2u3": _expand_mg_norm_lanes,
+    }
+    if invocation.kernel in lane_expanders:
+        yield from lane_expanders[invocation.kernel](
+            state, invocation, first, stop
         )
         return
     raise lazy.LazyTraceError(

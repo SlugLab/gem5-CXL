@@ -162,7 +162,192 @@ class NPBIndexedWindowsTest(unittest.TestCase):
             ))
         self.assertEqual(actual, expected)
 
+        for kernel in ("npb_cg_init", "npb_cg_update_p"):
+            invocation = next(
+                row for row in bundle.invocations if row.kernel == kernel
+            )
+            with lazy.MappedState(bundle) as expected_state:
+                expected = tuple(npb.EXPANDERS[kernel](
+                    expected_state, invocation, 4
+                ))
+            expected = tuple(
+                operation for operation in expected
+                if 1 <= operation.work_item < 3
+                and operation.opcode not in {
+                    canonical.Opcode.BARRIER, canonical.Opcode.COMMIT
+                }
+            )
+            with lazy.MappedState(bundle) as sliced_state:
+                actual = tuple(npb.expand_slice(
+                    sliced_state, invocation, 1, 3, 4
+                ))
+            self.assertEqual(actual, expected)
+
+        invocation = next(
+            row for row in bundle.invocations
+            if row.kernel == "npb_cg_normalize"
+        )
+        with lazy.MappedState(bundle) as expected_state:
+            expected_state.store_scalar("norm1", npb.raw_f64(1.0))
+            expected_state.store_scalar("norm2", npb.raw_f64(4.0))
+            complete = tuple(npb.expand_cg_normalize(
+                expected_state, invocation, 4
+            ))
+        vector_operations = complete[7:-1]
+        expected = tuple(
+            operation for operation in vector_operations
+            if 1 <= operation.work_item < 3
+        )
+        with lazy.MappedState(bundle) as sliced_state:
+            sliced_state.store_scalar("norm2", npb.raw_f64(4.0))
+            actual = tuple(npb.expand_slice(
+                sliced_state, invocation, 1, 3, 4
+            ))
+        self.assertEqual(actual, expected)
+
+        lane_kernels = (
+            "npb_cg_dot",
+            "npb_cg_update_zr",
+            "npb_cg_residual_norm",
+            "npb_cg_outer_dots",
+        )
+        for kernel in lane_kernels:
+            invocation = next(
+                row for row in bundle.invocations if row.kernel == kernel
+            )
+            with lazy.MappedState(bundle) as expected_state:
+                if kernel == "npb_cg_update_zr":
+                    expected_state.store_scalar("alpha", npb.raw_f64(0.5))
+                complete = tuple(npb.EXPANDERS[kernel](
+                    expected_state, invocation, 4
+                ))
+            expected = tuple(
+                operation for operation in complete
+                if operation.work_item == 1
+                and operation.opcode not in {
+                    canonical.Opcode.BARRIER, canonical.Opcode.COMMIT
+                }
+            )
+            with lazy.MappedState(bundle) as sliced_state:
+                if kernel == "npb_cg_update_zr":
+                    sliced_state.store_scalar("alpha", npb.raw_f64(0.5))
+                actual = tuple(npb.expand_slice(
+                    sliced_state, invocation, 1, 2, 4
+                ))
+            self.assertEqual(actual, expected)
+
         mg = self.mg_case.full_vcycle_bundle()
+        resid = next(
+            row for row in mg.invocations if row.kernel == "npb_mg_resid"
+        )
+        realized = npb.safe_work_item_range(
+            resid, 5, 7, stratum_first=4, stratum_stop=8
+        )
+        self.assertEqual(realized, (4, 8))
+        with lazy.MappedState(mg) as expected_state:
+            complete = tuple(npb.expand_mg_resid(
+                expected_state, resid, 4
+            ))
+        selected_work_items = {1, 49, 50, 51, 52}
+        expected = tuple(
+            operation for operation in complete
+            if operation.work_item in selected_work_items
+            and operation.opcode not in {
+                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT
+            }
+        )
+        with lazy.MappedState(mg) as sliced_state:
+            actual = tuple(npb.expand_slice(
+                sliced_state, resid, *realized, 4
+            ))
+        self.assertEqual(actual, expected)
+
+        psinv = next(
+            row for row in mg.invocations if row.kernel == "npb_mg_psinv"
+        )
+        realized = npb.safe_work_item_range(
+            psinv, 3, 4, stratum_first=2, stratum_stop=4
+        )
+        self.assertEqual(realized, (2, 4))
+        with lazy.MappedState(mg) as expected_state:
+            complete = tuple(npb.expand_mg_psinv(
+                expected_state, psinv, 4
+            ))
+        n1 = psinv.parameters["n1"]
+        rows = (psinv.parameters["n2"] - 2) * (
+            psinv.parameters["n3"] - 2
+        )
+        interior_prefix = complete[
+            :1 + rows * (14 * n1 + 15 * (n1 - 2))
+        ]
+        expected = tuple(
+            operation for operation in interior_prefix
+            if operation.work_item in {1, 25, 26}
+            and operation.opcode not in {
+                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT
+            }
+        )
+        with lazy.MappedState(mg) as sliced_state:
+            actual = tuple(npb.expand_slice(
+                sliced_state, psinv, *realized, 4
+            ))
+        self.assertEqual(actual, expected)
+
+        rprj3 = next(
+            row for row in mg.invocations if row.kernel == "npb_mg_rprj3"
+        )
+        realized = npb.safe_work_item_range(
+            rprj3, 3, 4, stratum_first=2, stratum_stop=4
+        )
+        self.assertEqual(realized, (2, 4))
+        with lazy.MappedState(mg) as expected_state:
+            complete = tuple(npb.expand_mg_rprj3(
+                expected_state, rprj3, 4
+            ))
+        m1 = rprj3.parameters["m1j"]
+        rows = (rprj3.parameters["m2j"] - 2) * (
+            rprj3.parameters["m3j"] - 2
+        )
+        interior_prefix = complete[
+            :1 + rows * (14 * (m1 - 1) + 30 * (m1 - 2))
+        ]
+        expected = tuple(
+            operation for operation in interior_prefix
+            if operation.work_item in {1, 25, 26}
+            and operation.opcode not in {
+                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT
+            }
+        )
+        with lazy.MappedState(mg) as sliced_state:
+            actual = tuple(npb.expand_slice(
+                sliced_state, rprj3, *realized, 4
+            ))
+        self.assertEqual(actual, expected)
+
+        norm = next(
+            row for row in mg.invocations if row.kernel == "npb_mg_norm2u3"
+        )
+        realized = npb.safe_work_item_range(
+            norm, 20, 25, stratum_first=16, stratum_stop=32
+        )
+        self.assertEqual(realized, (16, 32))
+        with lazy.MappedState(mg) as expected_state:
+            complete = tuple(npb.expand_mg_norm2u3(
+                expected_state, norm, 4
+            ))
+        expected = tuple(
+            operation for operation in complete
+            if 16 <= operation.work_item < 32
+            and operation.opcode not in {
+                canonical.Opcode.BARRIER, canonical.Opcode.COMMIT
+            }
+        )
+        with lazy.MappedState(mg) as sliced_state:
+            actual = tuple(npb.expand_slice(
+                sliced_state, norm, *realized, 4
+            ))
+        self.assertEqual(actual, expected)
+
         zero = lazy.Invocation(0, 200, "npb_mg_zero3", 1, 64, {
             "u": "vc_coarse_u", "n1": 4, "n2": 4, "n3": 4,
             "boundaries": [],
@@ -235,13 +420,13 @@ class NPBIndexedWindowsTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(lazy.LazyTraceError, "stratum"):
             npb.safe_work_item_range(
-                reduction, 1, 2, stratum_first=1, stratum_stop=2
+                reduction, 0, 2, stratum_first=1, stratum_stop=2
             )
         self.assertEqual(
             npb.safe_work_item_range(
                 reduction, 1, 2, stratum_first=0, stratum_stop=3
             ),
-            (0, 3),
+            (1, 2),
         )
 
     def test_dependency_closure_contains_cg_indirection_and_mg_halo(self):
@@ -270,6 +455,36 @@ class NPBIndexedWindowsTest(unittest.TestCase):
         self.assertTrue(closure.has_complete_halo)
         self.assertTrue(any(name == "vc_fine_u" for name, _ in closure.array_words))
         self.assertTrue(any(name == "vc_fine_v" for name, _ in closure.array_words))
+
+    def test_every_fixture_kernel_has_a_fail_closed_dependency_resolver(self):
+        self.require_indexer()
+        cg = self.cg_bundle()
+        with lazy.MappedState(cg) as state:
+            for invocation in cg.invocations:
+                with self.subTest(kernel=invocation.kernel):
+                    closure = npb.dependency_closure(
+                        invocation,
+                        0,
+                        invocation.work_items,
+                        state=state,
+                    )
+                    self.assertIsInstance(closure, npb.DependencyClosure)
+
+        mg = self.mg_case.full_vcycle_bundle()
+        for invocation in mg.invocations:
+            with self.subTest(kernel=invocation.kernel):
+                closure = npb.dependency_closure(
+                    invocation, 0, invocation.work_items
+                )
+                self.assertIsInstance(closure, npb.DependencyClosure)
+        zero = lazy.Invocation(0, 200, "npb_mg_zero3", 1, 64, {
+            "u": "vc_coarse_u", "n1": 4, "n2": 4, "n3": 4,
+            "boundaries": [],
+        })
+        self.assertIsInstance(
+            npb.dependency_closure(zero, 0, zero.work_items),
+            npb.DependencyClosure,
+        )
 
 
 if __name__ == "__main__":
