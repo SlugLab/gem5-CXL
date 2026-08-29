@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import gzip
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -104,6 +105,60 @@ class SectionView:
 
     def read(self) -> bytes:
         return b"".join(self.chunks())
+
+
+class _DigestingSectionReader(io.RawIOBase):
+    """Bounded raw reader which authenticates the stored section bytes."""
+
+    def __init__(self, path: Path, entry: DirectoryEntry):
+        super().__init__()
+        self._entry = entry
+        self._remaining = entry.stored_bytes
+        self._digest = hashlib.sha256()
+        try:
+            self._stream = Path(path).open("rb")
+            self._stream.seek(entry.offset)
+        except OSError as error:
+            raise FormatError(
+                f"cannot open MCFREG2 EVENTS section: {error}"
+            ) from error
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if self.closed:
+            raise ValueError("I/O operation on closed EVENTS section")
+        if self._remaining == 0:
+            return 0
+        size = min(len(buffer), self._remaining)
+        try:
+            data = self._stream.read(size)
+        except OSError as error:
+            raise FormatError(
+                f"cannot read MCFREG2 EVENTS section: {error}"
+            ) from error
+        if not data:
+            raise FormatError("MCFREG2 EVENTS section is truncated")
+        buffer[:len(data)] = data
+        self._digest.update(data)
+        self._remaining -= len(data)
+        return len(data)
+
+    def finish(self, expected_sha256):
+        """Drain unread stored bytes and require the directory digest."""
+
+        scratch = bytearray(1024 * 1024)
+        while self._remaining:
+            self.readinto(scratch)
+        if self._digest.digest() != expected_sha256:
+            raise FormatError("MCFREG2 EVENTS SHA-256 differs")
+
+    def close(self):
+        stream = getattr(self, "_stream", None)
+        if stream is not None:
+            stream.close()
+        super().close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1123,6 +1178,9 @@ def read_package(path, *, lazy_section_names=()) -> Package:
     for name in lazy_section_names:
         if name not in SECTION_TYPES:
             raise FormatError(f"unknown lazy MCFREG2 section: {name}")
+    lazy_section_types = {
+        SECTION_TYPES[name] for name in lazy_section_names
+    }
     try:
         file_size = path.stat().st_size
         with path.open("rb") as stream:
@@ -1187,18 +1245,19 @@ def read_package(path, *, lazy_section_names=()) -> Package:
                 )
                 if end > file_size:
                     raise FormatError("MCFREG2 section is truncated")
-                stream.seek(entry.offset)
-                remaining = entry.stored_bytes
-                digest = hashlib.sha256()
-                while remaining:
-                    chunk = stream.read(min(remaining, 1024 * 1024))
-                    if not chunk:
-                        raise FormatError("MCFREG2 section is truncated")
-                    digest.update(chunk)
-                    remaining -= len(chunk)
-                actual_digest = digest.digest()
-                if actual_digest != entry.sha256:
-                    raise FormatError("MCFREG2 section SHA-256 differs")
+                if entry.section_type not in lazy_section_types:
+                    stream.seek(entry.offset)
+                    remaining = entry.stored_bytes
+                    digest = hashlib.sha256()
+                    while remaining:
+                        chunk = stream.read(min(remaining, 1024 * 1024))
+                        if not chunk:
+                            raise FormatError("MCFREG2 section is truncated")
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    actual_digest = digest.digest()
+                    if actual_digest != entry.sha256:
+                        raise FormatError("MCFREG2 section SHA-256 differs")
                 sections.append(Section(
                     section_type=entry.section_type,
                     schema=entry.schema,
@@ -1217,6 +1276,75 @@ def read_package(path, *, lazy_section_names=()) -> Package:
         directory=tuple(directory),
         sections=tuple(sections),
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamedEvent:
+    ordinal: int
+    row: dict
+
+
+def _event_json(line, ordinal):
+    try:
+        row = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormatError(
+            f"MCFREG2 EVENTS row {ordinal + 1} is invalid"
+        ) from error
+    if not isinstance(row, dict):
+        raise FormatError(
+            f"MCFREG2 EVENTS row {ordinal + 1} is not an object"
+        )
+    return row
+
+
+def stream_events(path):
+    """Yield EVENTS rows while authenticating one bounded gzip scan.
+
+    The stored EVENTS bytes are read exactly through their directory extent;
+    the fully decompressed section is never retained in memory or written.
+    Authentication completes when the iterator is exhausted.
+    """
+
+    package = read_package(path, lazy_section_names=("EVENTS",))
+    entry = next(
+        item
+        for item in package.directory
+        if item.section_type == SECTION_TYPES["EVENTS"]
+    )
+    reader = _DigestingSectionReader(Path(path).resolve(), entry)
+    buffered = io.BufferedReader(reader, buffer_size=1024 * 1024)
+    compressed = gzip.GzipFile(fileobj=buffered, mode="rb")
+    count = 0
+    try:
+        try:
+            while True:
+                line = compressed.readline()
+                if not line:
+                    break
+                yield StreamedEvent(count, _event_json(line, count))
+                count += 1
+        except (OSError, EOFError) as error:
+            raise FormatError(
+                "MCFREG2 EVENTS gzip stream is invalid"
+            ) from error
+        if count != package.header.event_count:
+            raise FormatError(
+                "MCFREG2 EVENTS event count differs: "
+                f"declared={package.header.event_count}, observed={count}"
+            )
+        if entry.element_count != count:
+            raise FormatError(
+                "MCFREG2 EVENTS directory event count differs"
+            )
+    finally:
+        try:
+            reader.finish(entry.sha256)
+        finally:
+            try:
+                compressed.close()
+            finally:
+                buffered.close()
 
 
 def _pack_header(header: Header, section_count: int) -> bytes:
