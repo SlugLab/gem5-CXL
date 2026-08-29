@@ -12,8 +12,10 @@ import struct
 from pathlib import Path
 
 try:
+    from scripts import gapbs_pr_experiment_profiles as profiles
     from scripts import m2ndp_artifacts as artifacts
 except ImportError:
+    import gapbs_pr_experiment_profiles as profiles
     import m2ndp_artifacts as artifacts
 
 
@@ -591,11 +593,11 @@ def validate_trace_binding(
         "stage_sequence": list(UNIQUE_KERNELS),
         "measure_marker": (
             "K2_CONTRIB_TRIAL1_GROUP"
-            if profile.name == "pr-offload-4thread-1us"
+            if profiles.is_formal_offload_profile(profile.name)
             else "K0_INIT_TRIAL1"
         ),
     }
-    if profile.name == "pr-offload-4thread-1us":
+    if profiles.is_formal_offload_profile(profile.name):
         expected.update(
             logical_partitions=4,
             partition_bounds=[
@@ -677,7 +679,7 @@ def generate_trace(
 
     formal = (
         profile is not None
-        and profile.name == "pr-offload-4thread-1us"
+        and profiles.is_formal_offload_profile(profile.name)
     )
     if formal and getattr(profile, "logical_partitions", None) != 4:
         raise artifacts.EvidenceError(

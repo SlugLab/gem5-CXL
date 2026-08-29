@@ -1206,6 +1206,7 @@ class GapbsAmuCiraMetricTest(unittest.TestCase):
             text=True,
         )
         self.assertIn("pr-offload-4thread-1us", help_text)
+        self.assertIn("pr-offload-4thread-spectrum", help_text)
 
     def test_checkpoint_restore_timeout_returns_failure_row(self):
         with tempfile.TemporaryDirectory() as tmp:

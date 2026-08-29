@@ -107,6 +107,14 @@ def resolve_profile(options):
         return profiles.validate_formal_offload_profile(
             profiles.load_formal_offload_profile(manifest)
         )
+    if name == profiles.FORMAL_SPECTRUM_PROFILE_NAME:
+        if manifest is None:
+            raise VariantRunError(
+                f"profile {name} requires --graph-manifest"
+            )
+        return profiles.validate_formal_offload_spectrum_profile(
+            profiles.load_formal_offload_spectrum_profile(manifest)
+        )
     if name == profiles.SCALING_PROFILE_NAME:
         if manifest is None:
             raise VariantRunError(
@@ -469,7 +477,11 @@ def parse_args(argv=None):
         "--profile",
         choices=tuple(
             sorted(set(profiles.PROFILES) | set(profiles.FROZEN_PROFILE_CONTRACTS))
-            + [profiles.SCALING_PROFILE_NAME, profiles.FORMAL_PROFILE_NAME]
+            + [
+                profiles.SCALING_PROFILE_NAME,
+                profiles.FORMAL_PROFILE_NAME,
+                profiles.FORMAL_SPECTRUM_PROFILE_NAME,
+            ]
         ),
         default=profiles.FORMAL_PROFILE_NAME,
     )
@@ -532,7 +544,7 @@ def main(argv=None):
         manifest_path = options.variants_build / "manifest.json"
         manifest, variants = load_manifest(manifest_path)
         if "cira" in options.kind and (
-            profile.name == profiles.FORMAL_PROFILE_NAME
+            profiles.is_formal_offload_profile(profile.name)
             or options.cira_mode is not None
             or options.cira_source_row is not None
         ):

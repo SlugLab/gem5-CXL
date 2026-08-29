@@ -274,6 +274,25 @@ class MatchedVariantRunnerTest(unittest.TestCase):
         self.assertEqual(options.profile, "g4-4thread-sweep")
         self.assertEqual(options.cxl_link_delay, "2us")
 
+    def test_cli_accepts_formal_offload_spectrum_profile(self):
+        options = runner.parse_args(
+            [
+                "--gem5", "gem5.opt",
+                "--graph", "g20.sg",
+                "--graph-scale", "20",
+                "--variants-build", "variants",
+                "--kind", "amu",
+                "--checkpoint-root", "checkpoints",
+                "--outdir", "run",
+                "--profile", "pr-offload-4thread-spectrum",
+                "--graph-manifest", "g20.manifest.json",
+                "--cxl-link-delay", "2us",
+            ]
+        )
+
+        self.assertEqual(options.profile, "pr-offload-4thread-spectrum")
+        self.assertEqual(options.cxl_link_delay, "2us")
+
     def test_amu_row_requires_completed_owned_loads(self):
         row = self.valid_row("amu")
         row["asmc_loads"] = 32

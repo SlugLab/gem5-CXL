@@ -98,6 +98,24 @@ class OrchestratorTest(unittest.TestCase):
             "pr-offload-4thread-1us",
         )
 
+    def test_cli_accepts_formal_offload_spectrum_profile(self):
+        options = runner.parse_args(
+            [
+                "--graph", str(self.graph),
+                "--graph-scale", "20",
+                "--profile", "pr-offload-4thread-spectrum",
+                "--graph-manifest", str(self.outdir.parent / "g20.json"),
+                "--cxl-link-delay", "2us",
+                "--cxlmemuring", str(self.options.cxlmemuring),
+                "--m2ndp-root", str(self.options.m2ndp_root),
+                "--gem5", str(self.options.gem5),
+                "--outdir", str(self.outdir / "spectrum"),
+            ]
+        )
+
+        self.assertEqual(options.profile, "pr-offload-4thread-spectrum")
+        self.assertEqual(options.cxl_link_delay, "2us")
+
     def test_ndpsim_issues_grouped_partitions_concurrently(self):
         command = runner._ndpsim_command(self.paths)
         self.assertEqual(

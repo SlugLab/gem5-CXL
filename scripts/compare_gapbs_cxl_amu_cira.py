@@ -34,17 +34,20 @@ from gapbs_checkpoint import (  # noqa: E402
 from gapbs_pr_experiment_profiles import (  # noqa: E402
     FROZEN_PROFILE_CONTRACTS,
     FORMAL_PROFILE_NAME,
+    FORMAL_SPECTRUM_PROFILE_NAME,
     PROFILES as EXPERIMENT_PROFILES,
     SCALING_PROFILE_NAME,
     ProfileError,
     get_profile,
     load_frozen_profile,
     load_formal_offload_profile,
+    load_formal_offload_spectrum_profile,
     load_graph_manifest,
     load_scaling_profile,
     require_latency,
     validate_scaling_profile,
     validate_formal_offload_profile,
+    validate_formal_offload_spectrum_profile,
 )
 
 
@@ -1889,6 +1892,16 @@ def resolve_checkpoint_profile(args):
         if Path(manifest.graph).resolve() != Path(args.graph).resolve():
             raise ProfileError("graph path differs from frozen manifest")
         return profile
+    if name == FORMAL_SPECTRUM_PROFILE_NAME:
+        if manifest_path is None:
+            raise ProfileError(f"profile {name} requires --graph-manifest")
+        profile = validate_formal_offload_spectrum_profile(
+            load_formal_offload_spectrum_profile(manifest_path)
+        )
+        manifest = load_graph_manifest(manifest_path)
+        if Path(manifest.graph).resolve() != Path(args.graph).resolve():
+            raise ProfileError("graph path differs from frozen manifest")
+        return profile
     if name == SCALING_PROFILE_NAME:
         if manifest_path is None:
             raise ProfileError(f"profile {name} requires --graph-manifest")
@@ -1983,7 +1996,11 @@ def main():
         "--profile",
         choices=tuple(
             sorted(set(EXPERIMENT_PROFILES) | set(FROZEN_PROFILE_CONTRACTS))
-            + [SCALING_PROFILE_NAME, FORMAL_PROFILE_NAME]
+            + [
+                SCALING_PROFILE_NAME,
+                FORMAL_PROFILE_NAME,
+                FORMAL_SPECTRUM_PROFILE_NAME,
+            ]
         ),
         default="g20-2thread-1us",
     )

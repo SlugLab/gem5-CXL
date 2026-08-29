@@ -174,6 +174,21 @@ def _experiment_profile(options):
             raise profiles.ProfileError(
                 "graph path differs from frozen profile manifest"
             )
+    elif options.profile == profiles.FORMAL_SPECTRUM_PROFILE_NAME:
+        if options.profile_manifest is None:
+            raise profiles.ProfileError(
+                f"profile {options.profile} requires --graph-manifest"
+            )
+        profile = profiles.validate_formal_offload_spectrum_profile(
+            profiles.load_formal_offload_spectrum_profile(
+                options.profile_manifest
+            )
+        )
+        manifest = profiles.load_graph_manifest(options.profile_manifest)
+        if Path(manifest.graph).resolve() != Path(options.graph).resolve():
+            raise profiles.ProfileError(
+                "graph path differs from frozen profile manifest"
+            )
     elif options.profile == profiles.SCALING_PROFILE_NAME:
         if options.profile_manifest is None:
             raise profiles.ProfileError(
@@ -743,7 +758,7 @@ def _validate_trace_binding(options, paths):
         vanilla_raw_sha256=artifacts.sha256_file(paths.reference_raw),
         directed_edges=graph_meta.num_directed_edges,
     )
-    if options.profile == profiles.FORMAL_PROFILE_NAME:
+    if profiles.is_formal_offload_profile(options.profile):
         results.validate_formal_result(trace_meta)
 
 
@@ -788,7 +803,7 @@ def _parse_calibration(path):
 def _bind_calibration_artifact(options, path):
     if (
         options.profile not in profiles.FROZEN_PROFILE_CONTRACTS
-        and options.profile != profiles.FORMAL_PROFILE_NAME
+        and not profiles.is_formal_offload_profile(options.profile)
     ):
         return
     value = _load_json(path, "calibration artifact")
@@ -893,11 +908,11 @@ def _publish(options, paths):
         warmup_execution="full_cxl_trial0",
         measured_interval=(
             "trial1_iteration0_contrib_through_final_drain"
-            if options.profile == profiles.FORMAL_PROFILE_NAME
+            if profiles.is_formal_offload_profile(options.profile)
             else "trial1_init_through_final_drain"
         ),
     )
-    if options.profile == profiles.FORMAL_PROFILE_NAME:
+    if profiles.is_formal_offload_profile(options.profile):
         trace_meta = pagerank_trace.read_trace_meta(
             paths.trace / "trace.meta.json"
         )
@@ -1228,7 +1243,11 @@ def parse_args(argv=None):
                 (set(profiles.PROFILES) - set(profiles.LEGACY_DIAGNOSTIC_PROFILES))
                 | set(profiles.FROZEN_PROFILE_CONTRACTS)
             )
-            + [profiles.SCALING_PROFILE_NAME, profiles.FORMAL_PROFILE_NAME]
+            + [
+                profiles.SCALING_PROFILE_NAME,
+                profiles.FORMAL_PROFILE_NAME,
+                profiles.FORMAL_SPECTRUM_PROFILE_NAME,
+            ]
         ),
         default=profiles.FORMAL_PROFILE_NAME,
     )

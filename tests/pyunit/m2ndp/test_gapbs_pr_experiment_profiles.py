@@ -7,6 +7,7 @@ import json
 import os
 import struct
 from pathlib import Path
+from unittest import mock
 
 from scripts import gapbs_pr_experiment_profiles as profiles
 from scripts import m2ndp_artifacts as artifacts
@@ -87,6 +88,49 @@ class ExperimentProfileTest(unittest.TestCase):
         self.assertEqual(profile.trials, 2)
         self.assertEqual(profile.measured_trial, 1)
         self.assertEqual(profile.page_rank_iterations, 20)
+
+    def test_formal_offload_spectrum_profile_preserves_scale_contract(self):
+        profile = profiles.get_formal_offload_spectrum_profile()
+        self.assertEqual(profile.name, "pr-offload-4thread-spectrum")
+        self.assertEqual(profile.scales, (12, 14, 20))
+        self.assertEqual(profile.cores, 4)
+        self.assertEqual(profile.threads, 4)
+        self.assertEqual(profile.logical_partitions, 4)
+        self.assertEqual(
+            profile.latencies,
+            ("200ns", "500ns", "1us", "2us"),
+        )
+        self.assertEqual(profile.trials, 2)
+        self.assertEqual(profile.measured_trial, 1)
+        self.assertEqual(profile.page_rank_iterations, 20)
+        self.assertTrue(profiles.is_formal_offload_profile(profile.name))
+        self.assertTrue(
+            profiles.is_formal_offload_profile("pr-offload-4thread-1us")
+        )
+        self.assertFalse(
+            profiles.is_formal_offload_profile("pr-scaling-4thread-1us")
+        )
+
+    def test_formal_offload_spectrum_loads_g20_and_keeps_legacy_1us_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, manifest = self.make_manifest(Path(tmp), 20)
+            with mock.patch.dict(
+                profiles.SCALING_GRAPH_HASHES,
+                {20: manifest["graph_sha256"]},
+            ):
+                spectrum = profiles.validate_formal_offload_spectrum_profile(
+                    profiles.load_formal_offload_spectrum_profile(manifest_path)
+                )
+                legacy = profiles.load_formal_offload_profile(manifest_path)
+            self.assertEqual(
+                profiles.require_latency(spectrum, "500ns"),
+                profiles.LATENCY_TICKS["500ns"],
+            )
+            with self.assertRaisesRegex(
+                profiles.ProfileError,
+                "latency 500ns is outside profile pr-offload-4thread-1us",
+            ):
+                profiles.require_latency(legacy, "500ns")
 
     def test_legacy_two_thread_profile_is_diagnostic_only(self):
         self.assertNotIn("g20-2thread-1us", profiles.FORMAL_PROFILE_NAMES)

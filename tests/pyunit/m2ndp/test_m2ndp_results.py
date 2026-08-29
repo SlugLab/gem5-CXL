@@ -187,6 +187,8 @@ class M2NDPResultTest(unittest.TestCase):
             "timing_launch_records_per_trial": 165,
         }
         self.assertEqual(results.validate_formal_result(valid), valid)
+        spectrum = dict(valid, profile="pr-offload-4thread-spectrum")
+        self.assertEqual(results.validate_formal_result(spectrum), spectrum)
         for candidate in (
             dict(valid, profile="g20-2thread-1us"),
             dict(valid, logical_partitions=2),

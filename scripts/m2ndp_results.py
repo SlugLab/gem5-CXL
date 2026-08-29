@@ -92,7 +92,7 @@ def bind_formal_trace_cardinality(result, trace_meta):
 
 
 def validate_formal_result(result):
-    if result.get("profile") != FORMAL_PROFILE:
+    if not profiles.is_formal_offload_profile(result.get("profile")):
         raise artifacts.EvidenceError(
             "M2NDP result is not the formal PR profile"
         )
@@ -420,7 +420,7 @@ def validate_calibration_binding(
 ):
     if (
         profile.name not in profiles.FROZEN_PROFILE_CONTRACTS
-        and profile.name != FORMAL_PROFILE
+        and not profiles.is_formal_offload_profile(profile.name)
     ):
         return
     if calibration.profile != profile.name:
