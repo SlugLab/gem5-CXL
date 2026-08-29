@@ -936,7 +936,7 @@ def _valid_boundary_state(state, boundary):
     return False
 
 
-def _render(value, action):
+def _render(value, action, *, extra=None):
     fields = {
         "workload": action.workload,
         "system": action.system or "",
@@ -952,6 +952,13 @@ def _render(value, action):
             else str(action.cxl_link_delay_ticks)
         ),
     }
+    if extra is not None:
+        if not isinstance(extra, dict) or any(
+            not isinstance(name, str) or not isinstance(value, (str, int))
+            for name, value in extra.items()
+        ):
+            raise BreadthError("action template replacements are invalid")
+        fields.update(extra)
     result = str(value)
     for name, replacement in fields.items():
         result = result.replace("{{" + name + "}}", replacement)
@@ -1059,7 +1066,15 @@ class ManifestExecutor:
                 raise BreadthError(
                     "action evidence path escapes the evidence root"
                 ) from error
-        command = [_render(item, action) for item in command_value]
+        command = [
+            _render(item, action, extra={
+                "prepared_manifest": str(
+                    (self.root / "prepared/manifest.json").resolve()
+                ),
+                "evidence_path": str(evidence_path),
+            })
+            for item in command_value
+        ]
         if evidence_path.is_file():
             try:
                 return self._validated(action, evidence_path, command)

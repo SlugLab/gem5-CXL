@@ -123,6 +123,44 @@ def functional_state(*, cxl_link_delay="1us"):
 
 
 class BreadthRunnerTest(unittest.TestCase):
+    def test_executor_renders_child_prepared_and_evidence_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared = root / "prepared/manifest.json"
+            prepared.parent.mkdir(parents=True)
+            prepared.write_text("{}\n", encoding="utf-8")
+            artifact = root / "artifact.raw"
+            artifact.write_bytes(b"proof")
+            evidence = root / "evidence/reference/mcf.json"
+            evidence.parent.mkdir(parents=True)
+            command = [
+                "/bin/true",
+                "--prepared", str(prepared.resolve()),
+                "--evidence", str(evidence.resolve()),
+            ]
+            evidence.write_text(json.dumps({
+                "status": "pass",
+                "command": command,
+                "outputs": {"artifact": {
+                    "path": str(artifact.resolve()),
+                    "sha256": hashlib.sha256(
+                        artifact.read_bytes()
+                    ).hexdigest(),
+                }},
+            }) + "\n", encoding="utf-8")
+            executor = breadth.ManifestExecutor({
+                "workloads": {"mcf": {"actions": {"reference": {
+                    "command": [
+                        "/bin/true",
+                        "--prepared", "{{prepared_manifest}}",
+                        "--evidence", "{{evidence_path}}",
+                    ],
+                    "evidence": "evidence/reference/mcf.json",
+                }}}},
+            }, root=root)
+            observed = executor(breadth.Action("reference", "mcf"))
+        self.assertEqual(observed["command"], command)
+
     def test_schema2_calibration_requires_hash_bound_formal_qualification(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
