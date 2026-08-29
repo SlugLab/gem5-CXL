@@ -302,6 +302,40 @@ class LatencySpectrumPublisherTest(unittest.TestCase):
                     first["artifacts"],
                 )
 
+    def test_composite_uses_one_shared_speedup_scale(self):
+        data = publisher.load_complete(self.complete)
+        selected = [
+            row for row in data.rows if row.system in publisher.ACCELERATORS
+        ]
+        limits = publisher._global_speedup_limits(selected)
+        _matplotlib, plt, _np = publisher._matplotlib()
+        figure, axes = plt.subplots(2, 1)
+        try:
+            publisher._speedup_axis(axes[0], selected[:12], limits=limits)
+            publisher._speedup_axis(axes[1], selected[12:24], limits=limits)
+            self.assertEqual(axes[0].get_ylim(), axes[1].get_ylim())
+            self.assertLessEqual(axes[0].get_ylim()[0], 1.0)
+            self.assertGreaterEqual(axes[0].get_ylim()[1], 1.0)
+        finally:
+            plt.close(figure)
+
+    def test_grouped_speedup_bars_start_at_zero(self):
+        data = publisher.load_complete(self.complete)
+        selected = [
+            row for row in data.rows
+            if row.latency == "1us" and row.system in publisher.ACCELERATORS
+        ]
+        _matplotlib, plt, _np = publisher._matplotlib()
+        figure, axis = plt.subplots()
+        try:
+            publisher._bar_speedup_axis(axis, selected)
+            self.assertEqual(axis.get_ylim()[0], 0.0)
+            self.assertGreater(axis.get_ylim()[1], max(
+                float(row.ci_high) for row in selected
+            ))
+        finally:
+            plt.close(figure)
+
 
 if __name__ == "__main__":
     unittest.main()

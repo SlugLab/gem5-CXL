@@ -395,11 +395,33 @@ def _rows(data, workload, system):
     return selected
 
 
-def _speedup_axis(ax, selected):
-    values = [float(row.speedup) for row in selected]
-    minimum = min(values + [1.0])
-    maximum = max(values + [1.0])
-    ax.set_ylim(bottom=max(0.0, minimum * 0.9), top=maximum * 1.1)
+def _global_speedup_limits(selected):
+    if not selected:
+        raise PublicationError("speedup-axis evidence is empty")
+    lower = [
+        float(row.ci_low if row.ci_low is not None else row.speedup)
+        for row in selected
+    ]
+    upper = [
+        float(row.ci_high if row.ci_high is not None else row.speedup)
+        for row in selected
+    ]
+    minimum = min(lower + [1.0])
+    maximum = max(upper + [1.0])
+    return max(0.0, minimum * 0.9), maximum * 1.1
+
+
+def _speedup_axis(ax, selected, *, limits=None):
+    bottom, top = limits or _global_speedup_limits(selected)
+    ax.set_ylim(bottom=bottom, top=top)
+    ax.axhline(1.0, color="#333333", linewidth=0.8, zorder=0)
+    ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+
+
+def _bar_speedup_axis(ax, selected):
+    _, top = _global_speedup_limits(selected)
+    ax.set_ylim(bottom=0.0, top=top)
     ax.axhline(1.0, color="#333333", linewidth=0.8, zorder=0)
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
     ax.spines[["top", "right"]].set_visible(False)
@@ -449,14 +471,20 @@ def _render_composite(data, output_stem):
         "legend.fontsize": 7, "svg.hashsalt": "cxl-spectrum-v1",
         "pdf.compression": 9,
     }):
-        fig, axes = plt.subplots(2, 3, figsize=(7.1, 4.7), sharex=True)
+        all_selected = [
+            row for row in data.rows if row.system in ACCELERATORS
+        ]
+        shared_limits = _global_speedup_limits(all_selected)
+        fig, axes = plt.subplots(
+            2, 3, figsize=(7.1, 4.7), sharex=True, sharey=True
+        )
         for ax, workload in zip(axes.flat, WORKLOADS):
             selected = []
             for system in ACCELERATORS:
                 rows = _rows(data, workload, system)
                 selected.extend(rows)
                 _plot_speedup(ax, rows, system)
-            _speedup_axis(ax, selected)
+            _speedup_axis(ax, selected, limits=shared_limits)
             ax.set_title(WORKLOAD_LABELS[workload])
             ax.set_xticks(range(4), [LATENCY_LABELS[item] for item in latency.LABELS])
         for ax in axes[:, 0]:
@@ -500,7 +528,7 @@ def _render_one_us(data, output_stem):
                 hatch=HATCHES[system], yerr=np.array([low, high]), capsize=2,
                 error_kw={"linewidth": 0.7}, label=SYSTEM_LABELS[system],
             )
-        _speedup_axis(ax, selected)
+        _bar_speedup_axis(ax, selected)
         ax.set_xticks(x, [WORKLOAD_LABELS[item] for item in WORKLOADS],
                       rotation=20, ha="right")
         ax.set_ylabel("Speedup vs. Vanilla")
