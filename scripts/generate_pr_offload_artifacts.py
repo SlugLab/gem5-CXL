@@ -37,12 +37,15 @@ except ImportError:
 EXPECTED_OUTPUTS = {
     "pr-offload-raw.json", "pr-offload-raw.csv",
     "pr-offload-evidence.json", "pr-offload-table.tex",
+    "cira-policy-overhead.json", "cira-policy-overhead.csv",
     "fig/pr-offload-speedup.pdf", "fig/pr-offload-speedup.svg",
     "fig/pr-offload-latency.pdf", "fig/pr-offload-latency.svg",
     "fig/cira-policy-scaling.pdf", "fig/cira-policy-scaling.svg",
     "fig/cira-phase-breakdown.pdf", "fig/cira-phase-breakdown.svg",
     "fig/cira-mechanism-breakdown.pdf",
     "fig/cira-mechanism-breakdown.svg",
+    "fig/cira-pgo-fewshot-overhead.pdf",
+    "fig/cira-pgo-fewshot-overhead.svg",
 }
 MECHANISM_FIELDS = (
     "csr_reads", "rank_reads", "fp_compute", "queue_stall",
@@ -146,6 +149,32 @@ def _load_complete(path):
             ):
                 raise PublishError("CIRA mechanism evidence is invalid")
     validated["oracle"] = oracle
+    offline = value.get("pgo_offline", {"status": "not-recorded"})
+    if offline == {"status": "not-recorded"}:
+        validated["pgo_offline"] = offline
+    elif (
+        isinstance(offline, dict)
+        and set(offline) == {
+            "status", "collection_ns", "build_ns", "total_ns",
+            "source_sha256",
+        }
+        and offline.get("status") == "recorded"
+        and all(
+            isinstance(offline.get(name), int)
+            and not isinstance(offline.get(name), bool)
+            and offline[name] >= 0
+            for name in ("collection_ns", "build_ns", "total_ns")
+        )
+        and offline["collection_ns"] + offline["build_ns"]
+        == offline["total_ns"]
+        and isinstance(offline.get("source_sha256"), str)
+        and len(offline["source_sha256"]) == 64
+        and all(character in "0123456789abcdef"
+                for character in offline["source_sha256"])
+    ):
+        validated["pgo_offline"] = dict(offline)
+    else:
+        raise PublishError("offline PGO evidence is invalid")
     return validated
 
 
@@ -276,6 +305,68 @@ def _phase_figure(data, output):
     _save_figure(figure, output)
 
 
+def _policy_overhead_rows(data):
+    source = data["primary"] + data["ablations"]
+    rows = []
+    for scale in contract.SCALES:
+        for system, policy in (
+            ("cira-pgo", "pgo"), ("cira-few-shot", "few-shot")
+        ):
+            point = next(
+                row for row in source
+                if row["scale"] == scale and row["system"] == system
+            )
+            row = {"scale": scale, "policy": policy}
+            for name in contract.CIRA_PHASES:
+                row[f"{name}_ns"] = point["phases"][name]
+            row["runtime_policy_overhead_ns"] = sum(
+                point["phases"][name]
+                for name in ("sampling", "selection", "jit")
+            )
+            row["total_ns"] = point["phase_total_ns"]
+            rows.append(row)
+    return rows
+
+
+def _policy_overhead_figure(rows, offline, output):
+    figure, axis = plt.subplots(figsize=(6.3, 3.0))
+    labels = [
+        f"g{row['scale']}\n{'PGO' if row['policy'] == 'pgo' else 'Few-shot'}"
+        for row in rows
+    ]
+    bottoms = [0.0] * len(rows)
+    phase_colors = (
+        "#3978B5", "#D9902F", "#7A8E3A",
+        "#C95F75", "#7A6699", "#9AA1AA",
+    )
+    for index, name in enumerate(contract.CIRA_PHASES):
+        values = [phase_milliseconds(row[f"{name}_ns"]) for row in rows]
+        axis.bar(
+            range(len(rows)), values, bottom=bottoms, label=name,
+            color=phase_colors[index], edgecolor="#30343B", linewidth=0.35,
+            hatch=HATCHES[index],
+        )
+        bottoms = [left + value for left, value in zip(bottoms, values)]
+    axis.set_xticks(range(len(rows)), labels)
+    axis.set_ylabel("End-to-end latency (ms)")
+    axis.set_title("CIRA PGO vs. few-shot runtime overhead", loc="left")
+    axis.set_ylim(0, max(bottoms) * 1.2)
+    axis.grid(axis="y", color="#D8DCE2", linewidth=0.5)
+    axis.set_axisbelow(True)
+    axis.legend(
+        frameon=False, ncol=3, loc="upper center",
+        bbox_to_anchor=(0.5, 1.22),
+    )
+    note = (
+        "PGO offline collection/build: not recorded"
+        if offline["status"] == "not-recorded"
+        else "PGO offline collection/build: "
+             f"{phase_milliseconds(offline['total_ns']):.3f} ms (one-time)"
+    )
+    figure.text(0.01, 0.01, note, fontsize=6, color="#4D535C")
+    _save_figure(figure, output)
+
+
 def _mechanism_figure(data, output):
     source = data["primary"] + data["ablations"]
     policy_order = (
@@ -348,6 +439,20 @@ def render_all(data, staging):
         writer.writeheader()
         writer.writerows(rows)
     _write_table(data, staging / "pr-offload-table.tex")
+    overhead_rows = _policy_overhead_rows(data)
+    _atomic_json(staging / "cira-policy-overhead.json", {
+        "schema": 1,
+        "offline_pgo": data["pgo_offline"],
+        "rows": overhead_rows,
+    })
+    with (staging / "cira-policy-overhead.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=tuple(overhead_rows[0])
+        )
+        writer.writeheader()
+        writer.writerows(overhead_rows)
     primary_accelerated = [row for row in rows if row["category"] == "primary"]
     _grouped_bar(
         primary_accelerated,
@@ -368,6 +473,10 @@ def render_all(data, staging):
         staging / "fig/cira-policy-scaling",
     )
     _phase_figure(data, staging / "fig/cira-phase-breakdown")
+    _policy_overhead_figure(
+        overhead_rows, data["pgo_offline"],
+        staging / "fig/cira-pgo-fewshot-overhead",
+    )
     _mechanism_figure(data, staging / "fig/cira-mechanism-breakdown")
 
 

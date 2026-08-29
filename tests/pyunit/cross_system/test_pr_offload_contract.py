@@ -53,6 +53,10 @@ class OffloadContractTest(unittest.TestCase):
                 "formation": 100, "sampling": 100, "selection": 100,
                 "jit": 100, "execution": 500, "drain": 100,
             }
+            if system == "cira-pgo":
+                point["phases"].update(
+                    sampling=0, selection=0, jit=0, execution=800
+                )
             point["phase_total_ns"] = 1000
             point["selected_candidate"] = "B"
         return point

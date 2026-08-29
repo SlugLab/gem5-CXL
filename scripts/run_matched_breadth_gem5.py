@@ -666,6 +666,40 @@ def load_prepared_window_trace(dynamic_root, fixed_root):
         "fixed_event_records", "fixed_trace_sha256",
         "window_index", "warmup_start", "measure_start", "measure_stop",
     }
+    if record is None:
+        phases = dynamic.meta.get("phases")
+        flat_required = {
+            "source_schema", "source_trace_sha256", "window_index",
+            "warmup_start", "measure_start", "measure_stop",
+            "measure_start_item", "fixed_event_records",
+        }
+        if (
+            flat_required.issubset(dynamic.meta)
+            and isinstance(phases, list)
+            and len(phases) == 1
+            and isinstance(phases[0], dict)
+        ):
+            record = {
+                "source_schema": dynamic.meta["source_schema"],
+                "source_trace_sha256": dynamic.meta["source_trace_sha256"],
+                "phase": phases[0].get("id"),
+                "phase_name": phases[0].get("name"),
+                "warmup_items": (
+                    dynamic.meta["measure_start"]
+                    - dynamic.meta["warmup_start"]
+                ),
+                "measured_items": (
+                    dynamic.meta["measure_stop"]
+                    - dynamic.meta["measure_start"]
+                ),
+                "measure_start_item": dynamic.meta["measure_start_item"],
+                "fixed_event_records": dynamic.meta["fixed_event_records"],
+                "fixed_trace_sha256": fixed.meta.get("trace_sha256"),
+                "window_index": dynamic.meta["window_index"],
+                "warmup_start": dynamic.meta["warmup_start"],
+                "measure_start": dynamic.meta["measure_start"],
+                "measure_stop": dynamic.meta["measure_stop"],
+            }
     if not isinstance(record, dict) or set(record) != required:
         raise ReplayError("prepared window metadata fields differ")
     source_sha256 = record["source_trace_sha256"]

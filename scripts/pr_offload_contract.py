@@ -244,6 +244,12 @@ def validate_point(point):
             values[name] <= 0 for name in ("sampling", "selection", "jit")
         ):
             raise OffloadError("CIRA few-shot runtime phases are uncharged")
+        if system == "cira-pgo" and any(
+            values[name] != 0 for name in ("sampling", "selection", "jit")
+        ):
+            raise OffloadError(
+                "CIRA PGO offline policy work is charged inside the ROI"
+            )
     normalized = dict(point)
     normalized["seconds"] = seconds
     return normalized

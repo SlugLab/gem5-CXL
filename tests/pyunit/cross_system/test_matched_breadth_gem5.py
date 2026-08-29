@@ -1677,6 +1677,42 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         ):
             replay.load_prepared_window_trace(dynamic, fixed)
 
+    def test_materialized_window_can_be_reloaded_as_prepared_pair(self):
+        operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, phase=4, work_item=0,
+                address=0x1000, left=7, result=7),
+            _op(canonical.Opcode.BARRIER, 1, phase=4, work_item=0),
+            _op(canonical.Opcode.COMMIT, 2, phase=4, work_item=0),
+        )
+        trace = self.root / "reload-source"
+        canonical.write_bundle(
+            trace,
+            {
+                **_meta("reload_source", 1),
+                "phases": [{"id": 4, "name": "reload", "work_items": 1}],
+            },
+            operations,
+            {},
+            initial_memory=_initial_memory(operations),
+        )
+        plan = self.root / "reload-plan.json"
+        plan.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 0, 0, 1),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace,
+                manifest=plan,
+                phase=4,
+                window_index=0,
+                outdir=self.root / "reload-window",
+            )
+        observed = replay.load_prepared_window_trace(
+            materialized.root, materialized.fixed_root
+        )
+        self.assertEqual(observed, materialized)
+
     def test_cli_rejects_mixed_prepared_and_canonical_window_selection(self):
         with self.assertRaises(SystemExit):
             replay.parse_args([

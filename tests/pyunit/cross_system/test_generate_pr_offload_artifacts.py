@@ -78,6 +78,28 @@ class PublisherTest(unittest.TestCase):
     def test_phase_values_are_converted_from_nanoseconds_to_milliseconds(self):
         self.assertEqual(publisher.phase_milliseconds(1_000_000), 1.0)
 
+    def test_policy_overhead_artifacts_separate_runtime_and_offline_cost(self):
+        outdir = self.root / "overhead"
+        publisher.publish(self.complete, outdir)
+        value = json.loads(
+            (outdir / "cira-policy-overhead.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(value["offline_pgo"], {"status": "not-recorded"})
+        self.assertEqual(len(value["rows"]), 6)
+        for row in value["rows"]:
+            if row["policy"] == "pgo":
+                self.assertEqual(row["sampling_ns"], 0)
+                self.assertEqual(row["selection_ns"], 0)
+                self.assertEqual(row["jit_ns"], 0)
+            else:
+                self.assertGreater(row["sampling_ns"], 0)
+                self.assertGreater(row["selection_ns"], 0)
+                self.assertGreater(row["jit_ns"], 0)
+        self.assertTrue((outdir / "cira-policy-overhead.csv").is_file())
+        self.assertTrue(
+            (outdir / "fig/cira-pgo-fewshot-overhead.pdf").is_file()
+        )
+
     def fixture(self):
         identity = {
             key: digest(key) for key in contract.IDENTITY_HASH_FIELDS
@@ -121,6 +143,12 @@ class PublisherTest(unittest.TestCase):
         rank = copy.deepcopy(base); rank["primary"][1]["raw_sha256"] = "f" * 64; mutations.append(rank)
         speedup = copy.deepcopy(base); speedup["performance_gate"][0]["speedup"] = "1.49"; mutations.append(speedup)
         phase = copy.deepcopy(base); phase["primary"][2]["phases"]["drain"] -= 1; mutations.append(phase)
+        pgo_runtime = copy.deepcopy(base)
+        pgo = next(row for row in pgo_runtime["ablations"]
+                   if row["system"] == "cira-pgo")
+        pgo["phases"]["sampling"] = 1
+        pgo["phases"]["execution"] -= 1
+        mutations.append(pgo_runtime)
         pending = copy.deepcopy(base); pending["primary"][1]["pending"]["all"] = 1; mutations.append(pending)
         funcsim = copy.deepcopy(base); funcsim["primary"][3]["funcsim"]["status"] = "missing"; mutations.append(funcsim)
         gate = copy.deepcopy(base); gate["performance_gate"][0]["accepted"] = False; mutations.append(gate)
