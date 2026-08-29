@@ -34,11 +34,11 @@ except ImportError:
 REPO = Path(__file__).resolve().parents[1]
 WORKLOADS = (
     "pr_spmv",
+    "gap_bc",
     "mcf",
     "amg_gather",
     "lulesh_scatter",
     "npb_cg",
-    "npb_mg",
 )
 FUNCTIONAL_SYSTEMS = ("vanilla", "amu", "cira", "m2ndp-funcsim")
 TIMING_SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")

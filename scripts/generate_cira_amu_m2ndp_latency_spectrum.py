@@ -33,11 +33,11 @@ ACCELERATORS = SYSTEMS[1:]
 WORKLOADS = breadth.WORKLOADS
 WORKLOAD_LABELS = {
     "pr_spmv": "PageRank g20",
+    "gap_bc": "GAP BC g20",
     "mcf": "MCF",
     "amg_gather": "AMG Gather",
     "lulesh_scatter": "LULESH Scatter",
     "npb_cg": "NPB CG",
-    "npb_mg": "NPB MG",
 }
 LATENCY_LABELS = {
     "200ns": "200 ns", "500ns": "500 ns", "1us": "1 µs", "2us": "2 µs",

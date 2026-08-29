@@ -120,6 +120,17 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
 
     def test_matrix_is_four_latencies_by_six_workloads_by_four_systems(self):
         self.assertEqual(
+            spectrum.WORKLOADS,
+            (
+                "pr_spmv",
+                "gap_bc",
+                "mcf",
+                "amg_gather",
+                "lulesh_scatter",
+                "npb_cg",
+            ),
+        )
+        self.assertEqual(
             spectrum.coordinates(),
             tuple(
                 (latency, workload, system)
