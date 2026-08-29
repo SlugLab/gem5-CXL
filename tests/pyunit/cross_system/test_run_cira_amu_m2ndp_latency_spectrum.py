@@ -159,12 +159,16 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
         )
         self.assertEqual(state["correctness_policy"], "native-verified")
         command = spectrum._child_command(
-            self.shared, self.root / "child", "500ns", resume=False,
+            self.shared, record, self.root / "child", "500ns", resume=False,
             correctness_policy="native-verified",
         )
         self.assertEqual(
             command[command.index("--correctness-policy") + 1],
             "native-verified",
+        )
+        self.assertEqual(
+            command[command.index("--qualification") + 1],
+            str(self.qualification.resolve()),
         )
 
     def test_non_content_addressed_shared_object_is_rejected(self):

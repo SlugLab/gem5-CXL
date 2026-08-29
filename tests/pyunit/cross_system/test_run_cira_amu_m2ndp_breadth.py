@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from scripts import cross_system_contract as contract
 from scripts import run_cira_amu_m2ndp_breadth as breadth
@@ -121,6 +123,59 @@ def functional_state(*, cxl_link_delay="1us"):
 
 
 class BreadthRunnerTest(unittest.TestCase):
+    def test_schema2_calibration_requires_hash_bound_formal_qualification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            calibration = root / "calibration.json"
+            qualification = root / "qualification.json"
+            calibration.write_text(
+                json.dumps({"schema": 2}) + "\n", encoding="utf-8"
+            )
+            qualification.write_text("{}\n", encoding="utf-8")
+            options = SimpleNamespace(
+                calibration=calibration, qualification=qualification
+            )
+            with (
+                mock.patch.object(
+                    breadth, "_validate_formal_calibration_schema2"
+                ) as validate_schema,
+                mock.patch.object(
+                    breadth, "validate_qualification"
+                ) as validate_qualification,
+            ):
+                breadth._validate_calibration(options)
+            validate_schema.assert_called_once_with(
+                calibration, {"schema": 2}
+            )
+            validate_qualification.assert_called_once_with(
+                qualification,
+                hashlib.sha256(calibration.read_bytes()).hexdigest(),
+            )
+
+    def test_schema2_calibration_without_qualification_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calibration = Path(temporary) / "calibration.json"
+            calibration.write_text(
+                json.dumps({"schema": 2}) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                breadth.BreadthError, "qualification is required"
+            ):
+                breadth._validate_calibration(SimpleNamespace(
+                    calibration=calibration, qualification=None
+                ))
+
+    def test_qualification_changes_breadth_config_identity(self):
+        first = breadth._config_identity_sha256(
+            sha("prepared-config"), "1us", 1_000_000, "native-verified",
+            qualification_sha256=sha("qualification-a"),
+        )
+        second = breadth._config_identity_sha256(
+            sha("prepared-config"), "1us", 1_000_000, "native-verified",
+            qualification_sha256=sha("qualification-b"),
+        )
+        self.assertNotEqual(first, second)
+
     def test_native_verified_accepts_numerically_valid_boundary_hash_drift(self):
         with tempfile.TemporaryDirectory() as temporary:
             relaxed_path = Path(temporary) / "objective.u64"

@@ -22,10 +22,12 @@ from pathlib import Path
 try:
     from scripts import cross_system_contract as contract
     from scripts import cxl_latency_spectrum as latency
+    from scripts import run_pr_asymmetric_offload as offload
     from scripts import stratified_timing as timing
 except ImportError:
     import cross_system_contract as contract
     import cxl_latency_spectrum as latency
+    import run_pr_asymmetric_offload as offload
     import stratified_timing as timing
 
 
@@ -1310,6 +1312,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument("--qualification", type=Path)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument(
         "--cxl-link-delay", choices=latency.LABELS, default="1us"
@@ -1357,27 +1360,157 @@ def _g20_graph_sha256(inputs):
 
 def _config_identity_sha256(
     prepared_config_sha256, cxl_link_delay, cxl_link_delay_ticks,
-    correctness_policy,
+    correctness_policy, *, qualification_sha256=None,
 ):
     correctness_policy = _correctness_policy(correctness_policy)
-    return hashlib.sha256(contract.canonical_json({
+    config = {
         "prepared_config_sha256": prepared_config_sha256,
         "cxl_link_delay": cxl_link_delay,
         "cxl_link_delay_ticks": cxl_link_delay_ticks,
         "correctness_policy": correctness_policy,
-    })).hexdigest()
+    }
+    if qualification_sha256 is not None:
+        if (
+            not isinstance(qualification_sha256, str)
+            or _SHA256.fullmatch(qualification_sha256) is None
+        ):
+            raise BreadthError("qualification SHA-256 is invalid")
+        config["qualification_sha256"] = qualification_sha256
+    return hashlib.sha256(contract.canonical_json(config)).hexdigest()
+
+
+def validate_qualification(path, calibration_sha256):
+    """Validate the formal g12 gate authorizing a schema-2 calibration."""
+
+    path = Path(path).resolve()
+    value = _load_json(path, "g12 qualification")
+    if (
+        value.get("schema") != 1
+        or value.get("status") != "passed"
+        or value.get("profile") != "pr-offload-4thread-1us"
+    ):
+        raise BreadthError("qualification is not a formal PASS")
+    identity = value.get("identity")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("calibration_sha256") != calibration_sha256
+    ):
+        raise BreadthError("qualification calibration differs")
+    primary = value.get("primary")
+    replay = value.get("replay")
+    expected_keys = tuple(
+        f"g12:{system}" for system in offload.contract.PRIMARY_SYSTEMS
+    )
+    if (
+        not isinstance(primary, dict)
+        or not isinstance(replay, dict)
+        or set(primary) != set(expected_keys)
+        or set(replay) != set(expected_keys)
+    ):
+        raise BreadthError("qualification point set differs")
+    ordered_primary = {key: primary[key] for key in expected_keys}
+    ordered_replay = {key: replay[key] for key in expected_keys}
+    try:
+        expected_gate = offload.qualification_gate(ordered_primary)
+    except (offload.OffloadError, KeyError, TypeError, ValueError) as error:
+        raise BreadthError(
+            f"qualification primary evidence differs: {error}"
+        ) from error
+    if (
+        expected_gate.get("status") != "passed"
+        or expected_gate.get("offenders")
+        or value.get("performance_gate") != expected_gate
+    ):
+        raise BreadthError("qualification performance gate differs")
+    try:
+        offload.validate_replay(ordered_primary, ordered_replay)
+    except (offload.OffloadError, KeyError, TypeError, ValueError) as error:
+        raise BreadthError(f"qualification replay differs: {error}") from error
+    if primary != replay:
+        raise BreadthError("qualification replay differs from primary")
+    return {"path": str(path), "sha256": _sha256_file(path)}
+
+
+def _validate_formal_calibration_schema2(path, value):
+    """Validate the schema-2 AMU/CIRA interface consumed by formal builds."""
+
+    try:
+        from scripts import build_gapbs_matched_pr_spmv_variants as variants
+    except ImportError:
+        import build_gapbs_matched_pr_spmv_variants as variants
+    try:
+        read_entries = variants.resolve_amu_row_window(path)
+        cira_policy = variants.resolve_cira_build_policy(
+            path, "pgo-selected"
+        )
+        formal = value["amu"]["formal_profile"]
+        near_amu = value["near_data_pr"]["amu"]["parameters"]
+        near_cira = value["near_data_pr"]["cira"]
+    except (
+        KeyError, TypeError, variants.VariantEvidenceError
+    ) as error:
+        raise BreadthError(
+            f"formal schema-2 calibration interface differs: {error}"
+        ) from error
+    positive = (
+        "id_batch_entries", "pending_entries_per_state_machine", "spm_bytes"
+    )
+    nonnegative = (
+        "completion_cycles", "id_refill_cycles", "metadata_cycles"
+    )
+    if any(
+        not isinstance(formal.get(name), int)
+        or isinstance(formal.get(name), bool)
+        or formal[name] <= 0
+        for name in positive
+    ) or any(
+        not isinstance(formal.get(name), int)
+        or isinstance(formal.get(name), bool)
+        or formal[name] < 0
+        for name in nonnegative
+    ):
+        raise BreadthError("formal schema-2 AMU profile is invalid")
+    if (
+        read_entries
+        != formal["id_batch_entries"]
+        * formal["pending_entries_per_state_machine"]
+        or near_amu.get("read_entries") != read_entries
+        or near_amu.get("id_batch_entries") != formal["id_batch_entries"]
+        or near_amu.get("pending_entries_per_state_machine")
+        != formal["pending_entries_per_state_machine"]
+        or near_amu.get("spm_bytes") != formal["spm_bytes"]
+        or near_cira.get("selected_source_row") != cira_policy["source_row"]
+    ):
+        raise BreadthError("formal schema-2 calibration parameters differ")
+    return value
+
+
+def _validate_calibration(options):
+    calibration = _load_json(options.calibration, "calibration")
+    if (
+        calibration.get("passed") is True
+        or calibration.get("status") in {"pass", "accepted", "complete"}
+    ):
+        return calibration, None
+    if calibration.get("schema") != 2:
+        raise BreadthError("calibration manifest is not accepted")
+    qualification = getattr(options, "qualification", None)
+    if qualification is None:
+        raise BreadthError(
+            "qualification is required for schema-2 calibration"
+        )
+    _validate_formal_calibration_schema2(Path(options.calibration), calibration)
+    record = validate_qualification(
+        qualification, _sha256_file(options.calibration)
+    )
+    return calibration, record
 
 
 def _preflight_identity_unchecked(options):
     inputs = _load_json(options.inputs, "frozen inputs")
     if inputs.get("schema") != 1 or inputs.get("status") != "accepted":
         raise BreadthError("frozen inputs are not accepted schema 1")
-    calibration = _load_json(options.calibration, "calibration")
-    if not (
-        calibration.get("passed") is True
-        or calibration.get("status") in {"pass", "accepted", "complete"}
-    ):
-        raise BreadthError("calibration manifest is not accepted")
+    _calibration, qualification = _validate_calibration(options)
     # A prepared trace suite is created by build_matched_breadth_workloads.py.
     # Refuse to invent it here because source, binary, and ROI hashes are part
     # of the formal experiment identity.
@@ -1433,6 +1566,9 @@ def _preflight_identity_unchecked(options):
         selected_label,
         selected_ticks,
         options.correctness_policy,
+        qualification_sha256=(
+            qualification["sha256"] if qualification is not None else None
+        ),
     )
     identity = contract.ExperimentIdentity(
         code_sha256=code_hash,
