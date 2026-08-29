@@ -500,6 +500,13 @@ class M2NDPWorkloadTraceTest(unittest.TestCase):
                 timing_text = (
                     root / "package" / kernel["timing_path"]
                 ).read_text()
+                launch_fields = (
+                    root / "package" / kernel["launch_path"]
+                ).read_text().split()
+                self.assertGreaterEqual(
+                    int(launch_fields[4], 0), 32,
+                    "M2NDP always seeds one scratchpad packet",
+                )
                 self.assertTrue(text.startswith("-kernel name = "))
                 self.assertIn("\n-kernel id = ", text)
                 self.assertIn("\nKERNELBODY:\n", text)

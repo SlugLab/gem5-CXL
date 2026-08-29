@@ -272,7 +272,10 @@ def _kernel(name, kernel_id, rows):
 
 
 def _launch(kernel_id):
-    return f"1 {kernel_id} 0x1000000000000000 0x20 0x0 0x0\n"
+    # NdpUnit::Run always seeds one 32-byte argument packet, even when the
+    # launch has no arguments.  A zero-sized scratchpad therefore aborts in
+    # HashMemoryMap::Store before the first canonical instruction executes.
+    return f"1 {kernel_id} 0x1000000000000000 0x20 0x20 0x0\n"
 
 
 def _boundary_checks(bundle):
