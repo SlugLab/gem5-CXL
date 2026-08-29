@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -203,6 +204,41 @@ loadRaw(const void *address, uint32_t bytes)
 }
 
 void
+invalidateForHostWrite(void *destination, size_t bytes)
+{
+    auto *payload = static_cast<unsigned char *>(destination);
+    for (size_t offset = 0; offset < bytes; offset += 64)
+        __asm__ volatile("clflush (%0)" : : "r"(payload + offset) : "memory");
+    __asm__ volatile("mfence" : : : "memory");
+}
+
+std::string
+readTextFile(const std::string &path, const char *label)
+{
+    const int descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0)
+        throw std::runtime_error(std::string("cannot open ") + label);
+    std::string payload;
+    std::array<char, 64 * 1024> chunk;
+    while (true) {
+        invalidateForHostWrite(chunk.data(), chunk.size());
+        const ssize_t count = ::read(descriptor, chunk.data(), chunk.size());
+        if (count < 0) {
+            const int saved = errno;
+            ::close(descriptor);
+            errno = saved;
+            throw std::runtime_error(std::string("cannot read ") + label);
+        }
+        if (count == 0)
+            break;
+        payload.append(chunk.data(), size_t(count));
+    }
+    if (::close(descriptor) != 0)
+        throw std::runtime_error(std::string("cannot close ") + label);
+    return payload;
+}
+
+void
 storeRaw(void *address, uint32_t bytes, uint64_t bits)
 {
     if (bytes != 4 && bytes != 8)
@@ -254,8 +290,8 @@ class Memory
 
     void initialize(uint64_t base, const std::string &path, uint64_t bytes)
     {
-        std::ifstream stream(path, std::ios::binary);
-        if (!stream)
+        const int descriptor = ::open(path.c_str(), O_RDONLY);
+        if (descriptor < 0)
             throw std::runtime_error("cannot open initial memory image");
         for (uint64_t offset = 0; offset < bytes;) {
             const uint64_t logical = base + offset;
@@ -267,14 +303,23 @@ class Memory
             }
             const size_t count = std::min<uint64_t>(
                 bytes - offset, 64 - lineOffset(logical));
-            stream.read(static_cast<char *>(pointer(logical)), count);
-            if (stream.gcount() != static_cast<std::streamsize>(count))
+            invalidateForHostWrite(pointer(logical), count);
+            const ssize_t received = ::pread(
+                descriptor, pointer(logical), count, off_t(offset));
+            if (received != static_cast<ssize_t>(count)) {
+                ::close(descriptor);
                 throw std::runtime_error("initial memory image is truncated");
+            }
             offset += count;
         }
-        char trailing;
-        if (stream.get(trailing))
+        char trailing = 0;
+        invalidateForHostWrite(&trailing, sizeof(trailing));
+        if (::pread(descriptor, &trailing, 1, off_t(bytes)) != 0) {
+            ::close(descriptor);
             throw std::runtime_error("initial memory image is oversized");
+        }
+        if (::close(descriptor) != 0)
+            throw std::runtime_error("cannot close initial memory image");
     }
 
     void initializeWord(uint64_t logical, uint32_t bits, uint64_t value)
@@ -771,9 +816,7 @@ readBoundaryMap(const std::string &path)
 {
     if (path.empty())
         return {};
-    std::ifstream stream(path);
-    if (!stream)
-        throw std::runtime_error("cannot open canonical boundary map");
+    std::istringstream stream(readTextFile(path, "canonical boundary map"));
     std::string magic;
     uint64_t boundaryCount = 0;
     if (!(stream >> magic >> boundaryCount) || magic != "MTRBND2")
@@ -854,7 +897,8 @@ readInitialMemoryMap(const std::string &path, Memory &memory)
 {
     if (path.empty())
         throw std::runtime_error("canonical initial memory map is missing");
-    std::ifstream stream(path);
+    std::istringstream stream(
+        readTextFile(path, "canonical initial memory map"));
     std::string magic;
     uint64_t imageCount = 0;
     uint64_t sparseCount = 0;
