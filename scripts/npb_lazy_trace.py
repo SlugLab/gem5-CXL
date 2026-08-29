@@ -272,7 +272,9 @@ def primitive_count(invocation):
     )
 
 
-def expand_cg_spmv(state, invocation, batch_work_items):
+def _expand_cg_spmv_rows(
+    state, invocation, batch_work_items, row_first, row_stop, controls
+):
     required_parameters = (
         "rowstr", "colidx", "values", "source", "destination",
         "row_count", "edge_base", "column_base", "destination_count",
@@ -292,12 +294,15 @@ def expand_cg_spmv(state, invocation, batch_work_items):
         raise lazy.LazyTraceError("CG SpMV row count differs from work items")
     if parameters["destination_count"] != row_count:
         raise lazy.LazyTraceError("CG SpMV destination count differs")
-    yield _control(
-        invocation, canonical.Opcode.BARRIER, invocation.work_items
-    )
+    if not (0 <= row_first < row_stop <= row_count):
+        raise lazy.LazyTraceError("CG SpMV row slice is invalid")
+    if controls:
+        yield _control(
+            invocation, canonical.Opcode.BARRIER, invocation.work_items
+        )
     previous_end = None
-    for first in range(0, row_count, batch_work_items):
-        last = min(first + batch_work_items, row_count)
+    for first in range(row_first, row_stop, batch_work_items):
+        last = min(first + batch_work_items, row_stop)
         for row in range(first, last):
             start_address, start = state.load_raw(parameters["rowstr"], row)
             end_address, end = state.load_raw(parameters["rowstr"], row + 1)
@@ -365,13 +370,25 @@ def expand_cg_spmv(state, invocation, batch_work_items):
             )
             state.store_float(parameters["destination"], row, total)
             yield _store(invocation, row, destination_address, total)
-    if "nonzeros" in parameters:
+    if "nonzeros" in parameters and row_first == 0 and row_stop == row_count:
         nonzeros = _count_value(parameters["nonzeros"], "CG SpMV nonzeros")
         if previous_end is None or previous_end - edge_base != nonzeros:
             raise lazy.LazyTraceError(
                 "CG SpMV nonzero count differs from row offsets"
             )
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_cg_spmv(state, invocation, batch_work_items):
+    yield from _expand_cg_spmv_rows(
+        state,
+        invocation,
+        batch_work_items,
+        0,
+        invocation.work_items,
+        True,
+    )
 
 
 def lane_range(count, lane):
@@ -884,7 +901,9 @@ def f_index(i1, i2, i3, n1, n2, n3):
     return i1 + n1 * (i2 + n2 * i3)
 
 
-def expand_mg_zero3(state, invocation, batch_work_items):
+def _expand_mg_zero3_range(
+    state, invocation, batch_work_items, item_first, item_stop, controls
+):
     _require_parameters(invocation, (
         "u", "n1", "n2", "n3", "boundaries",
     ))
@@ -893,13 +912,28 @@ def expand_mg_zero3(state, invocation, batch_work_items):
     count = dimensions[0] * dimensions[1] * dimensions[2]
     if min(dimensions) < 1 or invocation.work_items != count:
         raise lazy.LazyTraceError("MG zero3 dimensions or work items differ")
-    yield _control(invocation, canonical.Opcode.BARRIER, count)
-    for first in range(0, count, batch_work_items):
-        for index in range(first, min(first + batch_work_items, count)):
+    if not (0 <= item_first < item_stop <= count):
+        raise lazy.LazyTraceError("MG zero3 slice is invalid")
+    if controls:
+        yield _control(invocation, canonical.Opcode.BARRIER, count)
+    for first in range(item_first, item_stop, batch_work_items):
+        for index in range(first, min(first + batch_work_items, item_stop)):
             address, _old = state.load_float(parameters["u"], index)
             state.store_float(parameters["u"], index, 0.0)
             yield _store(invocation, index, address, 0.0)
-    yield _control(invocation, canonical.Opcode.COMMIT)
+    if controls:
+        yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+def expand_mg_zero3(state, invocation, batch_work_items):
+    yield from _expand_mg_zero3_range(
+        state,
+        invocation,
+        batch_work_items,
+        0,
+        invocation.work_items,
+        True,
+    )
 
 
 def _grid_load(state, invocation, name, i1, i2, i3, dimensions, work_item):
@@ -1809,6 +1843,165 @@ def expand_mg_interp(state, invocation, _batch_work_items):
                     work_item, [z3[i1], z3[i1 + 1]], 0.125,
                 )
     yield _control(invocation, canonical.Opcode.COMMIT)
+
+
+@dataclasses.dataclass(frozen=True)
+class DependencyClosure:
+    array_words: tuple[tuple[str, int], ...]
+    scalar_names: tuple[str, ...]
+    has_complete_halo: bool
+
+
+_EXACT_ITEM_SLICE_KERNELS = frozenset({
+    "npb_cg_spmv",
+    "npb_mg_zero3",
+})
+
+
+def _slice_integer(value, label):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise lazy.LazyTraceError(f"NPB {label} is invalid")
+    return value
+
+
+def safe_work_item_range(
+    invocation,
+    requested_first,
+    requested_stop,
+    *,
+    stratum_first,
+    stratum_stop,
+):
+    """Align a request only to a currently proved kernel-safe unit."""
+
+    if invocation.kernel not in EXPANDERS:
+        raise lazy.LazyTraceError(
+            f"unknown NPB kernel {invocation.kernel}"
+        )
+    first = _slice_integer(requested_first, "slice first")
+    stop = _slice_integer(requested_stop, "slice stop")
+    stratum_first = _slice_integer(stratum_first, "stratum first")
+    stratum_stop = _slice_integer(stratum_stop, "stratum stop")
+    if first >= stop:
+        raise lazy.LazyTraceError("NPB slice is empty")
+    if stop > invocation.work_items:
+        raise lazy.LazyTraceError("NPB slice exceeds invocation work")
+    if stratum_first >= stratum_stop:
+        raise lazy.LazyTraceError("NPB stratum is empty")
+    realized = (
+        (first, stop)
+        if invocation.kernel in _EXACT_ITEM_SLICE_KERNELS
+        else (0, invocation.work_items)
+    )
+    if realized[0] < stratum_first or realized[1] > stratum_stop:
+        raise lazy.LazyTraceError("safe NPB range leaves its stratum")
+    return realized
+
+
+def _cg_spmv_dependency_closure(invocation, first, stop, state):
+    if state is None:
+        raise lazy.LazyTraceError(
+            "CG SpMV dependency closure requires structural state"
+        )
+    parameters = invocation.parameters
+    edge_base = parameters["edge_base"]
+    column_base = parameters["column_base"]
+    words = set()
+    for row in range(first, stop):
+        words.add((parameters["rowstr"], row))
+        words.add((parameters["rowstr"], row + 1))
+        _address, edge_first = state.load_raw(parameters["rowstr"], row)
+        _address, edge_stop = state.load_raw(parameters["rowstr"], row + 1)
+        if edge_first < edge_base or edge_stop < edge_first:
+            raise lazy.LazyTraceError("CG SpMV row offsets are invalid")
+        for edge in range(edge_first - edge_base, edge_stop - edge_base):
+            words.add((parameters["colidx"], edge))
+            words.add((parameters["values"], edge))
+            _address, column = state.load_raw(parameters["colidx"], edge)
+            if column < column_base:
+                raise lazy.LazyTraceError("CG SpMV column is invalid")
+            words.add((parameters["source"], column - column_base))
+        words.add((parameters["destination"], row))
+    return DependencyClosure(tuple(sorted(words)), (), False)
+
+
+def _mg_resid_dependency_closure(invocation, first, stop):
+    parameters = invocation.parameters
+    n1, n2, n3 = (
+        parameters["n1"], parameters["n2"], parameters["n3"]
+    )
+    x_items = n1 - 2
+    y_items = n2 - 2
+    if x_items <= 0 or y_items <= 0 or n3 <= 2:
+        raise lazy.LazyTraceError("MG resid dimensions are invalid")
+    words = set()
+    for item in range(first, stop):
+        i3 = 1 + item // (x_items * y_items)
+        remainder = item % (x_items * y_items)
+        i2 = 1 + remainder // x_items
+        i1 = 1 + remainder % x_items
+        if i3 >= n3 - 1:
+            raise lazy.LazyTraceError("MG resid work item is invalid")
+        center = f_index(i1, i2, i3, n1, n2, n3)
+        words.add((parameters["v"], center))
+        words.add((parameters["r"], center))
+        for z in range(i3 - 1, i3 + 2):
+            for y in range(i2 - 1, i2 + 2):
+                for x in range(i1 - 1, i1 + 2):
+                    words.add((
+                        parameters["u"], f_index(x, y, z, n1, n2, n3)
+                    ))
+    return DependencyClosure(tuple(sorted(words)), (), True)
+
+
+def dependency_closure(invocation, first, stop, *, state=None):
+    """Resolve the exact/superset raw words needed by a proved slice."""
+
+    first = _slice_integer(first, "dependency first")
+    stop = _slice_integer(stop, "dependency stop")
+    if first >= stop or stop > invocation.work_items:
+        raise lazy.LazyTraceError("NPB dependency slice is empty or invalid")
+    if invocation.kernel == "npb_cg_spmv":
+        return _cg_spmv_dependency_closure(invocation, first, stop, state)
+    if invocation.kernel == "npb_mg_resid":
+        return _mg_resid_dependency_closure(invocation, first, stop)
+    raise lazy.LazyTraceError(
+        f"NPB dependency resolver is absent for {invocation.kernel}"
+    )
+
+
+def expand_slice(
+    state, invocation, first, stop, batch_work_items=1024
+):
+    """Expand a proved work-item slice without replaying preceding items."""
+
+    lazy._validate_batch_work_items(batch_work_items)
+    first = _slice_integer(first, "slice first")
+    stop = _slice_integer(stop, "slice stop")
+    if first >= stop or stop > invocation.work_items:
+        raise lazy.LazyTraceError("NPB slice is empty or invalid")
+    if first == 0 and stop == invocation.work_items:
+        try:
+            expander = EXPANDERS[invocation.kernel]
+        except KeyError as error:
+            raise lazy.LazyTraceError(
+                f"unknown NPB kernel {invocation.kernel}"
+            ) from error
+        yield from expander(state, invocation, batch_work_items)
+        return
+    if invocation.kernel == "npb_cg_spmv":
+        yield from _expand_cg_spmv_rows(
+            state, invocation, batch_work_items, first, stop, False
+        )
+        return
+    if invocation.kernel == "npb_mg_zero3":
+        yield from _expand_mg_zero3_range(
+            state, invocation, batch_work_items, first, stop, False
+        )
+        return
+    raise lazy.LazyTraceError(
+        f"partial NPB slice is not proved for {invocation.kernel}"
+    )
 
 
 EXPANDERS = {
