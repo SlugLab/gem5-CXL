@@ -355,6 +355,14 @@ parser.add_argument(
     choices=["atomic"],
     help="CPU used before trial 0 begins; switch to --cpu at trial 0 begin.",
 )
+parser.add_argument(
+    "--fast-forward-replay-window",
+    action="store_true",
+    help=(
+        "Treat trial 0 as a replay-window warmup and trial 1 as its measured "
+        "ROI while switching from --fast-forward-cpu at trial 0."
+    ),
+)
 parser.add_argument("--scale", type=int)
 parser.add_argument("--iterations", type=int)
 parser.add_argument("--measure-trial", type=int, default=0)
@@ -518,6 +526,8 @@ if args.fast_forward_cpu and not args.roi_work_events:
     parser.error("--fast-forward-cpu requires --roi-work-events")
 if args.fast_forward_cpu and args.cpu not in ("timing", "o3"):
     parser.error("--fast-forward-cpu requires --cpu timing or o3")
+if args.fast_forward_replay_window and not args.fast_forward_cpu:
+    parser.error("--fast-forward-replay-window requires --fast-forward-cpu")
 if args.fast_forward_cpu and args.measure_trial != 1:
     parser.error(
         "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
@@ -534,12 +544,16 @@ try:
         arguments=workload_arguments,
         configured_scale=args.scale,
         configured_iterations=args.iterations,
-        fast_forward=bool(args.fast_forward_cpu),
+        fast_forward=(
+            bool(args.fast_forward_cpu) and not args.fast_forward_replay_window
+        ),
     )
 except ValueError as error:
     parser.error(str(error))
 if args.iterations <= 0:
     parser.error("--iterations must be positive")
+if args.fast_forward_replay_window and args.iterations != 2:
+    parser.error("--fast-forward-replay-window requires --iterations 2")
 if args.measure_trial < 0 or args.measure_trial >= args.iterations:
     parser.error("--measure-trial must be less than iterations")
 try:

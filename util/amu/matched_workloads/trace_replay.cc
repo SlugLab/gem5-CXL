@@ -206,15 +206,20 @@ loadRaw(const void *address, uint32_t bytes)
 void
 invalidateForHostWrite(void *destination, size_t bytes)
 {
-    auto *payload = static_cast<unsigned char *>(destination);
-    for (size_t offset = 0; offset < bytes; offset += 64)
-        __asm__ volatile("clflush (%0)" : : "r"(payload + offset) : "memory");
+    const uintptr_t first = reinterpret_cast<uintptr_t>(destination) & ~uintptr_t(63);
+    const uintptr_t stop = (
+        reinterpret_cast<uintptr_t>(destination) + bytes + 63
+    ) & ~uintptr_t(63);
+    for (uintptr_t address = first; address < stop; address += 64)
+        __asm__ volatile("clflush (%0)" : : "r"(address) : "memory");
     __asm__ volatile("mfence" : : : "memory");
 }
 
 std::string
 readTextFile(const std::string &path, const char *label)
 {
+    invalidateForHostWrite(
+        const_cast<char *>(path.c_str()), path.size() + 1);
     const int descriptor = ::open(path.c_str(), O_RDONLY);
     if (descriptor < 0)
         throw std::runtime_error(std::string("cannot open ") + label);
@@ -236,6 +241,109 @@ readTextFile(const std::string &path, const char *label)
     if (::close(descriptor) != 0)
         throw std::runtime_error(std::string("cannot close ") + label);
     return payload;
+}
+
+class TextReader
+{
+  public:
+    explicit TextReader(const std::string &payload) : payload(payload) {}
+
+    std::string token()
+    {
+        skipWhitespace();
+        const size_t start = offset;
+        while (offset < payload.size() && !isWhitespace(payload[offset]))
+            ++offset;
+        if (start == offset)
+            throw std::runtime_error("canonical text token is missing");
+        return payload.substr(start, offset - start);
+    }
+
+    uint64_t integer()
+    {
+        skipWhitespace();
+        if (offset == payload.size() || payload[offset] < '0' ||
+            payload[offset] > '9')
+            throw std::runtime_error("canonical text integer is missing");
+        uint64_t value = 0;
+        do {
+            const uint64_t digit = uint64_t(payload[offset] - '0');
+            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+                throw std::runtime_error("canonical text integer overflows");
+            value = value * 10 + digit;
+            ++offset;
+        } while (offset < payload.size() && payload[offset] >= '0' &&
+                 payload[offset] <= '9');
+        if (offset < payload.size() && !isWhitespace(payload[offset]))
+            throw std::runtime_error("canonical text integer is invalid");
+        return value;
+    }
+
+    bool finished()
+    {
+        skipWhitespace();
+        return offset == payload.size();
+    }
+
+  private:
+    static bool isWhitespace(char value)
+    {
+        return value == ' ' || value == '\n' || value == '\r' ||
+               value == '\t' || value == '\f' || value == '\v';
+    }
+
+    void skipWhitespace()
+    {
+        while (offset < payload.size() && isWhitespace(payload[offset]))
+            ++offset;
+    }
+
+    const std::string &payload;
+    size_t offset = 0;
+};
+
+void
+writeDescriptor(int descriptor, const std::string &payload, const char *label)
+{
+    invalidateForHostWrite(
+        const_cast<char *>(payload.data()), payload.size());
+    size_t written = 0;
+    while (written < payload.size()) {
+        const ssize_t count = ::write(
+            descriptor, payload.data() + written, payload.size() - written);
+        if (count <= 0)
+            throw std::runtime_error(std::string("cannot write ") + label);
+        written += size_t(count);
+    }
+}
+
+void
+writeTextFile(const std::string &path, const std::string &payload)
+{
+    invalidateForHostWrite(
+        const_cast<char *>(path.c_str()), path.size() + 1);
+    const int descriptor = ::open(
+        path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (descriptor < 0)
+        throw std::runtime_error("cannot create replay result");
+    try {
+        writeDescriptor(descriptor, payload, "replay result");
+    } catch (...) {
+        ::close(descriptor);
+        throw;
+    }
+    if (::close(descriptor) != 0)
+        throw std::runtime_error("cannot close replay result");
+}
+
+void
+writeAllocationMarker(size_t allocatedBytes)
+{
+    std::ostringstream stream;
+    stream << "TRACE_REPLAY_ALLOCATION logical_bytes=" << allocatedBytes
+           << " allocated_bytes=" << allocatedBytes
+           << " all_memory_cxl=true\n";
+    writeDescriptor(STDOUT_FILENO, stream.str(), "allocation marker");
 }
 
 void
@@ -290,6 +398,8 @@ class Memory
 
     void initialize(uint64_t base, const std::string &path, uint64_t bytes)
     {
+        invalidateForHostWrite(
+            const_cast<char *>(path.c_str()), path.size() + 1);
         const int descriptor = ::open(path.c_str(), O_RDONLY);
         if (descriptor < 0)
             throw std::runtime_error("cannot open initial memory image");
@@ -732,43 +842,13 @@ evaluate(const TraceRecord &record)
 std::vector<TraceRecord>
 readTrace(const std::string &path)
 {
-    const int descriptor = ::open(path.c_str(), O_RDONLY);
-    if (descriptor < 0)
-        throw std::runtime_error("cannot open canonical trace");
-    std::vector<TraceRecord> records;
-    off_t offset = 0;
-    while (true) {
-        alignas(64) std::array<unsigned char, 64> payload;
-        size_t received = 0;
-        while (received < sizeof(TraceRecord)) {
-            __asm__ volatile("clflush (%0)" : : "r"(payload.data()) : "memory");
-            __asm__ volatile("mfence" : : : "memory");
-            const ssize_t count = ::pread(
-                descriptor, payload.data() + received,
-                sizeof(TraceRecord) - received, offset + off_t(received));
-            if (count < 0) {
-                ::close(descriptor);
-                throw std::runtime_error("canonical trace pread failed");
-            }
-            if (count == 0)
-                break;
-            received += size_t(count);
-        }
-        if (received == 0)
-            break;
-        if (received != sizeof(TraceRecord)) {
-            ::close(descriptor);
-            throw std::runtime_error("canonical trace byte count differs");
-        }
-        TraceRecord record;
-        std::memcpy(&record, payload.data(), sizeof(record));
-        records.push_back(record);
-        offset += off_t(sizeof(record));
-    }
-    if (::close(descriptor) != 0)
-        throw std::runtime_error("canonical trace close failed");
-    if (records.empty())
+    const std::string payload = readTextFile(path, "canonical trace");
+    if (payload.empty())
         throw std::runtime_error("canonical trace is empty");
+    if (payload.size() % sizeof(TraceRecord) != 0)
+        throw std::runtime_error("canonical trace byte count differs");
+    std::vector<TraceRecord> records(payload.size() / sizeof(TraceRecord));
+    std::memcpy(records.data(), payload.data(), payload.size());
     for (size_t index = 0; index < records.size(); ++index) {
         if (records[index].sequence != index || records[index].reserved != 0)
             throw std::runtime_error("canonical trace sequence differs");
@@ -897,38 +977,39 @@ readInitialMemoryMap(const std::string &path, Memory &memory)
 {
     if (path.empty())
         throw std::runtime_error("canonical initial memory map is missing");
-    std::istringstream stream(
-        readTextFile(path, "canonical initial memory map"));
-    std::string magic;
-    uint64_t imageCount = 0;
+    const std::string payload = readTextFile(
+        path, "canonical initial memory map");
+    TextReader stream(payload);
+    const std::string magic = stream.token();
+    const uint64_t imageCount = stream.integer();
     uint64_t sparseCount = 0;
-    if (!(stream >> magic >> imageCount) ||
-        (magic != "MTRINI1" && magic != "MTRINI2"))
+    if (magic != "MTRINI1" && magic != "MTRINI2")
         throw std::runtime_error("canonical initial memory map header differs");
-    if (magic == "MTRINI2" && !(stream >> sparseCount))
-        throw std::runtime_error("canonical sparse memory count differs");
+    if (magic == "MTRINI2")
+        sparseCount = stream.integer();
     for (uint64_t index = 0; index < imageCount; ++index) {
-        uint64_t base = 0, wordBits = 0, words = 0;
-        std::string imagePath;
-        if (!(stream >> base >> wordBits >> words >> imagePath) ||
-            (wordBits != 32 && wordBits != 64) ||
+        const uint64_t base = stream.integer();
+        const uint64_t wordBits = stream.integer();
+        const uint64_t words = stream.integer();
+        const std::string imagePath = stream.token();
+        if ((wordBits != 32 && wordBits != 64) ||
             words > std::numeric_limits<uint64_t>::max() / (wordBits / 8)) {
             throw std::runtime_error("canonical initial memory image differs");
         }
         memory.initialize(base, imagePath, words * (wordBits / 8));
     }
     for (uint64_t index = 0; index < sparseCount; ++index) {
-        uint64_t address = 0, wordBits = 0, value = 0;
-        if (!(stream >> address >> wordBits >> value) ||
-            (wordBits != 32 && wordBits != 64) ||
+        const uint64_t address = stream.integer();
+        const uint64_t wordBits = stream.integer();
+        const uint64_t value = stream.integer();
+        if ((wordBits != 32 && wordBits != 64) ||
             (wordBits == 32 && value > UINT32_MAX)) {
             throw std::runtime_error(
                 "canonical sparse initial memory word differs");
         }
         memory.initializeWord(address, uint32_t(wordBits), value);
     }
-    std::string trailing;
-    if (stream >> trailing)
+    if (!stream.finished())
         throw std::runtime_error("canonical initial memory map has trailing data");
 }
 
@@ -1514,9 +1595,7 @@ writeResult(const std::string &path, const std::string &system,
             size_t phases, const ReplayStats &stats, const std::string &mode,
             const std::vector<OutputBoundary> &boundaries = {})
 {
-    std::ofstream stream(path);
-    if (!stream)
-        throw std::runtime_error("cannot create replay result");
+    std::ostringstream stream;
     stream << "{\"allocated_bytes\":" << allocatedBytes
            << ",\"commit_order\":[";
     for (size_t index = 0; index < commits.size(); ++index) {
@@ -1577,6 +1656,7 @@ writeResult(const std::string &path, const std::string &system,
            << ",\"verification\":\"pass\"}\n";
     if (!stream)
         throw std::runtime_error("replay result write failed");
+    writeTextFile(path, stream.str());
 }
 
 void
@@ -1662,10 +1742,7 @@ executeStreamFile(const std::string &path, const std::string &system,
                     "canonical boundary after-sequence is out of range");
         }
     }
-    std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
-              << memory.allocatedBytes() << " allocated_bytes="
-              << memory.allocatedBytes()
-              << " all_memory_cxl=true" << std::endl;
+    writeAllocationMarker(memory.allocatedBytes());
     writeResult(resultPath, system, size_t(expectedSequence), commits,
                 memory.allocatedBytes(), phaseExecutions, total,
                 "functional", boundaries);
@@ -1744,9 +1821,14 @@ main(int argc, char **argv)
             if (windowManifest.empty() || !hasPhase || !hasWindowIndex ||
                 !hasMeasureStartItem)
                 throw std::runtime_error("window replay selection is incomplete");
-            std::ifstream manifest(windowManifest);
-            if (!manifest)
+            invalidateForHostWrite(
+                const_cast<char *>(windowManifest.c_str()),
+                windowManifest.size() + 1);
+            const int manifest = ::open(windowManifest.c_str(), O_RDONLY);
+            if (manifest < 0)
                 throw std::runtime_error("cannot open window manifest");
+            if (::close(manifest) != 0)
+                throw std::runtime_error("cannot close window manifest");
         }
 #ifdef TRACE_REPLAY_NATIVE
         (void)selectedPhase;
@@ -1770,10 +1852,7 @@ main(int argc, char **argv)
         readInitialMemoryMap(initialMemoryMap, memory);
         auto boundaryProbes = indexBoundaryProbes(
             outputBoundaries, records.size());
-        std::cout << "TRACE_REPLAY_ALLOCATION logical_bytes="
-                  << memory.allocatedBytes() << " allocated_bytes="
-                  << memory.allocatedBytes()
-                  << " all_memory_cxl=true" << std::endl;
+        writeAllocationMarker(memory.allocatedBytes());
         const auto phases = buildPhases(records);
         std::unordered_map<uint64_t, uint64_t> previousStore;
         std::unordered_map<uint64_t, uint64_t> lastStore;
@@ -1801,11 +1880,15 @@ main(int argc, char **argv)
             const auto measured = selectGroups(phases, measureStartItem, false);
             if (measured.empty())
                 throw std::runtime_error("window measured range is empty");
+#ifndef TRACE_REPLAY_NATIVE
+            m5_work_begin(selectedPhase, windowIndex);
+#endif
             if (!warmup.empty()) {
                 executeTrace(system, warmup, records, memory, dependencies,
                              previousStore, commitSlots, commits);
             }
 #ifndef TRACE_REPLAY_NATIVE
+            m5_work_end(selectedPhase, windowIndex);
             m5_work_begin(selectedPhase, windowIndex);
 #endif
             stats = executeTrace(system, measured, records, memory,

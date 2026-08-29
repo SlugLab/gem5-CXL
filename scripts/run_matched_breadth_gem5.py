@@ -1451,7 +1451,12 @@ def command_for(options):
     if options.system == "cira":
         command.extend(("--cira", "--cira-to-l2"))
     if options.mode == "window":
-        command.extend(("--roi-work-events", "--continue-after-roi"))
+        command.extend((
+            "--roi-work-events", "--continue-after-roi",
+            "--fast-forward-cpu", "atomic",
+            "--fast-forward-replay-window",
+            "--iterations", "2", "--measure-trial", "1",
+        ))
     return command
 
 

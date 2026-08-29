@@ -1415,6 +1415,12 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             window_args[window_args.index("--window-index") + 1], "7"
         )
         self.assertIn("--roi-work-events", window)
+        self.assertEqual(
+            window[window.index("--fast-forward-cpu") + 1], "atomic"
+        )
+        self.assertIn("--fast-forward-replay-window", window)
+        self.assertEqual(window[window.index("--iterations") + 1], "2")
+        self.assertEqual(window[window.index("--measure-trial") + 1], "1")
 
     def test_run_evidence_uses_gem5_owned_amu_counters_and_exact_commits(self):
         operations = (
