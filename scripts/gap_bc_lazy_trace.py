@@ -706,6 +706,106 @@ EXPANDERS = {
 }
 
 
+def fast_forward(state, invocation, first=0, stop=None):
+    """Apply BC state semantics without allocating canonical operations."""
+
+    if stop is None:
+        stop = invocation.work_items
+    if not 0 <= first < stop <= invocation.work_items:
+        raise BCTraceError("GAP BC fast-forward range is invalid")
+    parameters = invocation.parameters
+    if invocation.kernel == "gap_bc_reset":
+        if first != 0 or stop != invocation.work_items:
+            raise BCTraceError("GAP BC reset fast-forward must be complete")
+        for vertex in range(parameters["nodes"]):
+            state.store_raw("depths", vertex, 0xFFFFFFFF)
+            state.store_float("path_counts", vertex, 0.0)
+            state.store_float("deltas", vertex, 0.0)
+        return
+    if invocation.kernel == "gap_bc_source_init":
+        if first != 0 or stop != 1:
+            raise BCTraceError("GAP BC source fast-forward must be complete")
+        source = parameters["source"]
+        state.store_raw("depths", source, 0)
+        state.store_float("path_counts", source, 1.0)
+        state.store_raw("queue", 0, source)
+        return
+    if invocation.kernel == "gap_bc_bfs_level":
+        if first == 0:
+            next_queue_slot = parameters["next_queue_start"]
+        else:
+            next_queue_slot = state.load_scalar("bc_next_queue")
+        queue_start = parameters["queue_start"]
+        for local_item in range(first, stop):
+            vertex = state.load_raw("queue", queue_start + local_item)[1]
+            row_start = state.load_raw("offsets", vertex)[1]
+            row_stop = state.load_raw("offsets", vertex + 1)[1]
+            depth_u = state.load_raw("depths", vertex)[1]
+            for edge in range(row_start, row_stop):
+                neighbor = state.load_raw("neighbors", edge)[1]
+                depth_v = state.load_raw("depths", neighbor)[1]
+                if depth_v == 0xFFFFFFFF:
+                    if next_queue_slot >= parameters["next_queue_stop"]:
+                        raise BCTraceError(
+                            "GAP BC fast-forward discovered extra vertices"
+                        )
+                    depth_v = depth_u + 1
+                    state.store_raw("depths", neighbor, depth_v)
+                    state.store_raw("queue", next_queue_slot, neighbor)
+                    next_queue_slot += 1
+                if depth_v == depth_u + 1:
+                    path_u = state.load_float("path_counts", vertex)[1]
+                    path_v = state.load_float("path_counts", neighbor)[1]
+                    state.store_float(
+                        "path_counts", neighbor, f64(path_v + path_u)
+                    )
+        state.store_scalar("bc_next_queue", next_queue_slot)
+        if (
+            stop == invocation.work_items
+            and next_queue_slot != parameters["next_queue_stop"]
+        ):
+            raise BCTraceError(
+                "GAP BC fast-forward discovery cardinality differs"
+            )
+        return
+    if invocation.kernel == "gap_bc_reverse_level":
+        queue_start = parameters["queue_start"]
+        for local_item in range(first, stop):
+            vertex = state.load_raw("queue", queue_start + local_item)[1]
+            row_start = state.load_raw("offsets", vertex)[1]
+            row_stop = state.load_raw("offsets", vertex + 1)[1]
+            depth_u = state.load_raw("depths", vertex)[1]
+            delta = f32(0.0)
+            for edge in range(row_start, row_stop):
+                neighbor = state.load_raw("neighbors", edge)[1]
+                if state.load_raw("depths", neighbor)[1] != depth_u + 1:
+                    continue
+                path_u = state.load_float("path_counts", vertex)[1]
+                path_v = state.load_float("path_counts", neighbor)[1]
+                delta_v = state.load_float("deltas", neighbor)[1]
+                if path_v == 0.0:
+                    raise BCTraceError(
+                        "GAP BC fast-forward successor path count is zero"
+                    )
+                term = f64(
+                    f64(path_u / path_v) * f64(1.0 + float(delta_v))
+                )
+                delta = f32(float(delta) + term)
+            score = state.load_float("scores", vertex)[1]
+            state.store_float("deltas", vertex, delta)
+            state.store_float("scores", vertex, f32(score + delta))
+        return
+    if invocation.kernel == "gap_bc_normalize":
+        maximum = f32_from_raw(parameters["maximum_raw"])
+        for vertex in range(first, stop):
+            score = state.load_float("scores", vertex)[1]
+            state.store_float("scores", vertex, f32(score / maximum))
+        return
+    raise BCTraceError(
+        f"GAP BC fast-forward is not defined for {invocation.kernel}"
+    )
+
+
 def fixed_controls(invocation):
     if invocation.kernel not in {
         "gap_bc_bfs_level", "gap_bc_reverse_level"

@@ -73,6 +73,16 @@ def fixed_controls(invocation):
     return function(invocation)
 
 
+def fast_forward(state, invocation, first=0, stop=None):
+    module = module_for_kernel(invocation.kernel)
+    function = getattr(module, "fast_forward", None)
+    if function is None:
+        raise lazy.LazyTraceError(
+            f"fast-forward is not defined for {invocation.kernel}"
+        )
+    return function(state, invocation, first, stop)
+
+
 def phase_name(bundle, phase):
     names = bundle.meta.get("phase_names")
     if isinstance(names, dict):

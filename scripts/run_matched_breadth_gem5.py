@@ -203,23 +203,12 @@ def _partition_bc_lazy_window(source, phase, window, state):
 
     with lazy.MappedState(source) as mapped:
         for invocation in source.invocations[:first_phase_ordinal]:
-            operations = lazy_registry.expander(invocation)(
-                mapped, invocation, 1024
-            )
-            yield from consume(
-                mapped, invocation, operations, selected=False
-            )
+            lazy_registry.fast_forward(mapped, invocation)
         for invocation in phase_invocations:
             invocation_start = phase_base
             invocation_stop = phase_base + invocation.work_items
             if invocation_stop <= window.warmup_start:
-                operations = lazy_registry.expand_slice(
-                    mapped, invocation, 0, invocation.work_items, 1024,
-                    include_controls=False,
-                )
-                yield from consume(
-                    mapped, invocation, operations, selected=False
-                )
+                lazy_registry.fast_forward(mapped, invocation)
             elif invocation_start < window.measure_stop:
                 local_start = max(
                     0, window.warmup_start - invocation_start
@@ -229,12 +218,8 @@ def _partition_bc_lazy_window(source, phase, window, state):
                     window.measure_stop - invocation_start,
                 )
                 if local_start:
-                    operations = lazy_registry.expand_slice(
-                        mapped, invocation, 0, local_start, 1024,
-                        include_controls=False,
-                    )
-                    yield from consume(
-                        mapped, invocation, operations, selected=False
+                    lazy_registry.fast_forward(
+                        mapped, invocation, 0, local_start
                     )
                 operations = lazy_registry.expand_slice(
                     mapped, invocation, local_start, local_stop, 1024,

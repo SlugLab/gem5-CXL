@@ -305,6 +305,32 @@ class GapBCLazyTraceTest(unittest.TestCase):
             state["expanded"], bundle.dynamic_work["primitive_records"]
         )
 
+    def test_fast_forward_matches_canonical_state_without_operation_objects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._build(Path(temporary) / "bc", compact=True)
+            stop = next(
+                row.ordinal for row in bundle.invocations
+                if row.kernel == "gap_bc_reverse_level"
+            )
+            names = ("depths", "path_counts", "deltas", "scores", "queue")
+            with lazy.MappedState(bundle) as canonical_state:
+                for invocation in bundle.invocations[:stop]:
+                    tuple(bc.EXPANDERS[invocation.kernel](
+                        canonical_state, invocation, 8
+                    ))
+                expected = {
+                    name: canonical_state.boundary_sha256(name)
+                    for name in names
+                }
+            with lazy.MappedState(bundle) as fast_state:
+                for invocation in bundle.invocations[:stop]:
+                    bc.fast_forward(fast_state, invocation)
+                observed = {
+                    name: fast_state.boundary_sha256(name)
+                    for name in names
+                }
+        self.assertEqual(observed, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
