@@ -141,18 +141,25 @@ def _validate_qualification_record(record, calibration_sha256):
     return current
 
 
-def new_state(shared, qualification, identity):
+def new_state(
+    shared, qualification, identity, *, correctness_policy="bit-exact",
+):
     shared = validate_shared(shared)
     qualification = _validate_qualification_record(
         qualification, shared["calibration"]["sha256"]
     )
     if not isinstance(identity, contract.ExperimentIdentity):
         raise SpectrumError("aggregate identity has the wrong type")
+    try:
+        correctness_policy = breadth._correctness_policy(correctness_policy)
+    except breadth.BreadthError as error:
+        raise SpectrumError(str(error)) from error
     return {
         "schema": 1,
         "status": "planned",
         "identity": dataclasses.asdict(identity),
         "identity_sha256": identity.digest(),
+        "correctness_policy": correctness_policy,
         "shared": shared,
         "qualification": qualification,
         "latencies": {
@@ -178,10 +185,15 @@ def _child_identity(path):
 
 def validate_child(
     root, label, shared, *, expected_identity_sha256=None,
+    correctness_policy="bit-exact",
 ):
     if label not in latency.LABELS:
         raise SpectrumError(f"unsupported child latency: {label}")
     shared = validate_shared(shared)
+    try:
+        correctness_policy = breadth._correctness_policy(correctness_policy)
+    except breadth.BreadthError as error:
+        raise SpectrumError(str(error)) from error
     root = Path(root).resolve()
     inconclusive_path = root / "inconclusive.json"
     complete_path = root / "complete.json"
@@ -211,6 +223,8 @@ def validate_child(
         raise SpectrumError("child campaign is inconclusive")
     if complete.get("status") != "complete":
         raise SpectrumError("child campaign is not complete")
+    if complete.get("correctness_policy") != correctness_policy:
+        raise SpectrumError("child campaign correctness policy differs")
     if (
         complete.get("identity_sha256") != digest
         or complete.get("cxl_link_delay") != label
@@ -254,6 +268,7 @@ def record_child(state, label, root, command):
     child = validate_child(
         root, label, state.get("shared"),
         expected_identity_sha256=expected,
+        correctness_policy=state.get("correctness_policy", "bit-exact"),
     )
     command_record = _command_record(command)
     updated = {
@@ -289,6 +304,9 @@ def complete_state(state, root):
         child = validate_child(
             row.get("child_root"), label, state["shared"],
             expected_identity_sha256=row.get("identity_sha256"),
+            correctness_policy=state.get(
+                "correctness_policy", "bit-exact"
+            ),
         )
         if child["complete"] != row.get("complete"):
             raise SpectrumError("child complete manifest hash differs")
@@ -309,7 +327,13 @@ def _record(path):
     return {"path": str(path), "sha256": _sha256_file(path)}
 
 
-def _aggregate_identity(shared, qualification):
+def _aggregate_identity(
+    shared, qualification, *, correctness_policy="bit-exact",
+):
+    try:
+        correctness_policy = breadth._correctness_policy(correctness_policy)
+    except breadth.BreadthError as error:
+        raise SpectrumError(str(error)) from error
     code_paths = (
         Path(__file__).resolve(),
         Path(breadth.__file__).resolve(),
@@ -323,6 +347,7 @@ def _aggregate_identity(shared, qualification):
         "workloads": WORKLOADS,
         "systems": SYSTEMS,
         "qualification_sha256": qualification["sha256"],
+        "correctness_policy": correctness_policy,
     })).hexdigest()
     return contract.ExperimentIdentity(
         code_sha256=code_sha256,
@@ -353,7 +378,9 @@ def _bind_prepared(child_root, prepared):
     return target
 
 
-def _child_command(shared, root, label, *, resume):
+def _child_command(
+    shared, root, label, *, resume, correctness_policy="bit-exact",
+):
     command = [
         sys.executable,
         str(Path(breadth.__file__).resolve()),
@@ -361,6 +388,7 @@ def _child_command(shared, root, label, *, resume):
         "--calibration", shared["calibration"]["path"],
         "--root", str(Path(root).resolve()),
         "--cxl-link-delay", label,
+        "--correctness-policy", correctness_policy,
     ]
     if resume:
         command.append("--resume")
@@ -369,6 +397,13 @@ def _child_command(shared, root, label, *, resume):
 
 def run(options):
     root = Path(options.root).resolve()
+    correctness_policy = getattr(
+        options, "correctness_policy", "bit-exact"
+    )
+    try:
+        correctness_policy = breadth._correctness_policy(correctness_policy)
+    except breadth.BreadthError as error:
+        raise SpectrumError(str(error)) from error
     shared = validate_shared({
         "inputs": _record(options.inputs),
         "calibration": _record(options.calibration),
@@ -377,7 +412,9 @@ def run(options):
     qualification = validate_qualification(
         options.qualification, shared["calibration"]["sha256"]
     )
-    identity = _aggregate_identity(shared, qualification)
+    identity = _aggregate_identity(
+        shared, qualification, correctness_policy=correctness_policy
+    )
     identity_path = root / "identity.json"
     state_path = root / "state.json"
     if options.resume:
@@ -396,6 +433,7 @@ def run(options):
                 shared["calibration"]["sha256"],
             ) != qualification
             or state.get("status") != "planned"
+            or state.get("correctness_policy") != correctness_policy
         ):
             raise SpectrumError("resume aggregate identity differs")
     else:
@@ -405,7 +443,10 @@ def run(options):
             contract.bind_root(root, identity)
         except contract.ContractError as error:
             raise SpectrumError(str(error)) from error
-        state = new_state(shared, qualification, identity)
+        state = new_state(
+            shared, qualification, identity,
+            correctness_policy=correctness_policy,
+        )
         contract.atomic_write_json(state_path, state)
     for label in latency.LABELS:
         row = state["latencies"][label]
@@ -414,12 +455,14 @@ def run(options):
             validate_child(
                 child_root, label, shared,
                 expected_identity_sha256=row.get("identity_sha256"),
+                correctness_policy=correctness_policy,
             )
             continue
         _bind_prepared(child_root, shared["prepared"])
         resume_child = (child_root / "identity.json").is_file()
         command = _child_command(
-            shared, child_root, label, resume=resume_child
+            shared, child_root, label, resume=resume_child,
+            correctness_policy=correctness_policy,
         )
         row["command"] = _command_record(command)
         row["status"] = "running"
@@ -453,6 +496,11 @@ def parse_args(argv=None):
     parser.add_argument("--prepared", type=Path, required=True)
     parser.add_argument("--qualification", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--correctness-policy",
+        choices=breadth.CORRECTNESS_POLICIES,
+        default="bit-exact",
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 

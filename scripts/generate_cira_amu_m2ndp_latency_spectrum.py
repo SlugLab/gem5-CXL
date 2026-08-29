@@ -80,6 +80,7 @@ class SpectrumRow:
     window_count: int
     workers: int = 4
     all_memory_cxl: bool = True
+    correctness_policy: str = "bit-exact"
     verification: str = "bit-exact"
 
 
@@ -88,6 +89,7 @@ class SpectrumData:
     rows: tuple[SpectrumRow, ...]
     geometric_means: dict
     input_records: dict
+    correctness_policy: str
 
 
 def _sha256_file(path):
@@ -124,12 +126,19 @@ def _close(left, right):
     return abs(left - right) <= max(abs(right) * Decimal("1e-12"), Decimal("1e-18"))
 
 
-def _functional_output_sha256(workload_row, system):
+def _functional_record(workload_row, system):
     key = "m2ndp-funcsim" if system == "m2ndp" else system
     try:
-        outputs = workload_row["functional"][key]["outputs"]
+        record = workload_row["functional"][key]
     except (KeyError, TypeError) as error:
         raise PublicationError(f"{system} functional outputs are missing") from error
+    if not isinstance(record, dict):
+        raise PublicationError(f"{system} functional evidence is invalid")
+    return record
+
+
+def _functional_output_sha256(workload_row, system):
+    outputs = _functional_record(workload_row, system).get("outputs")
     if (
         not isinstance(outputs, dict)
         or not outputs
@@ -151,14 +160,21 @@ def _validate_aggregate(value, complete_path):
     ):
         raise PublicationError("aggregate latency matrix is not complete")
     try:
+        correctness_policy = breadth._correctness_policy(
+            value.get("correctness_policy")
+        )
         shared = spectrum.validate_shared(value.get("shared"))
         qualification = spectrum._validate_qualification_record(
             value.get("qualification"), shared["calibration"]["sha256"]
         )
         stored_identity = contract.ExperimentIdentity(**value["identity"])
-        expected_identity = spectrum._aggregate_identity(shared, qualification)
+        expected_identity = spectrum._aggregate_identity(
+            shared, qualification,
+            correctness_policy=correctness_policy,
+        )
     except (
-        KeyError, TypeError, contract.ContractError, spectrum.SpectrumError
+        KeyError, TypeError, contract.ContractError, spectrum.SpectrumError,
+        breadth.BreadthError,
     ) as error:
         raise PublicationError(f"aggregate identity differs: {error}") from error
     if (
@@ -166,7 +182,7 @@ def _validate_aggregate(value, complete_path):
         or value.get("identity_sha256") != expected_identity.digest()
     ):
         raise PublicationError("aggregate identity differs")
-    return shared, qualification, {
+    return shared, qualification, correctness_policy, {
         "aggregate": {
             "path": str(Path(complete_path).resolve()),
             "sha256": _sha256_file(complete_path),
@@ -176,12 +192,13 @@ def _validate_aggregate(value, complete_path):
     }
 
 
-def _child_rows(aggregate, shared, label):
+def _child_rows(aggregate, shared, label, correctness_policy):
     row = aggregate["latencies"][label]
     try:
         validated = spectrum.validate_child(
             row.get("child_root"), label, shared,
             expected_identity_sha256=row.get("identity_sha256"),
+            correctness_policy=correctness_policy,
         )
     except spectrum.SpectrumError as error:
         raise PublicationError(str(error)) from error
@@ -200,8 +217,12 @@ def _child_rows(aggregate, shared, label):
     rows = []
     for workload in WORKLOADS:
         workload_row = child["workloads"][workload]
-        if not breadth.functional_complete(workload_row.get("functional")):
-            raise PublicationError(f"{label}:{workload} functional bit-exact gate failed")
+        if not breadth.functional_complete(
+            workload_row.get("functional"), correctness_policy
+        ):
+            raise PublicationError(
+                f"{label}:{workload} functional {correctness_policy} gate failed"
+            )
         result = child["results"][workload]
         if (
             result.get("status") != "complete"
@@ -253,6 +274,13 @@ def _child_rows(aggregate, shared, label):
                 raise PublicationError(
                     f"{label}:{workload}:{system} stored speedup differs"
                 )
+            functional_record = _functional_record(workload_row, system)
+            verification = (
+                "bit-exact"
+                if functional_record.get("bit_exact") is True
+                and functional_record.get("mismatched_words") == 0
+                else "native-verified"
+            )
             rows.append(SpectrumRow(
                 latency=label,
                 latency_ticks=latency.ticks(label),
@@ -266,6 +294,8 @@ def _child_rows(aggregate, shared, label):
                 evidence_sha256=validated["complete"]["sha256"],
                 output_sha256=_functional_output_sha256(workload_row, system),
                 window_count=result["level"],
+                correctness_policy=correctness_policy,
+                verification=verification,
             ))
     return rows, child.get("g20_graph_sha256")
 
@@ -291,11 +321,15 @@ def _geometric_means(rows):
 def load_complete(path):
     path = Path(path).resolve()
     aggregate = _load_json(path, "aggregate complete manifest")
-    shared, _, input_records = _validate_aggregate(aggregate, path)
+    shared, _, correctness_policy, input_records = _validate_aggregate(
+        aggregate, path
+    )
     rows = []
     graph_hash = None
     for label in latency.LABELS:
-        child_rows, selected_graph_hash = _child_rows(aggregate, shared, label)
+        child_rows, selected_graph_hash = _child_rows(
+            aggregate, shared, label, correctness_policy
+        )
         if graph_hash is None:
             graph_hash = selected_graph_hash
         elif selected_graph_hash != graph_hash:
@@ -309,6 +343,7 @@ def load_complete(path):
         rows=tuple(rows),
         geometric_means=_geometric_means(rows),
         input_records=input_records,
+        correctness_policy=correctness_policy,
     )
 
 
@@ -339,6 +374,7 @@ def _json_bytes(data):
         "latencies": list(latency.LABELS),
         "workloads": list(WORKLOADS),
         "systems": list(SYSTEMS),
+        "correctness_policy": data.correctness_policy,
         "geometric_means": data.geometric_means,
         "inputs": data.input_records,
         "rows": rows,
@@ -644,6 +680,7 @@ def publish(data, output_root):
             "status": "complete",
             "row_count": len(data.rows),
             "coordinate_count": len(spectrum.coordinates()),
+            "correctness_policy": data.correctness_policy,
             "inputs": data.input_records,
             "geometric_means": data.geometric_means,
             "artifacts": artifacts,

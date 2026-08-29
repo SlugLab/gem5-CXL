@@ -144,6 +144,29 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
             },
         )
 
+    def test_native_verified_policy_is_bound_to_state_identity_and_command(self):
+        record = self._qualification_record()
+        strict_identity = spectrum._aggregate_identity(
+            self.shared, record, correctness_policy="bit-exact"
+        )
+        relaxed_identity = spectrum._aggregate_identity(
+            self.shared, record, correctness_policy="native-verified"
+        )
+        self.assertNotEqual(strict_identity.digest(), relaxed_identity.digest())
+        state = spectrum.new_state(
+            self.shared, record, relaxed_identity,
+            correctness_policy="native-verified",
+        )
+        self.assertEqual(state["correctness_policy"], "native-verified")
+        command = spectrum._child_command(
+            self.shared, self.root / "child", "500ns", resume=False,
+            correctness_policy="native-verified",
+        )
+        self.assertEqual(
+            command[command.index("--correctness-policy") + 1],
+            "native-verified",
+        )
+
     def test_non_content_addressed_shared_object_is_rejected(self):
         broken = dict(self.shared)
         broken["inputs"] = {"path": self.shared["inputs"]["path"]}
@@ -182,7 +205,10 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
         ):
             self._qualification_record()
 
-    def _child(self, label, *, status="complete", parent=None):
+    def _child(
+        self, label, *, status="complete", parent=None,
+        correctness_policy="bit-exact",
+    ):
         parent = self.root if parent is None else Path(parent)
         root = parent / "latency" / label
         root.mkdir(parents=True, exist_ok=True)
@@ -212,6 +238,7 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
             "identity_sha256": child_identity.digest(),
             "cxl_link_delay": label,
             "cxl_link_delay_ticks": spectrum.latency.ticks(label),
+            "correctness_policy": correctness_policy,
         })
         return root, child_identity.digest()
 
@@ -281,6 +308,16 @@ class LatencySpectrumRunnerTest(unittest.TestCase):
             spectrum.SpectrumError, "child campaign is inconclusive"
         ):
             spectrum.validate_child(child, "2us", self.shared)
+
+    def test_native_verified_aggregate_rejects_strict_child(self):
+        child, _ = self._child("2us", correctness_policy="bit-exact")
+        with self.assertRaisesRegex(
+            spectrum.SpectrumError, "correctness policy differs"
+        ):
+            spectrum.validate_child(
+                child, "2us", self.shared,
+                correctness_policy="native-verified",
+            )
 
     def test_aggregate_requires_all_four_valid_children(self):
         state = spectrum.new_state(

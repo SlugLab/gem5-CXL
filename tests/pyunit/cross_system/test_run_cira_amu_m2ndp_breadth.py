@@ -284,6 +284,16 @@ class BreadthRunnerTest(unittest.TestCase):
         ])
         self.assertEqual(options.correctness_policy, "native-verified")
 
+    def test_correctness_policy_changes_breadth_config_identity(self):
+        strict = breadth._config_identity_sha256(
+            sha("prepared-config"), "1us", 1_000_000, "bit-exact"
+        )
+        relaxed = breadth._config_identity_sha256(
+            sha("prepared-config"), "1us", 1_000_000,
+            "native-verified",
+        )
+        self.assertNotEqual(strict, relaxed)
+
     def test_breadth_state_records_canonical_cxl_latency(self):
         state = breadth.new_state(
             identity(), specs(), g20_graph_sha256=sha("g20"),

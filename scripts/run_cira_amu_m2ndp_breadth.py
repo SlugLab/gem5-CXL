@@ -1355,6 +1355,19 @@ def _g20_graph_sha256(inputs):
     return digest
 
 
+def _config_identity_sha256(
+    prepared_config_sha256, cxl_link_delay, cxl_link_delay_ticks,
+    correctness_policy,
+):
+    correctness_policy = _correctness_policy(correctness_policy)
+    return hashlib.sha256(contract.canonical_json({
+        "prepared_config_sha256": prepared_config_sha256,
+        "cxl_link_delay": cxl_link_delay,
+        "cxl_link_delay_ticks": cxl_link_delay_ticks,
+        "correctness_policy": correctness_policy,
+    })).hexdigest()
+
+
 def _preflight_identity_unchecked(options):
     inputs = _load_json(options.inputs, "frozen inputs")
     if inputs.get("schema") != 1 or inputs.get("status") != "accepted":
@@ -1415,11 +1428,12 @@ def _preflight_identity_unchecked(options):
         "prepared": _aggregate_files(prepared_code, "code"),
     })).hexdigest()
     prepared_config_hash = _aggregate_files(prepared_config, "configuration")
-    config_hash = hashlib.sha256(contract.canonical_json({
-        "prepared_config_sha256": prepared_config_hash,
-        "cxl_link_delay": selected_label,
-        "cxl_link_delay_ticks": selected_ticks,
-    })).hexdigest()
+    config_hash = _config_identity_sha256(
+        prepared_config_hash,
+        selected_label,
+        selected_ticks,
+        options.correctness_policy,
+    )
     identity = contract.ExperimentIdentity(
         code_sha256=code_hash,
         input_manifest_sha256=_sha256_file(options.inputs),

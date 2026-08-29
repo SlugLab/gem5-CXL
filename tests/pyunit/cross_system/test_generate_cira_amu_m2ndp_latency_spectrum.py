@@ -80,9 +80,12 @@ def qualification(calibration_sha256):
 def functional(system):
     row = {
         "status": "pass",
+        "verification": "pass",
+        "numeric_verification": "pass",
         "bit_exact": True,
         "compared_words": 16,
         "mismatched_words": 0,
+        "nonfinite_words": 0,
         "outputs": {"rank": digest(f"{system}-rank")},
     }
     if system == "vanilla":
@@ -211,6 +214,7 @@ class LatencySpectrumPublisherTest(unittest.TestCase):
         complete = {
             "schema": 1,
             "status": "complete",
+            "correctness_policy": "bit-exact",
             "identity": dataclasses.asdict(child_identity),
             "identity_sha256": child_identity.digest(),
             "cxl_link_delay": label,
@@ -240,6 +244,28 @@ class LatencySpectrumPublisherTest(unittest.TestCase):
         ).hexdigest()
         contract.atomic_write_json(self.complete, aggregate)
 
+    def _convert_to_native_verified(self, mutate=None):
+        aggregate = json.loads(self.complete.read_text(encoding="utf-8"))
+        identity = spectrum._aggregate_identity(
+            self.shared,
+            aggregate["qualification"],
+            correctness_policy="native-verified",
+        )
+        aggregate["identity"] = dataclasses.asdict(identity)
+        aggregate["identity_sha256"] = identity.digest()
+        aggregate["correctness_policy"] = "native-verified"
+        for label in latency.LABELS:
+            child_path = self.campaign / "latency" / label / "complete.json"
+            child = json.loads(child_path.read_text(encoding="utf-8"))
+            child["correctness_policy"] = "native-verified"
+            if mutate is not None:
+                mutate(label, child)
+            contract.atomic_write_json(child_path, child)
+            aggregate["latencies"][label]["complete"]["sha256"] = (
+                hashlib.sha256(child_path.read_bytes()).hexdigest()
+            )
+        contract.atomic_write_json(self.complete, aggregate)
+
     def test_loads_exact_96_rows_and_recomputes_same_latency_speedup(self):
         data = publisher.load_complete(self.complete)
         self.assertEqual(len(data.rows), 96)
@@ -250,6 +276,42 @@ class LatencySpectrumPublisherTest(unittest.TestCase):
         for row in data.rows:
             if row.system == "vanilla":
                 self.assertEqual(row.speedup, Decimal(1))
+
+    def test_native_verified_rows_and_manifest_record_verification_strength(self):
+        def drift(_label, child):
+            row = child["workloads"]["mcf"]["functional"]["cira"]
+            row["bit_exact"] = False
+            row["mismatched_words"] = 1
+
+        self._convert_to_native_verified(drift)
+        data = publisher.load_complete(self.complete)
+        self.assertEqual(data.correctness_policy, "native-verified")
+        drift_rows = [
+            row for row in data.rows
+            if row.workload == "mcf" and row.system == "cira"
+        ]
+        self.assertEqual(len(drift_rows), 4)
+        self.assertEqual(
+            {row.verification for row in drift_rows}, {"native-verified"}
+        )
+        self.assertEqual(
+            {row.correctness_policy for row in data.rows},
+            {"native-verified"},
+        )
+        result = publisher.publish(data, self.root / "native-publication")
+        self.assertEqual(result["correctness_policy"], "native-verified")
+
+    def test_native_verified_publisher_rejects_failed_numeric_verification(self):
+        def fail(_label, child):
+            child["workloads"]["mcf"]["functional"]["cira"][
+                "numeric_verification"
+            ] = "failed"
+
+        self._convert_to_native_verified(fail)
+        with self.assertRaisesRegex(
+            publisher.PublicationError, "functional native-verified gate failed"
+        ):
+            publisher.load_complete(self.complete)
 
     def test_rejects_tampered_named_evidence_before_loading_rows(self):
         evidence = self.campaign / "latency/500ns/evidence.json"
@@ -277,6 +339,15 @@ class LatencySpectrumPublisherTest(unittest.TestCase):
         contract.atomic_write_json(self.complete, aggregate)
         with self.assertRaisesRegex(
             publisher.PublicationError, "latency matrix"
+        ):
+            publisher.load_complete(self.complete)
+
+    def test_rejects_unsupported_correctness_policy_as_publication_error(self):
+        aggregate = json.loads(self.complete.read_text(encoding="utf-8"))
+        aggregate["correctness_policy"] = "unchecked"
+        contract.atomic_write_json(self.complete, aggregate)
+        with self.assertRaisesRegex(
+            publisher.PublicationError, "aggregate identity differs"
         ):
             publisher.load_complete(self.complete)
 
