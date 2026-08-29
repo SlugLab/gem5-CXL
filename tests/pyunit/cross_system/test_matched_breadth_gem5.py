@@ -1520,6 +1520,33 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(options.fixed_trace, Path("fixed"))
         self.assertIsNone(options.window_manifest)
 
+    def test_prepared_window_binds_replay_selection_from_frozen_metadata(self):
+        dynamic = self.root / "prepared-dynamic"
+        dynamic.mkdir()
+        metadata = dynamic / "trace.meta.json"
+        metadata.write_text('{"schema":1}\n', encoding="utf-8")
+        materialized = replay.MaterializedTrace(
+            root=dynamic,
+            fixed_root=self.root / "prepared-fixed",
+            source_schema=3,
+            source_trace_sha256=_digest("formal-source"),
+            phase=4,
+            phase_name="amg_gather",
+            window_index=2,
+            warmup_items=8,
+            measured_items=8,
+            measure_start_item=8,
+            fixed_event_records=1,
+        )
+        options = SimpleNamespace(
+            window_manifest=None, phase=None, window_index=None,
+        )
+        replay.bind_materialized_window_selection(options, materialized)
+        self.assertEqual(options.window_manifest, metadata.resolve())
+        self.assertEqual(options.phase, 4)
+        self.assertEqual(options.window_index, 2)
+        self.assertEqual(options.measure_start_item, 8)
+
     def test_load_prepared_window_requires_hash_bound_fixed_pair(self):
         dynamic = self.root / "prepared-dynamic"
         fixed = self.root / "prepared-fixed"

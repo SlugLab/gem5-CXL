@@ -77,6 +77,7 @@ class MaterializedTrace:
     source_trace_sha256: str
     phase: int
     phase_name: str
+    window_index: int
     warmup_items: int
     measured_items: int
     measure_start_item: int
@@ -553,8 +554,8 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
     canonical.read_bundle(fixed_outdir)
     return MaterializedTrace(
         Path(outdir).resolve(), fixed_outdir.resolve(), source_schema,
-        source_sha256, phase,
-        phase_name, warmup_items, measured_items, warmup_items, state["fixed"],
+        source_sha256, phase, phase_name, window_index,
+        warmup_items, measured_items, warmup_items, state["fixed"],
     )
 
 
@@ -637,6 +638,7 @@ def load_prepared_window_trace(dynamic_root, fixed_root):
         source_sha256,
         record["phase"],
         record["phase_name"],
+        record["window_index"],
         record["warmup_items"],
         record["measured_items"],
         record["measure_start_item"],
@@ -652,6 +654,20 @@ def materialized_trace_record(materialized):
         "root": str(materialized.root),
         "fixed_root": str(materialized.fixed_root),
     }
+
+
+def bind_materialized_window_selection(options, materialized):
+    """Bind the replay ROI markers to a validated materialized window."""
+
+    if not isinstance(materialized, MaterializedTrace):
+        raise ReplayError("materialized trace selection has the wrong type")
+    manifest = materialized.root / "trace.meta.json"
+    if not manifest.is_file():
+        raise ReplayError("materialized trace metadata is missing")
+    options.window_manifest = manifest.resolve()
+    options.phase = materialized.phase
+    options.window_index = materialized.window_index
+    options.measure_start_item = materialized.measure_start_item
 
 
 def _emit_lazy_replay_stream(trace, stream):
@@ -1808,12 +1824,12 @@ def run(options):
         producer_thread.start()
     else:
         run_options.replay_trace = replay_trace / "trace.bin"
+    if materialized is not None:
+        bind_materialized_window_selection(run_options, materialized)
     if boundary_map is not None:
         run_options.boundary_map = boundary_map
     if initial_memory_map is not None:
         run_options.initial_memory_map = initial_memory_map
-    if materialized is not None:
-        run_options.measure_start_item = materialized.measure_start_item
     command = command_for(run_options)
     outdir.parent.mkdir(parents=True, exist_ok=True)
     driver_log = outdir.with_suffix(".dynamic.driver.log")
@@ -1873,6 +1889,10 @@ def run(options):
         fixed_options.outdir = fixed_outdir
         fixed_options.trace = materialized.fixed_root
         fixed_options.replay_trace = materialized.fixed_root / "trace.bin"
+        bind_materialized_window_selection(fixed_options, materialized)
+        fixed_options.window_manifest = (
+            materialized.fixed_root / "trace.meta.json"
+        ).resolve()
         fixed_options.measure_start_item = 0
         fixed_bundle = canonical.read_bundle(materialized.fixed_root)
         fixed_options.initial_memory_map = _write_initial_memory_map(
