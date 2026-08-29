@@ -3,6 +3,8 @@
 
 import hashlib
 import struct
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +105,54 @@ class NativeVerifiedWindowTraceTest(unittest.TestCase):
                     measure_stop=3,
                     outdir=root / "window",
                 )
+
+    def test_duplicate_scatter_store_order_does_not_deadlock_wavefront(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = root / "values.f32le"
+            index = root / "index.u64le"
+            values.write_bytes(struct.pack(
+                "<1024I", *(0x3F800000 + item for item in range(1024))
+            ))
+            index.write_bytes(struct.pack(
+                "<1024Q", *(item % 16 for item in range(1024))
+            ))
+            materialized = windows.materialize_spatter_window(
+                kind="scatter",
+                values_path=values,
+                index_path=index,
+                source_trace_sha256=digest("formal-scatter"),
+                input_sha256=digest("scatter-input"),
+                warmup_start=0,
+                measure_start=512,
+                measure_stop=1024,
+                outdir=root / "window",
+            )
+            binary = replay.build_replay_binary(
+                root / "native-build", native=True
+            )
+            bundle = canonical.read_bundle(materialized.root)
+            run_root = root / "run"
+            run_root.mkdir()
+            result = run_root / "result.json"
+            boundary_map = replay._write_boundary_map(
+                bundle, run_root / "boundary-map.txt"
+            )
+            initial_map = replay._write_initial_memory_map(
+                bundle, materialized.root,
+                run_root / "initial-memory-map.txt",
+            )
+            completed = subprocess.run([
+                str(binary), "--system", "amu", "--trace",
+                str(materialized.root / "trace.bin"),
+                "--result", str(result), "--boundary-map",
+                str(boundary_map), "--initial-memory-map", str(initial_map),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               timeout=5)
+            observed = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(observed["verification"], "pass")
+        self.assertEqual(observed["max_observed_outstanding"], 32)
 
 
 if __name__ == "__main__":

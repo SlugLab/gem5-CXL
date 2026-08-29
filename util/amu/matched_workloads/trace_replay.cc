@@ -1327,6 +1327,25 @@ executeAmuWavefront(
     }
 }
 
+bool
+requiresOrderedAmuBlocks(
+    const Phase &phase, const std::vector<TraceRecord> &records)
+{
+    std::unordered_map<uint64_t, uint64_t> storeWorkItems;
+    for (const auto &group : phase.groups) {
+        for (const size_t index : group.recordIndices) {
+            const auto &record = records[index];
+            if (!Memory::isStore(static_cast<Opcode>(record.opcode)))
+                continue;
+            const auto inserted = storeWorkItems.emplace(
+                record.address, record.work_item);
+            if (!inserted.second && inserted.first->second != record.work_item)
+                return true;
+        }
+    }
+    return false;
+}
+
 ReplayStats
 executeTrace(const std::string &system, const std::vector<Phase> &phases,
              const std::vector<TraceRecord> &records, Memory &memory,
@@ -1339,6 +1358,8 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
     ReplayStats total;
     omp_set_dynamic(0);
     for (const auto &phase : phases) {
+        const bool orderedAmuBlocks =
+            system == "amu" && requiresOrderedAmuBlocks(phase, records);
         std::array<ReplayStats, 4> threadStats{};
         std::atomic<bool> failed{false};
         std::string failure;
@@ -1350,10 +1371,9 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
             auto accessor = makeAccessor(system, memory);
             if (system == "amu" && boundaryProbes == nullptr) {
                 const size_t blockCount = (phase.groups.size() + 31) / 32;
-#pragma omp for schedule(dynamic, 1)
-                for (size_t block = 0; block < blockCount; ++block) {
+                const auto executeBlock = [&](size_t block) {
                     if (failed.load(std::memory_order_relaxed))
-                        continue;
+                        return;
                     try {
                         const size_t first = block * 32;
                         executeAmuWavefront(
@@ -1368,6 +1388,17 @@ executeTrace(const std::string &system, const std::vector<Phase> &phases,
                         if (failure.empty())
                             failure = error.what();
                     }
+                };
+                if (orderedAmuBlocks) {
+#pragma omp for ordered schedule(static, 1)
+                    for (size_t block = 0; block < blockCount; ++block) {
+#pragma omp ordered
+                        executeBlock(block);
+                    }
+                } else {
+#pragma omp for schedule(dynamic, 1)
+                    for (size_t block = 0; block < blockCount; ++block)
+                        executeBlock(block);
                 }
             } else {
 #pragma omp for ordered schedule(static)
