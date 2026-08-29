@@ -121,6 +121,169 @@ def functional_state(*, cxl_link_delay="1us"):
 
 
 class BreadthRunnerTest(unittest.TestCase):
+    def test_native_verified_accepts_numerically_valid_boundary_hash_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            relaxed_path = Path(temporary) / "objective.u64"
+            relaxed_path.write_bytes((8).to_bytes(8, "little"))
+            relaxed_boundaries = {
+                "objective": {
+                    "path": str(relaxed_path.resolve()),
+                    "sha256": hashlib.sha256(
+                        relaxed_path.read_bytes()
+                    ).hexdigest(),
+                    "word_bits": 64,
+                    "count": 1,
+                }
+            }
+            state = breadth.new_state(
+                identity(), specs(), g20_graph_sha256=sha("g20"),
+                correctness_policy="native-verified",
+            )
+            breadth.record_reference(state, "mcf", boundaries())
+            breadth.record_functional(
+                state,
+                "mcf",
+                "cira",
+                {
+                    "status": "pass",
+                    "verification": "pass",
+                    "numeric_verification": "pass",
+                    "bit_exact": False,
+                    "compared_words": 1,
+                    "mismatched_words": 1,
+                    "nonfinite_words": 0,
+                    "boundaries": relaxed_boundaries,
+                    "outputs": {"objective": sha("relaxed-objective")},
+                    **mechanism("cira"),
+                },
+            )
+            self.assertEqual(state["correctness_policy"], "native-verified")
+            self.assertEqual(
+                state["workloads"]["mcf"]["functional"]["cira"][
+                    "status"
+                ],
+                "pass",
+            )
+
+    def test_bit_exact_policy_rejects_same_boundary_hash_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            relaxed_path = Path(temporary) / "objective.u64"
+            relaxed_path.write_bytes((8).to_bytes(8, "little"))
+            relaxed_boundaries = {
+                "objective": {
+                    "path": str(relaxed_path.resolve()),
+                    "sha256": hashlib.sha256(
+                        relaxed_path.read_bytes()
+                    ).hexdigest(),
+                    "word_bits": 64,
+                    "count": 1,
+                }
+            }
+            state = breadth.new_state(
+                identity(), specs(), g20_graph_sha256=sha("g20"),
+                correctness_policy="bit-exact",
+            )
+            breadth.record_reference(state, "mcf", boundaries())
+            with self.assertRaisesRegex(
+                breadth.BreadthError, "raw output boundary hashes differ"
+            ):
+                breadth.record_functional(
+                    state,
+                    "mcf",
+                    "cira",
+                    {
+                        "status": "pass",
+                        "verification": "pass",
+                        "numeric_verification": "pass",
+                        "bit_exact": False,
+                        "compared_words": 1,
+                        "mismatched_words": 1,
+                        "nonfinite_words": 0,
+                        "boundaries": relaxed_boundaries,
+                        "outputs": {"objective": sha("relaxed-objective")},
+                        **mechanism("cira"),
+                    },
+                )
+
+    def test_native_verified_timing_accepts_numerically_valid_drift(self):
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20"),
+            correctness_policy="native-verified",
+        )
+        evidence = {
+            "verification": "pass",
+            "numeric_verification": "pass",
+            "bit_exact": False,
+            "compared_words": 1,
+            "mismatched_words": 1,
+            "nonfinite_words": 0,
+            "threads": 4,
+            "all_memory_cxl": True,
+            "allocated_on_cxl": True,
+            "cxl_link_delay": "1us",
+            "cxl_link_delay_ticks": 1_000_000,
+            "error_counters": {},
+            "boundaries": boundaries(),
+            "fixed_seconds": "0.01",
+            "seconds_per_item": "0.000001",
+        }
+        breadth._validate_window_evidence("vanilla", evidence, state)
+
+    def test_native_verified_rejects_failed_numeric_verification(self):
+        state = breadth.new_state(
+            identity(), specs(), g20_graph_sha256=sha("g20"),
+            correctness_policy="native-verified",
+        )
+        evidence = {
+            "verification": "pass",
+            "numeric_verification": "failed",
+            "bit_exact": False,
+            "compared_words": 1,
+            "mismatched_words": 1,
+            "nonfinite_words": 0,
+            "threads": 4,
+            "all_memory_cxl": True,
+            "allocated_on_cxl": True,
+            "cxl_link_delay": "1us",
+            "cxl_link_delay_ticks": 1_000_000,
+            "error_counters": {},
+            "boundaries": boundaries(),
+            "fixed_seconds": "0.01",
+            "seconds_per_item": "0.000001",
+        }
+        with self.assertRaisesRegex(
+            breadth.BreadthError, "correctness or 4-thread all-CXL gate"
+        ):
+            breadth._validate_window_evidence("vanilla", evidence, state)
+
+    def test_functional_adapter_preserves_native_verification_fields(self):
+        record = breadth._functional_record({
+            "outputs": {"objective": {
+                "path": str(_BOUNDARY_PATH.resolve()),
+                "sha256": _BOUNDARY_SHA256,
+            }},
+            "bit_exact": False,
+            "verification": "pass",
+            "numeric_verification": "pass",
+            "compared_words": 1,
+            "mismatched_words": 1,
+            "nonfinite_words": 0,
+            "error_counters": {},
+            "boundaries": boundaries(),
+        })
+        self.assertEqual(record["verification"], "pass")
+        self.assertEqual(record["numeric_verification"], "pass")
+        self.assertEqual(record["nonfinite_words"], 0)
+
+    def test_cli_accepts_native_verified_correctness_policy(self):
+        options = breadth.parse_args([
+            "--inputs", "inputs.json",
+            "--calibration", "calibration.json",
+            "--root", "evidence",
+            "--correctness-policy", "native-verified",
+        ])
+        self.assertEqual(options.correctness_policy, "native-verified")
+
     def test_breadth_state_records_canonical_cxl_latency(self):
         state = breadth.new_state(
             identity(), specs(), g20_graph_sha256=sha("g20"),

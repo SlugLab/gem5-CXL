@@ -495,6 +495,11 @@ class M2NDPWorkloadTraceTest(unittest.TestCase):
             evidence = m2ndp.run_funcsim_package(package)
             self.assertEqual(evidence["compared_words"], 1)
             self.assertEqual(evidence["completed_launches"], 1)
+            self.assertEqual(evidence["verification"], "pass")
+            self.assertEqual(evidence["numeric_verification"], "pass")
+            self.assertIs(evidence["bit_exact"], True)
+            self.assertEqual(evidence["mismatched_words"], 0)
+            self.assertEqual(evidence["nonfinite_words"], 0)
             memory = (root / "package" / "memory-map.data").read_text()
             self.assertIn("0x1000", memory)
 

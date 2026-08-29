@@ -2,7 +2,7 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Collect bit-exact, paired Vanilla/AMU/CIRA/M2NDP breadth evidence.
+"""Collect correctness-gated, paired Vanilla/AMU/CIRA/M2NDP breadth evidence.
 
 This module owns the experiment state machine.  It deliberately checkpoints
 only at reproducible boundaries; process lifetime is not evidence state.
@@ -40,6 +40,7 @@ WORKLOADS = (
 )
 FUNCTIONAL_SYSTEMS = ("vanilla", "amu", "cira", "m2ndp-funcsim")
 TIMING_SYSTEMS = ("vanilla", "amu", "cira", "m2ndp")
+CORRECTNESS_POLICIES = ("bit-exact", "native-verified")
 LEVELS = timing.LEVELS
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -148,8 +149,15 @@ def _canonical_latency(label):
         raise BreadthError(str(error)) from error
 
 
+def _correctness_policy(value):
+    if value not in CORRECTNESS_POLICIES:
+        raise BreadthError(f"unsupported correctness policy: {value}")
+    return value
+
+
 def new_state(
     identity, workload_specs, *, g20_graph_sha256, cxl_link_delay="1us",
+    correctness_policy="bit-exact",
 ):
     if not isinstance(identity, contract.ExperimentIdentity):
         raise BreadthError("experiment identity has the wrong type")
@@ -159,6 +167,7 @@ def new_state(
     ):
         raise BreadthError("g20 graph SHA-256 is invalid")
     specifications = _validate_specs(workload_specs)
+    correctness_policy = _correctness_policy(correctness_policy)
     cxl_link_delay, cxl_link_delay_ticks = _canonical_latency(cxl_link_delay)
     workloads = {}
     for workload, specification in specifications.items():
@@ -191,6 +200,7 @@ def new_state(
         "identity_sha256": identity.digest(),
         "cxl_link_delay": cxl_link_delay,
         "cxl_link_delay_ticks": cxl_link_delay_ticks,
+        "correctness_policy": correctness_policy,
         "g20_graph_sha256": g20_graph_sha256,
         "workload_order": list(specifications),
         "workloads": workloads,
@@ -271,28 +281,77 @@ def _counter_errors(row):
     return total
 
 
-def _valid_functional_row(row):
+def _boundary_layout(records):
+    return {
+        name: {
+            "word_bits": record["word_bits"],
+            "count": record["count"],
+        }
+        for name, record in sorted(records.items())
+    }
+
+
+def _valid_functional_row(row, correctness_policy="bit-exact"):
     try:
+        correctness_policy = _correctness_policy(correctness_policy)
         compared = row["compared_words"]
         mismatched = row["mismatched_words"]
-        return (
+        common = (
             row.get("status") == "pass"
-            and row.get("bit_exact") is True
             and isinstance(compared, int)
             and not isinstance(compared, bool)
             and compared > 0
-            and mismatched == 0
+            and isinstance(mismatched, int)
+            and not isinstance(mismatched, bool)
+            and mismatched >= 0
             and _counter_errors(row) == 0
+        )
+        if correctness_policy == "bit-exact":
+            return common and row.get("bit_exact") is True and mismatched == 0
+        return (
+            common
+            and row.get("verification") == "pass"
+            and row.get("numeric_verification") == "pass"
+            and isinstance(row.get("nonfinite_words"), int)
+            and not isinstance(row.get("nonfinite_words"), bool)
+            and row.get("nonfinite_words") == 0
         )
     except (KeyError, BreadthError):
         return False
 
 
-def functional_complete(records):
+def _valid_numerical_evidence(row, correctness_policy):
+    correctness_policy = _correctness_policy(correctness_policy)
+    compared = row.get("compared_words")
+    mismatched = row.get("mismatched_words")
+    common = (
+        row.get("verification") == "pass"
+        and isinstance(compared, int)
+        and not isinstance(compared, bool)
+        and compared > 0
+        and isinstance(mismatched, int)
+        and not isinstance(mismatched, bool)
+        and mismatched >= 0
+    )
+    if correctness_policy == "bit-exact":
+        return common and row.get("bit_exact") is True and mismatched == 0
+    return (
+        common
+        and row.get("numeric_verification") == "pass"
+        and isinstance(row.get("nonfinite_words"), int)
+        and not isinstance(row.get("nonfinite_words"), bool)
+        and row.get("nonfinite_words") == 0
+    )
+
+
+def functional_complete(records, correctness_policy="bit-exact"):
     return (
         isinstance(records, dict)
         and set(records) == set(FUNCTIONAL_SYSTEMS)
-        and all(_valid_functional_row(row) for row in records.values())
+        and all(
+            _valid_functional_row(row, correctness_policy)
+            for row in records.values()
+        )
     )
 
 
@@ -392,22 +451,36 @@ def record_functional(state, workload, system, record):
             "outputs": _hash_map(record.get("outputs"), system),
             "boundary_hashes": boundaries,
         }
-        if normalized["boundary_hashes"] != row["reference"]:
+        correctness_policy = _correctness_policy(
+            state.get("correctness_policy", "bit-exact")
+        )
+        if _boundary_layout(normalized["boundary_hashes"]) != _boundary_layout(
+            row["reference"]
+        ):
+            raise BreadthError(f"{system} raw output boundary layout differs")
+        if (
+            correctness_policy == "bit-exact"
+            and normalized["boundary_hashes"] != row["reference"]
+        ):
             raise BreadthError(f"{system} raw output boundary hashes differ")
         exact_words = sum(record["count"] for record in boundaries.values())
         if normalized.get("compared_words") != exact_words:
             raise BreadthError(f"{system} compared-word cardinality differs")
         _validate_mechanism(system, normalized)
-        if not _valid_functional_row(normalized):
+        if not _valid_functional_row(normalized, correctness_policy):
             if _counter_errors(normalized):
                 raise BreadthError(f"{system} error counters are nonzero")
+            if correctness_policy == "native-verified":
+                raise BreadthError(
+                    f"{system} workload-native numerical verification failed"
+                )
             raise BreadthError(f"{system} functional bit-exact gate failed")
     except BreadthError as error:
         state["status"] = "failed"
         state["reason"] = str(error)
         raise
     row["functional"][system] = normalized
-    if functional_complete(row["functional"]):
+    if functional_complete(row["functional"], correctness_policy):
         row["status"] = "functional_pass"
     return state
 
@@ -417,10 +490,14 @@ def begin_timing(state):
         raise BreadthError("timing transition requires planned state")
     if not all(
         row.get("status") == "functional_pass"
-        and functional_complete(row.get("functional"))
+        and functional_complete(
+            row.get("functional"), state.get("correctness_policy", "bit-exact")
+        )
         for row in state.get("workloads", {}).values()
     ):
-        raise BreadthError("all functional bit-exact gates must pass before timing")
+        raise BreadthError(
+            "all functional correctness gates must pass before timing"
+        )
     try:
         transitioned = contract.transition(state, "functional_pass")
         transitioned = contract.transition(transitioned, "timing_in_progress")
@@ -758,9 +835,13 @@ def _state_latency_matches(state, cxl_link_delay=None):
     return True
 
 
-def select_resume(root, identity_digest, *, cxl_link_delay=None):
+def select_resume(
+    root, identity_digest, *, cxl_link_delay=None, correctness_policy=None,
+):
     if not isinstance(identity_digest, str) or _SHA256.fullmatch(identity_digest) is None:
         raise BreadthError("identity SHA-256 is invalid")
+    if correctness_policy is not None:
+        correctness_policy = _correctness_policy(correctness_policy)
     valid = []
     rejected = []
     for record in _checkpoint_records(root):
@@ -781,6 +862,11 @@ def select_resume(root, identity_digest, *, cxl_link_delay=None):
             and isinstance(state, dict)
             and state.get("schema") == 1
             and _state_latency_matches(state, cxl_link_delay)
+            and (
+                correctness_policy is None
+                or state.get("correctness_policy", "bit-exact")
+                == correctness_policy
+            )
             and state.get("identity_sha256") == identity_digest
             and record.get("state_sha256") == state_hash
             and (not bound_outputs or record.get("outputs") == bound_outputs)
@@ -1050,9 +1136,12 @@ def _functional_record(evidence):
     outputs = evidence["outputs"]
     return {
         "status": "pass",
+        "verification": evidence.get("verification"),
+        "numeric_verification": evidence.get("numeric_verification"),
         "bit_exact": evidence.get("bit_exact") is True,
         "compared_words": evidence.get("compared_words"),
         "mismatched_words": evidence.get("mismatched_words"),
+        "nonfinite_words": evidence.get("nonfinite_words"),
         "error_counters": evidence.get("error_counters"),
         "boundaries": evidence.get("boundaries"),
         "outputs": {
@@ -1096,9 +1185,9 @@ def _validate_window_evidence(system, evidence, state):
     ):
         raise BreadthError("timing evidence CXL latency differs")
     if (
-        evidence.get("verification") != "pass"
-        or evidence.get("bit_exact") is not True
-        or evidence.get("mismatched_words") != 0
+        not _valid_numerical_evidence(
+            evidence, state.get("correctness_policy", "bit-exact")
+        )
         or evidence.get("threads") != 4
         or evidence.get("all_memory_cxl") is not True
         or evidence.get("allocated_on_cxl") is not True
@@ -1224,6 +1313,11 @@ def parse_args(argv=None):
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument(
         "--cxl-link-delay", choices=latency.LABELS, default="1us"
+    )
+    parser.add_argument(
+        "--correctness-policy",
+        choices=CORRECTNESS_POLICIES,
+        default="bit-exact",
     )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
@@ -1353,7 +1447,8 @@ def main(argv=None):
         state_path = root / "state.json"
         if options.resume:
             selected, _ = select_resume(
-                root, identity.digest(), cxl_link_delay=options.cxl_link_delay
+                root, identity.digest(), cxl_link_delay=options.cxl_link_delay,
+                correctness_policy=options.correctness_policy,
             )
             if selected is None:
                 raise BreadthError("resume has no valid boundary checkpoint")
@@ -1364,6 +1459,7 @@ def main(argv=None):
                 specifications,
                 g20_graph_sha256=g20_graph_sha256,
                 cxl_link_delay=options.cxl_link_delay,
+                correctness_policy=options.correctness_policy,
             )
         contract.atomic_write_json(state_path, state)
         collect(

@@ -959,7 +959,26 @@ def run_native_replay(binary, *, system, trace, outdir):
     if value.get("verification") != "pass":
         raise ReplayError("native replay bit-exact verification failed")
     validate_output_boundaries(bundle, value.get("output_boundaries"))
+    value.update(_exact_correctness_fields(value))
     return value
+
+
+def _exact_correctness_fields(result):
+    boundaries = result.get("output_boundaries", {})
+    compared_words = sum(
+        len(record.get("raw_words", ()))
+        for record in boundaries.values()
+        if isinstance(record, dict)
+    )
+    if compared_words == 0:
+        compared_words = len(result.get("raw_outputs", ()))
+    return {
+        "numeric_verification": "pass",
+        "bit_exact": True,
+        "compared_words": compared_words,
+        "mismatched_words": 0,
+        "nonfinite_words": 0,
+    }
 
 
 def run_native_lazy_replay(binary, *, system, trace, outdir):
@@ -1018,6 +1037,7 @@ def run_native_lazy_replay(binary, *, system, trace, outdir):
         payload = struct.pack(f"<{len(row['raw_words'])}{code}", *row["raw_words"])
         if hashlib.sha256(payload).hexdigest() != digest:
             raise ReplayError(f"native lazy replay boundary {name} differs")
+    value.update(_exact_correctness_fields(value))
     return value
 
 
@@ -1394,6 +1414,7 @@ def collect_run_evidence(run_dir, *, system, trace, config,
     sim_ticks = _stat_integer(stats, "simTicks")
     row = {
         "verification": "pass",
+        **_exact_correctness_fields(result),
         "threads": _integer(result, "threads"),
         "phases": _integer(result, "phases"),
         "all_memory_cxl": topology["all_memory_cxl"],

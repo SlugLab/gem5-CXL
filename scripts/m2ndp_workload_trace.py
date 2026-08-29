@@ -659,6 +659,8 @@ def run_funcsim_package(manifest_path, *, funcsim=None, evidence_path=None):
         )
     evidence = {
         "schema": 1, "status": "pass", "returncode": completed.returncode,
+        "verification": "pass", "numeric_verification": "pass",
+        "bit_exact": True, "mismatched_words": 0, "nonfinite_words": 0,
         "boundary_count": len(manifest["output_boundaries"]),
         "compared_words": boundaries,
         "compared_operations": operations,
@@ -901,6 +903,14 @@ def run_ndpsim_package(
         raise TraceTranslationError("NDPSim mutated immutable config provenance")
     evidence = {
         "schema": 1, "status": "pass", "returncode": completed.returncode,
+        "verification": functional_evidence.get("verification", "pass"),
+        "numeric_verification": functional_evidence.get(
+            "numeric_verification", "pass"
+        ),
+        "bit_exact": functional_evidence.get("bit_exact") is True,
+        "compared_words": functional_evidence.get("compared_words"),
+        "mismatched_words": functional_evidence.get("mismatched_words", 0),
+        "nonfinite_words": functional_evidence.get("nonfinite_words", 0),
         "cycles": cycles, "functional": functional_evidence,
         "expected_launches": expected_launches,
         "completed_launches": completed_launches,

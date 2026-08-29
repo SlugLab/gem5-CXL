@@ -167,6 +167,10 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                         reference["commit_order"],
                     )
                 self.assertEqual(reference["verification"], "pass")
+                self.assertEqual(reference["numeric_verification"], "pass")
+                self.assertIs(reference["bit_exact"], True)
+                self.assertEqual(reference["mismatched_words"], 0)
+                self.assertEqual(reference["nonfinite_words"], 0)
 
     def test_actual_fixture_bundles_pass_all_three_backends(self):
         manifest = builder.build_fixture_suite(self.root / "actual-build")
