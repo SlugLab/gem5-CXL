@@ -1713,11 +1713,22 @@ def _cg_invocation_descriptors(capture):
 
     def add(phase, kernel, iteration, work_items, parameters, count):
         nonlocal primitive_records
-        invocations.append(lazy.Invocation(
+        invocation = lazy.Invocation(
             len(invocations), phase, kernel, iteration,
             work_items, parameters,
-        ))
-        primitive_records += count
+        )
+        try:
+            derived_count = npb.primitive_count(invocation)
+        except lazy.LazyTraceError as error:
+            raise BuildError(
+                f"NPB CG {kernel} primitive count is invalid: {error}"
+            ) from error
+        if count != derived_count:
+            raise BuildError(
+                f"NPB CG {kernel} primitive count formula drifted"
+            )
+        invocations.append(invocation)
+        primitive_records += derived_count
 
     lanes = _canonical_lanes(columns)
     spmv_count = 3 * rows + 5 * nonzeros + 2
@@ -1740,7 +1751,7 @@ def _cg_invocation_descriptors(capture):
                 "rowstr": "rowstr", "colidx": "colidx", "values": "a",
                 "source": "p", "destination": "q", "row_count": rows,
                 "edge_base": 1, "column_base": 1,
-                "destination_count": rows,
+                "destination_count": rows, "nonzeros": nonzeros,
             }, spmv_count)
             add(103, "npb_cg_dot", iteration, columns, {
                 "left": "p", "right": "q", "result": "d",
@@ -1771,7 +1782,7 @@ def _cg_invocation_descriptors(capture):
             "rowstr": "rowstr", "colidx": "colidx", "values": "a",
             "source": "z", "destination": "r", "row_count": rows,
             "edge_base": 1, "column_base": 1,
-            "destination_count": rows,
+            "destination_count": rows, "nonzeros": nonzeros,
         }, spmv_count)
         add(103, "npb_cg_residual_norm", tail, columns, {
             "x": "x", "r": "r", "result": "rnorm", "lanes": lanes,
@@ -1791,76 +1802,6 @@ def _cg_invocation_descriptors(capture):
     return tuple(invocations), primitive_records, {
         "shift": shift_signed & ((1 << 64) - 1),
     }
-
-
-def _mg_comm3_records(dimensions):
-    n1, n2, n3 = dimensions
-    copies = (
-        2 * (n3 - 2) * (n2 - 2)
-        + 2 * (n3 - 2) * n1
-        + 2 * n2 * n1
-    )
-    return 2 * copies
-
-
-def _mg_resid_records(dimensions):
-    n1, n2, n3 = dimensions
-    rows = (n2 - 2) * (n3 - 2)
-    interior = (n1 - 2) * rows
-    return 2 + 14 * n1 * rows + 12 * interior + _mg_comm3_records(dimensions)
-
-
-def _mg_psinv_records(dimensions):
-    n1, n2, n3 = dimensions
-    rows = (n2 - 2) * (n3 - 2)
-    interior = (n1 - 2) * rows
-    return 2 + 14 * n1 * rows + 15 * interior + _mg_comm3_records(dimensions)
-
-
-def _mg_rprj_records(fine_dimensions, coarse_dimensions):
-    del fine_dimensions
-    m1, m2, m3 = coarse_dimensions
-    rows = (m2 - 2) * (m3 - 2)
-    return (
-        2 + rows * (14 * (m1 - 1) + 30 * (m1 - 2))
-        + _mg_comm3_records(coarse_dimensions)
-    )
-
-
-def _mg_interp_degenerate_records(coarse_dimensions, fine_dimensions):
-    mm1, mm2, mm3 = coarse_dimensions
-    n1, n2, n3 = fine_dimensions
-    d1, t1 = (2, 1) if n1 == 3 else (1, 0)
-    d2, t2 = (2, 1) if n2 == 3 else (1, 0)
-    d3, t3 = (2, 1) if n3 == 3 else (1, 0)
-    del t1, t2, t3
-
-    def emitted(outer_a, outer_b, inner_a, inner_b):
-        # One-source updates cost 4 records; two-source updates cost 7.
-        return outer_a * outer_b * (4 * inner_a + 7 * inner_b)
-
-    count = emitted(mm3 - d3, mm2 - d2, mm1 - d1, mm1 - 1)
-    # The remaining three source blocks use 2/4, 2/4, and 4/8 sources.
-    count += (mm3 - d3) * (mm2 - 1) * (
-        7 * (mm1 - d1) + 11 * (mm1 - 1)
-    )
-    count += (mm3 - 1) * (mm2 - d2) * (
-        7 * (mm1 - d1) + 11 * (mm1 - 1)
-    )
-    count += (mm3 - 1) * (mm2 - 1) * (
-        11 * (mm1 - d1) + 19 * (mm1 - 1)
-    )
-    return count + 2
-
-
-def _mg_interp_records(coarse_dimensions, fine_dimensions):
-    if 3 in fine_dimensions:
-        return _mg_interp_degenerate_records(
-            coarse_dimensions, fine_dimensions
-        )
-    mm1, mm2, mm3 = coarse_dimensions
-    rows = (mm2 - 1) * (mm3 - 1)
-    return 2 + rows * (10 * mm1 + 38 * (mm1 - 1))
 
 
 def _mg_invocation_descriptors(capture):
@@ -1921,11 +1862,22 @@ def _mg_invocation_descriptors(capture):
 
     def add(record, kernel, work_items, parameters, count):
         nonlocal primitive_records
-        invocations.append(lazy.Invocation(
+        invocation = lazy.Invocation(
             len(invocations), record["phase"], kernel,
             record["iteration"], work_items, parameters,
-        ))
-        primitive_records += count
+        )
+        try:
+            derived_count = npb.primitive_count(invocation)
+        except lazy.LazyTraceError as error:
+            raise BuildError(
+                f"NPB MG {kernel} primitive count is invalid: {error}"
+            ) from error
+        if count != derived_count:
+            raise BuildError(
+                f"NPB MG {kernel} primitive count formula drifted"
+            )
+        invocations.append(invocation)
+        primitive_records += derived_count
 
     for record, (expected_phase, level) in zip(records[1:], semantic_events):
         if (
@@ -1971,14 +1923,14 @@ def _mg_invocation_descriptors(capture):
                 "n1": dimensions[0], "n2": dimensions[1],
                 "n3": dimensions[2], "a_raw": a_raw,
                 "boundaries": [f"r.l{level}"],
-            }, _mg_resid_records(dimensions))
+            }, npb.mg_resid_primitive_count(dimensions))
         elif expected_phase == 201:
             add(record, "npb_mg_psinv", interior, {
                 "r": f"r.l{level}", "u": f"u.l{level}",
                 "n1": dimensions[0], "n2": dimensions[1],
                 "n3": dimensions[2], "c_raw": c_raw,
                 "boundaries": [f"u.l{level}"],
-            }, _mg_psinv_records(dimensions))
+            }, npb.mg_psinv_primitive_count(dimensions))
         elif expected_phase == 203:
             coarse = levels[level - 1][0]
             coarse_items = ((coarse[0] - 2) * (coarse[1] - 2)
@@ -1989,7 +1941,7 @@ def _mg_invocation_descriptors(capture):
                 "m3k": dimensions[2], "m1j": coarse[0],
                 "m2j": coarse[1], "m3j": coarse[2],
                 "boundaries": [f"r.l{level - 1}"],
-            }, _mg_rprj_records(dimensions, coarse))
+            }, npb.mg_rprj3_primitive_count(dimensions, coarse))
         elif expected_phase == 204:
             coarse = levels[level - 1][0]
             add(record, "npb_mg_interp", full_items, {
@@ -1997,7 +1949,7 @@ def _mg_invocation_descriptors(capture):
                 "mm1": coarse[0], "mm2": coarse[1], "mm3": coarse[2],
                 "n1": dimensions[0], "n2": dimensions[1],
                 "n3": dimensions[2], "boundaries": [f"u.l{level}"],
-            }, _mg_interp_records(coarse, dimensions))
+            }, npb.mg_interp_primitive_count(coarse, dimensions))
         else:
             add(record, "npb_mg_norm2u3", interior, {
                 "r": f"r.l{level}", "n1": dimensions[0],

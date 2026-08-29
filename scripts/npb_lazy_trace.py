@@ -19,6 +19,7 @@ except ImportError:
 
 _F64 = struct.Struct("<d")
 _U64 = struct.Struct("<Q")
+_UINT64_MAX = (1 << 64) - 1
 
 
 def raw_f64(value):
@@ -93,11 +94,194 @@ def _require_parameters(invocation, names):
         )
 
 
+def _count_value(value, label, *, minimum=0):
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+        or value > _UINT64_MAX
+    ):
+        raise lazy.LazyTraceError(f"{label} count is outside uint64")
+    return value
+
+
+def _count_result(value, label):
+    return _count_value(value, label)
+
+
+def _dimensions(values, label):
+    if (
+        not isinstance(values, (tuple, list))
+        or len(values) != 3
+    ):
+        raise lazy.LazyTraceError(f"{label} dimensions are invalid")
+    result = tuple(
+        _count_value(value, f"{label} dimension", minimum=3)
+        for value in values
+    )
+    return result
+
+
+def mg_comm3_primitive_count(dimensions):
+    n1, n2, n3 = _dimensions(dimensions, "MG comm3")
+    copies = (
+        2 * (n3 - 2) * (n2 - 2)
+        + 2 * (n3 - 2) * n1
+        + 2 * n2 * n1
+    )
+    return _count_result(2 * copies, "MG comm3 primitive")
+
+
+def mg_resid_primitive_count(dimensions):
+    n1, n2, n3 = _dimensions(dimensions, "MG resid")
+    rows = (n2 - 2) * (n3 - 2)
+    interior = (n1 - 2) * rows
+    return _count_result(
+        2 + 14 * n1 * rows + 12 * interior
+        + mg_comm3_primitive_count(dimensions),
+        "MG resid primitive",
+    )
+
+
+def mg_psinv_primitive_count(dimensions):
+    n1, n2, n3 = _dimensions(dimensions, "MG psinv")
+    rows = (n2 - 2) * (n3 - 2)
+    interior = (n1 - 2) * rows
+    return _count_result(
+        2 + 14 * n1 * rows + 15 * interior
+        + mg_comm3_primitive_count(dimensions),
+        "MG psinv primitive",
+    )
+
+
+def mg_rprj3_primitive_count(fine_dimensions, coarse_dimensions):
+    _dimensions(fine_dimensions, "MG rprj3 fine")
+    m1, m2, m3 = _dimensions(coarse_dimensions, "MG rprj3 coarse")
+    rows = (m2 - 2) * (m3 - 2)
+    return _count_result(
+        2 + rows * (14 * (m1 - 1) + 30 * (m1 - 2))
+        + mg_comm3_primitive_count(coarse_dimensions),
+        "MG rprj3 primitive",
+    )
+
+
+def _mg_interp_degenerate_primitive_count(
+    coarse_dimensions, fine_dimensions
+):
+    mm1, mm2, mm3 = _dimensions(
+        coarse_dimensions, "MG interp coarse"
+    )
+    n1, n2, n3 = _dimensions(fine_dimensions, "MG interp fine")
+    d1 = 2 if n1 == 3 else 1
+    d2 = 2 if n2 == 3 else 1
+    d3 = 2 if n3 == 3 else 1
+
+    def emitted(outer_a, outer_b, inner_a, inner_b):
+        return outer_a * outer_b * (4 * inner_a + 7 * inner_b)
+
+    count = emitted(mm3 - d3, mm2 - d2, mm1 - d1, mm1 - 1)
+    count += (mm3 - d3) * (mm2 - 1) * (
+        7 * (mm1 - d1) + 11 * (mm1 - 1)
+    )
+    count += (mm3 - 1) * (mm2 - d2) * (
+        7 * (mm1 - d1) + 11 * (mm1 - 1)
+    )
+    count += (mm3 - 1) * (mm2 - 1) * (
+        11 * (mm1 - d1) + 19 * (mm1 - 1)
+    )
+    return _count_result(count + 2, "MG degenerate interp primitive")
+
+
+def mg_interp_primitive_count(coarse_dimensions, fine_dimensions):
+    fine = _dimensions(fine_dimensions, "MG interp fine")
+    coarse = _dimensions(coarse_dimensions, "MG interp coarse")
+    if 3 in fine:
+        return _mg_interp_degenerate_primitive_count(coarse, fine)
+    mm1, mm2, mm3 = coarse
+    rows = (mm2 - 1) * (mm3 - 1)
+    return _count_result(
+        2 + rows * (10 * mm1 + 38 * (mm1 - 1)),
+        "MG interp primitive",
+    )
+
+
+def primitive_count(invocation):
+    """Return the exact uint64 primitive count for one NPB invocation."""
+
+    if not isinstance(invocation, lazy.Invocation):
+        raise lazy.LazyTraceError("NPB invocation type differs")
+    work_items = _count_value(
+        invocation.work_items, "NPB invocation work_items"
+    )
+    linear = {
+        "npb_cg_dot": 4 * work_items + 6,
+        "npb_cg_divide": 4,
+        "npb_cg_update_zr": 12 * work_items + 6,
+        "npb_cg_update_p": 5 * work_items + 2,
+        "npb_cg_residual_norm": 5 * work_items + 7,
+        "npb_cg_init": 6 * work_items + 2,
+        "npb_cg_outer_dots": 8 * work_items + 10,
+        "npb_cg_normalize": 3 * work_items + 8,
+        "npb_cg_prepare_iteration": 8,
+        "npb_mg_norm2u3": 6 * work_items + 12,
+        "npb_mg_zero3": work_items + 2,
+    }
+    if invocation.kernel in linear:
+        return _count_result(
+            linear[invocation.kernel],
+            f"{invocation.kernel} primitive",
+        )
+    parameters = invocation.parameters
+    if invocation.kernel == "npb_cg_spmv":
+        nonzeros = _count_value(
+            parameters.get("nonzeros"), "CG SpMV nonzeros"
+        )
+        rows = _count_value(
+            parameters.get("row_count"), "CG SpMV rows"
+        )
+        if rows != work_items:
+            raise lazy.LazyTraceError(
+                "CG SpMV row count differs from work items"
+            )
+        return _count_result(
+            3 * rows + 5 * nonzeros + 2,
+            "CG SpMV primitive",
+        )
+    dimensions = tuple(
+        parameters.get(name) for name in ("n1", "n2", "n3")
+    )
+    if invocation.kernel == "npb_mg_resid":
+        return mg_resid_primitive_count(dimensions)
+    if invocation.kernel == "npb_mg_psinv":
+        return mg_psinv_primitive_count(dimensions)
+    if invocation.kernel == "npb_mg_rprj3":
+        fine = tuple(
+            parameters.get(name) for name in ("m1k", "m2k", "m3k")
+        )
+        coarse = tuple(
+            parameters.get(name) for name in ("m1j", "m2j", "m3j")
+        )
+        return mg_rprj3_primitive_count(fine, coarse)
+    if invocation.kernel == "npb_mg_interp":
+        coarse = tuple(
+            parameters.get(name) for name in ("mm1", "mm2", "mm3")
+        )
+        return mg_interp_primitive_count(coarse, dimensions)
+    raise lazy.LazyTraceError(
+        f"unknown NPB kernel {invocation.kernel}"
+    )
+
+
 def expand_cg_spmv(state, invocation, batch_work_items):
-    _require_parameters(invocation, (
+    required_parameters = (
         "rowstr", "colidx", "values", "source", "destination",
         "row_count", "edge_base", "column_base", "destination_count",
-    ))
+    )
+    observed_parameters = set(invocation.parameters)
+    if observed_parameters not in (
+        set(required_parameters), set((*required_parameters, "nonzeros"))
+    ):
+        _require_parameters(invocation, required_parameters)
     parameters = invocation.parameters
     row_count = parameters["row_count"]
     edge_base = parameters["edge_base"]
@@ -111,6 +295,7 @@ def expand_cg_spmv(state, invocation, batch_work_items):
     yield _control(
         invocation, canonical.Opcode.BARRIER, invocation.work_items
     )
+    previous_end = None
     for first in range(0, row_count, batch_work_items):
         last = min(first + batch_work_items, row_count)
         for row in range(first, last):
@@ -118,6 +303,11 @@ def expand_cg_spmv(state, invocation, batch_work_items):
             end_address, end = state.load_raw(parameters["rowstr"], row + 1)
             if end < start:
                 raise lazy.LazyTraceError("CG row offsets decrease")
+            if previous_end is not None and start != previous_end:
+                raise lazy.LazyTraceError("CG row offsets are not contiguous")
+            if row == 0 and start != edge_base:
+                raise lazy.LazyTraceError("CG first row offset differs")
+            previous_end = end
             yield _load(
                 invocation, canonical.Opcode.LOAD_U32,
                 row, start_address, start,
@@ -175,6 +365,12 @@ def expand_cg_spmv(state, invocation, batch_work_items):
             )
             state.store_float(parameters["destination"], row, total)
             yield _store(invocation, row, destination_address, total)
+    if "nonzeros" in parameters:
+        nonzeros = _count_value(parameters["nonzeros"], "CG SpMV nonzeros")
+        if previous_end is None or previous_end - edge_base != nonzeros:
+            raise lazy.LazyTraceError(
+                "CG SpMV nonzero count differs from row offsets"
+            )
     yield _control(invocation, canonical.Opcode.COMMIT)
 
 
