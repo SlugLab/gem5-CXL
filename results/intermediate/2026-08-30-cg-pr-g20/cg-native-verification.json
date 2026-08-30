@@ -1,0 +1,39 @@
+{
+  "allocation": {
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-sparse-native-r1/run/allocation.u64",
+    "sha256": "8e15bd75a5d4e4d10f846394af054f147896e7bb31b03708f9db4683168d7707"
+  },
+  "benchmark": "NPB CG",
+  "binary": {
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-sparse-native-r1/source/bin/cg.D.x",
+    "sha256": "84947806fdc4d59e1f9f50269ca53e9ddb965c84f8e9497def6a4a94fa207080"
+  },
+  "class": "D",
+  "exit_status": 0,
+  "iterations": 100,
+  "official_verification": "pass",
+  "schema": 1,
+  "seconds": "2305.92",
+  "size": 1500000,
+  "sparse_capture": {
+    "descriptor_sha256": "b3d77394c9151c12f82224e068a91cd9c739f9a4916d9e3282b3e0eeed041a9a",
+    "emitted_words": 1367037,
+    "ordinals": [3],
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-sparse-native-r1/run/cg-spmv-rows0-1024.capture.bin",
+    "plan_path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-indexed-sparse-r1/cg-spmv-rows0-1024.plan.bin",
+    "plan_sha256": "b570f87fb436ffbdc5ae9cec33fcce829ea110c49e137b2ad77f7c08bad6481e",
+    "requested_words": 1367037,
+    "sha256": "a60455f18be6a2c291feb65b60f30e359973b1c6ee034df4e96cb0b05c9c1793"
+  },
+  "status": "pass",
+  "stderr": {
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-sparse-native-r1/run/stderr.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "stdout": {
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-sparse-native-r1/run/stdout.log",
+    "sha256": "2ae3352382b070ca363deb579e8fa8c4dd0ab552f6d9b25c612430218a3233d0"
+  },
+  "threads": 4,
+  "workload": "npb_cg"
+}

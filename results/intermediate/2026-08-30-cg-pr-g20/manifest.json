@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "status": "intermediate",
+  "captured_at_utc": "2026-08-30T04:37:20.965807+00:00",
+  "source_snapshot": {
+    "path": "/mnt/disk0/gem5-CXL-eval/current-run-snapshots/20260830T043719Z/snapshot.json",
+    "sha256": "27413650d3178b17a41c32ff40640d4398bacff44a8af68ad6b0a4bb29235f6d",
+    "size": 57165,
+    "attestation_path": "/mnt/disk0/gem5-CXL-eval/current-run-snapshots/20260830T043719Z/attestation.json",
+    "attestation_sha256": "25006a9edc22f5eaafcb986f847bc4102dfe9314a09bdcf31806505ae1287262"
+  },
+  "completed": {
+    "npb_cg_native": {
+      "class": "D",
+      "size": 1500000,
+      "iterations": 100,
+      "threads": 4,
+      "seconds": "2305.92",
+      "official_verification": "pass",
+      "source_path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-sparse-native-r1/run/native-verification.json",
+      "source_sha256": "beaa83acdcb749d8faf7c434437ec66970adde35995586e2b5c14b608c43ac1c",
+      "portable_copy": "cg-native-verification.json",
+      "portable_copy_sha256": "89650726454db75ddcb0e8b381f6cb7ce82cd54bf0cb72a60e189f3b86a40ad0"
+    },
+    "npb_cg_m2ndp_1us": {
+      "cycles": 102531389,
+      "core_period_ns": "0.5",
+      "seconds": "0.051265695",
+      "completed_launches": 1,
+      "expected_launches": 1,
+      "funcsim_compared_operations": 2395647,
+      "bit_exact": true,
+      "memory_match": "pass",
+      "source_path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/npb-cg-indexed-sparse-r1/m2ndp-package-r1/ndpsim-evidence-1us.json",
+      "source_sha256": "ffd688f07433d51a5b56f4eea348222fe89fd55e3a0cd5e90dfc44b99dd2569f",
+      "portable_copy": "cg-m2ndp-1us-evidence.json",
+      "portable_copy_sha256": "368c6496287228052730c9b0283e11fa071523710b19fec69d52811829efe22e"
+    },
+    "pagerank_vanilla_portable_copy": "pagerank-vanilla-raw.csv",
+    "pagerank_vanilla_portable_copy_sha256": "176662ad196acc3c2bb8cc194cf4a0313aa7d257587c684519937ed993bcfaf5",
+    "pagerank_vanilla": [
+      {
+        "latency": "200ns",
+        "sim_ticks": 64631302855146,
+        "sim_insts": 3785035524,
+        "verification": "pass",
+        "source_sha256": "a56ec1ca1c3eec45ee97068516a7ba0c1f5f913bfc3c7abc9ed7e68a93b4be76"
+      },
+      {
+        "latency": "500ns",
+        "sim_ticks": 147626316758817,
+        "sim_insts": 3790897291,
+        "verification": "pass",
+        "source_sha256": "64885472da020c3ea345d5bec102cdf2879a7145793942adff1e8559577843ce"
+      },
+      {
+        "latency": "1us",
+        "sim_ticks": 278449700576661,
+        "sim_insts": 3801215393,
+        "verification": "pass",
+        "source_sha256": "d0be0c8179ef2cfefb12184c97bf3edba2d7329b673c46d477cf837ddfdaa458"
+      },
+      {
+        "latency": "2us",
+        "sim_ticks": 546558761156976,
+        "sim_insts": 3823508561,
+        "verification": "pass",
+        "source_sha256": "a523b301337fd023ef445b2334cd66641492b044c433705acba3b98fc35670dc"
+      }
+    ]
+  },
+  "active_runs": [
+    {"unit": "cira-spectrum-prg20-r2-200ns-amu.service", "system": "amu", "latency": "200ns", "main_pid": 356568, "gem5_pid": 356643, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-200ns-cira.service", "system": "cira", "latency": "200ns", "main_pid": 356572, "gem5_pid": 356642, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-500ns-amu.service", "system": "amu", "latency": "500ns", "main_pid": 356576, "gem5_pid": 356644, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-500ns-cira.service", "system": "cira", "latency": "500ns", "main_pid": 356582, "gem5_pid": 356645, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-1us-amu.service", "system": "amu", "latency": "1us", "main_pid": 356588, "gem5_pid": 356647, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-1us-cira.service", "system": "cira", "latency": "1us", "main_pid": 356590, "gem5_pid": 356646, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-2us-amu.service", "system": "amu", "latency": "2us", "main_pid": 356594, "gem5_pid": 356649, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-spectrum-prg20-r2-2us-cira.service", "system": "cira", "latency": "2us", "main_pid": 356596, "gem5_pid": 356648, "state": "active/running", "stats_emitted": false},
+    {"unit": "cira-pgo-overhead-g20-r1.service", "system": "cira-pgo", "latency": "1us", "main_pid": 992557, "gem5_pid": 993638, "state": "active/running", "stats_emitted": false}
+  ],
+  "restart_checkpoints": [
+    {
+      "system": "amu",
+      "checkpoint_id": "7f2ce78042e6bff93ae54c9d1d654700501f533aa5b49d998ec7a0f8862b5baa",
+      "identity_validated": true,
+      "manifest_sha256": "2ccc44c33953e5fd4c9b745fb548249aca88b8fae675c2d8412781f164a8e640",
+      "boundary": "trial0_entry_before_timing_roi"
+    },
+    {
+      "system": "cira",
+      "checkpoint_id": "7499f8a4d7958108b5de547b0294045d70a5dde7c2ec1ebdb190de4cf2cee714",
+      "identity_validated": true,
+      "manifest_sha256": "a2c21576aacf9ac694fb13c705a93dc515ec93c38406e739d3f46c1b374e4d20",
+      "boundary": "trial0_entry_before_timing_roi"
+    },
+    {
+      "system": "cira-pgo",
+      "checkpoint_id": "88184b3e5e85f0e7ee67b078a468990c98715f8e8eec192ed0314f14a37701de",
+      "identity_validated": true,
+      "manifest_sha256": "f31d8e8c13027854635fb9def4d1363a126f4b60b7ad663ed747afb7d2444275",
+      "boundary": "trial0_entry_before_timing_roi"
+    }
+  ],
+  "limitations": [
+    "No active AMU/CIRA/PGO run had emitted non-empty timing stats at capture time.",
+    "The existing gem5 checkpoints are at trial0 entry, not at the current mid-ROI instruction.",
+    "Restarting an active run from its recorded checkpoint repeats the full timing ROI.",
+    "No AMU/CIRA/PGO speedup is computed from this intermediate record."
+  ]
+}
