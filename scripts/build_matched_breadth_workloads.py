@@ -5,6 +5,7 @@
 """Build exact MCF and Spatter canonical-region adapters."""
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ try:
     from scripts import lazy_work_trace as lazy
     from scripts import mcfreg2
     from scripts import npb_lazy_trace as npb
+    from scripts import npb_indexed_windows as npb_indexed
 except ImportError:
     import canonical_work_trace as canonical
     import cross_system_contract as contract
@@ -29,6 +31,7 @@ except ImportError:
     import lazy_work_trace as lazy
     import mcfreg2
     import npb_lazy_trace as npb
+    import npb_indexed_windows as npb_indexed
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1560,6 +1563,91 @@ def _npb_allocation_probe(path, expected_workload):
 _NPB_ARRAY_MAGIC = 0x4e50424152593032
 _NPB_INVOCATION_MAGIC = 0x4e5042494e563032
 _NPB_BOUNDARY_MAGIC = 0x4e50425348413032
+_NPB_SPARSE_CAPTURE_HEADER = struct.Struct("<8sQQ32s32s")
+_NPB_SPARSE_CAPTURE_RECORD = struct.Struct("<QQQQQ")
+
+
+@dataclasses.dataclass(frozen=True)
+class NpbSparseCaptureRecord:
+    ordinal: int
+    kind: int
+    request_id: int
+    index: int
+    raw_word: int
+
+
+@dataclasses.dataclass(frozen=True)
+class NpbSparseCapture:
+    descriptor_sha256: str
+    plan_sha256: str
+    capture_sha256: str
+    request_count: int
+    records: tuple[NpbSparseCaptureRecord, ...]
+
+
+def parse_npb_sparse_capture(path, plan, *, plan_path):
+    """Authenticate an exact native sparse-state capture against its plan."""
+
+    try:
+        npb_indexed.validate_sparse_capture_plan(plan)
+    except npb_indexed.IndexError as error:
+        raise BuildError(f"NPB sparse capture plan is invalid: {error}") from error
+    path = Path(path).resolve()
+    plan_path = Path(plan_path).resolve()
+    try:
+        payload = path.read_bytes()
+        plan_payload = plan_path.read_bytes()
+    except OSError as error:
+        raise BuildError(f"cannot read NPB sparse capture: {error}") from error
+    try:
+        disk_plan = npb_indexed.read_sparse_capture_plan(plan_path)
+    except npb_indexed.IndexError as error:
+        raise BuildError(f"NPB sparse capture plan is invalid: {error}") from error
+    if disk_plan != plan:
+        raise BuildError("NPB sparse capture plan content differs")
+    if len(payload) < _NPB_SPARSE_CAPTURE_HEADER.size:
+        raise BuildError("NPB sparse capture header is truncated")
+    magic, schema, count, descriptor, plan_digest = (
+        _NPB_SPARSE_CAPTURE_HEADER.unpack_from(payload)
+    )
+    if magic != b"NPBSPC01" or schema != 1:
+        raise BuildError("NPB sparse capture header is invalid")
+    if descriptor.hex() != plan.descriptor_sha256:
+        raise BuildError("NPB sparse capture descriptor SHA-256 differs")
+    expected_plan_sha256 = hashlib.sha256(plan_payload).digest()
+    if plan_digest != expected_plan_sha256:
+        raise BuildError("NPB sparse capture plan SHA-256 differs")
+    if count != len(plan.entries):
+        raise BuildError("NPB sparse capture request count differs")
+    expected_size = (
+        _NPB_SPARSE_CAPTURE_HEADER.size
+        + count * _NPB_SPARSE_CAPTURE_RECORD.size
+    )
+    if expected_size != len(payload):
+        raise BuildError("NPB sparse capture record count differs")
+    records = []
+    cursor = _NPB_SPARSE_CAPTURE_HEADER.size
+    for request in plan.entries:
+        values = _NPB_SPARSE_CAPTURE_RECORD.unpack_from(payload, cursor)
+        cursor += _NPB_SPARSE_CAPTURE_RECORD.size
+        ordinal, kind, request_id, index = npb_indexed._request_key(request)
+        if values[:4] != (ordinal, kind, request_id, index):
+            raise BuildError("NPB sparse capture record order differs")
+        raw_word = values[4]
+        if kind == npb_indexed.ARRAY_REQUEST and isinstance(
+            request, npb_indexed.ArrayRequest
+        ):
+            # Width is checked against the descriptor before materialization;
+            # the native ABI always transports one zero-extended uint64 word.
+            pass
+        records.append(NpbSparseCaptureRecord(*values))
+    return NpbSparseCapture(
+        descriptor_sha256=descriptor.hex(),
+        plan_sha256=expected_plan_sha256.hex(),
+        capture_sha256=hashlib.sha256(payload).hexdigest(),
+        request_count=count,
+        records=tuple(records),
+    )
 
 
 def _parse_npb_capture(path):

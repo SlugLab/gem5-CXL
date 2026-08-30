@@ -3,6 +3,7 @@
 
 import dataclasses
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -137,6 +138,38 @@ class NPBIndexedWindowsTest(unittest.TestCase):
             with self.subTest(offset=offset):
                 with self.assertRaisesRegex(indexed.IndexError, "outside"):
                     indexed.locate(index, offset)
+
+    def test_cg_descriptor_migration_adds_nonzeros_without_copying_images(self):
+        self.require_indexer()
+        source = self.cg_case.full_cg_bundle()
+        self.assertTrue(any(
+            invocation.kernel == "npb_cg_spmv"
+            and "nonzeros" not in invocation.parameters
+            for invocation in source.invocations
+        ))
+        destination_root = Path(self.cg_case.root) / "migrated-cg"
+        migrated = indexed.migrate_cg_descriptor(
+            source.root, destination_root
+        )
+        nonzeros = next(
+            array.count for array in migrated.arrays
+            if array.name == "colidx"
+        )
+        self.assertTrue(all(
+            invocation.parameters["nonzeros"] == nonzeros
+            for invocation in migrated.invocations
+            if invocation.kernel == "npb_cg_spmv"
+        ))
+        self.assertEqual(
+            migrated.dynamic_work, source.dynamic_work
+        )
+        for source_array, migrated_array in zip(
+            source.arrays, migrated.arrays
+        ):
+            self.assertEqual(
+                os.stat(source.root / source_array.path).st_ino,
+                os.stat(migrated.root / migrated_array.path).st_ino,
+            )
 
     def test_safe_partial_spmv_and_zero3_equal_sequential_operations(self):
         self.require_indexer()

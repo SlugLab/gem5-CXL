@@ -32,6 +32,9 @@ void matched_invocation_(const int64_t *ordinal, const int64_t *phase,
                          const int64_t *work_items,
                          const int64_t *parameters,
                          const int64_t *parameter_count);
+void matched_sparse_scalar_u64_(const int64_t *scalar_id,
+                                const uint64_t *raw_word);
+void matched_sparse_invocation_(const int64_t *ordinal);
 void matched_boundary_sha256_(const int64_t *boundary,
                               const int64_t *iteration, const void *data,
                               const int64_t *element_bits,

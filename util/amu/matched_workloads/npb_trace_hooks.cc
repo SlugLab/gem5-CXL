@@ -8,6 +8,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -15,9 +16,13 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace
 {
@@ -26,6 +31,11 @@ constexpr uint64_t ArrayMagic = 0x4e50424152593032ULL; // NPBARY02
 constexpr uint64_t InvocationMagic = 0x4e5042494e563032ULL; // NPBINV02
 constexpr uint64_t BoundaryMagic = 0x4e50425348413032ULL; // NPBSHA02
 constexpr uint64_t AllocationMagic = 0x4e5042414c4c3031ULL; // NPBALL01
+constexpr char SparsePlanMagic[8] = {'N','P','B','S','P','N','0','1'};
+constexpr char SparseCaptureMagic[8] = {'N','P','B','S','P','C','0','1'};
+constexpr uint64_t SparseSchema = 1;
+constexpr uint64_t SparseArrayRequest = 1;
+constexpr uint64_t SparseScalarRequest = 2;
 
 std::FILE *captureStream = nullptr;
 std::FILE *allocationStream = nullptr;
@@ -39,9 +49,35 @@ struct ArrayIdentity
     uint64_t logicalBase;
     uint64_t count;
     std::vector<unsigned char> digest;
+    const void *data;
 };
 
 std::map<uint64_t, ArrayIdentity> arrays;
+std::map<uint64_t, uint64_t> sparseScalars;
+
+struct SparseRequest
+{
+    uint64_t ordinal;
+    uint64_t kind;
+    uint64_t id;
+    uint64_t index;
+};
+
+struct SparseRecord
+{
+    SparseRequest request;
+    uint64_t rawWord;
+};
+
+bool sparseLoaded = false;
+bool sparseEnabled = false;
+bool sparsePublished = false;
+uint64_t nextSparseInvocation = 0;
+std::vector<SparseRequest> sparseRequests;
+std::vector<SparseRecord> sparseRecords;
+std::array<unsigned char, 32> sparseDescriptor{};
+std::array<unsigned char, 32> sparsePlanDigest{};
+std::string sparseCapturePath;
 
 [[noreturn]] void
 fail(const char *message)
@@ -91,6 +127,18 @@ flush(std::FILE *stream)
 {
     if (std::fflush(stream) != 0)
         fail("capture flush failed");
+}
+
+uint64_t
+readU64(const std::vector<unsigned char> &payload, size_t &cursor,
+        const char *label)
+{
+    if (payload.size() - std::min(payload.size(), cursor) < sizeof(uint64_t))
+        fail(label);
+    uint64_t value = 0;
+    std::memcpy(&value, payload.data() + cursor, sizeof(value));
+    cursor += sizeof(value);
+    return value;
 }
 
 size_t
@@ -149,6 +197,168 @@ sha256(const void *data, size_t bytes)
     return hash.digest(data, bytes);
 }
 
+void requireLittleEndian();
+
+std::vector<unsigned char>
+readFile(const char *path)
+{
+    std::FILE *stream = std::fopen(path, "rb");
+    if (stream == nullptr)
+        fail("sparse plan open failed");
+    if (std::fseek(stream, 0, SEEK_END) != 0)
+        fail("sparse plan seek failed");
+    const long end = std::ftell(stream);
+    if (end < 0 || std::fseek(stream, 0, SEEK_SET) != 0)
+        fail("sparse plan size failed");
+    std::vector<unsigned char> result(static_cast<size_t>(end));
+    if (!result.empty() && std::fread(
+            result.data(), 1, result.size(), stream) != result.size()) {
+        fail("sparse plan read failed");
+    }
+    if (std::fclose(stream) != 0)
+        fail("sparse plan close failed");
+    return result;
+}
+
+void
+loadSparsePlan()
+{
+    if (sparseLoaded)
+        return;
+    sparseLoaded = true;
+    const char *planPath = std::getenv("MATCHED_NPB_SPARSE_PLAN_FILE");
+    const char *capturePath = std::getenv("MATCHED_NPB_SPARSE_CAPTURE_FILE");
+    if ((planPath == nullptr || planPath[0] == '\0') !=
+        (capturePath == nullptr || capturePath[0] == '\0')) {
+        fail("sparse plan and capture environment must be paired");
+    }
+    if (planPath == nullptr || planPath[0] == '\0')
+        return;
+    requireLittleEndian();
+    const auto payload = readFile(planPath);
+    constexpr size_t headerBytes = 8 + 8 + 8 + 32;
+    constexpr size_t requestBytes = 4 * 8;
+    if (payload.size() < headerBytes || std::memcmp(
+            payload.data(), SparsePlanMagic, 8) != 0) {
+        fail("sparse plan header is invalid");
+    }
+    size_t cursor = 8;
+    const uint64_t schema = readU64(
+        payload, cursor, "sparse plan schema is truncated");
+    const uint64_t count = readU64(
+        payload, cursor, "sparse plan count is truncated");
+    if (schema != SparseSchema || count == 0 ||
+        count > (std::numeric_limits<size_t>::max() - headerBytes) /
+                    requestBytes ||
+        payload.size() != headerBytes + static_cast<size_t>(count) *
+                                      requestBytes) {
+        fail("sparse plan shape is invalid");
+    }
+    std::memcpy(sparseDescriptor.data(), payload.data() + cursor, 32);
+    cursor += 32;
+    SparseRequest previous{};
+    bool havePrevious = false;
+    for (uint64_t position = 0; position < count; ++position) {
+        SparseRequest request{
+            readU64(payload, cursor, "sparse request ordinal is truncated"),
+            readU64(payload, cursor, "sparse request kind is truncated"),
+            readU64(payload, cursor, "sparse request id is truncated"),
+            readU64(payload, cursor, "sparse request index is truncated"),
+        };
+        if ((request.kind != SparseArrayRequest &&
+             request.kind != SparseScalarRequest) || request.id == 0 ||
+            (request.kind == SparseScalarRequest && request.index != 0)) {
+            fail("sparse request is invalid");
+        }
+        const auto key = std::tie(
+            request.ordinal, request.kind, request.id, request.index);
+        const auto previousKey = std::tie(
+            previous.ordinal, previous.kind, previous.id, previous.index);
+        if (havePrevious && !(previousKey < key))
+            fail("sparse requests are not uniquely ordered");
+        sparseRequests.push_back(request);
+        previous = request;
+        havePrevious = true;
+    }
+    const auto digest = sha256(payload.data(), payload.size());
+    std::copy(digest.begin(), digest.end(), sparsePlanDigest.begin());
+    sparseCapturePath = capturePath;
+    sparseEnabled = true;
+}
+
+void
+publishSparseCapture()
+{
+    if (sparsePublished || sparseRecords.size() != sparseRequests.size())
+        return;
+    const std::string temporary = sparseCapturePath + ".tmp";
+    const int descriptor = ::open(
+        temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (descriptor < 0)
+        fail("sparse temporary capture create failed");
+    std::FILE *stream = ::fdopen(descriptor, "wb");
+    if (stream == nullptr) {
+        ::close(descriptor);
+        fail("sparse temporary capture stream failed");
+    }
+    writeBytes(stream, SparseCaptureMagic, 8);
+    writeU64(stream, SparseSchema);
+    writeU64(stream, static_cast<uint64_t>(sparseRecords.size()));
+    writeBytes(stream, sparseDescriptor.data(), sparseDescriptor.size());
+    writeBytes(stream, sparsePlanDigest.data(), sparsePlanDigest.size());
+    for (const auto &record : sparseRecords) {
+        writeU64(stream, record.request.ordinal);
+        writeU64(stream, record.request.kind);
+        writeU64(stream, record.request.id);
+        writeU64(stream, record.request.index);
+        writeU64(stream, record.rawWord);
+    }
+    flush(stream);
+    if (::fsync(::fileno(stream)) != 0 || std::fclose(stream) != 0)
+        fail("sparse capture sync failed");
+    if (::rename(temporary.c_str(), sparseCapturePath.c_str()) != 0)
+        fail("sparse capture publication failed");
+    sparsePublished = true;
+}
+
+void
+captureSparseInvocation(uint64_t ordinal)
+{
+    loadSparsePlan();
+    if (!sparseEnabled)
+        return;
+    if (ordinal != nextSparseInvocation)
+        fail("sparse invocation ordinal is duplicate or non-contiguous");
+    ++nextSparseInvocation;
+    size_t cursor = sparseRecords.size();
+    if (cursor < sparseRequests.size() &&
+        sparseRequests[cursor].ordinal < ordinal) {
+        fail("sparse invocation skipped a request");
+    }
+    while (cursor < sparseRequests.size() &&
+           sparseRequests[cursor].ordinal == ordinal) {
+        const auto &request = sparseRequests[cursor];
+        uint64_t raw = 0;
+        if (request.kind == SparseArrayRequest) {
+            const auto found = arrays.find(request.id);
+            if (found == arrays.end() || request.index >= found->second.count)
+                fail("sparse array request is outside a registered array");
+            const size_t bytes = found->second.elementBits / 8;
+            const auto *source = static_cast<const unsigned char *>(
+                found->second.data) + request.index * bytes;
+            std::memcpy(&raw, source, bytes);
+        } else {
+            const auto found = sparseScalars.find(request.id);
+            if (found == sparseScalars.end())
+                fail("sparse scalar request is not registered");
+            raw = found->second;
+        }
+        sparseRecords.push_back({request, raw});
+        ++cursor;
+    }
+    publishSparseCapture();
+}
+
 void
 requireLittleEndian()
 {
@@ -194,6 +404,9 @@ matched_phase_begin_(const int64_t *phase, const int64_t *iteration,
             ordinal, static_cast<uint64_t>(*phase),
             static_cast<uint64_t>(*phase), static_cast<uint64_t>(*iteration),
             static_cast<uint64_t>(*workItems), nullptr, 0);
+        if (ordinal == 0)
+            fail("sparse invocation has no configuration root");
+        captureSparseInvocation(ordinal - 1);
     }
 }
 
@@ -224,7 +437,7 @@ matched_array_image_(const int64_t *arrayId, const int64_t *elementBits,
     const ArrayIdentity identity{
         static_cast<uint64_t>(*elementBits),
         static_cast<uint64_t>(*logicalBase),
-        static_cast<uint64_t>(*count), digest,
+        static_cast<uint64_t>(*count), digest, data,
     };
     std::lock_guard<std::mutex> lock(captureMutex);
     const auto found = arrays.find(id);
@@ -249,6 +462,25 @@ matched_array_image_(const int64_t *arrayId, const int64_t *elementBits,
     writeBytes(stream, digest.data(), digest.size());
     writeBytes(stream, data, bytes);
     flush(stream);
+}
+
+extern "C" void
+matched_sparse_scalar_u64_(const int64_t *scalarId,
+                           const uint64_t *rawWord)
+{
+    if (scalarId == nullptr || rawWord == nullptr || *scalarId <= 0)
+        fail("sparse scalar registration is invalid");
+    std::lock_guard<std::mutex> lock(captureMutex);
+    sparseScalars[static_cast<uint64_t>(*scalarId)] = *rawWord;
+}
+
+extern "C" void
+matched_sparse_invocation_(const int64_t *ordinal)
+{
+    if (ordinal == nullptr || *ordinal < 0)
+        fail("sparse invocation argument is invalid");
+    std::lock_guard<std::mutex> lock(captureMutex);
+    captureSparseInvocation(static_cast<uint64_t>(*ordinal));
 }
 
 extern "C" void
