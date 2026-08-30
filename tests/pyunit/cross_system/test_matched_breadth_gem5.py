@@ -548,6 +548,20 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(result["verification"], "pass")
         self.assertEqual(result["max_observed_outstanding"], 1)
 
+    def test_dependency_publication_never_blocks_earlier_sequence_progress(self):
+        source = replay.SOURCE.read_text(encoding="utf-8")
+        tracker = source[
+            source.index("class DependencyTracker"):
+            source.index("uint64_t\ndependencySequence")
+        ]
+        publish = tracker[
+            tracker.index("void publish("):
+            tracker.index("bool complete(")
+        ]
+        self.assertNotIn("MaxOutOfOrder", tracker)
+        self.assertNotIn("ready.wait", publish)
+        self.assertIn("outOfOrder.insert(sequence)", publish)
+
     def test_cross_work_item_failure_cancels_dependency_waiters(self):
         operations = (
             _op(canonical.Opcode.LOAD_U64, 0, work_item=0,

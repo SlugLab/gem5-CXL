@@ -49,8 +49,6 @@ using matched_trace::LoadDependencyRelativeFlag;
 class DependencyTracker
 {
   public:
-    static constexpr size_t MaxOutOfOrder = 65536;
-
     void wait(uint64_t sequence)
     {
         std::unique_lock<std::mutex> lock(mutex);
@@ -66,11 +64,7 @@ class DependencyTracker
     void publish(uint64_t sequence)
     {
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            ready.wait(lock, [&] {
-                return cancelled || sequence <= frontier ||
-                       outOfOrder.size() < MaxOutOfOrder;
-            });
+            std::lock_guard<std::mutex> lock(mutex);
             if (cancelled)
                 throw std::runtime_error(
                     "canonical dependency cancelled: " +
