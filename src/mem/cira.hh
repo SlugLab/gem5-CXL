@@ -190,6 +190,20 @@ class CIRA : public ClockedObject
         uint64_t leadBlocks = 0;
     };
 
+    // The generic trace-replay path models the already selected CIRA
+    // prefetch template.  The host ORC JIT makes this plan before ROI and the
+    // replay binary installs it through m5ops.  Keeping the plan explicit in
+    // the model makes the control path auditable without fabricating a JIT
+    // execution-time bonus.
+    struct JitThreadConfig
+    {
+        uint64_t batchSize = 0;
+        uint64_t traversalDepth = 0;
+        uint64_t pipelineDistance = 0;
+        uint64_t templateTag = 0;
+        bool active = false;
+    };
+
     struct PacketSenderState : public Packet::SenderState
     {
         PacketSenderState(PacketRole packet_role, uint64_t request_id,
@@ -533,6 +547,11 @@ class CIRA : public ClockedObject
     std::set<Addr> pendingPrWriteLines;
     uint64_t prEpoch = 0;
     std::unordered_map<ThreadContext *, PrThreadConfig> prThreadConfigs;
+    // Unlike PageRank descriptor tuning, the compiler dispatch plan is a
+    // region-level control-plane setting.  The m5op that verifies it can run
+    // on a different OpenMP worker than the m5op that installed it, so it is
+    // intentionally CIRA-instance scoped rather than ThreadContext scoped.
+    JitThreadConfig jitPlan;
     std::unordered_map<uint64_t, ThreadContext *> prReconfigurations;
 
     CIRAStats stats;

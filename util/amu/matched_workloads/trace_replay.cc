@@ -1673,6 +1673,56 @@ warmWorkerThreads()
     if (std::find(workers.begin(), workers.end(), false) != workers.end())
         throw std::runtime_error("replay worker warmup did not use four threads");
 }
+
+struct CiraJitPlan
+{
+    uint64_t batchSize = 0;
+    uint64_t traversalDepth = 0;
+    uint64_t pipelineDistance = 0;
+    uint64_t templateTag = 0;
+
+    bool enabled() const
+    {
+        return batchSize != 0 || traversalDepth != 0 ||
+            pipelineDistance != 0 || templateTag != 0;
+    }
+};
+
+void
+installCiraJitPlan(const std::string &system, const CiraJitPlan &plan)
+{
+    if (!plan.enabled())
+        return;
+    if (system != "cira" || plan.batchSize == 0 ||
+        plan.traversalDepth == 0 || plan.templateTag == 0)
+        throw std::runtime_error("CIRA JIT plan is incomplete or misrouted");
+    const std::array<std::pair<uint64_t, uint64_t>, 4> writes = {{
+        {CIRA_CFG_JIT_BATCH_SIZE, plan.batchSize},
+        {CIRA_CFG_JIT_TRAVERSAL_DEPTH, plan.traversalDepth},
+        {CIRA_CFG_JIT_PIPELINE_DISTANCE, plan.pipelineDistance},
+        {CIRA_CFG_JIT_TEMPLATE_TAG, plan.templateTag},
+    }};
+    for (const auto &[reg, value] : writes) {
+        if (cira_cfgwr(reg, value) != 1 || cira_cfgrd(reg) != value)
+            throw std::runtime_error("CIRA JIT plan register verification failed");
+    }
+    if (cira_cfgwr(CIRA_CFG_JIT_ACTIVE, 1) != 1 ||
+        cira_cfgrd(CIRA_CFG_JIT_ACTIVE) != 1)
+        throw std::runtime_error("CIRA JIT plan activation failed");
+}
+
+void
+verifyCiraJitPlan(const std::string &system, const CiraJitPlan &plan)
+{
+    if (!plan.enabled())
+        return;
+    if (system != "cira" || cira_cfgrd(CIRA_CFG_JIT_ACTIVE) != 1 ||
+        cira_cfgrd(CIRA_CFG_JIT_BATCH_SIZE) != plan.batchSize ||
+        cira_cfgrd(CIRA_CFG_JIT_TRAVERSAL_DEPTH) != plan.traversalDepth ||
+        cira_cfgrd(CIRA_CFG_JIT_PIPELINE_DISTANCE) != plan.pipelineDistance ||
+        cira_cfgrd(CIRA_CFG_JIT_TEMPLATE_TAG) != plan.templateTag)
+        throw std::runtime_error("CIRA JIT plan is not active at ROI completion");
+}
 #endif
 
 void
@@ -1680,7 +1730,10 @@ writeResult(const std::string &path, const std::string &system,
             size_t traceRecords,
             const std::vector<Commit> &commits, size_t allocatedBytes,
             size_t phases, const ReplayStats &stats, const std::string &mode,
-            const std::vector<OutputBoundary> &boundaries = {})
+            const std::vector<OutputBoundary> &boundaries = {},
+            uint64_t jitBatchSize = 0, uint64_t jitTraversalDepth = 0,
+            uint64_t jitPipelineDistance = 0, uint64_t jitTemplateTag = 0,
+            bool jitActive = false)
 {
     std::ostringstream stream;
     stream << "{\"allocated_bytes\":" << allocatedBytes
@@ -1739,8 +1792,15 @@ writeResult(const std::string &path, const std::string &system,
         }
         stream << "]}";
     }
-    stream << "},\"trace_records\":" << traceRecords
-           << ",\"verification\":\"pass\"}\n";
+    stream << "},\"trace_records\":" << traceRecords;
+    if (jitActive) {
+        stream << ",\"cira_jit\":{\"active\":true,\"batch_size\":"
+               << jitBatchSize << ",\"traversal_depth\":"
+               << jitTraversalDepth << ",\"pipeline_distance\":"
+               << jitPipelineDistance << ",\"template_tag\":"
+               << jitTemplateTag << '}';
+    }
+    stream << ",\"verification\":\"pass\"}\n";
     if (!stream)
         throw std::runtime_error("replay result write failed");
     writeTextFile(path, stream.str());
@@ -1851,6 +1911,10 @@ main(int argc, char **argv)
         uint64_t selectedPhase = 0;
         uint64_t windowIndex = 0;
         uint64_t measureStartItem = 0;
+        uint64_t ciraJitBatchSize = 0;
+        uint64_t ciraJitTraversalDepth = 0;
+        uint64_t ciraJitPipelineDistance = 0;
+        uint64_t ciraJitTemplateTag = 0;
         bool hasPhase = false;
         bool hasWindowIndex = false;
         bool hasMeasureStartItem = false;
@@ -1882,6 +1946,14 @@ main(int argc, char **argv)
             } else if (option == "--measure-start-item") {
                 measureStartItem = std::stoull(argv[++index]);
                 hasMeasureStartItem = true;
+            } else if (option == "--cira-jit-batch-size") {
+                ciraJitBatchSize = std::stoull(argv[++index]);
+            } else if (option == "--cira-jit-traversal-depth") {
+                ciraJitTraversalDepth = std::stoull(argv[++index]);
+            } else if (option == "--cira-jit-pipeline-distance") {
+                ciraJitPipelineDistance = std::stoull(argv[++index]);
+            } else if (option == "--cira-jit-template-tag") {
+                ciraJitTemplateTag = std::stoull(argv[++index]);
             } else if (option == "--stream") {
                 const std::string value = argv[++index];
                 if (value != "0" && value != "1")
@@ -1918,8 +1990,15 @@ main(int argc, char **argv)
                 throw std::runtime_error("cannot close window manifest");
         }
 #ifdef TRACE_REPLAY_NATIVE
+        if (ciraJitBatchSize != 0 || ciraJitTraversalDepth != 0 ||
+            ciraJitPipelineDistance != 0 || ciraJitTemplateTag != 0)
+            throw std::runtime_error("native replay cannot install a CIRA JIT plan");
         (void)selectedPhase;
         (void)windowIndex;
+#else
+        const CiraJitPlan ciraJitPlan{
+            ciraJitBatchSize, ciraJitTraversalDepth,
+            ciraJitPipelineDistance, ciraJitTemplateTag};
 #endif
 
         if (streamMode) {
@@ -1968,6 +2047,7 @@ main(int argc, char **argv)
             if (measured.empty())
                 throw std::runtime_error("window measured range is empty");
 #ifndef TRACE_REPLAY_NATIVE
+            installCiraJitPlan(system, ciraJitPlan);
             m5_work_begin(selectedPhase, windowIndex);
             warmWorkerThreads();
 #endif
@@ -1984,6 +2064,7 @@ main(int argc, char **argv)
                                  previousStore, commitSlots, commits);
 #ifndef TRACE_REPLAY_NATIVE
             m5_work_end(selectedPhase, windowIndex);
+            verifyCiraJitPlan(system, ciraJitPlan);
 #endif
             measuredPhases = measured.size();
         } else {
@@ -1996,7 +2077,11 @@ main(int argc, char **argv)
         }
         writeResult(resultPath, system, records.size(), commits,
                     memory.allocatedBytes(), measuredPhases, stats, mode,
-                    outputBoundaries);
+                    outputBoundaries,
+                    ciraJitBatchSize, ciraJitTraversalDepth,
+                    ciraJitPipelineDistance, ciraJitTemplateTag,
+                    ciraJitBatchSize != 0 || ciraJitTraversalDepth != 0 ||
+                    ciraJitPipelineDistance != 0 || ciraJitTemplateTag != 0);
 #ifndef TRACE_REPLAY_NATIVE
         m5_exit(0);
 #endif

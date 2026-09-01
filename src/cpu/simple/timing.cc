@@ -548,7 +548,7 @@ TimingSimpleCPU::writeMem(uint8_t *data, unsigned size,
     BaseMMU::Mode mode = BaseMMU::Write;
 
     if (data == NULL) {
-        assert(flags & Request::STORE_NO_DATA);
+        assert(flags & (Request::STORE_NO_DATA | Request::NO_ACCESS));
         // This must be a cache block cleaning request
         memset(newData, 0, size);
     } else {

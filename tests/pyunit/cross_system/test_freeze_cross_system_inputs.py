@@ -170,6 +170,10 @@ def use_fixture_spatter_capacity(value):
 
 def valid_record(root):
     graph = write(root / "g20.sg", b"graph")
+    gap_trace = root / "gap-bc-trace"
+    gap_trace.mkdir()
+    gap_descriptor = write(gap_trace / "trace.v2.json", b"{}\n")
+    gap_formal = write(root / "gap-bc-formal.json", b"{}\n")
     mcf_source = write(root / "mcf.cc", b"mcf source")
     source_commit = "2b30de22399402d8c44bd74b8ebf743b6a6a55e9"
     source_tree_sha256 = "1" * 64
@@ -252,6 +256,18 @@ def valid_record(root):
             "allocated_bytes": 240_000_000,
             "scale": 20,
         },
+        "gap_bc": {
+            "input": str(graph),
+            "input_sha256": sha256(graph),
+            "allocated_bytes": 159_151_968,
+            "scale": 20,
+            "synthetic": False,
+            "formal_record": str(gap_formal),
+            "formal_record_sha256": sha256(gap_formal),
+            "trace": str(gap_trace.resolve()),
+            "trace_descriptor_sha256": sha256(gap_descriptor),
+            "source_vertex": 756607,
+        },
         "mcf": {
             "input": str(mcf_input),
             "input_sha256": sha256(mcf_input),
@@ -272,14 +288,6 @@ def valid_record(root):
             "source_commit": commit,
             "parameter_file": str(cg_params),
             "parameter_sha256": sha256(cg_params),
-            "allocated_bytes": 12_800_000_000,
-            "class": "paper-exact",
-        },
-        "npb_mg": {
-            "source_root": str(npb_root),
-            "source_commit": commit,
-            "parameter_file": str(mg_params),
-            "parameter_sha256": sha256(mg_params),
             "allocated_bytes": 12_800_000_000,
             "class": "paper-exact",
         },
@@ -353,9 +361,6 @@ class FreezeInputTest(unittest.TestCase):
         self.assertEqual(
             freeze.MINIMUM_ALLOCATED_BYTES["npb_cg"], 12_800_000_000
         )
-        self.assertEqual(
-            freeze.MINIMUM_ALLOCATED_BYTES["npb_mg"], 12_800_000_000
-        )
         with tempfile.TemporaryDirectory() as tmp:
             value = valid_record(Path(tmp))
             value["npb_cg"]["allocated_bytes"] = 12_000_000_000
@@ -394,17 +399,14 @@ class FreezeInputTest(unittest.TestCase):
                 write(root / f"g{scale}.json", b"{}\n")
                 for scale in (4, 12, 14, 20)
             )
-            rows = {
-                name: {
-                    "source_root": str(root / "npb"),
-                    "source_commit": "a" * 40,
-                    "parameter_file": str(root / f"{short}.params"),
-                    "parameter_sha256": "b" * 64,
-                    "allocated_bytes": 12_800_000_000,
-                    "class": "D",
-                }
-                for short, name in (("cg", "npb_cg"), ("mg", "npb_mg"))
-            }
+            rows = {"npb_cg": {
+                "source_root": str(root / "npb"),
+                "source_commit": "a" * 40,
+                "parameter_file": str(root / "cg.params"),
+                "parameter_sha256": "b" * 64,
+                "allocated_bytes": 12_800_000_000,
+                "class": "D",
+            }}
             graphs = tuple(
                 SimpleNamespace(
                     scale=scale,
@@ -428,9 +430,11 @@ class FreezeInputTest(unittest.TestCase):
             frozen_path = root / "inputs.json"
             frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
 
-            loaded, _digest = builder.load_frozen_npb_inputs(frozen_path)
+            loaded, _digest = builder.load_frozen_npb_inputs(
+                frozen_path, workload_names=("npb_cg",)
+            )
 
-            self.assertEqual(set(loaded), {"cg", "mg"})
+            self.assertEqual(set(loaded), {"cg"})
 
     def test_npb_requires_parameter_hash_and_allocated_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -542,7 +546,10 @@ class FreezeInputTest(unittest.TestCase):
                 freeze.MINIMUM_ALLOCATED_BYTES,
                 {"amg_gather": 1, "lulesh_scatter": 1},
             ):
-                result = freeze.validate_bound_inputs(value)
+                with mock.patch.object(
+                    freeze, "validate_gap_bc_record", return_value={}
+                ):
+                    result = freeze.validate_bound_inputs(value)
             self.assertEqual(tuple(result), freeze.WORKLOADS)
             self.assertEqual(result["npb_cg"]["source_commit"], value["npb_cg"]["source_commit"])
             self.assertEqual(result["amg_gather"]["index"], value["amg_gather"]["index"])

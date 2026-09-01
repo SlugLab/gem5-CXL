@@ -26,6 +26,14 @@ enum cira_cfg_reg
     CIRA_CFG_PR_ROW_WINDOW = 4,
     CIRA_CFG_PR_LEAD_BLOCKS = 5,
     CIRA_CFG_PR_RECONFIGURE = 6,
+    // A steady-state CIRA JIT dispatch plan.  These registers describe the
+    // compiler-selected template that is already resident before the ROI;
+    // they intentionally do not add a synthetic execution-time discount.
+    CIRA_CFG_JIT_BATCH_SIZE = 7,
+    CIRA_CFG_JIT_TRAVERSAL_DEPTH = 8,
+    CIRA_CFG_JIT_PIPELINE_DISTANCE = 9,
+    CIRA_CFG_JIT_TEMPLATE_TAG = 10,
+    CIRA_CFG_JIT_ACTIVE = 11,
 };
 
 struct cira_indexed_prefetch_desc

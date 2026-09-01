@@ -57,6 +57,10 @@ def make_git_source(root):
 
 def valid_record(root):
     graph = write(root / "g20.sg", b"graph")
+    gap_trace = root / "gap-bc-trace"
+    gap_trace.mkdir()
+    gap_descriptor = write(gap_trace / "trace.v2.json", b"{}\n")
+    gap_formal = write(root / "gap-bc-formal.json", b"{}\n")
     mcf_source = write(root / "mcf.cc", b"mcf source")
     source_commit = "2b30de22399402d8c44bd74b8ebf743b6a6a55e9"
     source_tree_sha256 = "1" * 64
@@ -137,6 +141,16 @@ def valid_record(root):
             "input": str(graph), "input_sha256": sha256(graph),
             "allocated_bytes": 240_000_000, "scale": 20,
         },
+        "gap_bc": {
+            "input": str(graph), "input_sha256": sha256(graph),
+            "allocated_bytes": 159_151_968, "scale": 20,
+            "synthetic": False,
+            "formal_record": str(gap_formal),
+            "formal_record_sha256": sha256(gap_formal),
+            "trace": str(gap_trace.resolve()),
+            "trace_descriptor_sha256": sha256(gap_descriptor),
+            "source_vertex": 756607,
+        },
         "mcf": {
             "input": str(mcf_input), "input_sha256": sha256(mcf_input),
             "allocated_bytes": 345_000_000,
@@ -155,12 +169,6 @@ def valid_record(root):
             "source_root": str(npb_root), "source_commit": commit,
             "parameter_file": str(cg_params),
             "parameter_sha256": sha256(cg_params),
-            "allocated_bytes": 12_800_000_000, "class": "C",
-        },
-        "npb_mg": {
-            "source_root": str(npb_root), "source_commit": commit,
-            "parameter_file": str(mg_params),
-            "parameter_sha256": sha256(mg_params),
             "allocated_bytes": 12_800_000_000, "class": "C",
         },
     }
@@ -192,6 +200,12 @@ class InputAuditTest(unittest.TestCase):
                 set(audit.template_record()[workload]),
                 freeze.REQUIRED[workload],
             )
+
+    def test_template_gap_bc_shape_matches_formal_required_shape(self):
+        self.assertEqual(
+            set(audit.template_record()["gap_bc"]),
+            freeze.REQUIRED["gap_bc"],
+        )
 
     @mock.patch.object(audit.subprocess, "check_output", return_value="clean\n")
     def test_git_inspection_scopes_safe_directory_to_source_root(self, check):
@@ -226,11 +240,15 @@ class InputAuditTest(unittest.TestCase):
             freeze.MINIMUM_ALLOCATED_BYTES,
             {"amg_gather": 1, "lulesh_scatter": 1},
         ):
-            result = audit.audit_record(candidate)
+            with mock.patch.object(
+                freeze, "validate_gap_bc_record", return_value={}
+            ):
+                result = audit.audit_record(candidate)
+                bound = freeze.validate_bound_inputs(candidate)
             self.assertEqual(result["status"], "ready_for_freeze")
             self.assertNotEqual(result["status"], "accepted")
             self.assertEqual(
-                freeze.validate_bound_inputs(candidate)["npb_cg"]["source_commit"],
+                bound["npb_cg"]["source_commit"],
                 candidate["npb_cg"]["source_commit"],
             )
 

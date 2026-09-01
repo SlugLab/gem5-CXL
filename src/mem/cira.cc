@@ -2477,6 +2477,40 @@ CIRA::cfgWrite(ThreadContext *tc, uint64_t reg, uint64_t value)
         schedule(event, curTick() + prReconfigurationLatency);
         return id;
       }
+      case 7:
+        if (value == 0)
+            return 0;
+        jitPlan.batchSize = value;
+        jitPlan.active = false;
+        return 1;
+      case 8:
+        if (value == 0)
+            return 0;
+        jitPlan.traversalDepth = value;
+        jitPlan.active = false;
+        return 1;
+      case 9:
+        jitPlan.pipelineDistance = value;
+        jitPlan.active = false;
+        return 1;
+      case 10:
+        if (value == 0)
+            return 0;
+        jitPlan.templateTag = value;
+        jitPlan.active = false;
+        return 1;
+      case 11: {
+        auto &plan = jitPlan;
+        if (value == 0) {
+            plan.active = false;
+            return 1;
+        }
+        if (plan.batchSize == 0 || plan.traversalDepth == 0 ||
+            plan.templateTag == 0)
+            return 0;
+        plan.active = true;
+        return 1;
+      }
       default:
         return 0;
     }
@@ -2505,6 +2539,21 @@ CIRA::cfgRead(ThreadContext *tc, uint64_t reg) const
       case 5: {
         const auto it = prThreadConfigs.find(tc);
         return it == prThreadConfigs.end() ? 0 : it->second.leadBlocks;
+      }
+      case 7: {
+        return jitPlan.batchSize;
+      }
+      case 8: {
+        return jitPlan.traversalDepth;
+      }
+      case 9: {
+        return jitPlan.pipelineDistance;
+      }
+      case 10: {
+        return jitPlan.templateTag;
+      }
+      case 11: {
+        return jitPlan.active ? 1 : 0;
       }
       default:
         return 0;
@@ -2570,6 +2619,7 @@ CIRA::reset()
     pendingPrCsrPackets = 0;
     pendingPrWriteLines.clear();
     prThreadConfigs.clear();
+    jitPlan = {};
     prReconfigurations.clear();
     stats.prOutstandingWork = 0;
     for (PortID core = 0; core < memSidePorts.size(); ++core)

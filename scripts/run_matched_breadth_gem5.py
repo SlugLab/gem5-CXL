@@ -414,7 +414,7 @@ def _remember_initial(words, operation):
     words[operation.address] = (bits, initial)
 
 
-def _eager_initial_word(bundle, root, address, bits):
+def _eager_initial_word(bundle, root, address, bits, *, fallback=None):
     width = bits // 8
     for record in bundle.meta.get("initial_memory", {}).values():
         if record["word_bits"] != bits:
@@ -428,6 +428,8 @@ def _eager_initial_word(bundle, root, address, bits):
             if len(payload) != width:
                 raise ReplayError("eager initial image is truncated")
             return int.from_bytes(payload, "little")
+    if fallback is not None:
+        return fallback
     raise ReplayError("eager window address lacks initial authority")
 
 
@@ -487,9 +489,17 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                                 "eager window memory width changes at one address"
                             )
                         if value is None:
-                            value = (bits, _eager_initial_word(
-                                source, trace, operation.address, bits
-                            ))
+                            # A store-only location needs an allocation but no
+                            # source live-in value.  Prepared scatter windows
+                            # legitimately omit such locations from their
+                            # initial-memory authority.
+                            if operation.opcode.name.startswith("STORE_"):
+                                value = (bits, 0)
+                            else:
+                                value = (bits, _eager_initial_word(
+                                    source, trace, operation.address, bits,
+                                    fallback=operation.operand0,
+                                ))
                         dynamic_initial[operation.address] = value
                     yield False, dataclasses.replace(
                         operation,
@@ -1583,6 +1593,17 @@ def command_for(options):
             "--measure-start-item",
             str(getattr(options, "measure_start_item", 0)),
         ))
+    jit_plan = getattr(options, "cira_jit_plan", None)
+    if jit_plan is not None:
+        if options.system != "cira":
+            raise ReplayError("a CIRA JIT plan may only be used with CIRA")
+        plan = _load_cira_jit_plan(jit_plan)
+        binary_args.extend((
+            "--cira-jit-batch-size", str(plan["batch_size"]),
+            "--cira-jit-traversal-depth", str(plan["traversal_depth"]),
+            "--cira-jit-pipeline-distance", str(plan["pipeline_distance"]),
+            "--cira-jit-template-tag", str(plan["template_tag"]),
+        ))
 
     command = [
         str(Path(options.gem5).resolve()),
@@ -1614,10 +1635,13 @@ def command_for(options):
     if options.mode == "window":
         command.extend((
             "--roi-work-events", "--continue-after-roi",
-            "--fast-forward-cpu", "atomic",
-            "--fast-forward-replay-window",
             "--iterations", "2", "--measure-trial", "1",
         ))
+        if not getattr(options, "no_fast_forward_window", False):
+            command.extend((
+                "--fast-forward-cpu", "atomic",
+                "--fast-forward-replay-window",
+            ))
     return command
 
 
@@ -1629,6 +1653,35 @@ def _load_json(path, label):
     if not isinstance(value, dict):
         raise ReplayError(f"{label} must be a JSON object")
     return value
+
+
+def _load_cira_jit_plan(path):
+    path = Path(path).resolve()
+    value = _load_json(path, "CIRA JIT plan")
+    if value.get("schema") != 1 or value.get("status") != "pass":
+        raise ReplayError("CIRA JIT plan did not pass")
+    if value.get("steady_state") is not True:
+        raise ReplayError("CIRA JIT plan is not a steady-state plan")
+    orc = value.get("orc")
+    plan = value.get("plan")
+    if not isinstance(orc, dict) or not isinstance(plan, dict):
+        raise ReplayError("CIRA JIT plan has invalid structure")
+    if orc.get("cold_rc") != 1 or orc.get("warm_rc") != 1:
+        raise ReplayError("CIRA JIT plan did not run the ORC template twice")
+    if (not isinstance(orc.get("cold_cache_entries"), int) or
+            orc["cold_cache_entries"] <= 0 or
+            orc.get("warm_cache_entries") != orc["cold_cache_entries"]):
+        raise ReplayError("CIRA JIT plan has no verified ORC cache hit")
+    required = ("batch_size", "traversal_depth", "pipeline_distance", "template_tag")
+    selected = {}
+    for name in required:
+        number = plan.get(name)
+        if not isinstance(number, int) or number < 0:
+            raise ReplayError(f"CIRA JIT plan field is invalid: {name}")
+        selected[name] = number
+    if selected["batch_size"] == 0 or selected["traversal_depth"] == 0 or selected["template_tag"] == 0:
+        raise ReplayError("CIRA JIT plan is incomplete")
+    return selected
 
 
 def _stat_integer(stats, name):
@@ -1667,7 +1720,8 @@ def _required_shadow_bytes(bundle):
 
 def collect_run_evidence(run_dir, *, system, trace, config,
                          expected=None, required_bytes=None,
-                         require_activity=True, cxl_link_delay="1us"):
+                         require_activity=True, cxl_link_delay="1us",
+                         cira_jit_plan=None):
     """Join bit-exact program output with gem5-owned causal statistics."""
     if system not in SYSTEMS:
         raise ReplayError(f"unsupported replay system: {system}")
@@ -1693,6 +1747,14 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         raise ReplayError("stream replay record count differs")
     if result.get("verification") != "pass":
         raise ReplayError("replay program verification did not pass")
+    if cira_jit_plan is not None:
+        expected_plan = _load_cira_jit_plan(cira_jit_plan)
+        observed_plan = result.get("cira_jit")
+        if not isinstance(observed_plan, dict) or observed_plan.get("active") is not True:
+            raise ReplayError("CIRA JIT plan is not active in replay result")
+        for name, expected_value in expected_plan.items():
+            if observed_plan.get(name) != expected_value:
+                raise ReplayError(f"CIRA JIT replay plan differs: {name}")
     if bundle is not None:
         validate_output_boundaries(bundle, result.get("output_boundaries"))
     else:
@@ -1791,6 +1853,8 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         row["descriptor_errors"] = _stat_integer(
             stats, "board.cira.droppedCsrDescriptors"
         )
+        if cira_jit_plan is not None:
+            row["cira_jit"] = result["cira_jit"]
     validate_mechanism(
         system, row, require_activity=require_activity,
         cxl_link_delay=cxl_link_delay,
@@ -1865,6 +1929,19 @@ def parse_args(argv=None):
     )
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument(
+        "--cira-jit-plan", type=Path,
+        help="verified steady-state ORC CIRA JIT plan to install before ROI",
+    )
+    parser.add_argument(
+        "--no-fast-forward-window",
+        action="store_true",
+        help=(
+            "Run both replay-window trials on the timing CPU. Use this for "
+            "traces containing cache-maintenance instructions unsupported "
+            "by gem5's AtomicSimpleCPU."
+        ),
+    )
     options = parser.parse_args(argv)
     canonical_selection = (
         options.window_manifest, options.phase, options.window_index
@@ -1872,6 +1949,7 @@ def parse_args(argv=None):
     if options.mode == "functional" and (
         options.fixed_trace is not None
         or any(value is not None for value in canonical_selection)
+        or options.no_fast_forward_window
     ):
         parser.error("functional replay may not select a timing window")
     if options.mode == "window":
@@ -1896,6 +1974,13 @@ def parse_args(argv=None):
         parser.error("--window-index must be nonnegative")
     if options.timeout < 0:
         parser.error("--timeout must be nonnegative")
+    if options.cira_jit_plan is not None:
+        if options.system != "cira":
+            parser.error("--cira-jit-plan requires --system cira")
+        try:
+            _load_cira_jit_plan(options.cira_jit_plan)
+        except ReplayError as error:
+            parser.error(str(error))
     return options
 
 
@@ -2033,6 +2118,7 @@ def run(options):
             outdir, system=options.system, trace=replay_trace,
             config=outdir / "config.ini",
             cxl_link_delay=options.cxl_link_delay,
+            cira_jit_plan=options.cira_jit_plan,
         )
     else:
         widths = {"u32": 4, "u64": 8, "f32": 4, "f64": 8}
@@ -2045,6 +2131,7 @@ def run(options):
             config=outdir / "config.ini", expected=producer_evidence,
             required_bytes=required_bytes,
             cxl_link_delay=options.cxl_link_delay,
+            cira_jit_plan=options.cira_jit_plan,
         )
     fixed_command = None
     fixed_row = None
@@ -2081,6 +2168,7 @@ def run(options):
             trace=materialized.fixed_root,
             config=fixed_outdir / "config.ini", require_activity=False,
             cxl_link_delay=options.cxl_link_delay,
+            cira_jit_plan=options.cira_jit_plan,
         )
         row = combine_window_evidence(
             row, fixed_row,
@@ -2107,6 +2195,14 @@ def run(options):
         "command": command,
         "row": row,
     }
+    if options.cira_jit_plan is not None:
+        plan_path = Path(options.cira_jit_plan).resolve()
+        evidence["cira_jit_steady_state"] = {
+            "plan": str(plan_path),
+            "plan_sha256": _sha256_file(plan_path),
+            "vortex_device_jit": False,
+            "roi_excludes_orc_cold_compile": True,
+        }
     if materialized is not None:
         evidence["materialized_window"] = {
             **materialized_trace_record(materialized),

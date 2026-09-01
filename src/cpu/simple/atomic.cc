@@ -444,7 +444,7 @@ AtomicSimpleCPU::writeMem(uint8_t *data, unsigned size, Addr addr,
 
     if (data == NULL) {
         assert(size <= 64);
-        assert(flags & Request::STORE_NO_DATA);
+        assert(flags & (Request::STORE_NO_DATA | Request::NO_ACCESS));
         // This must be a cache block cleaning request
         data = zero_array;
     }
