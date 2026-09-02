@@ -16,6 +16,7 @@
 #include "CiraRuntime.h"
 #include "cira_jit.h"
 #include "cira_jit_engine.h"
+#include "cira_vortex_jit.h"
 
 namespace {
 
@@ -36,6 +37,8 @@ struct Profile
     uint64_t elements = 0;
     uint64_t templateTag = 0;
     bool hardwareCeilingPlan = false;
+    std::string vortexTemplate;
+    std::string vortexTemplateId;
 };
 
 Profile
@@ -60,6 +63,10 @@ parseArgs(int argc, char **argv, std::string &out)
         else if (option == "--hardware-ceiling-plan")
             profile.hardwareCeilingPlan =
                 parseU64(value, "hardware-ceiling-plan") != 0;
+        else if (option == "--vortex-template")
+            profile.vortexTemplate = value;
+        else if (option == "--vortex-template-id")
+            profile.vortexTemplateId = value;
         else
             throw std::runtime_error("unknown JIT option: " + option);
     }
@@ -102,6 +109,32 @@ main(int argc, char **argv)
             decision.pipeline_distance = limits.max_pipeline_distance;
         }
 
+        // Compile a PGO-specialized device image twice before the modeled ROI.
+        // This verifies the real .vxbin cache without falsely claiming that
+        // this host-only preflight uploaded or executed the image.
+        std::string vortexPath;
+        if (!profile.vortexTemplate.empty()) {
+            cira_vortex_jit_spec_t deviceSpec{};
+            deviceSpec.source_path = profile.vortexTemplate.c_str();
+            deviceSpec.template_id = profile.vortexTemplateId.empty() ?
+                nullptr : profile.vortexTemplateId.c_str();
+            deviceSpec.decision = decision;
+            char firstPath[4096] = {};
+            char secondPath[4096] = {};
+            const int firstResult = cira_vortex_jit_compile(
+                &deviceSpec, firstPath, sizeof(firstPath));
+            const int secondResult = cira_vortex_jit_compile(
+                &deviceSpec, secondPath, sizeof(secondPath));
+            if (firstResult != CIRA_VORTEX_JIT_OK ||
+                secondResult != CIRA_VORTEX_JIT_OK ||
+                std::string(firstPath).empty() ||
+                std::string(firstPath) != std::string(secondPath)) {
+                throw std::runtime_error(
+                    "Vortex device JIT compile/cache verification failed");
+            }
+            vortexPath = firstPath;
+        }
+
         auto &engine = cira::CiraJitEngine::shared();
         engine.resetCache();
         void *operands[] = {nullptr};
@@ -133,7 +166,8 @@ main(int argc, char **argv)
         if (!stream)
             throw std::runtime_error("cannot write JIT plan");
         stream << "{\"schema\":1,\"status\":\"pass\","
-               << "\"steady_state\":true,\"vortex_device_jit\":false,"
+               << "\"steady_state\":true,\"vortex_device_jit\":"
+               << (!vortexPath.empty() ? "true" : "false") << ","
                << "\"selection\":\""
                << (profile.hardwareCeilingPlan ? "hardware_ceiling_sensitivity"
                                                : "cost_model")
@@ -156,7 +190,11 @@ main(int argc, char **argv)
                << costModelDecision.batch_size << ",\"traversal_depth\":"
                << costModelDecision.traversal_depth
                << ",\"pipeline_distance\":"
-               << costModelDecision.pipeline_distance << "}}\n";
+               << costModelDecision.pipeline_distance
+               << "},\"vortex\":{\"artifact\":\"" << vortexPath
+               << "\",\"compiled_and_cached\":"
+               << (!vortexPath.empty() ? "true" : "false")
+               << ",\"uploaded_or_executed\":false}}\n";
         if (!stream)
             throw std::runtime_error("JIT plan write failed");
         return 0;

@@ -87,6 +87,9 @@
 #define M5OP_AMU_WAITFIN        0x64
 #define M5OP_AMU_PR_ROWS       0x65
 #define M5OP_CIRA_PR_ROWS      0x66
+/* Stage two register-supplied addresses; submit the staged batch with 0x67. */
+#define M5OP_AMU_ALOAD_BATCH   0x67
+#define M5OP_AMU_ALOAD_STAGE   0x68
 
 #define M5OP_WORKLOAD           0x70
 

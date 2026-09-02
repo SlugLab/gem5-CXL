@@ -1,0 +1,44 @@
+{
+  "csv": "cira-vortex-cxl-link-dispatch.csv",
+  "link_model": "SerialLink request plus response",
+  "runs": [
+    {
+      "link_latency_ns": 200,
+      "read_rtt_ticks": 402264,
+      "read_samples": 111,
+      "sim_ticks": 167866058907,
+      "stats_path": "/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-200ns-256-fixed/stats.txt",
+      "write_rtt_ticks": 402264,
+      "write_samples": 12246
+    },
+    {
+      "link_latency_ns": 500,
+      "read_rtt_ticks": 1002330,
+      "read_samples": 111,
+      "sim_ticks": 175339547604,
+      "stats_path": "/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-500ns-256-final-v2/stats.txt",
+      "write_rtt_ticks": 1002330,
+      "write_samples": 12246
+    },
+    {
+      "link_latency_ns": 1000,
+      "read_rtt_ticks": 2002662,
+      "read_samples": 111,
+      "sim_ticks": 187676231571,
+      "stats_path": "/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-1us-256-final/stats.txt",
+      "write_rtt_ticks": 2002662,
+      "write_samples": 12246
+    },
+    {
+      "link_latency_ns": 2000,
+      "read_rtt_ticks": 4002660,
+      "read_samples": 111,
+      "sim_ticks": 212411792583,
+      "stats_path": "/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-2us-256-fixed/stats.txt",
+      "write_rtt_ticks": 4002660,
+      "write_samples": 12246
+    }
+  ],
+  "schema": 1,
+  "scope": "timing-CPU CIRA/Vortex JIT dispatch microbenchmark"
+}

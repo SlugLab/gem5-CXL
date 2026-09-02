@@ -521,6 +521,11 @@ TimingSimpleCPU::handleWritePacket()
         if (!FullSystem && !req->isSwap() &&
             !req->hasAtomicOpFunctor() &&
             !req->getFlags().isSet(Request::STORE_NO_DATA) &&
+            // A device BAR (for example Vortex VRAM behind the modeled CXL
+            // link) has no backing entry in PhysicalMemory.  It must reach
+            // its PIO responder only; mirroring it into the syscall shadow
+            // both bypasses that device and asserts in PhysicalMemory.
+            system->getPhysMem().isMemAddr(req->getPaddr()) &&
             !dcache_pkt->isHtmTransactional()) {
             Packet shadow_pkt(req, MemCmd::WriteReq);
             shadow_pkt.dataStaticConst(

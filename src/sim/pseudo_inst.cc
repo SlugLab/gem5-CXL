@@ -617,6 +617,22 @@ amuAload(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
 }
 
 uint64_t
+amuAloadStage(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
+{
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->stageAload(tc, spmAddr.addr, memAddr.addr);
+    return 0;
+}
+
+uint64_t
+amuAloadBatch(ThreadContext *tc)
+{
+    if (auto *asmc = ASMC::get(tc->getSystemPtr()))
+        return asmc->issueAloadBatch(tc);
+    return 0;
+}
+
+uint64_t
 amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr)
 {
     if (auto *asmc = ASMC::get(tc->getSystemPtr()))

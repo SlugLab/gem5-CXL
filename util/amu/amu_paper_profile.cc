@@ -15,8 +15,8 @@
 #include <immintrin.h>
 
 #include <gem5/m5ops.h>
-
 #include "amu.h"
+#include "cira.h"
 
 namespace {
 
@@ -40,6 +40,12 @@ constexpr size_t kHashBuckets = 16000;
 constexpr size_t kHashDepth = 4;
 constexpr size_t kStreamGranularity = 512;
 constexpr size_t kStreamBlocks = 256;
+// Table 3 of Wang et al. describes BFS as a Graph500 workload with 16,384
+// vertices and 262,144 edges.  Keep this workload deliberately small enough
+// for detailed OoO simulation, but large enough that its edge array does not
+// fit in the 256 KiB private L2 used by the paper configuration.
+constexpr size_t kBfsVertices = 16384;
+constexpr size_t kBfsEdges = 262144;
 constexpr unsigned kChecksumMagic = 0x414d5531;
 
 struct HashNode {
@@ -62,6 +68,11 @@ struct Options {
     std::string rawOutput;
     size_t iterations = 1;
     bool amu = false;
+    bool cira = false;
+    uint64_t ciraJitBatchSize = 0;
+    uint64_t ciraJitTraversalDepth = 0;
+    uint64_t ciraJitPipelineDistance = 0;
+    uint64_t ciraJitTemplateTag = 0;
 };
 
 struct BenchmarkState {
@@ -74,6 +85,11 @@ struct BenchmarkState {
     std::vector<StreamBlock> streamA;
     std::vector<StreamBlock> streamB;
     std::vector<StreamBlock> streamC;
+    std::vector<uint32_t> bfsOffsets;
+    std::vector<uint32_t> bfsEdges;
+    std::vector<int32_t> bfsParents;
+    std::vector<uint32_t> bfsFrontier;
+    std::vector<uint32_t> bfsNextFrontier;
 };
 
 enum class SlotPhase {
@@ -113,16 +129,41 @@ parseOptions(int argc, char **argv)
             options.rawOutput = argv[++i];
         } else if (argument == "--amu") {
             options.amu = true;
+        } else if (argument == "--cira") {
+            options.cira = true;
+        } else if (argument == "--cira-jit-batch-size" && i + 1 < argc) {
+            options.ciraJitBatchSize = std::stoull(argv[++i]);
+        } else if (argument == "--cira-jit-traversal-depth" &&
+                   i + 1 < argc) {
+            options.ciraJitTraversalDepth = std::stoull(argv[++i]);
+        } else if (argument == "--cira-jit-pipeline-distance" &&
+                   i + 1 < argc) {
+            options.ciraJitPipelineDistance = std::stoull(argv[++i]);
+        } else if (argument == "--cira-jit-template-tag" && i + 1 < argc) {
+            options.ciraJitTemplateTag = std::stoull(argv[++i]);
         } else {
             throw std::runtime_error("invalid AMU paper-profile argument");
         }
     }
     if (options.workload != "gups" && options.workload != "hj" &&
-        options.workload != "stream") {
-        throw std::runtime_error("--workload must be gups, hj, or stream");
+        options.workload != "stream" && options.workload != "bfs") {
+        throw std::runtime_error(
+            "--workload must be gups, hj, stream, or bfs");
     }
     if (options.iterations == 0 || options.rawOutput.empty())
         throw std::runtime_error("iterations and raw output are required");
+    if (options.amu && options.cira)
+        throw std::runtime_error("AMU and CIRA modes are mutually exclusive");
+    const bool hasCiraJitField = options.ciraJitBatchSize != 0 ||
+        options.ciraJitTraversalDepth != 0 ||
+        options.ciraJitPipelineDistance != 0 ||
+        options.ciraJitTemplateTag != 0;
+    if (hasCiraJitField &&
+        (!options.cira || options.ciraJitBatchSize == 0 ||
+         options.ciraJitTraversalDepth == 0 ||
+         options.ciraJitTemplateTag == 0)) {
+        throw std::runtime_error("CIRA JIT plan is incomplete");
+    }
     return options;
 }
 
@@ -206,6 +247,39 @@ profileAload(void *spm_address, const void *memory_address)
 }
 
 __attribute__((always_inline)) inline uint64_t
+profileAloadBatch()
+{
+#if defined(__x86_64__)
+    uint64_t result;
+    asm volatile(".byte 0x0f, 0x04\n\t.word %c[function]"
+                 : "=a"(result)
+                 : [function] "i"(M5OP_AMU_ALOAD_BATCH)
+                 : "memory");
+    return result;
+#else
+    return 0;
+#endif
+}
+
+__attribute__((always_inline)) inline uint64_t
+profileAloadStage(void *spm_address, const void *memory_address)
+{
+#if defined(__x86_64__)
+    uint64_t result;
+    asm volatile(".byte 0x0f, 0x04\n\t.word %c[function]"
+                 : "=a"(result)
+                 : "D"(spm_address), "S"(memory_address),
+                   [function] "i"(M5OP_AMU_ALOAD_STAGE)
+                 : "memory");
+    return result;
+#else
+    (void)spm_address;
+    (void)memory_address;
+    return 0;
+#endif
+}
+
+__attribute__((always_inline)) inline uint64_t
 profileAstore(const void *spm_address, void *memory_address)
 {
 #if defined(__x86_64__)
@@ -270,12 +344,22 @@ class PersistentScheduler
         if (liveRequests != 0)
             throw std::runtime_error(
                 "cannot rebind AMU configuration with live requests");
+        // The fast-forward ROI flow replays the guest from work_begin on the
+        // O3 CPU. ASMC is an external asynchronous model, so clear work the
+        // atomic replay instance may already have submitted before binding
+        // this scheduler to the measured CPU context.
+        if (amu_cfgwr(AMU_CFG_RESET, 0) == 0)
+            throw std::runtime_error("AMU reset failed at ROI CPU bind");
         configure(granularity);
         if (amu_cfgrd(AMU_CFG_GRANULARITY) != granularity ||
             amu_cfgrd(AMU_CFG_MAX_OUTSTANDING) != kWindowSlots) {
             throw std::runtime_error(
                 "AMU configuration did not bind to the ROI CPU");
         }
+        std::printf("AMU_SCHEDULER_CAPACITY slots=%zu queue_safe=%zu "
+                    "max_outstanding=%llu\n", activeSlots, queueSafeSlots,
+                    static_cast<unsigned long long>(
+                        amu_cfgrd(AMU_CFG_MAX_OUTSTANDING)));
     }
 
     Slot &slot(size_t index)
@@ -307,6 +391,41 @@ class PersistentScheduler
             spmArena.data() + index * stride, source);
         registerId(index, id, SlotPhase::LoadPending);
         entry.id = id;
+    }
+
+    size_t issueLoadBatch(const size_t *indices, const size_t *operations,
+                          const void *const *sources, size_t count,
+                          uint8_t stage)
+    {
+        if (count == 0 || count > activeSlots)
+            throw std::runtime_error("invalid AMU batch size");
+        for (size_t item = 0; item < count; ++item) {
+            Slot &entry = slot(indices[item]);
+            if (entry.phase != SlotPhase::Free)
+                throw std::runtime_error("batch load uses a non-free slot");
+            if (profileAloadStage(spmArena.data() + indices[item] * stride,
+                                  sources[item]) == 0) {
+                throw std::runtime_error("AMU batch staging failed");
+            }
+        }
+        const uint64_t batch_result = profileAloadBatch();
+        const size_t accepted = static_cast<uint32_t>(batch_result);
+        const uint64_t first_id = batch_result >> 32;
+        if (accepted > count)
+            throw std::runtime_error("AMU batch returned an invalid count");
+        if (accepted != 0 && first_id == 0)
+            throw std::runtime_error("AMU batch returned an invalid first ID");
+        for (size_t item = 0; item < accepted; ++item) {
+            Slot &entry = slot(indices[item]);
+            entry.op = operations[item];
+            entry.destination = nullptr;
+            entry.stage = stage;
+            entry.phase = SlotPhase::LoadPending;
+            const uint64_t id = first_id + item;
+            registerId(indices[item], id, SlotPhase::LoadPending);
+            entry.id = id;
+        }
+        return accepted;
     }
 
     void readyToStore(size_t index, void *destination)
@@ -527,6 +646,8 @@ workloadGranularity(const Options &options)
         return sizeof(uint64_t);
     if (options.workload == "hj")
         return sizeof(HashNode);
+    if (options.workload == "bfs")
+        return sizeof(uint32_t);
     return sizeof(StreamBlock);
 }
 
@@ -549,6 +670,10 @@ flushFarWorkingSet(const Options &options, BenchmarkState &state)
         flushVector(state.streamA);
         flushVector(state.streamB);
         flushVector(state.streamC);
+        if (options.workload == "bfs") {
+            flushVector(state.bfsOffsets);
+            flushVector(state.bfsEdges);
+        }
     }
 }
 
@@ -559,7 +684,9 @@ workloadTag(const Options &options)
         return 1;
     if (options.workload == "hj")
         return 2;
-    return 3;
+    if (options.workload == "stream")
+        return 3;
+    return 4;
 }
 
 void
@@ -588,7 +715,7 @@ prepareAndPrime(const Options &options, BenchmarkState &state)
                     -1 : static_cast<int32_t>(index + 1);
             }
         }
-    } else {
+    } else if (options.workload == "stream") {
         state.streamA.resize(kStreamBlocks);
         state.streamB.resize(kStreamBlocks);
         state.streamC.resize(kStreamBlocks);
@@ -599,12 +726,263 @@ prepareAndPrime(const Options &options, BenchmarkState &state)
                     UINT64_C(0x100000001) + block + word;
             }
         }
+    } else {
+        // A deterministic, Graph500-style sparse graph.  The fixed ring
+        // makes the source component explicit; the remaining edges use a
+        // Kronecker/R-MAT quadrant distribution.  The stored CSR contains
+        // exactly the Table-3 vertex/edge cardinalities.
+        struct Edge {
+            uint32_t source;
+            uint32_t destination;
+        };
+        std::vector<Edge> edges;
+        edges.reserve(kBfsEdges);
+        for (uint32_t vertex = 0; vertex + 1 < kBfsVertices; ++vertex)
+            edges.push_back({vertex, vertex + 1});
+
+        uint64_t random = UINT64_C(0x9e3779b97f4a7c15);
+        auto nextRandom = [&random]() {
+            random ^= random >> 12;
+            random ^= random << 25;
+            random ^= random >> 27;
+            return random * UINT64_C(2685821657736338717);
+        };
+        while (edges.size() != kBfsEdges) {
+            uint32_t source = 0;
+            uint32_t destination = 0;
+            for (uint32_t bit = kBfsVertices >> 1; bit != 0; bit >>= 1) {
+                const uint32_t quadrant = static_cast<uint32_t>(
+                    nextRandom() % 10000);
+                if (quadrant < 5700) {
+                    // top-left
+                } else if (quadrant < 7600) {
+                    destination |= bit;
+                } else if (quadrant < 9500) {
+                    source |= bit;
+                } else {
+                    source |= bit;
+                    destination |= bit;
+                }
+            }
+            edges.push_back({source, destination});
+        }
+
+        // Graph500 applies a vertex-ID permutation after generating the
+        // Kronecker edge list.  Without it vertex zero is an artificial
+        // high-degree/self-loop hub, and a BFS rooted at zero exposes only
+        // one frontier vertex at a time.  Permuting the ring scaffold as
+        // well retains connectivity while restoring the broad frontiers that
+        // make the paper's AMI/coroutine MLP experiment meaningful.
+        std::vector<uint32_t> permutation(kBfsVertices);
+        for (uint32_t vertex = 0; vertex < kBfsVertices; ++vertex)
+            permutation[vertex] = vertex;
+        for (uint32_t vertex = kBfsVertices - 1; vertex != 0; --vertex) {
+            const uint32_t selected = static_cast<uint32_t>(
+                nextRandom() % (static_cast<uint64_t>(vertex) + 1));
+            std::swap(permutation[vertex], permutation[selected]);
+        }
+        for (Edge &edge : edges) {
+            edge.source = permutation[edge.source];
+            edge.destination = permutation[edge.destination];
+        }
+
+        state.bfsOffsets.assign(kBfsVertices + 1, 0);
+        for (const Edge &edge : edges)
+            ++state.bfsOffsets[edge.source + 1];
+        for (size_t vertex = 1; vertex < state.bfsOffsets.size(); ++vertex)
+            state.bfsOffsets[vertex] += state.bfsOffsets[vertex - 1];
+        state.bfsEdges.resize(kBfsEdges);
+        std::vector<uint32_t> next = state.bfsOffsets;
+        for (const Edge &edge : edges)
+            state.bfsEdges[next[edge.source]++] = edge.destination;
+        state.bfsParents.assign(kBfsVertices, -1);
     }
 
     if (options.amu) {
         flushFarWorkingSet(options, state);
         queueSafeSlots = queueSafeSlotCount(workloadGranularity(options));
         primeSpm(workloadGranularity(options));
+    }
+}
+
+void
+resetBfsState(BenchmarkState &state)
+{
+    std::fill(state.bfsParents.begin(), state.bfsParents.end(), -1);
+    state.bfsParents[0] = 0;
+    state.bfsFrontier.clear();
+    state.bfsNextFrontier.clear();
+    state.bfsFrontier.push_back(0);
+}
+
+void
+runBfsBaseline(BenchmarkState &state)
+{
+    while (!state.bfsFrontier.empty()) {
+        state.bfsNextFrontier.clear();
+        for (const uint32_t source : state.bfsFrontier) {
+            for (uint32_t edge = state.bfsOffsets[source];
+                 edge < state.bfsOffsets[source + 1]; ++edge) {
+                const uint32_t destination = state.bfsEdges[edge];
+                if (state.bfsParents[destination] == -1) {
+                    state.bfsParents[destination] =
+                        static_cast<int32_t>(source);
+                    state.bfsNextFrontier.push_back(destination);
+                }
+            }
+        }
+        state.bfsFrontier.swap(state.bfsNextFrontier);
+    }
+}
+
+void
+runBfsAmu(BenchmarkState &state, PersistentScheduler &scheduler)
+{
+    while (!state.bfsFrontier.empty()) {
+        std::vector<uint32_t> levelEdges;
+        std::vector<uint32_t> levelSources;
+        for (const uint32_t source : state.bfsFrontier) {
+            for (uint32_t edge = state.bfsOffsets[source];
+                 edge < state.bfsOffsets[source + 1]; ++edge) {
+                levelEdges.push_back(edge);
+                levelSources.push_back(source);
+            }
+        }
+
+        // Completion order is intentionally decoupled from commit order.
+        // This is the coroutine-equivalent part of the port: up to 256 edge
+        // reads remain live while a small reorder buffer preserves the exact
+        // sequential BFS update order used by the baseline.
+        std::vector<uint32_t> completed(levelEdges.size());
+        std::vector<uint8_t> ready(levelEdges.size(), 0);
+        std::vector<size_t> freeSlots;
+        freeSlots.reserve(scheduler.capacity());
+        for (size_t slot = 0; slot < scheduler.capacity(); ++slot)
+            freeSlots.push_back(slot);
+
+        size_t nextIssue = 0;
+        size_t nextCommit = 0;
+        while (nextCommit != levelEdges.size()) {
+            while (nextIssue != levelEdges.size() && !freeSlots.empty()) {
+                std::array<size_t, kWindowSlots> slotsToIssue;
+                std::array<size_t, kWindowSlots> operations;
+                std::array<const void *, kWindowSlots> sources;
+                const size_t count = std::min({
+                    freeSlots.size(), levelEdges.size() - nextIssue,
+                    scheduler.capacity()});
+                for (size_t item = 0; item < count; ++item) {
+                    slotsToIssue[item] =
+                        freeSlots[freeSlots.size() - 1 - item];
+                    operations[item] = nextIssue + item;
+                    sources[item] = &state.bfsEdges[
+                        levelEdges[nextIssue + item]];
+                }
+                const size_t accepted = scheduler.issueLoadBatch(
+                    slotsToIssue.data(), operations.data(), sources.data(),
+                    count, 0);
+                if (accepted == 0)
+                    throw std::runtime_error("AMU batch admission stalled");
+                freeSlots.resize(freeSlots.size() - accepted);
+                nextIssue += accepted;
+            }
+
+            std::array<size_t, kCompletionBatch> completionSlots;
+            const size_t count = scheduler.waitCompletionBatch(completionSlots);
+            for (size_t index = 0; index < count; ++index) {
+                const size_t slot = completionSlots[index];
+                const size_t operation = scheduler.slot(slot).op;
+                completed[operation] = *scheduler.payload<uint32_t>(slot);
+                ready[operation] = 1;
+                scheduler.release(slot);
+                freeSlots.push_back(slot);
+            }
+            while (nextCommit != levelEdges.size() && ready[nextCommit]) {
+                const uint32_t destination = completed[nextCommit];
+                // The level worklist is constructed in the same order as the
+                // baseline, so this parent lookup has exactly the same source.
+                const uint32_t source = levelSources[nextCommit];
+                if (state.bfsParents[destination] == -1) {
+                    state.bfsParents[destination] =
+                        static_cast<int32_t>(source);
+                    state.bfsNextFrontier.push_back(destination);
+                }
+                ++nextCommit;
+            }
+        }
+        state.bfsFrontier.swap(state.bfsNextFrontier);
+        state.bfsNextFrontier.clear();
+    }
+    scheduler.requireDrained();
+}
+
+void
+configureCira(const Options &options)
+{
+    if (cira_cfgwr(CIRA_CFG_ENABLE, 1) == 0 ||
+        cira_cfgwr(CIRA_CFG_MAX_OUTSTANDING, kWindowSlots) == 0) {
+        throw std::runtime_error("CIRA configuration failed");
+    }
+    if (options.ciraJitBatchSize == 0)
+        return;
+    if (cira_cfgwr(CIRA_CFG_JIT_BATCH_SIZE,
+                   options.ciraJitBatchSize) == 0 ||
+        cira_cfgwr(CIRA_CFG_JIT_TRAVERSAL_DEPTH,
+                   options.ciraJitTraversalDepth) == 0 ||
+        cira_cfgwr(CIRA_CFG_JIT_PIPELINE_DISTANCE,
+                   options.ciraJitPipelineDistance) == 0 ||
+        cira_cfgwr(CIRA_CFG_JIT_TEMPLATE_TAG,
+                   options.ciraJitTemplateTag) == 0 ||
+        cira_cfgwr(CIRA_CFG_JIT_ACTIVE, 1) == 0 ||
+        cira_cfgrd(CIRA_CFG_JIT_ACTIVE) != 1) {
+        throw std::runtime_error("CIRA JIT plan activation failed");
+    }
+}
+
+void
+runBfsCira(BenchmarkState &state, const Options &options)
+{
+    // This is a non-mutating CIRA CSR-stream offload: the CIRA device stages
+    // edge lines while the CPU retains the baseline's deterministic parent
+    // update order.  The compiler-selected batch size directly determines
+    // descriptor shape; the CIRA model receives the activated plan registers
+    // before any descriptor is issued.
+    const size_t batchEdges = options.ciraJitBatchSize != 0 ?
+        options.ciraJitBatchSize : 64;
+    while (!state.bfsFrontier.empty()) {
+        state.bfsNextFrontier.clear();
+        for (const uint32_t source : state.bfsFrontier) {
+            const uint32_t begin = state.bfsOffsets[source];
+            const uint32_t end = state.bfsOffsets[source + 1];
+            for (uint32_t edge = begin; edge < end;) {
+                const uint32_t count = static_cast<uint32_t>(std::min<size_t>(
+                    batchEdges, static_cast<size_t>(end - edge)));
+                cira_csr_prefetch_desc desc{};
+                desc.offsets_addr = reinterpret_cast<uint64_t>(
+                    &state.bfsEdges[edge]);
+                desc.records_addr = reinterpret_cast<uint64_t>(
+                    &state.bfsEdges[edge + count]);
+                desc.row_start = edge;
+                desc.row_count = 1;
+                desc.record_stride = sizeof(uint32_t);
+                desc.flags = CIRA_CSR_PREFETCH_RECORDS |
+                    CIRA_CSR_RECORD_SPAN;
+                if (cira_prefetch_csr(&desc) != count)
+                    throw std::runtime_error("CIRA BFS descriptor rejected");
+                edge += count;
+            }
+        }
+        for (const uint32_t source : state.bfsFrontier) {
+            for (uint32_t edge = state.bfsOffsets[source];
+                 edge < state.bfsOffsets[source + 1]; ++edge) {
+                const uint32_t destination = state.bfsEdges[edge];
+                if (state.bfsParents[destination] == -1) {
+                    state.bfsParents[destination] =
+                        static_cast<int32_t>(source);
+                    state.bfsNextFrontier.push_back(destination);
+                }
+            }
+        }
+        state.bfsFrontier.swap(state.bfsNextFrontier);
     }
 }
 
@@ -878,10 +1256,16 @@ runKernelIteration(const Options &options, BenchmarkState &state,
             runHashJoinAmu(iteration, state, *scheduler);
         else
             runHashJoinBaseline(iteration, state);
-    } else if (options.amu) {
+    } else if (options.workload == "stream" && options.amu) {
         runStreamAmu(state, *scheduler);
-    } else {
+    } else if (options.workload == "stream") {
         runStreamBaseline(state);
+    } else if (options.amu) {
+        runBfsAmu(state, *scheduler);
+    } else if (options.cira) {
+        runBfsCira(state, options);
+    } else {
+        runBfsBaseline(state);
     }
 }
 
@@ -901,10 +1285,13 @@ checksum(const Options &options, const BenchmarkState &state)
     } else if (options.workload == "hj") {
         for (const auto value : state.hashResults)
             digest = fold(digest, value);
-    } else {
+    } else if (options.workload == "stream") {
         for (const auto &block : state.streamA)
             for (const auto value : block.words)
                 digest = fold(digest, value);
+    } else {
+        for (const auto parent : state.bfsParents)
+            digest = fold(digest, static_cast<uint32_t>(parent));
     }
     return digest;
 }
@@ -925,19 +1312,28 @@ main(int argc, char **argv)
         }
         for (size_t iteration = 0; iteration < options.iterations;
             ++iteration) {
+            if (options.workload == "bfs") {
+                resetBfsState(state);
+                flushFarWorkingSet(options, state);
+            }
             m5_work_begin(iteration, 0);
             if (options.amu && iteration == 0)
                 scheduler->bindToCurrentThread();
+            if (options.cira && iteration == 0)
+                configureCira(options);
             runKernelIteration(options, state, scheduler.get(), iteration);
             m5_work_end(iteration, 0);
         }
         uint64_t digest = checksum(options, state);
         (void)m5_sum(static_cast<unsigned>(digest),
                      static_cast<unsigned>(digest >> 32), kChecksumMagic,
-                     workloadTag(options), options.amu ? 1 : 0, 0);
+                     workloadTag(options), options.amu ? 1 :
+                     (options.cira ? 2 : 0), 0);
         std::printf("PROXY_CHECKSUM workload=%s kind=%s value=%016llx\n",
-                    options.workload.c_str(), options.amu ? "amu" : "baseline",
+                    options.workload.c_str(), options.amu ? "amu" :
+                    (options.cira ? "cira" : "baseline"),
                     static_cast<unsigned long long>(digest));
+        std::fflush(stdout);
         m5_exit(0);
         return 0;
     } catch (const std::exception &error) {

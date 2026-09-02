@@ -14,6 +14,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "arch/generic/mmu.hh"
@@ -49,6 +50,8 @@ class ASMC : public ClockedObject
     static ASMC *get(System *system);
 
     uint64_t issueAload(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
+    uint64_t stageAload(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
+    uint64_t issueAloadBatch(ThreadContext *tc);
     uint64_t issueAstore(ThreadContext *tc, Addr spm_addr, Addr mem_addr);
     uint64_t issuePrRows(ThreadContext *tc, Addr desc_addr);
     uint64_t getFinished(ThreadContext *tc);
@@ -312,8 +315,14 @@ class ASMC : public ClockedObject
 
     uint64_t issue(ThreadContext *tc, ReqType type, Addr spm_addr,
                    Addr mem_addr);
+    uint64_t issueTranslated(ThreadContext *tc, ReqType type, Addr spm_addr,
+                             Addr mem_addr,
+                             std::vector<TranslationChunk> memory_chunks,
+                             std::vector<TranslationChunk> spm_chunks);
     bool readGuest(ThreadContext *tc, Addr addr, void *data,
                    uint64_t size) const;
+    bool writeGuest(ThreadContext *tc, Addr addr, const void *data,
+                    uint64_t size) const;
     bool validatePrDescriptor(ThreadContext *tc,
                               const pr_row_offload_desc &desc) const;
     bool reservePrRead(PrDescriptorState &state, PrRowState &row,
@@ -411,6 +420,8 @@ class ASMC : public ClockedObject
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
     std::unordered_map<ThreadContext *, ThreadConfig> threadConfigs;
     std::unordered_map<ThreadContext *, uint64_t> outstandingPerThread;
+    std::unordered_map<ThreadContext *, std::vector<std::pair<Addr, Addr>>>
+        stagedLoads;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;
     std::unordered_map<ThreadContext *, Tick> pollWaitStart;
     std::unordered_set<ThreadContext *> completionWaiters;

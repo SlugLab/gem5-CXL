@@ -1,0 +1,5 @@
+link_latency_ns,sim_ticks,read_samples,read_rtt_ticks,write_samples,write_rtt_ticks,stats_path
+200,167866058907,111,402264,12246,402264,/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-200ns-256-fixed/stats.txt
+500,175339547604,111,1002330,12246,1002330,/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-500ns-256-final-v2/stats.txt
+1000,187676231571,111,2002662,12246,2002662,/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-1us-256-final/stats.txt
+2000,212411792583,111,4002660,12246,4002660,/mnt/disk0/gem5-CXL-eval/cira-vortex-e2e-20260902/cxl-timing-2us-256-fixed/stats.txt

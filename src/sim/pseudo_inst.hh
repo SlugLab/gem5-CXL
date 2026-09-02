@@ -114,6 +114,9 @@ void m5Syscall(ThreadContext *tc);
 void togglesync(ThreadContext *tc);
 void triggerWorkloadEvent(ThreadContext *tc);
 uint64_t amuAload(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr);
+uint64_t amuAloadStage(ThreadContext *tc, GuestAddr spmAddr,
+                       GuestAddr memAddr);
+uint64_t amuAloadBatch(ThreadContext *tc);
 uint64_t amuAstore(ThreadContext *tc, GuestAddr spmAddr, GuestAddr memAddr);
 uint64_t amuGetfin(ThreadContext *tc);
 uint64_t amuGetfinBatch(ThreadContext *tc);
@@ -256,6 +259,14 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
 
       case M5OP_AMU_ALOAD:
         result = invokeSimcall<ABI, store_ret>(tc, amuAload);
+        return true;
+
+      case M5OP_AMU_ALOAD_BATCH:
+        result = invokeSimcall<ABI, store_ret>(tc, amuAloadBatch);
+        return true;
+
+      case M5OP_AMU_ALOAD_STAGE:
+        result = invokeSimcall<ABI, store_ret>(tc, amuAloadStage);
         return true;
 
       case M5OP_AMU_ASTORE:

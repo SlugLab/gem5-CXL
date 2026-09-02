@@ -18,6 +18,7 @@ from pathlib import Path
 
 import m5
 from m5.objects import (
+    AddrRange,
     ASMC,
     CIRA,
     Cache,
@@ -53,6 +54,7 @@ from gem5.isas import ISA
 from gem5.resources.resource import BinaryResource, CheckpointResource
 from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
+from m5.util.convert import toMemorySize
 from gem5.utils.requires import requires
 
 
@@ -398,6 +400,10 @@ parser.add_argument("--asmc-spm-size", default="256KiB")
 parser.add_argument("--asmc-granularity", type=int, default=8)
 parser.add_argument("--asmc-max-outstanding", type=int, default=256)
 parser.add_argument("--asmc-max-send-queue", type=int, default=512)
+parser.add_argument(
+    "--asmc-pending-queue-entries", type=int,
+    help="Override calibrated ASMC metadata admission entries (batch issue)."
+)
 parser.add_argument("--asmc-issue-latency", default="1ns")
 parser.add_argument("--asmc-completion-latency", default="0ns")
 parser.add_argument("--asmc-latency", default="0ns")
@@ -422,6 +428,19 @@ parser.add_argument(
     help="Measure request-to-response latency at the CXL link boundary.",
 )
 parser.add_argument("--cira", action="store_true", help="Enable CIRA model.")
+parser.add_argument(
+    "--vortex-device",
+    action="store_true",
+    help=(
+        "Attach VortexGPGPU and identity-map its hosted CP/VRAM ranges into "
+        "the syscall-emulation process."
+    ),
+)
+parser.add_argument(
+    "--vortex-device-library",
+    type=Path,
+    help="Absolute path to Vortex's libvortex-gem5.so; required with --vortex-device.",
+)
 parser.add_argument(
     "--cira-to-l2",
     action="store_true",
@@ -532,6 +551,24 @@ if args.fast_forward_cpu and args.measure_trial != 1:
     parser.error(
         "--fast-forward-cpu requires --iterations 2 and --measure-trial 1"
     )
+if args.vortex_device:
+    if args.vortex_device_library is None:
+        parser.error("--vortex-device requires --vortex-device-library")
+    vortex_device_library = args.vortex_device_library.resolve()
+    if not vortex_device_library.is_file():
+        parser.error(
+            f"Vortex device library does not exist: {vortex_device_library}"
+        )
+    # Vortex's hosted runtime fixes its CP register window at 0x20000000.
+    # The normal DRAM range must end before it so membus address ownership is
+    # disjoint, as in Vortex's upstream gem5 hosted runner.
+    if toMemorySize(args.mem_size) > 0x20000000:
+        parser.error(
+            "--vortex-device requires --mem-size no larger than 512MiB "
+            "because the hosted CP is fixed at 0x20000000"
+        )
+else:
+    vortex_device_library = None
 
 binary = Path(args.binary).resolve()
 if not binary.exists():
@@ -579,7 +616,13 @@ cpu_type = {
     "minor": CPUTypes.MINOR,
 }[args.cpu]
 
-if args.checkpoint_save:
+if args.checkpoint_save or args.vortex_device:
+    # The stdlib private-cache hierarchy currently corrupts the startup path
+    # of this multi-threaded, dynamically linked SE Vortex host process
+    # before it reaches main().  Use the same uncached CPU-to-membus topology
+    # as Vortex's maintained gem5 hosted runner.  This is deliberate: a
+    # completed Vortex launch is more meaningful than a cached configuration
+    # which exits from ld.so with status 127.
     cache_hierarchy = NoCache()
 else:
     cache_hierarchy = TunablePrivateL1PrivateL2CacheHierarchy(
@@ -629,6 +672,62 @@ board = CXLSimpleBoard(
 )
 board.m5ops_base = 0xFFFF0000
 
+if args.vortex_device:
+    try:
+        from m5.objects import VortexGPGPU
+    except ImportError:
+        parser.error(
+            "this gem5 binary lacks VortexGPGPU; run "
+            "scripts/build_vortex_gem5.sh first"
+        )
+    board.vortex = VortexGPGPU(
+        library=str(vortex_device_library),
+        pio_addr=0x20000000,
+        pio_size=0x200,
+        pin_addr=0x100000000,
+        pin_size=0x100000000,
+    )
+    # Vortex is a CXL-attached device.  Both its CP doorbells and its
+    # non-cacheable VRAM BAR therefore cross this SerialLink before entering
+    # the SimObject.  The device library retains the VRAM bytes in-process,
+    # but host uploads/downloads and every CP transaction now accumulate the
+    # selected modeled CXL link delay and serialization cost.  Vortex kernel
+    # loads remain device-local VRAM accesses, as on a CXL-attached accelerator;
+    # they are not incorrectly modeled as a second host-link traversal.
+    board.vortex_cxl_link = SerialLink(
+        ranges=[
+            AddrRange(0x20000000, size=0x200),
+            AddrRange(0x100000000, size=0x100000000),
+        ],
+        delay=args.cxl_link_delay,
+        link_speed=args.cxl_link_speed,
+        num_lanes=args.cxl_link_lanes,
+        req_size=args.cxl_link_req_size,
+        resp_size=args.cxl_link_resp_size,
+    )
+    board.vortex_cxl_link.mem_side_port = board.vortex.pio
+    if args.cxl_latency_monitor:
+        board.vortex_cxl_latency_monitor = CommMonitor(
+            disable_burst_length_hists=True,
+            disable_bandwidth_hists=True,
+            disable_itt_dists=True,
+            disable_outstanding_hists=True,
+            disable_transaction_hists=True,
+        )
+        board.vortex_cxl_latency_monitor.mem_side_port = (
+            board.vortex_cxl_link.cpu_side_port
+        )
+        board.vortex_cxl_latency_monitor.cpu_side_port = (
+            cache_hierarchy.get_mem_side_port()
+        )
+    else:
+        board.vortex_cxl_link.cpu_side_port = (
+            cache_hierarchy.get_mem_side_port()
+        )
+    # The current device library does not originate gem5 DMA requests, but
+    # retain this endpoint for the planned device-initiated memory seam.
+    board.vortex.dma = cache_hierarchy.get_cpu_side_port()
+
 if not args.no_asmc:
     board.asmc = ASMC(
         calibration_profile=args.asmc_profile,
@@ -637,9 +736,11 @@ if not args.no_asmc:
         default_granularity=args.asmc_granularity,
         max_outstanding=args.asmc_max_outstanding,
         max_send_queue=args.asmc_max_send_queue,
-        pending_queue_entries=amu_profile[
-            "pending_entries_per_state_machine"
-        ],
+        pending_queue_entries=(
+            args.asmc_pending_queue_entries
+            if args.asmc_pending_queue_entries is not None
+            else amu_profile["pending_entries_per_state_machine"]
+        ),
         id_batch_entries=amu_profile["id_batch_entries"],
         metadata_latency=amu_profile["metadata_cycles"],
         id_refill_latency=amu_profile["id_refill_cycles"],
@@ -707,12 +808,30 @@ checkpoint = (
     if args.checkpoint_restore
     else None
 )
+workload_env = list(args.env)
+if not args.vortex_device:
+    workload_env.insert(0, f"OMP_NUM_THREADS={args.cores}")
 board.set_se_binary_workload(
     BinaryResource(local_path=str(binary)),
     arguments=workload_arguments,
-    env_list=[f"OMP_NUM_THREADS={args.cores}", *args.env],
+    env_list=workload_env,
     checkpoint=checkpoint,
 )
+if args.vortex_device:
+    # Match Vortex's upstream hosted runner.  libvortex loads its selected
+    # backend during process startup, so give every possible switchable CPU
+    # the binary directory as a real guest cwd rather than the config's
+    # inherited Python cwd.  The runtime also uses pthread helpers, which
+    # require SE mode to advertise multi-thread support before instantiate.
+    workload_cores = (
+        processor._all_cores()
+        if isinstance(processor, SimpleSwitchableProcessor)
+        else processor.get_cores()
+    )
+    for core in workload_cores:
+        core.get_simobject().workload[0].cwd = str(binary.parent)
+    board.multi_thread = True
+    print(f"VORTEX_HOSTED_PROCESS_CWD cwd={binary.parent}")
 if not args.no_asmc:
     # SimpleBoard initializes mem_ranges when its workload is installed.
     # Binding the I/O cache range earlier silently leaves it empty, causing
@@ -803,8 +922,26 @@ else:
 
 start_wall = time.time()
 print(f"Running {binary} {' '.join(args.arguments.split())}")
-if args.checkpoint_restore:
+if args.checkpoint_restore or args.vortex_device:
     simulator._instantiate()
+    if args.vortex_device:
+        process = (
+            board.get_processor().get_cores()[0].get_simobject().workload[0]
+        )
+        # The hosted Vortex backend uses ordinary guest loads/stores to the
+        # CP register file and a non-cacheable VRAM BAR aperture.
+        process.map(0x20000000, 0x20000000, 0x200, cacheable=False)
+        process.map(0x100000000, 0x100000000, 0x100000000, cacheable=False)
+        print(
+            "VORTEX_HOSTED_MAPPING "
+            "pio=0x20000000+0x200 pin=0x100000000+0x100000000"
+        )
+        print(
+            "VORTEX_CXL_LINK "
+            f"delay={args.cxl_link_delay} speed_gbps={args.cxl_link_speed} "
+            f"lanes={args.cxl_link_lanes}"
+        )
+if args.checkpoint_restore:
     for action in checkpoint_state.resume_actions():
         if action == "reset":
             print("Resetting stats at restored measured ROI!")

@@ -258,6 +258,70 @@ ASMC::issueAload(ThreadContext *tc, Addr spm_addr, Addr mem_addr)
 }
 
 uint64_t
+ASMC::stageAload(ThreadContext *tc, Addr spm_addr, Addr mem_addr)
+{
+    if (!tc || spm_addr == 0 || mem_addr == 0) {
+        ++stats.rejectedQueueFull;
+        return 0;
+    }
+    auto &staged = stagedLoads[tc];
+    if (staged.size() == 256) {
+        ++stats.rejectedQueueFull;
+        return 0;
+    }
+    staged.emplace_back(spm_addr, mem_addr);
+    return 1;
+}
+
+uint64_t
+ASMC::issueAloadBatch(ThreadContext *tc)
+{
+    if (!tc)
+        return 0;
+    const auto staging = stagedLoads.find(tc);
+    if (staging == stagedLoads.end() || staging->second.empty())
+        return 0;
+    auto requests = std::move(staging->second);
+    stagedLoads.erase(staging);
+
+    const uint64_t first_id = nextId;
+    std::vector<std::vector<TranslationChunk>> memory_chunks(requests.size());
+    std::vector<std::vector<TranslationChunk>> spm_chunks(requests.size());
+    const ThreadConfig &config = configFor(tc);
+    uint64_t translatable = 0;
+    for (; translatable < requests.size(); ++translatable) {
+        if (!translate(tc, requests[translatable].second, config.granularity,
+                       BaseMMU::Read, memory_chunks[translatable]) ||
+            !translate(tc, requests[translatable].first, config.granularity,
+                       BaseMMU::Write, spm_chunks[translatable])) {
+            DPRINTF(ASMC,
+                    "truncate staged aload batch at %llu spm=%#llx source=%#llx\n",
+                    static_cast<unsigned long long>(translatable),
+                    static_cast<unsigned long long>(requests[translatable].first),
+                    static_cast<unsigned long long>(requests[translatable].second));
+            ++stats.translationFaults;
+            break;
+        }
+    }
+
+    // Page-table walks may advance simulated time. Complete them before
+    // admitting the batch so all requests that fit the hardware queues enter
+    // on the same tick and can occupy the advertised AMU window.
+    uint64_t accepted = 0;
+    for (; accepted < translatable; ++accepted) {
+        const uint64_t id = issueTranslated(
+            tc, ReqType::Load, requests[accepted].first,
+            requests[accepted].second, std::move(memory_chunks[accepted]),
+            std::move(spm_chunks[accepted]));
+        if (id == 0)
+            break;
+    }
+    panic_if(first_id > std::numeric_limits<uint32_t>::max(),
+             "ASMC batch ABI exhausted its 32-bit request-ID field");
+    return (first_id << 32) | accepted;
+}
+
+uint64_t
 ASMC::issueAstore(ThreadContext *tc, Addr spm_addr, Addr mem_addr)
 {
     return issue(tc, ReqType::Store, spm_addr, mem_addr);
@@ -268,6 +332,14 @@ ASMC::readGuest(ThreadContext *tc, Addr addr, void *data, uint64_t size) const
 {
     SETranslatingPortProxy proxy(tc);
     return proxy.tryReadBlob(addr, data, size);
+}
+
+bool
+ASMC::writeGuest(ThreadContext *tc, Addr addr, const void *data,
+                 uint64_t size) const
+{
+    SETranslatingPortProxy proxy(tc);
+    return proxy.tryWriteBlob(addr, data, size);
 }
 
 bool
@@ -1305,6 +1377,33 @@ ASMC::enqueueSpmAcquirePackets(RequestState &state)
 uint64_t
 ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
 {
+    const ThreadConfig &config = configFor(tc);
+    std::vector<TranslationChunk> memory_chunks;
+    const auto memory_mode = type == ReqType::Load ?
+        BaseMMU::Read : BaseMMU::Write;
+    if (!translate(tc, mem_addr, config.granularity, memory_mode,
+                   memory_chunks)) {
+        ++stats.translationFaults;
+        return 0;
+    }
+
+    std::vector<TranslationChunk> spm_chunks;
+    const auto spm_mode = type == ReqType::Load ?
+        BaseMMU::Write : BaseMMU::Read;
+    if (!translate(tc, spm_addr, config.granularity, spm_mode, spm_chunks)) {
+        ++stats.translationFaults;
+        return 0;
+    }
+    return issueTranslated(tc, type, spm_addr, mem_addr,
+                           std::move(memory_chunks), std::move(spm_chunks));
+}
+
+uint64_t
+ASMC::issueTranslated(ThreadContext *tc, ReqType type, Addr spm_addr,
+                      Addr mem_addr,
+                      std::vector<TranslationChunk> memory_chunks,
+                      std::vector<TranslationChunk> spm_chunks)
+{
     const auto context = tc->contextId();
     if (context < 0 || static_cast<size_t>(context) >= spmSidePorts.size()) {
         ++stats.rejectedQueueFull;
@@ -1325,23 +1424,6 @@ ASMC::issue(ThreadContext *tc, ReqType type, Addr spm_addr, Addr mem_addr)
 
     if (spmUsed + config.granularity > spmSize) {
         ++stats.rejectedSpmFull;
-        return 0;
-    }
-
-    std::vector<TranslationChunk> memory_chunks;
-    const auto memory_mode = type == ReqType::Load ?
-        BaseMMU::Read : BaseMMU::Write;
-    if (!translate(tc, mem_addr, config.granularity, memory_mode,
-                   memory_chunks)) {
-        ++stats.translationFaults;
-        return 0;
-    }
-
-    std::vector<TranslationChunk> spm_chunks;
-    const auto spm_mode = type == ReqType::Load ?
-        BaseMMU::Write : BaseMMU::Read;
-    if (!translate(tc, spm_addr, config.granularity, spm_mode, spm_chunks)) {
-        ++stats.translationFaults;
         return 0;
     }
 
@@ -2242,6 +2324,7 @@ ASMC::reset()
     if (prServiceEvent.scheduled())
         deschedule(prServiceEvent);
     outstandingPerThread.clear();
+    stagedLoads.clear();
     finished.clear();
     for (ThreadContext *tc : completionWaiters)
         tc->activate();
