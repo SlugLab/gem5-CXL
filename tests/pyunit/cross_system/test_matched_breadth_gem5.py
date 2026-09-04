@@ -1247,6 +1247,22 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             replay._sha256_file(replay.M5_LIBRARY),
         )
 
+    def test_replay_builder_records_explicit_m5_library_identity(self):
+        selected = self.root / "selected-libm5.a"
+        selected.write_bytes(replay.M5_LIBRARY.read_bytes())
+        binary = replay.build_replay_binary(
+            self.root / "explicit-m5-build", native=False,
+            m5_library=selected,
+        )
+        manifest = json.loads(
+            (binary.parent / "build.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["m5_library"], str(selected.resolve()))
+        self.assertEqual(
+            manifest["m5_library_sha256"], replay._sha256_file(selected)
+        )
+        self.assertIn(str(selected.resolve()), manifest["command"])
+
     def test_amu_window_is_bounded_by_far_and_spm_queue_geometry(self):
         source = replay.SOURCE.read_text(encoding="utf-8")
         self.assertIn("AMU_CFG_CACHE_LINE_BYTES", source)

@@ -888,7 +888,9 @@ def write_lazy_replay_stream(trace, path):
         temporary.unlink(missing_ok=True)
 
 
-def build_replay_binary(outdir, *, native=False, cxx="g++"):
+def build_replay_binary(
+    outdir, *, native=False, cxx="g++", m5_library=M5_LIBRARY,
+):
     outdir = Path(outdir).resolve()
     if outdir.exists():
         raise ReplayError(f"replay build root already exists: {outdir}")
@@ -917,9 +919,10 @@ def build_replay_binary(outdir, *, native=False, cxx="g++"):
         command.extend(("-static", "-no-pie"))
     command.append(str(SOURCE))
     if not native:
-        if not M5_LIBRARY.is_file():
-            raise ReplayError(f"checked-in m5 ABI library is missing: {M5_LIBRARY}")
-        command.append(str(M5_LIBRARY))
+        m5_library = Path(m5_library).resolve()
+        if not m5_library.is_file():
+            raise ReplayError(f"checked-in m5 ABI library is missing: {m5_library}")
+        command.append(str(m5_library))
     command.extend(("-o", str(binary)))
     try:
         subprocess.run(
@@ -944,8 +947,8 @@ def build_replay_binary(outdir, *, native=False, cxx="g++"):
         "command": command,
     }
     if not native:
-        manifest["m5_library"] = str(M5_LIBRARY)
-        manifest["m5_library_sha256"] = _sha256_file(M5_LIBRARY)
+        manifest["m5_library"] = str(m5_library)
+        manifest["m5_library_sha256"] = _sha256_file(m5_library)
     (outdir / "build.json").write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
@@ -2049,6 +2052,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument("--require-device-timing", action="store_true")
     options = parser.parse_args(argv)
     canonical_selection = (
         options.window_manifest, options.phase, options.window_index
@@ -2217,6 +2221,9 @@ def run(options):
             outdir, system=options.system, trace=replay_trace,
             config=outdir / "config.ini",
             cxl_link_delay=options.cxl_link_delay,
+            require_device_timing=getattr(
+                options, "require_device_timing", False
+            ),
         )
     else:
         widths = {"u32": 4, "u64": 8, "f32": 4, "f64": 8}
@@ -2229,6 +2236,9 @@ def run(options):
             config=outdir / "config.ini", expected=producer_evidence,
             required_bytes=required_bytes,
             cxl_link_delay=options.cxl_link_delay,
+            require_device_timing=getattr(
+                options, "require_device_timing", False
+            ),
         )
     fixed_command = None
     fixed_row = None
