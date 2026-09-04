@@ -8,10 +8,12 @@ try:
     from scripts import gap_bc_lazy_trace as gap_bc
     from scripts import lazy_work_trace as lazy
     from scripts import npb_lazy_trace as npb
+    from scripts import pr_spmv_lazy_trace as pr_spmv
 except ImportError:
     import gap_bc_lazy_trace as gap_bc
     import lazy_work_trace as lazy
     import npb_lazy_trace as npb
+    import pr_spmv_lazy_trace as pr_spmv
 
 
 NPB_PHASE_NAMES = {
@@ -25,7 +27,7 @@ NPB_PHASE_NAMES = {
     204: "mg_interp",
     205: "mg_norm2u3",
 }
-_MODULES = (npb, gap_bc)
+_MODULES = (npb, gap_bc, pr_spmv)
 
 
 def module_for_kernel(kernel):
@@ -51,7 +53,7 @@ def expand_slice(
     *, include_controls=True,
 ):
     module = module_for_kernel(invocation.kernel)
-    if module is gap_bc:
+    if module in {gap_bc, pr_spmv}:
         return module.expand_slice(
             state, invocation, first, stop, batch_work_items,
             include_controls=include_controls,
