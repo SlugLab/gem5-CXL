@@ -40,7 +40,7 @@ except ImportError:
 REPO = Path(__file__).resolve().parents[1]
 SOURCE = REPO / "util/amu/matched_workloads/trace_replay.cc"
 M5_LIBRARY = REPO / "util/m5/build/x86/out/libm5.a"
-SYSTEMS = ("vanilla", "amu", "cira")
+SYSTEMS = ("vanilla", "amu", "cira", "cira-inline")
 _CORE_SECTION = re.compile(r"^board\.processor\.cores([0-9]+)\.core$")
 _START_CORE_SECTION = re.compile(r"^board\.processor\.start([0-9]+)\.core$")
 _SWITCH_CORE_SECTION = re.compile(r"^board\.processor\.switch([0-9]+)\.core$")
@@ -1387,6 +1387,25 @@ def validate_mechanism(
             raise ReplayError("CIRA requires four active cores")
         if issued_per_core != completed_per_core:
             raise ReplayError("CIRA per-core issued/completed work differs")
+    elif system == "cira-inline":
+        if row.get("offload_disabled") is not True:
+            raise ReplayError("CIRA inline replay did not disable offload")
+        if _integer(row, "host_region_entry_count") == 0:
+            raise ReplayError("CIRA inline replay has no host region entries")
+        for field in (
+            "issued_loads", "completed_loads", "drains",
+            "max_observed_outstanding",
+        ):
+            if _integer(row, field):
+                raise ReplayError("CIRA inline replay has offload activity")
+        for field in ("issued_per_core", "completed_per_core"):
+            values = row.get(field)
+            if (
+                not isinstance(values, list)
+                or len(values) != 4
+                or any(_integer({"value": value}, "value") for value in values)
+            ):
+                raise ReplayError("CIRA inline replay has offload activity")
     return row
 
 
@@ -1934,6 +1953,28 @@ def collect_run_evidence(run_dir, *, system, trace, config,
                     "matched CIRA replay unexpectedly used PageRank descriptors"
                 )
             row.update(metrics)
+    elif system == "cira-inline":
+        issued_per_core = result.get("issued_per_core")
+        completed_per_core = result.get("completed_per_core")
+        if not isinstance(issued_per_core, list):
+            raise ReplayError("CIRA inline issued-per-core evidence is invalid")
+        if not isinstance(completed_per_core, list):
+            raise ReplayError("CIRA inline completed-per-core evidence is invalid")
+        row.update({
+            "offload_disabled": result.get("offload_disabled"),
+            "host_region_cumulative_ticks": sim_ticks,
+            "host_region_entry_count": _integer(
+                result, "host_region_entry_count"
+            ),
+            "issued_loads": _integer(result, "issued_loads"),
+            "completed_loads": _integer(result, "completed_loads"),
+            "drains": _integer(result, "drains"),
+            "max_observed_outstanding": _integer(
+                result, "max_observed_outstanding"
+            ),
+            "issued_per_core": issued_per_core,
+            "completed_per_core": completed_per_core,
+        })
     validate_mechanism(
         system, row, require_activity=require_activity,
         cxl_link_delay=cxl_link_delay,

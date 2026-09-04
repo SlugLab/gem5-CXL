@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1179,7 +1180,7 @@ readStreamFrame(int descriptor, uint64_t &expectedSequence, bool &finished,
 std::unique_ptr<Accessor>
 makeAccessor(const std::string &system, Memory &memory)
 {
-    if (system == "vanilla")
+    if (system == "vanilla" || system == "cira-inline")
         return std::make_unique<VanillaAccessor>(memory);
     if (system == "amu")
         return std::make_unique<AmuAccessor>(memory);
@@ -1661,6 +1662,15 @@ selectGroups(const std::vector<Phase> &phases, uint64_t measureStart,
     return selected;
 }
 
+size_t
+countGroups(const std::vector<Phase> &phases)
+{
+    size_t count = 0;
+    for (const auto &phase : phases)
+        count += phase.groups.size();
+    return count;
+}
+
 #ifndef TRACE_REPLAY_NATIVE
 void
 warmWorkerThreads()
@@ -1680,6 +1690,7 @@ writeResult(const std::string &path, const std::string &system,
             size_t traceRecords,
             const std::vector<Commit> &commits, size_t allocatedBytes,
             size_t phases, const ReplayStats &stats, const std::string &mode,
+            size_t hostRegionEntryCount,
             const std::vector<OutputBoundary> &boundaries = {})
 {
     std::ostringstream stream;
@@ -1740,6 +1751,9 @@ writeResult(const std::string &path, const std::string &system,
         stream << "]}";
     }
     stream << "},\"trace_records\":" << traceRecords
+           << ",\"offload_disabled\":"
+           << (system == "cira-inline" ? "true" : "false")
+           << ",\"host_region_entry_count\":" << hostRegionEntryCount
            << ",\"verification\":\"pass\"}\n";
     if (!stream)
         throw std::runtime_error("replay result write failed");
@@ -1762,6 +1776,7 @@ executeStreamFile(const std::string &path, const std::string &system,
     ReplayStats total;
     std::vector<Commit> commits;
     std::unordered_map<uint64_t, uint64_t> lastStore;
+    std::set<std::pair<uint16_t, uint64_t>> hostRegionEntries;
     DependencyTracker dependencies;
     uint64_t expectedSequence = 0;
     size_t phaseExecutions = 0;
@@ -1788,6 +1803,7 @@ executeStreamFile(const std::string &path, const std::string &system,
             std::unordered_map<uint64_t, uint64_t> previousStore;
             std::unordered_map<uint64_t, size_t> commitSlots;
             for (const auto &record : records) {
+                hostRegionEntries.emplace(record.phase, record.work_item);
                 const auto opcode = static_cast<Opcode>(record.opcode);
                 if (Memory::isLoad(opcode) || Memory::isStore(opcode)) {
                     const auto prior = lastStore.find(record.address);
@@ -1832,7 +1848,7 @@ executeStreamFile(const std::string &path, const std::string &system,
     writeAllocationMarker(memory.allocatedBytes());
     writeResult(resultPath, system, size_t(expectedSequence), commits,
                 memory.allocatedBytes(), phaseExecutions, total,
-                "functional", boundaries);
+                "functional", hostRegionEntries.size(), boundaries);
 }
 
 } // anonymous namespace
@@ -1962,6 +1978,7 @@ main(int argc, char **argv)
         memory.flushForRoi();
         ReplayStats stats;
         size_t measuredPhases = phases.size();
+        size_t hostRegionEntryCount = countGroups(phases);
         if (mode == "window") {
             const auto warmup = selectGroups(phases, measureStartItem, true);
             const auto measured = selectGroups(phases, measureStartItem, false);
@@ -1986,6 +2003,7 @@ main(int argc, char **argv)
             m5_work_end(selectedPhase, windowIndex);
 #endif
             measuredPhases = measured.size();
+            hostRegionEntryCount = countGroups(measured);
         } else {
             const BoundaryProbes *orderedProbes =
                 outputBoundaries.empty() ? nullptr : &boundaryProbes;
@@ -1996,7 +2014,7 @@ main(int argc, char **argv)
         }
         writeResult(resultPath, system, records.size(), commits,
                     memory.allocatedBytes(), measuredPhases, stats, mode,
-                    outputBoundaries);
+                    hostRegionEntryCount, outputBoundaries);
 #ifndef TRACE_REPLAY_NATIVE
         m5_exit(0);
 #endif

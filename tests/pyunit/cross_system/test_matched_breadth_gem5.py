@@ -172,6 +172,32 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 self.assertEqual(reference["mismatched_words"], 0)
                 self.assertEqual(reference["nonfinite_words"], 0)
 
+    def test_cira_inline_uses_same_binary_and_executes_on_host(self):
+        operations = _fixtures()["gather"]
+        trace = self.root / "inline"
+        canonical.write_bundle(
+            trace, _meta("inline", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        binary = replay.build_replay_binary(
+            self.root / "build-inline", native=True
+        )
+        inline = replay.run_native_replay(
+            binary, system="cira-inline", trace=trace,
+            outdir=self.root / "run-inline",
+        )
+        vanilla = replay.run_native_replay(
+            binary, system="vanilla", trace=trace,
+            outdir=self.root / "run-vanilla",
+        )
+        self.assertEqual(inline["system"], "cira-inline")
+        self.assertIs(inline["offload_disabled"], True)
+        self.assertEqual(inline["host_region_entry_count"], 1)
+        self.assertEqual(inline["raw_outputs"], vanilla["raw_outputs"])
+        self.assertEqual(inline["commit_order"], vanilla["commit_order"])
+        self.assertEqual(inline["issued_loads"], 0)
+        self.assertEqual(inline["issued_per_core"], [0, 0, 0, 0])
+
     def test_native_replay_initializes_sparse_window_from_load_operands(self):
         operations = (
             _op(
@@ -1417,6 +1443,37 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertIn("void drain() override", cira)
         self.assertNotIn("void drain() override {}", cira)
 
+    def test_cira_inline_requires_entries_and_zero_offload_activity(self):
+        clean = {
+            "verification": "pass",
+            "threads": 4,
+            "all_memory_cxl": True,
+            "cxl_link_delay_ticks": 1_000_000,
+            "allocated_on_cxl": True,
+            "queue_errors": 0,
+            "descriptor_errors": 0,
+            "offload_disabled": True,
+            "host_region_entry_count": 3,
+            "issued_loads": 0,
+            "completed_loads": 0,
+            "drains": 0,
+            "max_observed_outstanding": 0,
+            "issued_per_core": [0, 0, 0, 0],
+            "completed_per_core": [0, 0, 0, 0],
+        }
+        replay.validate_mechanism("cira-inline", clean)
+        for change, message in (
+            ({"offload_disabled": False}, "did not disable"),
+            ({"host_region_entry_count": 0}, "no host region entries"),
+            ({"issued_per_core": [1, 0, 0, 0]}, "offload activity"),
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(
+                replay.ReplayError, message
+            ):
+                replay.validate_mechanism(
+                    "cira-inline", {**clean, **change}
+                )
+
     def test_all_backends_require_four_threads_all_cxl_and_one_microsecond(self):
         clean = {
             "verification": "pass",
@@ -1570,6 +1627,28 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(window[window.index("--iterations") + 1], "2")
         self.assertEqual(window[window.index("--measure-trial") + 1], "1")
 
+    def test_cira_inline_command_uses_host_path_without_cira_device(self):
+        trace = self.root / "inline-command-trace"
+        trace.mkdir()
+        (trace / "trace.bin").write_bytes(b"")
+        command = replay.command_for(SimpleNamespace(
+            system="cira-inline", trace=trace,
+            binary=self.root / "trace_replay", gem5=self.root / "gem5.opt",
+            config=self.root / "config.py", outdir=self.root / "inline-out",
+            calibration=self.root / "calibration.json", mode="functional",
+            window_manifest=None, phase=None, window_index=None,
+            cxl_link_delay="1us",
+        ))
+        binary_args = shlex.split(
+            command[command.index("--arguments") + 1]
+        )
+        self.assertEqual(
+            binary_args[binary_args.index("--system") + 1], "cira-inline"
+        )
+        self.assertIn("--no-asmc", command)
+        self.assertNotIn("--cira", command)
+        self.assertNotIn("--cira-to-l2", command)
+
     def test_run_evidence_uses_gem5_owned_amu_counters_and_exact_commits(self):
         operations = (
             _op(canonical.Opcode.LOAD_U64, 0, address=0xA000,
@@ -1619,6 +1698,52 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(row["sim_ticks"], 12345)
         self.assertEqual(row["verification"], "pass")
         self.assertEqual(row["raw_outputs"], [17])
+
+    def test_cira_inline_evidence_exports_roi_ticks_and_entry_count(self):
+        operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, address=0xA000,
+                left=17, result=17),
+            _op(canonical.Opcode.COMMIT, 1, address=0xB000,
+                left=17, result=17),
+        )
+        bundle = self.root / "inline-evidence-trace"
+        canonical.write_bundle(
+            bundle, _meta("inline_evidence", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        run_dir = self.root / "inline-run"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps({
+            "verification": "pass", "threads": 4, "phases": 1,
+            "commit_order": [1], "raw_outputs": [17],
+            "output_boundaries": {}, "offload_disabled": True,
+            "host_region_entry_count": 7,
+            "issued_loads": 0, "completed_loads": 0, "drains": 0,
+            "max_observed_outstanding": 0,
+            "issued_per_core": [0, 0, 0, 0],
+            "completed_per_core": [0, 0, 0, 0],
+        }) + "\n", encoding="utf-8")
+        (run_dir / "simout").write_text(
+            "TRACE_REPLAY_ALLOCATION logical_bytes=64 "
+            "allocated_bytes=64 all_memory_cxl=true\n",
+            encoding="utf-8",
+        )
+        (run_dir / "stats.txt").write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            "simTicks 24680\n"
+            "---------- End Simulation Statistics ----------\n",
+            encoding="utf-8",
+        )
+
+        row = replay.collect_run_evidence(
+            run_dir, system="cira-inline", trace=bundle,
+            config=self._write_config(),
+        )
+
+        self.assertIs(row["offload_disabled"], True)
+        self.assertEqual(row["host_region_cumulative_ticks"], 24680)
+        self.assertEqual(row["host_region_entry_count"], 7)
+        self.assertEqual(row["sim_ticks"], 24680)
 
     def test_cira_run_evidence_requires_new_timing_only_when_requested(self):
         operations = (
