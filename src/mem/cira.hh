@@ -86,6 +86,7 @@ class CIRA : public ClockedObject
         Addr vaddr = 0;
         uint64_t size = 0;
         Tick issueTick = 0;
+        uint64_t statsEpoch = 0;
         uint32_t pendingPackets = 0;
     };
 
@@ -359,6 +360,15 @@ class CIRA : public ClockedObject
         statistics::Vector coalescedPrefetchesPerCore;
         statistics::Vector usefulPrefetchesPerCore;
         statistics::Vector latePrefetchesPerCore;
+        statistics::Scalar genericPrefetchFirstIssueTick;
+        statistics::Scalar genericPrefetchLastCompletionTick;
+        statistics::Scalar genericPrefetchBusyTicks;
+        statistics::Scalar genericPrefetchSpanValid;
+        statistics::Scalar genericPrefetchResetOutstanding;
+        statistics::Vector genericPrefetchFirstIssueTickPerCore;
+        statistics::Vector genericPrefetchLastCompletionTickPerCore;
+        statistics::Vector genericPrefetchBusyTicksPerCore;
+        statistics::Vector genericPrefetchSpanValidPerCore;
         statistics::Scalar rejectedDisabled;
         statistics::Scalar rejectedQueueFull;
         statistics::Scalar translationFaults;
@@ -463,6 +473,9 @@ class CIRA : public ClockedObject
     void completePrReconfiguration(uint64_t id);
     void notePrStall(PrDescriptorState &state);
     void clearPrStall(PrDescriptorState &state);
+    void resetGenericPrefetchSpan();
+    void noteGenericPrefetchIssue(PortID core);
+    void noteGenericPrefetchCompletion(PortID core);
     void completeRequest(uint64_t id);
     void handleCacheProbe(PortID targetCore, CacheProbeEvent event,
                           const CacheAccessProbeArg &arg);
@@ -505,6 +518,11 @@ class CIRA : public ClockedObject
     uint64_t nextId = 1;
     uint64_t nextCsrWalkId = 1;
     uint64_t nextCsrIndexReadId = 1;
+    uint64_t genericPrefetchStatsEpoch = 0;
+    bool genericPrefetchSpanStarted = false;
+    Tick genericPrefetchFirstIssue = 0;
+    std::vector<bool> genericPrefetchSpanPerCoreStarted;
+    std::vector<Tick> genericPrefetchFirstIssuePerCore;
 
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> outstanding;
     std::unordered_map<ThreadContext *, std::deque<uint64_t>> finished;

@@ -105,6 +105,31 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
                "CIRA useful prefetches per target core"),
       ADD_STAT(latePrefetchesPerCore, statistics::units::Count::get(),
                "CIRA late prefetches per target core"),
+      ADD_STAT(genericPrefetchFirstIssueTick,
+               statistics::units::Tick::get(),
+               "Tick of the first accepted generic CIRA prefetch"),
+      ADD_STAT(genericPrefetchLastCompletionTick,
+               statistics::units::Tick::get(),
+               "Tick of the last completed generic CIRA prefetch"),
+      ADD_STAT(genericPrefetchBusyTicks, statistics::units::Tick::get(),
+               "Span from first generic prefetch issue to last completion"),
+      ADD_STAT(genericPrefetchSpanValid, statistics::units::Count::get(),
+               "One after a generic prefetch span has completed"),
+      ADD_STAT(genericPrefetchResetOutstanding,
+               statistics::units::Count::get(),
+               "Generic prefetches outstanding when span statistics reset"),
+      ADD_STAT(genericPrefetchFirstIssueTickPerCore,
+               statistics::units::Tick::get(),
+               "First accepted generic prefetch tick per target core"),
+      ADD_STAT(genericPrefetchLastCompletionTickPerCore,
+               statistics::units::Tick::get(),
+               "Last completed generic prefetch tick per target core"),
+      ADD_STAT(genericPrefetchBusyTicksPerCore,
+               statistics::units::Tick::get(),
+               "Generic prefetch issue-to-completion span per target core"),
+      ADD_STAT(genericPrefetchSpanValidPerCore,
+               statistics::units::Count::get(),
+               "One after a generic prefetch span completes per target core"),
       ADD_STAT(rejectedDisabled, statistics::units::Count::get(),
                "CIRA requests rejected because the model is disabled"),
       ADD_STAT(rejectedQueueFull, statistics::units::Count::get(),
@@ -203,6 +228,10 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
     coalescedPrefetchesPerCore.init(num_cores);
     usefulPrefetchesPerCore.init(num_cores);
     latePrefetchesPerCore.init(num_cores);
+    genericPrefetchFirstIssueTickPerCore.init(num_cores);
+    genericPrefetchLastCompletionTickPerCore.init(num_cores);
+    genericPrefetchBusyTicksPerCore.init(num_cores);
+    genericPrefetchSpanValidPerCore.init(num_cores);
     issuedPrDescriptorsPerCore.init(num_cores);
     completedPrDescriptorsPerCore.init(num_cores);
     prRowsPerCore.init(num_cores);
@@ -226,6 +255,10 @@ CIRA::CIRAStats::CIRAStats(statistics::Group *parent, size_t num_cores)
         coalescedPrefetchesPerCore.subname(core, label);
         usefulPrefetchesPerCore.subname(core, label);
         latePrefetchesPerCore.subname(core, label);
+        genericPrefetchFirstIssueTickPerCore.subname(core, label);
+        genericPrefetchLastCompletionTickPerCore.subname(core, label);
+        genericPrefetchBusyTicksPerCore.subname(core, label);
+        genericPrefetchSpanValidPerCore.subname(core, label);
         issuedPrDescriptorsPerCore.subname(core, label);
         completedPrDescriptorsPerCore.subname(core, label);
         prRowsPerCore.subname(core, label);
@@ -309,6 +342,8 @@ CIRA::CIRA(const Params &p)
     prDescriptors.resize(numCores);
     reservedPrCoherentSlots.resize(numCores, 0);
     pendingPrCoherentPackets.resize(numCores, 0);
+    genericPrefetchSpanPerCoreStarted.resize(numCores, false);
+    genericPrefetchFirstIssuePerCore.resize(numCores, 0);
     prEvents.reserve(numCores);
     for (PortID core = 0; core < numCores; ++core) {
         prEvents.emplace_back(std::make_unique<EventFunctionWrapper>(
@@ -384,8 +419,56 @@ CIRA::resetStats()
 {
     ClockedObject::resetStats();
     stats.timingCsrTraversalEnabled = timingCsrTraversal ? 1 : 0;
+    resetGenericPrefetchSpan();
     for (auto &tracker : lineTrackers)
         tracker.clear();
+}
+
+void
+CIRA::resetGenericPrefetchSpan()
+{
+    stats.genericPrefetchResetOutstanding = outstanding.size();
+    ++genericPrefetchStatsEpoch;
+    genericPrefetchSpanStarted = false;
+    genericPrefetchFirstIssue = 0;
+    std::fill(genericPrefetchSpanPerCoreStarted.begin(),
+              genericPrefetchSpanPerCoreStarted.end(), false);
+    std::fill(genericPrefetchFirstIssuePerCore.begin(),
+              genericPrefetchFirstIssuePerCore.end(), 0);
+}
+
+void
+CIRA::noteGenericPrefetchIssue(PortID core)
+{
+    panic_if(core < 0 || core >= genericPrefetchSpanPerCoreStarted.size(),
+             "CIRA generic prefetch span has invalid core %d", core);
+    if (!genericPrefetchSpanStarted) {
+        genericPrefetchSpanStarted = true;
+        genericPrefetchFirstIssue = curTick();
+        stats.genericPrefetchFirstIssueTick = curTick();
+    }
+    if (!genericPrefetchSpanPerCoreStarted[core]) {
+        genericPrefetchSpanPerCoreStarted[core] = true;
+        genericPrefetchFirstIssuePerCore[core] = curTick();
+        stats.genericPrefetchFirstIssueTickPerCore[core] = curTick();
+    }
+}
+
+void
+CIRA::noteGenericPrefetchCompletion(PortID core)
+{
+    panic_if(!genericPrefetchSpanStarted,
+             "CIRA generic prefetch completed without a measured issue");
+    panic_if(core < 0 || core >= genericPrefetchSpanPerCoreStarted.size() ||
+             !genericPrefetchSpanPerCoreStarted[core],
+             "CIRA generic prefetch completed without a core span");
+    stats.genericPrefetchLastCompletionTick = curTick();
+    stats.genericPrefetchBusyTicks = curTick() - genericPrefetchFirstIssue;
+    stats.genericPrefetchSpanValid = 1;
+    stats.genericPrefetchLastCompletionTickPerCore[core] = curTick();
+    stats.genericPrefetchBusyTicksPerCore[core] =
+        curTick() - genericPrefetchFirstIssuePerCore[core];
+    stats.genericPrefetchSpanValidPerCore[core] = 1;
 }
 
 Port &
@@ -1681,6 +1764,7 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
     state->vaddr = addr;
     state->size = installSize;
     state->issueTick = curTick();
+    state->statsEpoch = genericPrefetchStatsEpoch;
     RequestState *rawState = state.get();
     outstanding[id] = std::move(state);
 
@@ -1702,6 +1786,7 @@ CIRA::issuePrefetch(ThreadContext *tc, Addr addr, uint64_t size)
 
     ++stats.issuedPrefetches;
     ++stats.issuedPrefetchesPerCore[targetCore];
+    noteGenericPrefetchIssue(targetCore);
 
     DPRINTF(CIRA,
             "issue id=%#llx vaddr=%#llx size=%llu install_size=%llu "
@@ -2403,6 +2488,8 @@ CIRA::completeRequest(uint64_t id)
     stats.totalLatency += curTick() - state.issueTick;
     ++stats.completedPrefetches;
     ++stats.completedPrefetchesPerCore[state.targetCore];
+    if (state.statsEpoch == genericPrefetchStatsEpoch)
+        noteGenericPrefetchCompletion(state.targetCore);
 
     DPRINTF(CIRA, "complete id=%#llx latency=%llu\n",
             static_cast<unsigned long long>(id),
