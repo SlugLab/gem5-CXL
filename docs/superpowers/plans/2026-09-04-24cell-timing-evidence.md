@@ -36,32 +36,45 @@
 - Consumes: accepted generic prefetches in `CIRA::issuePrefetch()` and their terminal completion in `CIRA::completeRequest()`.
 - Produces: gem5 statistics `genericPrefetchFirstIssueTick`, `genericPrefetchLastCompletionTick`, `genericPrefetchBusyTicks`, `genericPrefetchSpanValid`, `genericPrefetchResetOutstanding`, and four-element `*PerCore` vectors.
 
-- [ ] **Step 1: Write source-contract tests for the new statistics and reset hooks**
+- [ ] **Step 1: Write a live multicore behavior test for the new statistics**
 
 ```python
-class CiraDeviceSpanSourceTest(unittest.TestCase):
-    def test_generic_span_is_registered_updated_and_reset(self):
-        source = Path("src/mem/cira.cc").read_text()
-        header = Path("src/mem/cira.hh").read_text()
-        for name in (
-            "genericPrefetchFirstIssueTick",
-            "genericPrefetchLastCompletionTick",
-            "genericPrefetchBusyTicks",
-            "genericPrefetchSpanValid",
-            "genericPrefetchResetOutstanding",
-            "genericPrefetchBusyTicksPerCore",
-        ):
-            self.assertIn(name, source + header)
-        self.assertIn("resetGenericPrefetchSpan", source)
-        self.assertIn("noteGenericPrefetchIssue", source)
-        self.assertIn("noteGenericPrefetchCompletion", source)
+class CiraDeviceSpanTest(unittest.TestCase):
+    def test_live_multicore_prefetch_reports_consistent_busy_spans(self):
+        gem5 = os.environ.get("CIRA_TEST_GEM5")
+        if not gem5:
+            self.skipTest("CIRA_TEST_GEM5 is not set")
+        stats = self.run_multicore_workload(Path(gem5))
+        first = int(stats["board.cira.genericPrefetchFirstIssueTick"])
+        last = int(stats["board.cira.genericPrefetchLastCompletionTick"])
+        busy = int(stats["board.cira.genericPrefetchBusyTicks"])
+        self.assertGreater(first, 0)
+        self.assertGreaterEqual(last, first)
+        self.assertEqual(busy, last - first)
+        self.assertEqual(int(stats["board.cira.genericPrefetchSpanValid"]), 1)
+        self.assertEqual(
+            int(stats["board.cira.genericPrefetchResetOutstanding"]), 0
+        )
 ```
+
+`run_multicore_workload()` compiles the real
+`tests/gem5/cira/cira_multicore_prefetch.cc` against the checked-in `libm5.a`,
+runs the real `tests/gem5/cira/run_cira_multicore.py`, parses `stats.txt`, and
+also checks every active core has `busy == last - first` and issued equals
+completed. It contains no CIRA model mock.
 
 - [ ] **Step 2: Run the new test and confirm the missing-symbol failure**
 
-Run: `python3 -m unittest tests.pyunit.amu.test_cira_device_span -v`
+Run:
 
-Expected: FAIL because the new statistic and helper names do not exist.
+```bash
+CIRA_TEST_GEM5=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/build/X86/gem5.opt \
+CIRA_TEST_M5_LIBRARY=/home/victoryang00/gem5-CXL/.worktrees/m2ndp-g20-pr-spmv/util/m5/build/x86/out/libm5.a \
+python3 -m unittest tests.pyunit.amu.test_cira_device_span -v
+```
+
+Expected: FAIL with a missing `board.cira.genericPrefetchFirstIssueTick`
+statistic from the pre-change gem5 binary.
 
 - [ ] **Step 3: Declare span state, helpers, and statistics**
 
@@ -120,11 +133,14 @@ assert stat("board.cira.genericPrefetchBusyTicks") == (
 For each active core, impose the equivalent per-core equality and require
 issued equals completed.
 
-- [ ] **Step 6: Run focused tests**
+- [ ] **Step 6: Build the changed model and run focused tests**
 
 Run:
 
 ```bash
+scons build/X86/gem5.opt -j4
+CIRA_TEST_GEM5=build/X86/gem5.opt \
+CIRA_TEST_M5_LIBRARY=util/m5/build/x86/out/libm5.a \
 python3 -m unittest tests.pyunit.amu.test_cira_device_span -v
 python3 -m py_compile tests/gem5/cira/run_cira_multicore.py
 ```
