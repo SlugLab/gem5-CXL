@@ -1694,7 +1694,7 @@ _CIRA_DEVICE_STAT_NAMES = frozenset(
 )
 
 
-def parse_cira_device_metrics(stats):
+def parse_cira_device_metrics(stats, *, require_activity=True):
     """Parse and validate generic and descriptor-specific CIRA timing."""
 
     def scalar(name):
@@ -1711,6 +1711,54 @@ def parse_cira_device_metrics(stats):
     busy = scalar("genericPrefetchBusyTicks")
     valid = scalar("genericPrefetchSpanValid")
     reset_outstanding = scalar("genericPrefetchResetOutstanding")
+    first_per_core = vector("genericPrefetchFirstIssueTickPerCore")
+    last_per_core = vector("genericPrefetchLastCompletionTickPerCore")
+    busy_per_core = vector("genericPrefetchBusyTicksPerCore")
+    valid_per_core = vector("genericPrefetchSpanValidPerCore")
+    pr_compute = scalar("prComputeTicks")
+    pr_stall = scalar("prQueueStallTicks")
+    pr_issued = scalar("issuedPrDescriptors")
+    pr_completed = scalar("completedPrDescriptors")
+    pr_compute_per_core = vector("prComputeTicksPerCore")
+    pr_stall_per_core = vector("prQueueStallTicksPerCore")
+    pr_issued_per_core = vector("issuedPrDescriptorsPerCore")
+    pr_completed_per_core = vector("completedPrDescriptorsPerCore")
+
+    if not require_activity and valid == 0:
+        inactive_state = (
+            first, last, busy, reset_outstanding,
+            *first_per_core, *last_per_core, *busy_per_core, *valid_per_core,
+            pr_compute, pr_stall, pr_issued, pr_completed,
+            *pr_compute_per_core, *pr_stall_per_core,
+            *pr_issued_per_core, *pr_completed_per_core,
+        )
+        if any(inactive_state):
+            raise ReplayError("inactive CIRA span has state")
+        return {
+            "generic_prefetch": {
+                "first_issue_tick": first,
+                "last_completion_tick": last,
+                "busy_ticks": busy,
+                "span_valid": valid,
+                "reset_outstanding": reset_outstanding,
+                "first_issue_tick_per_core": first_per_core,
+                "last_completion_tick_per_core": last_per_core,
+                "busy_ticks_per_core": busy_per_core,
+                "span_valid_per_core": valid_per_core,
+            },
+            "pr_descriptor_metrics": {
+                "applicable": False,
+                "compute_ticks": pr_compute,
+                "queue_stall_ticks": pr_stall,
+                "compute_ticks_per_core": pr_compute_per_core,
+                "queue_stall_ticks_per_core": pr_stall_per_core,
+                "max_compute_plus_stall_ticks": 0,
+                "issued": pr_issued,
+                "completed": pr_completed,
+                "issued_per_core": pr_issued_per_core,
+                "completed_per_core": pr_completed_per_core,
+            },
+        }
     if last < first or busy != last - first:
         raise ReplayError("CIRA generic prefetch busy span differs")
     if valid != 1:
@@ -1718,10 +1766,6 @@ def parse_cira_device_metrics(stats):
     if reset_outstanding:
         raise ReplayError("CIRA generic prefetch span reset with live requests")
 
-    first_per_core = vector("genericPrefetchFirstIssueTickPerCore")
-    last_per_core = vector("genericPrefetchLastCompletionTickPerCore")
-    busy_per_core = vector("genericPrefetchBusyTicksPerCore")
-    valid_per_core = vector("genericPrefetchSpanValidPerCore")
     for core in range(4):
         if (
             valid_per_core[core] != 1
@@ -1733,14 +1777,6 @@ def parse_cira_device_metrics(stats):
                 f"CIRA generic prefetch busy span differs for core {core}"
             )
 
-    pr_compute = scalar("prComputeTicks")
-    pr_stall = scalar("prQueueStallTicks")
-    pr_issued = scalar("issuedPrDescriptors")
-    pr_completed = scalar("completedPrDescriptors")
-    pr_compute_per_core = vector("prComputeTicksPerCore")
-    pr_stall_per_core = vector("prQueueStallTicksPerCore")
-    pr_issued_per_core = vector("issuedPrDescriptorsPerCore")
-    pr_completed_per_core = vector("completedPrDescriptorsPerCore")
     if pr_issued != pr_completed or pr_issued_per_core != pr_completed_per_core:
         raise ReplayError("CIRA PageRank descriptor issued/completed counts differ")
     if sum(pr_issued_per_core) != pr_issued:
@@ -1945,7 +1981,9 @@ def collect_run_evidence(run_dir, *, system, trace, config,
                 + ", ".join(missing)
             )
         if available_device_stats == _CIRA_DEVICE_STAT_NAMES:
-            metrics = parse_cira_device_metrics(stats)
+            metrics = parse_cira_device_metrics(
+                stats, require_activity=require_activity
+            )
             descriptor = metrics["pr_descriptor_metrics"]
             if (
                 descriptor["applicable"]

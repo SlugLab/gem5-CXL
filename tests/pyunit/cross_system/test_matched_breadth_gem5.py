@@ -1448,6 +1448,27 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         with self.assertRaisesRegex(replay.ReplayError, "busy span differs"):
             replay.parse_cira_device_metrics(stats)
 
+    def test_inactive_fixed_cira_span_is_valid_only_when_empty(self):
+        stats = {
+            f"board.cira.{name}": 0
+            for name in replay._CIRA_DEVICE_SCALARS
+        }
+        for name in replay._CIRA_DEVICE_VECTORS:
+            for core in range(4):
+                stats[f"board.cira.{name}::{core}"] = 0
+
+        observed = replay.parse_cira_device_metrics(
+            stats, require_activity=False
+        )
+        self.assertEqual(observed["generic_prefetch"]["span_valid"], 0)
+        self.assertEqual(observed["generic_prefetch"]["busy_ticks"], 0)
+
+        stats["board.cira.genericPrefetchFirstIssueTick"] = 1
+        with self.assertRaisesRegex(
+            replay.ReplayError, "inactive CIRA span has state"
+        ):
+            replay.parse_cira_device_metrics(stats, require_activity=False)
+
     def test_cira_drains_each_core_before_window_boundary(self):
         source = replay.SOURCE.read_text(encoding="utf-8")
         cira = source[
