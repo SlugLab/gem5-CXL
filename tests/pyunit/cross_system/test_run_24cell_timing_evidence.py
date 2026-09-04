@@ -66,9 +66,20 @@ class Run24CellTimingEvidenceTest(unittest.TestCase):
 
     def _registry_cell(self):
         return {
-            "trace": self._file_record("trace/trace.meta.json", b"trace"),
+            "input_sha256": _digest("input"),
+            "trace": self._file_record(
+                "trace/trace.meta.json",
+                json.dumps({
+                    "workload": "pr_spmv",
+                    "input_sha256": _digest("input"),
+                }).encode("utf-8"),
+            ),
             "fixed_trace": self._file_record(
-                "fixed/trace.meta.json", b"fixed"
+                "fixed/trace.meta.json",
+                json.dumps({
+                    "workload": "pr_spmv",
+                    "input_sha256": _digest("input"),
+                }).encode("utf-8"),
             ),
             "window_manifest": self._file_record("window.json", b"window"),
             "phase": 0,
@@ -252,11 +263,27 @@ class Run24CellTimingEvidenceTest(unittest.TestCase):
         )
 
     def test_registry_requires_exact_matrix_and_hashes(self):
-        cell = self._registry_cell()
         registry = {
             "schema": 1, "status": "verified",
             "cells": {
-                f"{workload}:{latency}": cell
+                f"{workload}:{latency}": {
+                    **self._registry_cell(),
+                    "trace": self._file_record(
+                        f"{workload}/{latency}/trace/trace.meta.json",
+                        json.dumps({
+                            "workload": workload,
+                            "input_sha256": _digest(f"{workload}-input"),
+                        }).encode("utf-8"),
+                    ),
+                    "fixed_trace": self._file_record(
+                        f"{workload}/{latency}/fixed/trace.meta.json",
+                        json.dumps({
+                            "workload": workload,
+                            "input_sha256": _digest(f"{workload}-input"),
+                        }).encode("utf-8"),
+                    ),
+                    "input_sha256": _digest(f"{workload}-input"),
+                }
                 for workload, latency in evidence.COORDINATES
             },
         }
@@ -267,6 +294,16 @@ class Run24CellTimingEvidenceTest(unittest.TestCase):
         path.write_text(json.dumps(registry) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(runner.CampaignError, "exact 24-cell matrix"):
             runner.load_registry(path)
+
+    def test_registry_rejects_trace_workload_or_input_relabeling(self):
+        cell = self._registry_cell()
+        with self.assertRaisesRegex(runner.CampaignError, "trace workload differs"):
+            runner._validate_registry_cell("mcf:200ns", cell)
+
+        cell = self._registry_cell()
+        cell["input_sha256"] = _digest("different-input")
+        with self.assertRaisesRegex(runner.CampaignError, "trace input SHA-256 differs"):
+            runner._validate_registry_cell("pr_spmv:200ns", cell)
 
     def test_default_cira_launcher_requires_device_timing(self):
         cell = self._registry_cell()

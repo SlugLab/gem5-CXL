@@ -135,14 +135,49 @@ def _validate_file_record(record: dict, label: str) -> Path:
     return resolved
 
 
+def _trace_identity(path: Path, label: str) -> tuple[str, str]:
+    value = _load_json(path, label)
+    identity = value.get("meta") if isinstance(value.get("meta"), dict) else value
+    workload = identity.get("workload")
+    input_sha256 = identity.get("input_sha256")
+    if not isinstance(workload, str) or not isinstance(input_sha256, str):
+        raise CampaignError(f"{label} identity is missing")
+    return workload, input_sha256
+
+
 def _validate_registry_cell(key: str, row: dict) -> dict:
     if not isinstance(row, dict):
         raise CampaignError(f"prepared cell {key} is invalid")
-    for name in ("trace", "window_manifest"):
-        _validate_file_record(row.get(name), f"{key} {name}")
+    try:
+        workload, _latency = key.split(":", 1)
+    except ValueError as error:
+        raise CampaignError(f"prepared cell key is invalid: {key}") from error
+    expected_input = row.get("input_sha256")
+    if (
+        not isinstance(expected_input, str)
+        or len(expected_input) != 64
+        or any(character not in "0123456789abcdef" for character in expected_input)
+    ):
+        raise CampaignError(f"prepared cell {key} input SHA-256 is invalid")
+    trace_path = _validate_file_record(row.get("trace"), f"{key} trace")
+    trace_workload, trace_input = _trace_identity(trace_path, f"{key} trace")
+    if trace_workload != workload:
+        raise CampaignError(f"prepared cell {key} trace workload differs")
+    if trace_input != expected_input:
+        raise CampaignError(f"prepared cell {key} trace input SHA-256 differs")
+    _validate_file_record(row.get("window_manifest"), f"{key} window_manifest")
     fixed = row.get("fixed_trace")
     if fixed is not None:
-        _validate_file_record(fixed, f"{key} fixed_trace")
+        fixed_path = _validate_file_record(fixed, f"{key} fixed_trace")
+        fixed_workload, fixed_input = _trace_identity(
+            fixed_path, f"{key} fixed trace"
+        )
+        if fixed_workload != workload:
+            raise CampaignError(f"prepared cell {key} fixed trace workload differs")
+        if fixed_input != expected_input:
+            raise CampaignError(
+                f"prepared cell {key} fixed trace input SHA-256 differs"
+            )
     phase = row.get("phase")
     window = row.get("window_index")
     if (
@@ -467,7 +502,10 @@ def _launch_m2ndp(
     reused = cell.get("m2ndp_evidence")
     if reused is not None:
         source = _validate_file_record(reused, "M2NDP reused evidence")
-        return evidence.load_m2ndp_cell(source, workload, latency)
+        return evidence.load_m2ndp_cell(
+            source, workload, latency,
+            expected_input_sha256=cell["input_sha256"],
+        )
     package = _validate_file_record(cell["m2ndp_package"], "M2NDP package")
     functional_path = _validate_file_record(
         cell["functional_evidence"], "FuncSim evidence"
@@ -491,7 +529,10 @@ def _launch_m2ndp(
         "calibration_evidence_sha256": calibration.evidence_sha256,
     })
     atomic_write_json(raw_path, raw)
-    return evidence.load_m2ndp_cell(raw_path, workload, latency)
+    return evidence.load_m2ndp_cell(
+        raw_path, workload, latency,
+        expected_input_sha256=cell["input_sha256"],
+    )
 
 
 def require_free_space(path: Path, minimum: int = MINIMUM_FREE_BYTES) -> None:

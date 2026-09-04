@@ -147,7 +147,9 @@ class TimingEvidence24CellTest(unittest.TestCase):
     def test_load_m2ndp_cell_hash_binds_logs_binary_configs_and_calibration(self):
         calibration = self._write_calibration()
         path = self._write_m2ndp(calibration)
-        row = evidence.load_m2ndp_cell(path, "npb_cg", "1us")
+        row = evidence.load_m2ndp_cell(
+            path, "npb_cg", "1us", expected_input_sha256="3" * 64
+        )
         self.assertEqual(row["cycles"], 102531389)
         self.assertEqual(row["core_period_ns"], "0.5")
         self.assertEqual(row["kernel_time_ns"], "51265694.5")
@@ -190,14 +192,20 @@ class TimingEvidence24CellTest(unittest.TestCase):
                 candidate = self.root / f"candidate-{index}.json"
                 candidate.write_text(json.dumps(record) + "\n", encoding="utf-8")
                 with self.assertRaisesRegex(evidence.EvidenceError, message):
-                    evidence.load_m2ndp_cell(candidate, "npb_cg", "1us")
+                    evidence.load_m2ndp_cell(
+                        candidate, "npb_cg", "1us",
+                        expected_input_sha256="3" * 64,
+                    )
 
         missing = copy.deepcopy(pristine)
         missing.pop("functional")
         candidate = self.root / "missing-functional.json"
         candidate.write_text(json.dumps(missing) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(evidence.EvidenceError, "functional evidence"):
-            evidence.load_m2ndp_cell(candidate, "npb_cg", "1us")
+            evidence.load_m2ndp_cell(
+                candidate, "npb_cg", "1us",
+                expected_input_sha256="3" * 64,
+            )
 
         Path(pristine["stdout_path"]).write_text(
             "Gantt info: host 0 finished NDP kernel\n"
@@ -209,7 +217,25 @@ class TimingEvidence24CellTest(unittest.TestCase):
         candidate = self.root / "floating-period.json"
         candidate.write_text(json.dumps(floating) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(evidence.EvidenceError, "decimal string"):
-            evidence.load_m2ndp_cell(candidate, "npb_cg", "1us")
+            evidence.load_m2ndp_cell(
+                candidate, "npb_cg", "1us",
+                expected_input_sha256="3" * 64,
+            )
+
+    def test_m2ndp_rejects_cross_workload_input_relabeling(self):
+        calibration = self._write_calibration()
+        path = self._write_m2ndp(
+            calibration, workload="amg_gather", latency="1us"
+        )
+        row = json.loads(path.read_text())
+        row.pop("workload")
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(evidence.EvidenceError, "input SHA-256 differs"):
+            evidence.load_m2ndp_cell(
+                path, "pr_spmv", "1us",
+                expected_input_sha256="9" * 64,
+            )
 
     def test_calibration_rejects_derived_config_hash_drift(self):
         path = self._write_calibration()

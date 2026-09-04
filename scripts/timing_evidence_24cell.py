@@ -259,7 +259,9 @@ def _validate_functional(row: dict) -> None:
     )
 
 
-def load_m2ndp_cell(path: Path, workload: str, latency: str) -> dict:
+def load_m2ndp_cell(
+    path: Path, workload: str, latency: str, *, expected_input_sha256: str,
+) -> dict:
     if workload not in WORKLOADS or latency not in LATENCIES:
         raise EvidenceError("M2NDP coordinate is not in the 24-cell matrix")
     path = Path(path).resolve()
@@ -289,6 +291,12 @@ def load_m2ndp_cell(path: Path, workload: str, latency: str) -> dict:
         "trace_sha256", "input_sha256", "patch_sha256",
     ):
         _digest(row, field)
+    if not isinstance(expected_input_sha256, str) or not _SHA256.fullmatch(
+        expected_input_sha256
+    ):
+        raise EvidenceError("expected input SHA-256 is invalid")
+    if row["input_sha256"] != expected_input_sha256:
+        raise EvidenceError("M2NDP input SHA-256 differs from requested coordinate")
     _validate_functional(row)
     _command_file(
         row, binary_hash_field="ndpsim_sha256",
