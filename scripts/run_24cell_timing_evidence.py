@@ -229,7 +229,7 @@ def _require_replay_identity(result: dict, identity: CampaignIdentity, system: s
 
 def _host_evidence(
     result: dict, identity: CampaignIdentity, workload: str, latency: str,
-    calibration: evidence.CalibrationRow,
+    calibration: evidence.CalibrationRow, source: dict,
 ) -> dict:
     row = _require_replay_identity(result, identity, "cira-inline")
     if (
@@ -243,24 +243,30 @@ def _host_evidence(
     ticks = row.get("host_region_cumulative_ticks")
     if isinstance(ticks, bool) or not isinstance(ticks, int) or ticks <= 0:
         raise CampaignError("cira-inline cumulative ticks are invalid")
+    sim_freq = row.get("sim_freq_hz")
+    if isinstance(sim_freq, bool) or not isinstance(sim_freq, int) or sim_freq <= 0:
+        raise CampaignError("cira-inline simFreq is invalid")
     return {
         "schema": 1, "status": "pass", "workload": workload,
         "latency": latency, "campaign_identity_sha256": identity.digest(),
         "system": "cira-inline", "offload_disabled": True,
         "host_region_cumulative_ticks": ticks,
         "host_region_entry_count": row["host_region_entry_count"],
+        "sim_freq_hz": sim_freq,
         "replay_binary_sha256": result["binary_sha256"],
         "gem5_sha256": result["gem5_sha256"],
         "config_sha256": result.get("config_sha256"),
         "calibration_evidence_path": calibration.evidence_path,
         "calibration_evidence_sha256": calibration.evidence_sha256,
         "source_command": result.get("command"),
+        "source_evidence_path": source["path"],
+        "source_evidence_sha256": source["sha256"],
     }
 
 
 def _cira_evidence(
     result: dict, identity: CampaignIdentity, workload: str, latency: str,
-    calibration: evidence.CalibrationRow,
+    calibration: evidence.CalibrationRow, source: dict,
 ) -> dict:
     row = _require_replay_identity(result, identity, "cira")
     generic = row.get("generic_prefetch")
@@ -281,6 +287,9 @@ def _cira_evidence(
         for name in ("compute_ticks", "queue_stall_ticks", "issued", "completed")
     ):
         raise CampaignError("matched CIRA replay used descriptor metrics")
+    sim_freq = row.get("sim_freq_hz")
+    if isinstance(sim_freq, bool) or not isinstance(sim_freq, int) or sim_freq <= 0:
+        raise CampaignError("CIRA simFreq is invalid")
     return {
         "schema": 1, "status": "pass", "workload": workload,
         "latency": latency, "campaign_identity_sha256": identity.digest(),
@@ -289,6 +298,7 @@ def _cira_evidence(
         "completed_prefetches": row.get("completed_prefetches"),
         "issued_per_core": row.get("issued_per_core"),
         "completed_per_core": row.get("completed_per_core"),
+        "sim_freq_hz": sim_freq,
         "pr_descriptor_metrics": descriptor,
         "replay_binary_sha256": result["binary_sha256"],
         "gem5_sha256": result["gem5_sha256"],
@@ -296,6 +306,8 @@ def _cira_evidence(
         "calibration_evidence_path": calibration.evidence_path,
         "calibration_evidence_sha256": calibration.evidence_sha256,
         "source_command": result.get("command"),
+        "source_evidence_path": source["path"],
+        "source_evidence_sha256": source["sha256"],
     }
 
 
@@ -373,12 +385,21 @@ def execute_cell(
             workload=workload, latency=latency, cell=registry_cell,
             root=attempt_root / "raw-m2ndp", calibration=calibration,
         )
+        replay_sources = {}
+        for name, result in (
+            ("host_inline", host_result), ("cira_runtime", cira_result),
+        ):
+            source_path = attempt_root / f"{name}-replay-evidence.json"
+            atomic_write_json(source_path, result)
+            replay_sources[name] = _evidence_record(source_path)
         payloads = {
             "host_inline": _host_evidence(
-                host_result, identity, workload, latency, calibration
+                host_result, identity, workload, latency, calibration,
+                replay_sources["host_inline"],
             ),
             "cira_runtime": _cira_evidence(
-                cira_result, identity, workload, latency, calibration
+                cira_result, identity, workload, latency, calibration,
+                replay_sources["cira_runtime"],
             ),
             "m2ndp": _m2ndp_evidence(
                 m2ndp_result, identity, workload, latency, calibration

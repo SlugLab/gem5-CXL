@@ -127,6 +127,22 @@ def cycles_to_ns(cycles: int, period_ns: str) -> str:
     return _canonical_decimal(decimal.Decimal(cycles) * period)
 
 
+def ticks_to_ns(ticks: int, sim_freq_hz: int) -> str:
+    if isinstance(ticks, bool) or not isinstance(ticks, int) or ticks < 0:
+        raise EvidenceError("ticks must be a nonnegative integer")
+    if (
+        isinstance(sim_freq_hz, bool)
+        or not isinstance(sim_freq_hz, int)
+        or sim_freq_hz <= 0
+    ):
+        raise EvidenceError("sim_freq_hz must be a positive integer")
+    numerator = decimal.Decimal(ticks) * decimal.Decimal(1_000_000_000)
+    result = numerator / decimal.Decimal(sim_freq_hz)
+    if result * decimal.Decimal(sim_freq_hz) != numerator:
+        raise EvidenceError("tick-to-nanosecond conversion is not exactly representable")
+    return _canonical_decimal(result)
+
+
 def _calibration_row(
     record: dict, *, source: Path | None, verify_config: bool,
 ) -> CalibrationRow:
@@ -349,4 +365,3 @@ def load_m2ndp_cell(path: Path, workload: str, latency: str) -> dict:
         "output_sha256": row["output_sha256"],
         "command": row["command"],
     }
-

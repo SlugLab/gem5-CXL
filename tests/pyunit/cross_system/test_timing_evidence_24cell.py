@@ -117,6 +117,13 @@ class TimingEvidence24CellTest(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "decimal string"):
             evidence.cycles_to_ns(1, 0.5)
 
+    def test_ticks_to_ns_uses_recorded_frequency_exactly(self):
+        self.assertEqual(
+            evidence.ticks_to_ns(12345, 1_000_000_000_000), "12.345"
+        )
+        with self.assertRaisesRegex(evidence.EvidenceError, "exactly"):
+            evidence.ticks_to_ns(1, 3)
+
     def test_calibration_rows_match_microprobe_records(self):
         cases = {
             "200ns": (1397, "412.254", "412.250", "0.004", "4"),

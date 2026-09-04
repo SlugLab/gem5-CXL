@@ -1887,6 +1887,8 @@ def collect_run_evidence(run_dir, *, system, trace, config,
         "queue_errors": 0,
         "descriptor_errors": 0,
     }
+    if "simFreq" in stats:
+        row["sim_freq_hz"] = _stat_integer(stats, "simFreq")
     if system == "amu":
         row.update({
             "issued_loads": _stat_integer(
@@ -2298,6 +2300,13 @@ def run(options):
         "binary_sha256": _sha256_file(options.binary),
         "gem5_sha256": _sha256_file(options.gem5),
         "config_sha256": _sha256_file(outdir / "config.ini"),
+        "config_path": str((outdir / "config.ini").resolve()),
+        "stats_path": str((outdir / "stats.txt").resolve()),
+        "stats_sha256": _sha256_file(outdir / "stats.txt"),
+        "result_path": str((outdir / "result.json").resolve()),
+        "result_sha256": _sha256_file(outdir / "result.json"),
+        "simout_path": str((outdir / "simout").resolve()),
+        "simout_sha256": _sha256_file(outdir / "simout"),
         "command": command,
         "row": row,
     }

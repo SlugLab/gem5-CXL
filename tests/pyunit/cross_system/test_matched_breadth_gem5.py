@@ -1747,6 +1747,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         (run_dir / "stats.txt").write_text(
             "---------- Begin Simulation Statistics ----------\n"
             "simTicks 24680\n"
+            "simFreq 1000000000000\n"
             "---------- End Simulation Statistics ----------\n",
             encoding="utf-8",
         )
@@ -1760,6 +1761,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(row["host_region_cumulative_ticks"], 24680)
         self.assertEqual(row["host_region_entry_count"], 7)
         self.assertEqual(row["sim_ticks"], 24680)
+        self.assertEqual(row["sim_freq_hz"], 1_000_000_000_000)
 
     def test_cira_run_evidence_requires_new_timing_only_when_requested(self):
         operations = (

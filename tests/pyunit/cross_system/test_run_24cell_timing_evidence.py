@@ -90,6 +90,7 @@ class Run24CellTimingEvidenceTest(unittest.TestCase):
                 "verification": "pass", "offload_disabled": True,
                 "host_region_cumulative_ticks": 1234,
                 "host_region_entry_count": 17,
+                "sim_freq_hz": 1_000_000_000_000,
                 "issued_loads": 0, "completed_loads": 0,
                 "issued_per_core": [0, 0, 0, 0],
                 "completed_per_core": [0, 0, 0, 0],
@@ -105,6 +106,7 @@ class Run24CellTimingEvidenceTest(unittest.TestCase):
             "config_sha256": _digest("cira-config"),
             "row": {
                 "verification": "pass",
+                "sim_freq_hz": 1_000_000_000_000,
                 "issued_prefetches": 8, "completed_prefetches": 8,
                 "issued_per_core": [2, 2, 2, 2],
                 "completed_per_core": [2, 2, 2, 2],
