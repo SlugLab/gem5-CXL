@@ -1321,6 +1321,91 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             ):
                 replay.validate_mechanism("cira", {**clean, **change})
 
+    def test_cira_device_metrics_export_global_per_core_and_pr_fields(self):
+        stats = {
+            "board.cira.genericPrefetchFirstIssueTick": 100,
+            "board.cira.genericPrefetchLastCompletionTick": 190,
+            "board.cira.genericPrefetchBusyTicks": 90,
+            "board.cira.genericPrefetchSpanValid": 1,
+            "board.cira.genericPrefetchResetOutstanding": 0,
+            "board.cira.prComputeTicks": 0,
+            "board.cira.prQueueStallTicks": 0,
+            "board.cira.issuedPrDescriptors": 0,
+            "board.cira.completedPrDescriptors": 0,
+        }
+        for core in range(4):
+            first = 110 + core
+            busy = 20 + core
+            stats.update({
+                f"board.cira.genericPrefetchFirstIssueTickPerCore::{core}":
+                    first,
+                f"board.cira.genericPrefetchLastCompletionTickPerCore::{core}":
+                    first + busy,
+                f"board.cira.genericPrefetchBusyTicksPerCore::{core}": busy,
+                f"board.cira.genericPrefetchSpanValidPerCore::{core}": 1,
+                f"board.cira.prComputeTicksPerCore::{core}": 0,
+                f"board.cira.prQueueStallTicksPerCore::{core}": 0,
+                f"board.cira.issuedPrDescriptorsPerCore::{core}": 0,
+                f"board.cira.completedPrDescriptorsPerCore::{core}": 0,
+            })
+
+        observed = replay.parse_cira_device_metrics(stats)
+        self.assertEqual(observed["generic_prefetch"]["busy_ticks"], 90)
+        self.assertEqual(
+            observed["generic_prefetch"]["busy_ticks_per_core"],
+            [20, 21, 22, 23],
+        )
+        self.assertEqual(
+            observed["generic_prefetch"]["first_issue_tick_per_core"],
+            [110, 111, 112, 113],
+        )
+        self.assertEqual(
+            observed["generic_prefetch"]["last_completion_tick_per_core"],
+            [130, 132, 134, 136],
+        )
+        self.assertEqual(
+            observed["generic_prefetch"]["span_valid_per_core"],
+            [1, 1, 1, 1],
+        )
+        self.assertIs(
+            observed["pr_descriptor_metrics"]["applicable"], False
+        )
+        self.assertEqual(
+            observed["pr_descriptor_metrics"]["compute_ticks_per_core"],
+            [0, 0, 0, 0],
+        )
+        self.assertEqual(
+            observed["pr_descriptor_metrics"]["queue_stall_ticks_per_core"],
+            [0, 0, 0, 0],
+        )
+
+    def test_cira_device_metrics_reject_inconsistent_busy_span(self):
+        stats = {
+            "board.cira.genericPrefetchFirstIssueTick": 100,
+            "board.cira.genericPrefetchLastCompletionTick": 190,
+            "board.cira.genericPrefetchBusyTicks": 89,
+            "board.cira.genericPrefetchSpanValid": 1,
+            "board.cira.genericPrefetchResetOutstanding": 0,
+            "board.cira.prComputeTicks": 0,
+            "board.cira.prQueueStallTicks": 0,
+            "board.cira.issuedPrDescriptors": 0,
+            "board.cira.completedPrDescriptors": 0,
+        }
+        for core in range(4):
+            stats.update({
+                f"board.cira.genericPrefetchFirstIssueTickPerCore::{core}": 100,
+                f"board.cira.genericPrefetchLastCompletionTickPerCore::{core}":
+                    120,
+                f"board.cira.genericPrefetchBusyTicksPerCore::{core}": 20,
+                f"board.cira.genericPrefetchSpanValidPerCore::{core}": 1,
+                f"board.cira.prComputeTicksPerCore::{core}": 0,
+                f"board.cira.prQueueStallTicksPerCore::{core}": 0,
+                f"board.cira.issuedPrDescriptorsPerCore::{core}": 0,
+                f"board.cira.completedPrDescriptorsPerCore::{core}": 0,
+            })
+        with self.assertRaisesRegex(replay.ReplayError, "busy span differs"):
+            replay.parse_cira_device_metrics(stats)
+
     def test_cira_drains_each_core_before_window_boundary(self):
         source = replay.SOURCE.read_text(encoding="utf-8")
         cira = source[
@@ -1534,6 +1619,98 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(row["sim_ticks"], 12345)
         self.assertEqual(row["verification"], "pass")
         self.assertEqual(row["raw_outputs"], [17])
+
+    def test_cira_run_evidence_requires_new_timing_only_when_requested(self):
+        operations = (
+            _op(canonical.Opcode.LOAD_U64, 0, address=0xA000,
+                left=17, result=17),
+            _op(canonical.Opcode.COMMIT, 1, address=0xB000,
+                left=17, result=17),
+        )
+        bundle = self.root / "cira-evidence-trace"
+        canonical.write_bundle(
+            bundle, _meta("cira_evidence", 1), operations, {},
+            initial_memory=_initial_memory(operations),
+        )
+        run_dir = self.root / "cira-run"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps({
+            "verification": "pass", "threads": 4, "phases": 1,
+            "commit_order": [1], "raw_outputs": [17],
+            "output_boundaries": {}, "drains": 4,
+        }) + "\n", encoding="utf-8")
+        (run_dir / "simout").write_text(
+            "TRACE_REPLAY_ALLOCATION logical_bytes=64 "
+            "allocated_bytes=64 all_memory_cxl=true\n",
+            encoding="utf-8",
+        )
+        base_stats = [
+            "simTicks 12345",
+            "board.cira.issuedPrefetches 4",
+            "board.cira.completedPrefetches 4",
+            "board.cira.rejectedQueueFull 0",
+            "board.cira.rejectedCsrIndexQueueFull 0",
+            "board.cira.droppedCsrDescriptors 0",
+        ]
+        for core in range(4):
+            base_stats.extend((
+                f"board.cira.issuedPrefetchesPerCore::{core} 1",
+                f"board.cira.completedPrefetchesPerCore::{core} 1",
+            ))
+
+        def write_stats(lines):
+            (run_dir / "stats.txt").write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                + "\n".join(lines)
+                + "\n---------- End Simulation Statistics ----------\n",
+                encoding="utf-8",
+            )
+
+        write_stats(base_stats)
+        legacy = replay.collect_run_evidence(
+            run_dir, system="cira", trace=bundle,
+            config=self._write_config(),
+        )
+        self.assertNotIn("generic_prefetch", legacy)
+        with self.assertRaisesRegex(
+            replay.ReplayError, "missing required CIRA device timing"
+        ):
+            replay.collect_run_evidence(
+                run_dir, system="cira", trace=bundle,
+                config=self._write_config(), require_device_timing=True,
+            )
+
+        timing_stats = [
+            "board.cira.genericPrefetchFirstIssueTick 100",
+            "board.cira.genericPrefetchLastCompletionTick 190",
+            "board.cira.genericPrefetchBusyTicks 90",
+            "board.cira.genericPrefetchSpanValid 1",
+            "board.cira.genericPrefetchResetOutstanding 0",
+            "board.cira.prComputeTicks 0",
+            "board.cira.prQueueStallTicks 0",
+            "board.cira.issuedPrDescriptors 0",
+            "board.cira.completedPrDescriptors 0",
+        ]
+        for core in range(4):
+            timing_stats.extend((
+                f"board.cira.genericPrefetchFirstIssueTickPerCore::{core} 110",
+                f"board.cira.genericPrefetchLastCompletionTickPerCore::{core} 130",
+                f"board.cira.genericPrefetchBusyTicksPerCore::{core} 20",
+                f"board.cira.genericPrefetchSpanValidPerCore::{core} 1",
+                f"board.cira.prComputeTicksPerCore::{core} 0",
+                f"board.cira.prQueueStallTicksPerCore::{core} 0",
+                f"board.cira.issuedPrDescriptorsPerCore::{core} 0",
+                f"board.cira.completedPrDescriptorsPerCore::{core} 0",
+            ))
+        write_stats(base_stats + timing_stats)
+        current = replay.collect_run_evidence(
+            run_dir, system="cira", trace=bundle,
+            config=self._write_config(), require_device_timing=True,
+        )
+        self.assertEqual(current["generic_prefetch"]["busy_ticks"], 90)
+        self.assertIs(
+            current["pr_descriptor_metrics"]["applicable"], False
+        )
 
     def test_run_evidence_rejects_program_commit_drift(self):
         operations = (
