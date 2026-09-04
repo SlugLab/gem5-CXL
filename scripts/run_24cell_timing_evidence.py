@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
 import hashlib
 import json
@@ -11,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 try:
@@ -26,11 +28,16 @@ except ImportError:
 REPO = Path(__file__).resolve().parents[1]
 GEM5_CONFIG = REPO / "configs/example/gem5_library/x86-gapbs-amu-se.py"
 MINIMUM_FREE_BYTES = 20 * 1024**3
-_EVIDENCE_NAMES = (
-    "m2ndp",
-    "host_inline",
-    "cira_runtime",
-)
+REPLAY_STAGES = ("host_inline", "cira_runtime")
+_STAGE_SYSTEM = {
+    "host_inline": "cira-inline",
+    "cira_runtime": "cira",
+}
+_SYSTEM_SELECTIONS = {
+    "host-inline,cira": REPLAY_STAGES,
+    "host-inline": ("host_inline",),
+    "cira": ("cira_runtime",),
+}
 
 
 class CampaignError(RuntimeError):
@@ -46,8 +53,8 @@ class CampaignIdentity:
     replay_binary_sha256: str
     gem5_sha256: str
     m5_library_sha256: str
-    funcsim_sha256: str
-    ndpsim_sha256: str
+    funcsim_sha256: str | None
+    ndpsim_sha256: str | None
     gem5_config_sha256: str
     calibration_sha256: tuple[tuple[str, str], ...]
 
@@ -83,13 +90,16 @@ def new_state(identity: CampaignIdentity) -> dict:
     return {
         "schema": 1,
         "status": "running",
-        "identity": dataclasses.asdict(identity),
+        "identity": json.loads(json.dumps(dataclasses.asdict(identity))),
         "identity_sha256": identity.digest(),
         "cells": {
             f"{workload}:{latency}": {
                 "workload": workload,
                 "latency": latency,
                 "status": "pending",
+                "stages": {
+                    stage: {"status": "pending"} for stage in REPLAY_STAGES
+                },
             }
             for workload, latency in evidence.COORDINATES
         },
@@ -100,7 +110,8 @@ def resume_state(state: dict, identity: CampaignIdentity) -> dict:
     if not isinstance(state, dict) or state.get("schema") != 1:
         raise CampaignError("campaign state schema differs")
     if (
-        state.get("identity") != dataclasses.asdict(identity)
+        state.get("identity")
+        != json.loads(json.dumps(dataclasses.asdict(identity)))
         or state.get("identity_sha256") != identity.digest()
     ):
         raise CampaignError("campaign identity differs")
@@ -109,6 +120,12 @@ def resume_state(state: dict, identity: CampaignIdentity) -> dict:
     }
     if set(state.get("cells", {})) != expected:
         raise CampaignError("campaign state does not contain the exact 24-cell matrix")
+    for key, row in state["cells"].items():
+        if (
+            not isinstance(row, dict)
+            or set(row.get("stages", {})) != set(REPLAY_STAGES)
+        ):
+            raise CampaignError(f"campaign stage matrix differs for {key}")
     return state
 
 
@@ -145,7 +162,9 @@ def _trace_identity(path: Path, label: str) -> tuple[str, str]:
     return workload, input_sha256
 
 
-def _validate_registry_cell(key: str, row: dict) -> dict:
+def _validate_registry_cell(
+    key: str, row: dict, *, require_m2ndp: bool = False,
+) -> dict:
     if not isinstance(row, dict):
         raise CampaignError(f"prepared cell {key} is invalid")
     try:
@@ -185,16 +204,17 @@ def _validate_registry_cell(key: str, row: dict) -> dict:
         or isinstance(window, bool) or not isinstance(window, int) or window < 0
     ):
         raise CampaignError(f"prepared cell {key} window selection is invalid")
-    reused = row.get("m2ndp_evidence")
-    package = row.get("m2ndp_package")
-    functional = row.get("functional_evidence")
-    if reused is not None:
-        _validate_file_record(reused, f"{key} M2NDP evidence")
-    elif package is not None and functional is not None:
-        _validate_file_record(package, f"{key} M2NDP package")
-        _validate_file_record(functional, f"{key} FuncSim evidence")
-    else:
-        raise CampaignError(f"prepared cell {key} M2NDP source is missing")
+    if require_m2ndp:
+        reused = row.get("m2ndp_evidence")
+        package = row.get("m2ndp_package")
+        functional = row.get("functional_evidence")
+        if reused is not None:
+            _validate_file_record(reused, f"{key} M2NDP evidence")
+        elif package is not None and functional is not None:
+            _validate_file_record(package, f"{key} M2NDP package")
+            _validate_file_record(functional, f"{key} FuncSim evidence")
+        else:
+            raise CampaignError(f"prepared cell {key} M2NDP source is missing")
     return row
 
 
@@ -202,6 +222,10 @@ def load_registry(path: Path) -> dict:
     value = _load_json(path, "prepared 24-cell registry")
     if value.get("schema") != 1 or value.get("status") != "verified":
         raise CampaignError("prepared 24-cell registry is not verified schema 1")
+    graph = value.get("graph")
+    if not isinstance(graph, dict) or graph.get("scale") != 14:
+        raise CampaignError("prepared registry graph is not scale 14")
+    _validate_file_record(graph, "prepared registry graph")
     cells = value.get("cells")
     expected = {
         f"{workload}:{latency}" for workload, latency in evidence.COORDINATES
@@ -215,35 +239,49 @@ def _evidence_record(path: Path) -> dict:
     return {"path": str(Path(path).resolve()), "sha256": evidence.sha256_file(path)}
 
 
-def cell_complete(
+def stage_complete(
     row: dict, identity: CampaignIdentity, workload: str, latency: str,
+    stage: str,
 ) -> bool:
-    if (
-        not isinstance(row, dict)
-        or row.get("status") != "complete"
-        or row.get("workload") != workload
-        or row.get("latency") != latency
-        or row.get("identity_sha256") != identity.digest()
-    ):
+    if stage not in REPLAY_STAGES or not isinstance(row, dict):
         return False
-    records = row.get("evidence")
-    if not isinstance(records, dict) or set(records) != set(_EVIDENCE_NAMES):
+    stages = row.get("stages")
+    item = stages.get(stage) if isinstance(stages, dict) else None
+    if not isinstance(item, dict) or item.get("status") != "complete":
         return False
+    record = item.get("evidence")
     try:
-        for name, record in records.items():
-            path = _validate_file_record(record, f"{workload}:{latency} {name}")
-            payload = _load_json(path, f"{workload}:{latency} {name}")
-            if (
-                payload.get("schema") != 1
-                or payload.get("status") != "pass"
-                or payload.get("workload") != workload
-                or payload.get("latency") != latency
-                or payload.get("campaign_identity_sha256") != identity.digest()
-            ):
-                return False
+        path = _validate_file_record(record, f"{workload}:{latency} {stage}")
+        payload = _load_json(path, f"{workload}:{latency} {stage}")
+        if (
+            payload.get("schema") != 1
+            or payload.get("status") != "pass"
+            or payload.get("workload") != workload
+            or payload.get("latency") != latency
+            or payload.get("campaign_identity_sha256") != identity.digest()
+            or payload.get("system") != _STAGE_SYSTEM[stage]
+        ):
+            return False
     except (CampaignError, evidence.EvidenceError):
         return False
     return True
+
+
+def cell_complete(
+    row: dict, identity: CampaignIdentity, workload: str, latency: str,
+    stages: tuple[str, ...] = REPLAY_STAGES,
+) -> bool:
+    return (
+        isinstance(row, dict)
+        and row.get("status") == "complete"
+        and row.get("workload") == workload
+        and row.get("latency") == latency
+        and row.get("identity_sha256") == identity.digest()
+        and all(
+            stage_complete(row, identity, workload, latency, stage)
+            for stage in stages
+        )
+    )
 
 
 def _require_replay_identity(result: dict, identity: CampaignIdentity, system: str) -> dict:
@@ -367,20 +405,111 @@ def _m2ndp_evidence(
     }
 
 
+def _refresh_cell_status(row: dict, identity: CampaignIdentity) -> None:
+    statuses = [row["stages"][stage].get("status") for stage in REPLAY_STAGES]
+    if all(status == "complete" for status in statuses):
+        row["status"] = "complete"
+        row["identity_sha256"] = identity.digest()
+    elif any(status == "failed" for status in statuses):
+        row["status"] = "failed"
+        row.pop("identity_sha256", None)
+    elif any(status in ("running", "complete") for status in statuses):
+        row["status"] = "partial"
+        row.pop("identity_sha256", None)
+    else:
+        row["status"] = "pending"
+        row.pop("identity_sha256", None)
+
+
+def execute_replay_stage(
+    state: dict, identity: CampaignIdentity, workload: str, latency: str,
+    stage: str, registry_cell: dict, calibration: evidence.CalibrationRow,
+    *, root: Path, replay_launcher, state_lock: threading.Lock,
+) -> dict:
+    if stage not in REPLAY_STAGES:
+        raise CampaignError(f"unknown replay stage: {stage}")
+    key = f"{workload}:{latency}"
+    root = Path(root).resolve()
+    with state_lock:
+        current = state["cells"][key]
+        item = current["stages"][stage]
+        if item.get("status") == "complete":
+            if stage_complete(current, identity, workload, latency, stage):
+                return item
+            raise CampaignError(f"stale complete stage cannot be resumed: {key} {stage}")
+        prior_attempt = item.get("attempt", 0)
+        if isinstance(prior_attempt, bool) or not isinstance(prior_attempt, int):
+            raise CampaignError(f"invalid attempt counter for {key} {stage}")
+        attempt = prior_attempt + 1
+        attempt_root = (
+            root / "cells" / workload / latency / stage / "attempts"
+            / f"{attempt:04d}"
+        )
+        if attempt_root.exists():
+            raise CampaignError(f"attempt root already exists: {attempt_root}")
+        attempt_root.mkdir(parents=True)
+        current["stages"][stage] = {
+            "status": "running", "attempt": attempt,
+            "attempt_root": str(attempt_root),
+        }
+        _refresh_cell_status(current, identity)
+        atomic_write_json(root / "state.json", state)
+
+    system = _STAGE_SYSTEM[stage]
+    try:
+        result = replay_launcher(
+            stage=stage, system=system, workload=workload, latency=latency,
+            cell=registry_cell, root=attempt_root / f"raw-{system}",
+            require_device_timing=(stage == "cira_runtime"),
+        )
+        source_path = attempt_root / "replay-evidence.json"
+        atomic_write_json(source_path, result)
+        source = _evidence_record(source_path)
+        normalizer = _host_evidence if stage == "host_inline" else _cira_evidence
+        payload = normalizer(
+            result, identity, workload, latency, calibration, source
+        )
+        evidence_path = attempt_root / (
+            "host-inline-evidence.json"
+            if stage == "host_inline" else "cira-runtime-evidence.json"
+        )
+        atomic_write_json(evidence_path, payload)
+        record = _evidence_record(evidence_path)
+        with state_lock:
+            current = state["cells"][key]
+            current["stages"][stage] = {
+                "status": "complete", "attempt": attempt,
+                "attempt_root": str(attempt_root), "evidence": record,
+            }
+            _refresh_cell_status(current, identity)
+            atomic_write_json(root / "state.json", state)
+            return current["stages"][stage]
+    except Exception as error:
+        with state_lock:
+            current = state["cells"][key]
+            current["stages"][stage] = {
+                "status": "failed", "attempt": attempt,
+                "attempt_root": str(attempt_root),
+                "error": f"{type(error).__name__}: {error}",
+            }
+            _refresh_cell_status(current, identity)
+            atomic_write_json(root / "state.json", state)
+        raise
+
+
 def execute_cell(
     state: dict, identity: CampaignIdentity, workload: str, latency: str,
     registry_cell: dict, calibration: evidence.CalibrationRow, *, root: Path,
-    replay_launcher, m2ndp_launcher,
+    replay_launcher, state_lock: threading.Lock,
+    stages: tuple[str, ...] = REPLAY_STAGES,
 ) -> dict:
     key = f"{workload}:{latency}"
-    resume_state(state, identity)
+    with state_lock:
+        resume_state(state, identity)
     if key not in state["cells"]:
         raise CampaignError(f"coordinate is not in campaign: {key}")
-    current = state["cells"][key]
-    if current.get("status") == "complete":
-        if cell_complete(current, identity, workload, latency):
-            return current
-        raise CampaignError(f"stale complete cell cannot be resumed: {key}")
+    if any(stage not in REPLAY_STAGES for stage in stages):
+        raise CampaignError("replay stage selection is invalid")
     _validate_registry_cell(key, registry_cell)
     calibration_hashes = dict(identity.calibration_sha256)
     if (
@@ -388,84 +517,39 @@ def execute_cell(
         or calibration_hashes.get(latency) != calibration.evidence_sha256
     ):
         raise CampaignError(f"calibration identity differs for {key}")
+    for stage in REPLAY_STAGES:
+        if stage in stages:
+            execute_replay_stage(
+                state, identity, workload, latency, stage, registry_cell,
+                calibration, root=root, replay_launcher=replay_launcher,
+                state_lock=state_lock,
+            )
+    return state["cells"][key]
 
-    root = Path(root).resolve()
-    cell_root = root / "cells" / workload / latency
-    cell_root.mkdir(parents=True, exist_ok=True)
-    prior_attempt = current.get("attempt", 0)
-    if isinstance(prior_attempt, bool) or not isinstance(prior_attempt, int):
-        raise CampaignError(f"invalid attempt counter for {key}")
-    attempt = prior_attempt + 1
-    attempt_root = cell_root / "attempts" / f"{attempt:04d}"
-    if attempt_root.exists():
-        raise CampaignError(f"attempt root already exists: {attempt_root}")
-    attempt_root.mkdir(parents=True)
-    state["cells"][key] = {
-        "workload": workload, "latency": latency, "status": "running",
-        "attempt": attempt,
-    }
-    atomic_write_json(root / "state.json", state)
-    try:
-        host_result = replay_launcher(
-            system="cira-inline", workload=workload, latency=latency,
-            cell=registry_cell, root=attempt_root / "raw-host-inline",
-            require_device_timing=False,
+
+def execute_coordinates(
+    state: dict, identity: CampaignIdentity,
+    coordinates: list[tuple[str, str]], registry: dict,
+    calibrations: dict[str, evidence.CalibrationRow], *, root: Path,
+    replay_launcher, stages: tuple[str, ...] = REPLAY_STAGES, jobs: int = 1,
+) -> None:
+    if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs <= 0:
+        raise CampaignError("jobs must be a positive integer")
+    state_lock = threading.Lock()
+
+    def run_coordinate(coordinate):
+        workload, latency = coordinate
+        return execute_cell(
+            state, identity, workload, latency,
+            registry[f"{workload}:{latency}"], calibrations[latency],
+            root=root, replay_launcher=replay_launcher,
+            state_lock=state_lock, stages=stages,
         )
-        cira_result = replay_launcher(
-            system="cira", workload=workload, latency=latency,
-            cell=registry_cell, root=attempt_root / "raw-cira",
-            require_device_timing=True,
-        )
-        m2ndp_result = m2ndp_launcher(
-            workload=workload, latency=latency, cell=registry_cell,
-            root=attempt_root / "raw-m2ndp", calibration=calibration,
-        )
-        replay_sources = {}
-        for name, result in (
-            ("host_inline", host_result), ("cira_runtime", cira_result),
-        ):
-            source_path = attempt_root / f"{name}-replay-evidence.json"
-            atomic_write_json(source_path, result)
-            replay_sources[name] = _evidence_record(source_path)
-        payloads = {
-            "host_inline": _host_evidence(
-                host_result, identity, workload, latency, calibration,
-                replay_sources["host_inline"],
-            ),
-            "cira_runtime": _cira_evidence(
-                cira_result, identity, workload, latency, calibration,
-                replay_sources["cira_runtime"],
-            ),
-            "m2ndp": _m2ndp_evidence(
-                m2ndp_result, identity, workload, latency, calibration
-            ),
-        }
-        filenames = {
-            "host_inline": "host-inline-evidence.json",
-            "cira_runtime": "cira-runtime-evidence.json",
-            "m2ndp": "m2ndp-evidence.json",
-        }
-        records = {}
-        for name in _EVIDENCE_NAMES:
-            path = cell_root / filenames[name]
-            atomic_write_json(path, payloads[name])
-            records[name] = _evidence_record(path)
-        complete = {
-            "workload": workload, "latency": latency, "status": "complete",
-            "identity_sha256": identity.digest(), "attempt": attempt,
-            "evidence": records,
-        }
-        state["cells"][key] = complete
-        atomic_write_json(root / "state.json", state)
-        return complete
-    except Exception as error:
-        state["cells"][key] = {
-            "workload": workload, "latency": latency, "status": "failed",
-            "attempt": attempt, "attempt_root": str(attempt_root),
-            "error": f"{type(error).__name__}: {error}",
-        }
-        atomic_write_json(root / "state.json", state)
-        raise
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = [executor.submit(run_coordinate, item) for item in coordinates]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
 
 def _launch_replay(
@@ -562,7 +646,6 @@ def _code_digest() -> str:
         Path(__file__).resolve(),
         REPO / "scripts/timing_evidence_24cell.py",
         REPO / "scripts/run_matched_breadth_gem5.py",
-        REPO / "scripts/m2ndp_workload_trace.py",
         REPO / "util/amu/matched_workloads/trace_replay.cc",
         REPO / "src/mem/cira.hh",
         REPO / "src/mem/cira.cc",
@@ -574,6 +657,16 @@ def _code_digest() -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _positive_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return result
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
@@ -581,9 +674,14 @@ def parse_args(argv=None):
     parser.add_argument("--calibration", action="append", type=Path, required=True)
     parser.add_argument("--gem5", type=Path, required=True)
     parser.add_argument("--m5-library", type=Path, required=True)
-    parser.add_argument("--funcsim", type=Path, required=True)
-    parser.add_argument("--ndpsim", type=Path, required=True)
+    parser.add_argument("--funcsim", type=Path)
+    parser.add_argument("--ndpsim", type=Path)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--systems", choices=tuple(_SYSTEM_SELECTIONS),
+        default="host-inline,cira",
+    )
+    parser.add_argument("--jobs", type=_positive_int, default=1)
     parser.add_argument(
         "--coordinate",
         choices=[f"{workload}:{latency}" for workload, latency in evidence.COORDINATES],
@@ -593,6 +691,7 @@ def parse_args(argv=None):
     options = parser.parse_args(argv)
     if len(options.calibration) != len(evidence.LATENCIES):
         parser.error("exactly four --calibration files are required")
+    options.stages = _SYSTEM_SELECTIONS[options.systems]
     return options
 
 
@@ -612,12 +711,17 @@ def main(argv=None) -> int:
         require_free_space(REPO)
         registry = load_registry(options.prepared)
         calibrations = _load_calibrations(options.calibration)
-        for path, label in (
+        required_paths = [
             (options.inputs, "inputs"), (options.prepared, "prepared"),
             (options.gem5, "gem5"), (options.m5_library, "m5 library"),
-            (options.funcsim, "FuncSim"), (options.ndpsim, "NDPSim"),
             (GEM5_CONFIG, "gem5 config"),
-        ):
+        ]
+        optional_paths = [
+            (options.funcsim, "FuncSim"), (options.ndpsim, "NDPSim"),
+        ]
+        for path, label in required_paths + [
+            item for item in optional_paths if item[0] is not None
+        ]:
             if not Path(path).is_file():
                 raise CampaignError(f"{label} is missing: {path}")
 
@@ -643,8 +747,14 @@ def main(argv=None) -> int:
             replay_binary_sha256=evidence.sha256_file(build),
             gem5_sha256=evidence.sha256_file(options.gem5),
             m5_library_sha256=evidence.sha256_file(options.m5_library),
-            funcsim_sha256=evidence.sha256_file(options.funcsim),
-            ndpsim_sha256=evidence.sha256_file(options.ndpsim),
+            funcsim_sha256=(
+                evidence.sha256_file(options.funcsim)
+                if options.funcsim is not None else None
+            ),
+            ndpsim_sha256=(
+                evidence.sha256_file(options.ndpsim)
+                if options.ndpsim is not None else None
+            ),
             gem5_config_sha256=evidence.sha256_file(GEM5_CONFIG),
             calibration_sha256=tuple(
                 (latency, calibrations[latency].evidence_sha256)
@@ -662,11 +772,12 @@ def main(argv=None) -> int:
         )
         if options.validate_only:
             incomplete = [
-                f"{workload}:{latency}"
+                f"{workload}:{latency}:{stage}"
                 for workload, latency in coordinates
-                if not cell_complete(
+                for stage in options.stages
+                if not stage_complete(
                     state["cells"][f"{workload}:{latency}"], identity,
-                    workload, latency,
+                    workload, latency, stage,
                 )
             ]
             if incomplete:
@@ -676,20 +787,20 @@ def main(argv=None) -> int:
         calibration_paths = {
             label: Path(row.evidence_path) for label, row in calibrations.items()
         }
-        for workload, latency in coordinates:
-            execute_cell(
-                state, identity, workload, latency,
-                registry[f"{workload}:{latency}"], calibrations[latency],
-                root=root,
-                replay_launcher=lambda **kwargs: _launch_replay(
-                    **kwargs, binary=build, gem5=options.gem5,
-                    calibration_paths=calibration_paths,
-                ),
-                m2ndp_launcher=lambda **kwargs: _launch_m2ndp(
-                    **kwargs, ndpsim=options.ndpsim,
-                ),
+        execute_coordinates(
+            state, identity, coordinates, registry, calibrations, root=root,
+            replay_launcher=lambda **kwargs: _launch_replay(
+                **kwargs, binary=build, gem5=options.gem5,
+                calibration_paths=calibration_paths,
+            ),
+            stages=options.stages, jobs=options.jobs,
+        )
+        if all(
+            cell_complete(
+                row, identity, row["workload"], row["latency"]
             )
-        if all(row.get("status") == "complete" for row in state["cells"].values()):
+            for row in state["cells"].values()
+        ):
             state["status"] = "complete"
             atomic_write_json(state_path, state)
             atomic_write_json(root / "complete.json", state)
