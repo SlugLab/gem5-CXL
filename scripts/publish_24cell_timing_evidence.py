@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish the validated 24-cell campaign as deterministic sharing artifacts."""
+"""Publish deterministic progress or final host/CIRA timing artifacts."""
 
 from __future__ import annotations
 
@@ -20,8 +20,7 @@ except ImportError:
 
 
 FIELDS = (
-    "workload", "latency",
-    "m2ndp_cycles", "m2ndp_core_period_ns", "m2ndp_kernel_time_ns",
+    "workload", "latency", "host_status", "cira_status",
     "selected_link_latency", "calibration_residual_ps",
     "host_region_cumulative_ticks", "host_region_cumulative_ns",
     "host_region_entry_count",
@@ -38,7 +37,6 @@ FIELDS = (
     "pr_compute_ticks_core2", "pr_compute_ticks_core3",
     "pr_queue_stall_ticks_core0", "pr_queue_stall_ticks_core1",
     "pr_queue_stall_ticks_core2", "pr_queue_stall_ticks_core3",
-    "m2ndp_evidence_path", "m2ndp_evidence_sha256",
     "host_inline_evidence_path", "host_inline_evidence_sha256",
     "cira_runtime_evidence_path", "cira_runtime_evidence_sha256",
 )
@@ -95,70 +93,73 @@ def _vector(row: dict, name: str) -> list[int]:
     if (
         not isinstance(value, list)
         or len(value) != 4
-        or any(isinstance(item, bool) or not isinstance(item, int) or item < 0
-               for item in value)
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in value
+        )
     ):
         raise PublishError(f"{name} must contain four nonnegative integers")
     return value
 
 
-def _read_cell(
-    state: dict, identity: runner.CampaignIdentity,
-    workload: str, latency: str,
-) -> tuple[dict, dict, dict, evidence.CalibrationRow]:
-    key = f"{workload}:{latency}"
-    state_row = state["cells"][key]
-    if not runner.cell_complete(state_row, identity, workload, latency):
-        raise PublishError(f"campaign cell is not complete: {key}")
-    records = state_row["evidence"]
-    values = {}
-    for name in ("m2ndp", "host_inline", "cira_runtime"):
-        values[name] = _load_json(
-            Path(records[name]["path"]), f"{key} {name} evidence"
-        )
-        _source_hash(values[name], f"{key} {name}")
-    m2ndp = values["m2ndp"]
-    host = values["host_inline"]
-    cira = values["cira_runtime"]
-
-    calibration_path = host.get("calibration_evidence_path")
-    calibration_hash = host.get("calibration_evidence_sha256")
-    if (
-        not isinstance(calibration_path, str)
-        or not isinstance(calibration_hash, str)
-        or any(
-            row.get("calibration_evidence_path") != calibration_path
-            or row.get("calibration_evidence_sha256") != calibration_hash
-            for row in (m2ndp, cira)
-        )
-        or evidence.sha256_file(Path(calibration_path)) != calibration_hash
+def _stage_value(
+    state_row: dict, identity: runner.CampaignIdentity,
+    workload: str, latency: str, stage: str,
+) -> tuple[str, dict | None, dict | None]:
+    stages = state_row.get("stages")
+    item = stages.get(stage) if isinstance(stages, dict) else None
+    if not isinstance(item, dict):
+        raise PublishError(f"campaign stage is missing: {workload}:{latency} {stage}")
+    status = item.get("status")
+    if status not in ("pending", "running", "failed", "complete"):
+        raise PublishError(f"campaign stage status differs: {workload}:{latency} {stage}")
+    if status != "complete":
+        return status, None, None
+    if not runner.stage_complete(
+        state_row, identity, workload, latency, stage
     ):
-        raise PublishError(f"calibration identity differs for {key}")
-    calibration = evidence.load_calibration(Path(calibration_path))
-    if calibration.latency != latency:
-        raise PublishError(f"calibration latency differs for {key}")
+        raise PublishError(
+            f"complete stage differs: {workload}:{latency} {stage}"
+        )
+    record = item["evidence"]
+    value = _load_json(Path(record["path"]), f"{workload}:{latency} {stage}")
+    _source_hash(value, f"{workload}:{latency} {stage}")
+    return status, value, record
 
-    cycles = m2ndp.get("cycles")
+
+def _calibration_from_payload(
+    row: dict, workload: str, latency: str,
+) -> evidence.CalibrationRow:
+    path = row.get("calibration_evidence_path")
+    expected = row.get("calibration_evidence_sha256")
     if (
-        isinstance(cycles, bool) or not isinstance(cycles, int) or cycles <= 0
-        or m2ndp.get("core_period_ns") != calibration.core_period_ns
-        or m2ndp.get("kernel_time_ns")
-        != evidence.cycles_to_ns(cycles, calibration.core_period_ns)
+        not isinstance(path, str)
+        or not isinstance(expected, str)
+        or evidence.sha256_file(Path(path)) != expected
     ):
-        raise PublishError(f"M2NDP timing differs for {key}")
-    host_ticks = host.get("host_region_cumulative_ticks")
+        raise PublishError(f"calibration identity differs for {workload}:{latency}")
+    result = evidence.load_calibration(Path(path))
+    if result.latency != latency or result.evidence_sha256 != expected:
+        raise PublishError(f"calibration latency differs for {workload}:{latency}")
+    return result
+
+
+def _validate_host(host: dict, key: str) -> None:
+    ticks = host.get("host_region_cumulative_ticks")
     entries = host.get("host_region_entry_count")
+    sim_freq = host.get("sim_freq_hz")
     if (
         host.get("system") != "cira-inline"
         or host.get("offload_disabled") is not True
-        or isinstance(host_ticks, bool) or not isinstance(host_ticks, int)
-        or host_ticks <= 0
+        or isinstance(ticks, bool) or not isinstance(ticks, int) or ticks <= 0
         or isinstance(entries, bool) or not isinstance(entries, int) or entries <= 0
+        or isinstance(sim_freq, bool) or not isinstance(sim_freq, int)
+        or sim_freq <= 0
     ):
         raise PublishError(f"host-inline timing differs for {key}")
-    if host.get("sim_freq_hz") != cira.get("sim_freq_hz"):
-        raise PublishError(f"gem5 simFreq differs for {key}")
 
+
+def _validate_cira(cira: dict, key: str) -> None:
     generic = cira.get("generic_prefetch")
     descriptor = cira.get("pr_descriptor_metrics")
     if not isinstance(generic, dict) or not isinstance(descriptor, dict):
@@ -166,10 +167,15 @@ def _read_cell(
     first = generic.get("first_issue_tick")
     last = generic.get("last_completion_tick")
     busy = generic.get("busy_ticks")
+    sim_freq = cira.get("sim_freq_hz")
     if (
-        any(isinstance(item, bool) or not isinstance(item, int)
-            for item in (first, last, busy))
-        or first < 0 or last < first or busy <= 0 or busy != last - first
+        cira.get("system") != "cira"
+        or any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in (first, last, busy, sim_freq)
+        )
+        or first < 0 or last < first or busy <= 0
+        or busy != last - first or sim_freq <= 0
     ):
         raise PublishError(f"CIRA device busy span differs for {key}")
     _vector(generic, "busy_ticks_per_core")
@@ -185,7 +191,40 @@ def _read_cell(
             raise PublishError(f"PR descriptor {name} differs for {key}")
     _vector(descriptor, "compute_ticks_per_core")
     _vector(descriptor, "queue_stall_ticks_per_core")
-    return m2ndp, host, cira, calibration
+
+
+def _read_cell(
+    state: dict, identity: runner.CampaignIdentity,
+    workload: str, latency: str,
+) -> dict:
+    key = f"{workload}:{latency}"
+    state_row = state["cells"][key]
+    host_status, host, host_record = _stage_value(
+        state_row, identity, workload, latency, "host_inline"
+    )
+    cira_status, cira, cira_record = _stage_value(
+        state_row, identity, workload, latency, "cira_runtime"
+    )
+    calibration = None
+    for payload in (host, cira):
+        if payload is None:
+            continue
+        candidate = _calibration_from_payload(payload, workload, latency)
+        if calibration is not None and candidate != calibration:
+            raise PublishError(f"calibration identity differs for {key}")
+        calibration = candidate
+    if host is not None:
+        _validate_host(host, key)
+    if cira is not None:
+        _validate_cira(cira, key)
+    if host is not None and cira is not None:
+        if host.get("sim_freq_hz") != cira.get("sim_freq_hz"):
+            raise PublishError(f"gem5 simFreq differs for {key}")
+    return {
+        "host_status": host_status, "cira_status": cira_status,
+        "host": host, "cira": cira, "calibration": calibration,
+        "records": {"host_inline": host_record, "cira_runtime": cira_record},
+    }
 
 
 def _csv_text(fields: tuple[str, ...], rows: list[dict]) -> str:
@@ -199,140 +238,146 @@ def _csv_text(fields: tuple[str, ...], rows: list[dict]) -> str:
 
 
 def _row(
-    workload: str, latency: str, m2ndp: dict, host: dict, cira: dict,
-    calibration: evidence.CalibrationRow, paths: dict[str, dict],
+    workload: str, latency: str, values: dict, output_records: dict,
 ) -> dict:
-    generic = cira["generic_prefetch"]
-    descriptor = cira["pr_descriptor_metrics"]
-    row = {
+    row = {field: "" for field in FIELDS}
+    row.update({
         "workload": workload, "latency": latency,
-        "m2ndp_cycles": m2ndp["cycles"],
-        "m2ndp_core_period_ns": m2ndp["core_period_ns"],
-        "m2ndp_kernel_time_ns": m2ndp["kernel_time_ns"],
-        "selected_link_latency": calibration.selected_link_latency,
-        "calibration_residual_ps": calibration.residual_ps,
-        "host_region_cumulative_ticks": host["host_region_cumulative_ticks"],
-        "host_region_cumulative_ns": evidence.ticks_to_ns(
-            host["host_region_cumulative_ticks"], host["sim_freq_hz"]
-        ),
-        "host_region_entry_count": host["host_region_entry_count"],
-        "cira_device_first_issue_tick": generic["first_issue_tick"],
-        "cira_device_last_completion_tick": generic["last_completion_tick"],
-        "cira_device_busy_ticks": generic["busy_ticks"],
-        "cira_device_busy_ns": evidence.ticks_to_ns(
-            generic["busy_ticks"], cira["sim_freq_hz"]
-        ),
-        "pr_descriptor_applicable": "false",
-        "pr_compute_ticks": descriptor["compute_ticks"],
-        "pr_queue_stall_ticks": descriptor["queue_stall_ticks"],
-    }
-    for core in range(4):
-        row[f"cira_busy_ticks_core{core}"] = generic["busy_ticks_per_core"][core]
-        row[f"cira_issued_core{core}"] = cira["issued_per_core"][core]
-        row[f"cira_completed_core{core}"] = cira["completed_per_core"][core]
-        row[f"pr_compute_ticks_core{core}"] = descriptor[
-            "compute_ticks_per_core"
-        ][core]
-        row[f"pr_queue_stall_ticks_core{core}"] = descriptor[
-            "queue_stall_ticks_per_core"
-        ][core]
+        "host_status": values["host_status"],
+        "cira_status": values["cira_status"],
+    })
+    calibration = values["calibration"]
+    if calibration is not None:
+        row["selected_link_latency"] = calibration.selected_link_latency
+        row["calibration_residual_ps"] = calibration.residual_ps
+    host = values["host"]
+    if host is not None:
+        row.update({
+            "host_region_cumulative_ticks": host["host_region_cumulative_ticks"],
+            "host_region_cumulative_ns": evidence.ticks_to_ns(
+                host["host_region_cumulative_ticks"], host["sim_freq_hz"]
+            ),
+            "host_region_entry_count": host["host_region_entry_count"],
+        })
+    cira = values["cira"]
+    if cira is not None:
+        generic = cira["generic_prefetch"]
+        descriptor = cira["pr_descriptor_metrics"]
+        row.update({
+            "cira_device_first_issue_tick": generic["first_issue_tick"],
+            "cira_device_last_completion_tick": generic["last_completion_tick"],
+            "cira_device_busy_ticks": generic["busy_ticks"],
+            "cira_device_busy_ns": evidence.ticks_to_ns(
+                generic["busy_ticks"], cira["sim_freq_hz"]
+            ),
+            "pr_descriptor_applicable": "false",
+            "pr_compute_ticks": descriptor["compute_ticks"],
+            "pr_queue_stall_ticks": descriptor["queue_stall_ticks"],
+        })
+        for core in range(4):
+            row[f"cira_busy_ticks_core{core}"] = generic["busy_ticks_per_core"][core]
+            row[f"cira_issued_core{core}"] = cira["issued_per_core"][core]
+            row[f"cira_completed_core{core}"] = cira["completed_per_core"][core]
+            row[f"pr_compute_ticks_core{core}"] = descriptor[
+                "compute_ticks_per_core"
+            ][core]
+            row[f"pr_queue_stall_ticks_core{core}"] = descriptor[
+                "queue_stall_ticks_per_core"
+            ][core]
     for name, prefix in (
-        ("m2ndp", "m2ndp"),
         ("host_inline", "host_inline"),
         ("cira_runtime", "cira_runtime"),
     ):
-        row[f"{prefix}_evidence_path"] = paths[name]["path"]
-        row[f"{prefix}_evidence_sha256"] = paths[name]["sha256"]
+        record = output_records.get(name)
+        if record is not None:
+            row[f"{prefix}_evidence_path"] = record["path"]
+            row[f"{prefix}_evidence_sha256"] = record["sha256"]
     return row
 
 
-def _readme(rows: list[dict], calibrations: list[evidence.CalibrationRow]) -> str:
+def _readme(rows: list[dict], progress: bool) -> str:
+    title = "G14 host-inline and CIRA timing progress" if progress else (
+        "G14 24-cell host-inline and CIRA timing evidence"
+    )
     lines = [
-        "# 24-cell CIRA, host-inline, and M2NDP timing evidence",
-        "",
-        "All primary measurements retain integer cycles or ticks. Times in ns are exact",
-        "conversions using the recorded 0.5 ns M2NDP core period and per-cell gem5",
-        "`simFreq`. CIRA uses generic prefetch spans; PR descriptor fields are not",
-        "applicable and are required to be zero for these cells.",
-        "",
-        "## Link calibration",
-        "",
-        "| CXL latency | link_latency | gem5 RT (ns) | M2NDP RT (ns) | residual (ps) |",
-        "|---|---:|---:|---:|---:|",
+        f"# {title}", "",
+        "All primary measurements retain integer gem5 ticks. Nanoseconds are",
+        "exact conversions using the per-cell recorded `simFreq`. Blank numeric",
+        "fields mean the corresponding stage is pending, running, or failed;",
+        "consult `host_status` and `cira_status` rather than treating blanks as zero.",
+        "", "| Workload | CXL latency | Host status | Host ticks | CIRA status | CIRA busy ticks |",
+        "|---|---|---|---:|---|---:|",
     ]
-    for item in calibrations:
-        lines.append(
-            f"| {item.latency} | {item.selected_link_latency} | "
-            f"{item.gem5_round_trip_ns} | {item.m2ndp_round_trip_ns} | "
-            f"{item.residual_ps} |"
-        )
-    lines.extend((
-        "", "## Per-cell timing", "",
-        "| Workload | CXL latency | M2NDP kernel (ns) | Host inline (ns) | Entries | CIRA device (ns) |",
-        "|---|---|---:|---:|---:|---:|",
-    ))
     for row in rows:
         lines.append(
-            f"| {row['workload']} | {row['latency']} | "
-            f"{row['m2ndp_kernel_time_ns']} | "
-            f"{row['host_region_cumulative_ns']} | "
-            f"{row['host_region_entry_count']} | "
-            f"{row['cira_device_busy_ns']} |"
+            f"| {row['workload']} | {row['latency']} | {row['host_status']} | "
+            f"{row['host_region_cumulative_ticks']} | {row['cira_status']} | "
+            f"{row['cira_device_busy_ticks']} |"
         )
     return "\n".join(lines) + "\n"
 
 
-def publish(source: Path, destination: Path) -> Path:
+def publish(source: Path, destination: Path, *, progress: bool = False) -> Path:
     source = Path(source).resolve()
     destination = Path(destination).resolve()
     if destination.exists():
         raise PublishError(f"fresh publication root required: {destination}")
-    state = _load_json(source / "complete.json", "complete campaign")
-    if state.get("schema") != 1 or state.get("status") != "complete":
-        raise PublishError("source campaign is not complete")
+    state = _load_json(source / "state.json", "campaign state")
+    if state.get("schema") != 1:
+        raise PublishError("source campaign schema differs")
     identity = _identity(state)
     expected = {
         f"{workload}:{latency}" for workload, latency in evidence.COORDINATES
     }
     if set(state.get("cells", {})) != expected:
-        raise PublishError("source campaign does not contain 24 complete cells")
+        raise PublishError("source campaign does not contain 24 cells")
 
     validated = []
+    incomplete = []
     calibration_by_latency = {}
     for workload, latency in evidence.COORDINATES:
         values = _read_cell(state, identity, workload, latency)
-        calibration = values[3]
-        previous = calibration_by_latency.setdefault(latency, calibration)
-        if previous != calibration:
-            raise PublishError(f"calibration differs within latency {latency}")
-        validated.append((workload, latency, *values))
+        for stage, status in (
+            ("host", values["host_status"]), ("CIRA", values["cira_status"]),
+        ):
+            if status != "complete":
+                incomplete.append(f"{workload}:{latency}:{stage}={status}")
+        calibration = values["calibration"]
+        if calibration is not None:
+            previous = calibration_by_latency.setdefault(latency, calibration)
+            if previous != calibration:
+                raise PublishError(f"calibration differs within latency {latency}")
+        validated.append((workload, latency, values))
+    if not progress and incomplete:
+        raise PublishError("incomplete host/CIRA cells: " + ", ".join(incomplete))
+    if not progress and state.get("status") != "complete":
+        raise PublishError("source campaign is not complete")
 
     destination.mkdir(parents=True)
     rows = []
     generated = {}
-    for workload, latency, m2ndp, host, cira, calibration in validated:
-        source_records = state["cells"][f"{workload}:{latency}"]["evidence"]
+    for workload, latency, values in validated:
         output_records = {}
         filenames = {
-            "m2ndp": "m2ndp-evidence.json",
             "host_inline": "host-inline-evidence.json",
             "cira_runtime": "cira-runtime-evidence.json",
         }
         for name, filename in filenames.items():
+            source_record = values["records"][name]
+            if source_record is None:
+                continue
             relative = Path("cells") / workload / latency / filename
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_records[name]["path"], target)
+            shutil.copyfile(source_record["path"], target)
             digest = evidence.sha256_file(target)
-            if digest != source_records[name]["sha256"]:
+            if digest != source_record["sha256"]:
                 raise PublishError(f"copied evidence differs: {relative}")
             output_records[name] = {
                 "path": relative.as_posix(), "sha256": digest,
             }
             generated[relative.as_posix()] = digest
-        rows.append(_row(
-            workload, latency, m2ndp, host, cira, calibration, output_records
-        ))
+        rows.append(_row(workload, latency, values, output_records))
 
     calibration_rows = [
         {
@@ -340,23 +385,29 @@ def publish(source: Path, destination: Path) -> Path:
                 calibration_by_latency[latency]
             ).items() if key in CALIBRATION_FIELDS
         }
-        for latency in evidence.LATENCIES
+        for latency in evidence.LATENCIES if latency in calibration_by_latency
     ]
+    csv_name = "timing-24cells-progress.csv" if progress else "timing-24cells.csv"
     outputs = {
-        "timing-24cells.csv": _csv_text(FIELDS, rows),
+        csv_name: _csv_text(FIELDS, rows),
         "calibration.csv": _csv_text(CALIBRATION_FIELDS, calibration_rows),
-        "README.md": _readme(
-            rows, [calibration_by_latency[item] for item in evidence.LATENCIES]
-        ),
+        "README.md": _readme(rows, progress),
     }
-    for name, text in outputs.items():
+    for name, content in outputs.items():
         path = destination / name
-        path.write_text(text, encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
         generated[name] = evidence.sha256_file(path)
     manifest = {
-        "schema": 1, "status": "complete", "rows": len(rows),
+        "schema": 1, "status": "progress" if progress else "complete",
+        "mode": "progress" if progress else "final", "rows": len(rows),
         "identity": state["identity"],
         "identity_sha256": identity.digest(),
+        "completed_host_stages": sum(
+            row[2]["host_status"] == "complete" for row in validated
+        ),
+        "completed_cira_stages": sum(
+            row[2]["cira_status"] == "complete" for row in validated
+        ),
         "files": dict(sorted(generated.items())),
     }
     runner.atomic_write_json(destination / "manifest.json", manifest)
@@ -367,9 +418,10 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--progress", action="store_true")
     options = parser.parse_args(argv)
     try:
-        publish(options.source, options.destination)
+        publish(options.source, options.destination, progress=options.progress)
     except (PublishError, runner.CampaignError, evidence.EvidenceError) as error:
         print(f"TIMING_24CELL_PUBLISH_FAILED {error}")
         return 1
@@ -378,4 +430,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

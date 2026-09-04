@@ -58,7 +58,7 @@ class Publish24CellTimingEvidenceTest(unittest.TestCase):
             prepared_manifest_sha256=_digest("prepared"),
             replay_binary_sha256=_digest("replay"),
             gem5_sha256=_digest("gem5"), m5_library_sha256=_digest("m5"),
-            funcsim_sha256=_digest("funcsim"), ndpsim_sha256=_digest("ndpsim"),
+            funcsim_sha256=None, ndpsim_sha256=None,
             gem5_config_sha256=_digest("config"),
             calibration_sha256=tuple(
                 (latency, evidence.sha256_file(calibrations[latency]))
@@ -67,79 +67,115 @@ class Publish24CellTimingEvidenceTest(unittest.TestCase):
         )
         campaign = self.root / "campaign"
         state = runner.new_state(identity)
+        campaign.mkdir()
+        runner.atomic_write_json(campaign / "state.json", state)
+        return campaign, state, identity, calibrations
+
+    def _complete_stage(
+        self, campaign, state, identity, calibrations, workload, latency, stage,
+        index,
+    ):
+        root = campaign / "cells" / workload / latency / stage / "attempts/0001"
+        root.mkdir(parents=True)
+        raw = root / "replay-evidence.json"
+        raw.write_text(json.dumps({"cell": f"{workload}:{latency}:{stage}"}) + "\n")
+        calibration = calibrations[latency]
+        common = {
+            "schema": 1, "status": "pass", "workload": workload,
+            "latency": latency,
+            "campaign_identity_sha256": identity.digest(),
+            "calibration_evidence_path": str(calibration),
+            "calibration_evidence_sha256": evidence.sha256_file(calibration),
+            "source_evidence_path": str(raw),
+            "source_evidence_sha256": evidence.sha256_file(raw),
+        }
+        if stage == "host_inline":
+            payload = {
+                **common, "system": "cira-inline", "offload_disabled": True,
+                "host_region_cumulative_ticks": 2000 + index,
+                "host_region_entry_count": 10 + index,
+                "sim_freq_hz": 1_000_000_000_000,
+            }
+            filename = "host-inline-evidence.json"
+        else:
+            payload = {
+                **common, "system": "cira",
+                "sim_freq_hz": 1_000_000_000_000,
+                "generic_prefetch": {
+                    "first_issue_tick": 100,
+                    "last_completion_tick": 400 + index,
+                    "busy_ticks": 300 + index,
+                    "busy_ticks_per_core": [70, 71, 72, 73],
+                },
+                "issued_per_core": [4, 4, 4, 4],
+                "completed_per_core": [4, 4, 4, 4],
+                "pr_descriptor_metrics": {
+                    "applicable": False, "compute_ticks": 0,
+                    "queue_stall_ticks": 0,
+                    "compute_ticks_per_core": [0, 0, 0, 0],
+                    "queue_stall_ticks_per_core": [0, 0, 0, 0],
+                },
+            }
+            filename = "cira-runtime-evidence.json"
+        path = root / filename
+        runner.atomic_write_json(path, payload)
+        state["cells"][f"{workload}:{latency}"]["stages"][stage] = {
+            "status": "complete", "attempt": 1,
+            "attempt_root": str(root),
+            "evidence": {
+                "path": str(path), "sha256": evidence.sha256_file(path),
+            },
+        }
+        runner._refresh_cell_status(
+            state["cells"][f"{workload}:{latency}"], identity
+        )
+
+    def test_progress_has_24_rows_and_explicit_stage_status(self):
+        campaign, state, identity, calibrations = self._campaign()
+        self._complete_stage(
+            campaign, state, identity, calibrations,
+            "pr_spmv", "200ns", "host_inline", 1,
+        )
+        runner.atomic_write_json(campaign / "state.json", state)
+        destination = self.root / "progress"
+        publisher.publish(campaign, destination, progress=True)
+        with (destination / "timing-24cells-progress.csv").open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 24)
+        self.assertEqual(rows[0]["host_status"], "complete")
+        self.assertEqual(rows[0]["cira_status"], "pending")
+        self.assertEqual(rows[0]["host_region_cumulative_ticks"], "2001")
+        self.assertEqual(rows[0]["cira_device_busy_ticks"], "")
+        self.assertEqual(rows[1]["host_status"], "pending")
+        self.assertEqual(rows[1]["host_region_cumulative_ticks"], "")
+        self.assertEqual(rows[1]["cira_device_busy_ticks"], "")
+        manifest = json.loads((destination / "manifest.json").read_text())
+        self.assertEqual(manifest["mode"], "progress")
+        self.assertEqual(manifest["rows"], 24)
+
+    def test_final_rejects_incomplete_host_or_cira_stage(self):
+        campaign, state, identity, calibrations = self._campaign()
+        self._complete_stage(
+            campaign, state, identity, calibrations,
+            "pr_spmv", "200ns", "host_inline", 1,
+        )
+        runner.atomic_write_json(campaign / "state.json", state)
+        with self.assertRaisesRegex(
+            publisher.PublishError, "incomplete host/CIRA cells"
+        ):
+            publisher.publish(campaign, self.root / "final")
+
+    def test_final_is_deterministic_and_has_complete_host_cira_rows(self):
+        campaign, state, identity, calibrations = self._campaign()
         for index, (workload, latency) in enumerate(evidence.COORDINATES, 1):
-            cell = campaign / "cells" / workload / latency
-            cell.mkdir(parents=True)
-            raw = cell / "raw-evidence.json"
-            raw.write_text(json.dumps({"cell": f"{workload}:{latency}"}) + "\n")
-            raw_hash = evidence.sha256_file(raw)
-            calibration = calibrations[latency]
-            common = {
-                "schema": 1, "status": "pass", "workload": workload,
-                "latency": latency,
-                "campaign_identity_sha256": identity.digest(),
-                "calibration_evidence_path": str(calibration),
-                "calibration_evidence_sha256": evidence.sha256_file(calibration),
-                "source_evidence_path": str(raw),
-                "source_evidence_sha256": raw_hash,
-            }
-            payloads = {
-                "m2ndp": {
-                    **common, "cycles": 1000 + index,
-                    "core_period_ns": "0.5",
-                    "kernel_time_ns": evidence.cycles_to_ns(1000 + index, "0.5"),
-                    "execution_origin": "verified_reuse",
-                },
-                "host_inline": {
-                    **common, "system": "cira-inline",
-                    "offload_disabled": True,
-                    "host_region_cumulative_ticks": 2000 + index,
-                    "host_region_entry_count": 10 + index,
-                    "sim_freq_hz": 1_000_000_000_000,
-                },
-                "cira_runtime": {
-                    **common, "system": "cira",
-                    "sim_freq_hz": 1_000_000_000_000,
-                    "generic_prefetch": {
-                        "first_issue_tick": 100,
-                        "last_completion_tick": 400 + index,
-                        "busy_ticks": 300 + index,
-                        "busy_ticks_per_core": [70, 71, 72, 73],
-                    },
-                    "issued_per_core": [4, 4, 4, 4],
-                    "completed_per_core": [4, 4, 4, 4],
-                    "pr_descriptor_metrics": {
-                        "applicable": False, "compute_ticks": 0,
-                        "queue_stall_ticks": 0,
-                        "compute_ticks_per_core": [0, 0, 0, 0],
-                        "queue_stall_ticks_per_core": [0, 0, 0, 0],
-                    },
-                },
-            }
-            names = {
-                "m2ndp": "m2ndp-evidence.json",
-                "host_inline": "host-inline-evidence.json",
-                "cira_runtime": "cira-runtime-evidence.json",
-            }
-            records = {}
-            for name, payload in payloads.items():
-                path = cell / names[name]
-                runner.atomic_write_json(path, payload)
-                records[name] = {
-                    "path": str(path), "sha256": evidence.sha256_file(path),
-                }
-            state["cells"][f"{workload}:{latency}"] = {
-                "workload": workload, "latency": latency,
-                "status": "complete", "identity_sha256": identity.digest(),
-                "evidence": records,
-            }
+            for stage in runner.REPLAY_STAGES:
+                self._complete_stage(
+                    campaign, state, identity, calibrations,
+                    workload, latency, stage, index,
+                )
         state["status"] = "complete"
         runner.atomic_write_json(campaign / "state.json", state)
         runner.atomic_write_json(campaign / "complete.json", state)
-        return campaign
-
-    def test_publication_is_deterministic_and_has_24_complete_rows(self):
-        campaign = self._campaign()
         first = self.root / "published-a"
         second = self.root / "published-b"
         publisher.publish(campaign, first)
@@ -153,27 +189,23 @@ class Publish24CellTimingEvidenceTest(unittest.TestCase):
             [(row["workload"], row["latency"]) for row in rows],
             list(evidence.COORDINATES),
         )
+        self.assertTrue(all(row["host_status"] == "complete" for row in rows))
+        self.assertTrue(all(row["cira_status"] == "complete" for row in rows))
         self.assertEqual(rows[0]["host_region_cumulative_ns"], "2.001")
         self.assertEqual(rows[0]["cira_device_busy_ns"], "0.301")
         self.assertEqual(rows[0]["pr_compute_ticks_core3"], "0")
 
-    def test_publication_rejects_incomplete_or_source_hash_drift(self):
-        campaign = self._campaign()
-        state = json.loads((campaign / "complete.json").read_text())
-        state["cells"]["npb_cg:2us"]["status"] = "failed"
-        runner.atomic_write_json(campaign / "complete.json", state)
-        with self.assertRaisesRegex(publisher.PublishError, "complete"):
-            publisher.publish(campaign, self.root / "incomplete")
-
-        runner.atomic_write_json(
-            campaign / "complete.json",
-            json.loads((campaign / "state.json").read_text()),
+    def test_progress_rejects_completed_stage_hash_drift(self):
+        campaign, state, identity, calibrations = self._campaign()
+        self._complete_stage(
+            campaign, state, identity, calibrations,
+            "pr_spmv", "200ns", "host_inline", 1,
         )
-        compact = campaign / "cells/pr_spmv/200ns/host-inline-evidence.json"
-        record = json.loads(compact.read_text())
-        Path(record["source_evidence_path"]).write_text("changed\n")
-        with self.assertRaisesRegex(publisher.PublishError, "source evidence SHA-256"):
-            publisher.publish(campaign, self.root / "stale")
+        runner.atomic_write_json(campaign / "state.json", state)
+        record = state["cells"]["pr_spmv:200ns"]["stages"]["host_inline"]["evidence"]
+        Path(record["path"]).write_text("changed\n")
+        with self.assertRaisesRegex(publisher.PublishError, "complete stage differs"):
+            publisher.publish(campaign, self.root / "stale", progress=True)
 
 
 if __name__ == "__main__":
