@@ -400,7 +400,7 @@ def _write_sparse_initial(root, words):
     return records
 
 
-def _remember_initial(words, operation):
+def _remember_initial(words, operation, *, store_result_visible=False):
     widths = {
         canonical.Opcode.LOAD_U32: 32, canonical.Opcode.LOAD_F32: 32,
         canonical.Opcode.STORE_U32: 32, canonical.Opcode.STORE_F32: 32,
@@ -410,7 +410,11 @@ def _remember_initial(words, operation):
     bits = widths.get(operation.opcode)
     if bits is None or operation.address in words:
         return
-    initial = operation.operand0 if operation.opcode.name.startswith("LOAD") else 0
+    initial = (
+        operation.operand0
+        if operation.opcode.name.startswith("LOAD") or store_result_visible
+        else 0
+    )
     words[operation.address] = (bits, initial)
 
 
@@ -486,7 +490,9 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                             raise ReplayError(
                                 "eager window memory width changes at one address"
                             )
-                        if value is None:
+                        if operation.opcode.name.startswith("STORE_"):
+                            value = (bits, operation.operand0)
+                        elif value is None:
                             value = (bits, _eager_initial_word(
                                 source, trace, operation.address, bits
                             ))
@@ -565,7 +571,10 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                                 window.warmup_start <= global_item
                                 < window.measure_stop
                             ):
-                                _remember_initial(dynamic_initial, operation)
+                                _remember_initial(
+                                    dynamic_initial, operation,
+                                    store_result_visible=True,
+                                )
                                 yield False, dataclasses.replace(
                                     operation,
                                     work_item=(

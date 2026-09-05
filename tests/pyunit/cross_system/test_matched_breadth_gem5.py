@@ -16,6 +16,7 @@ from scripts import build_matched_breadth_workloads as builder
 from scripts import canonical_work_trace as canonical
 from scripts import lazy_work_trace as lazy
 from scripts import npb_lazy_trace as npb
+from scripts import pr_spmv_lazy_trace as pagerank
 from scripts import run_matched_breadth_gem5 as replay
 from scripts import stratified_timing as timing
 
@@ -721,6 +722,101 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertEqual(value["issued_loads"], 1)
         self.assertEqual(value["completed_loads"], 1)
         self.assertEqual(value["raw_outputs"], [41, 43])
+
+    def test_pagerank_warmup_reads_snapshot_instead_of_future_measured_store(self):
+        trace = pagerank.build_bundle(
+            self.root / "pagerank-cross-window",
+            offsets=(0, 1, 1), neighbors=(1,), out_degrees=(0, 1),
+            graph_sha256=_digest("g14.sg"),
+            source_sha256=_digest("source"),
+            binary_sha256=_digest("binary"),
+            config_sha256=_digest("config"), graph_scale=14,
+            iterations=1, verify_expansion=True,
+        )
+        manifest = self.root / "pagerank-cross-window-plan.json"
+        manifest.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 0, 1, 2),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace.root, manifest=manifest, phase=pagerank.PHASE_ITERATION,
+                window_index=0, outdir=self.root / "pagerank-materialized",
+            )
+        bundle = canonical.read_bundle(materialized.root)
+        initial_map = replay._write_initial_memory_map(
+            bundle, materialized.root, self.root / "pagerank-initial-map.txt"
+        )
+        binary = replay.build_replay_binary(
+            self.root / "pagerank-window-build", native=True
+        )
+        result = self.root / "pagerank-window-result.json"
+        command = [
+            str(binary), "--system", "vanilla", "--trace",
+            str(materialized.root / "trace.bin"), "--result", str(result),
+            "--mode", "window", "--window-manifest", str(manifest),
+            "--phase", str(pagerank.PHASE_ITERATION),
+            "--window-index", "0", "--measure-start-item", "1",
+            "--initial-memory-map", str(initial_map),
+        ]
+        try:
+            subprocess.run(
+                command, check=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("PageRank warmup waited for a measured-region store")
+        except subprocess.CalledProcessError as error:
+            self.fail(f"PageRank window replay failed: {error.stderr.strip()}")
+        value = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(value["verification"], "pass")
+        self.assertEqual(value["host_region_entry_count"], 1)
+
+    def test_eager_warmup_reads_snapshot_of_earlier_measured_store(self):
+        operations = (
+            _op(canonical.Opcode.STORE_U64, 0, work_item=1,
+                address=0x3100, left=7, result=7),
+            _op(canonical.Opcode.LOAD_U64, 1, work_item=0,
+                address=0x3100, left=7, result=7),
+            _op(canonical.Opcode.COMMIT, 2, work_item=2,
+                address=0x3100, left=7, result=7),
+        )
+        trace = self.root / "eager-cross-window"
+        canonical.write_bundle(
+            trace, _meta("eager_cross_window", 2), operations, {},
+            initial_memory={"destination": {
+                "logical_base": 0x3100, "word_bits": 64, "words": (0,),
+            }},
+        )
+        manifest = self.root / "eager-cross-window-plan.json"
+        manifest.write_text('{"schema":1}\n', encoding="utf-8")
+        with mock.patch.object(
+            replay, "_window_coordinates",
+            return_value=timing.TimingWindow(0, 0, 1, 2),
+        ):
+            materialized = replay.materialize_window_trace(
+                trace, manifest=manifest, phase=0, window_index=0,
+                outdir=self.root / "eager-cross-window-materialized",
+            )
+        bundle = canonical.read_bundle(materialized.root)
+        initial_map = replay._write_initial_memory_map(
+            bundle, materialized.root,
+            self.root / "eager-cross-window-initial.txt",
+        )
+        binary = replay.build_replay_binary(
+            self.root / "eager-cross-window-build", native=True
+        )
+        result = self.root / "eager-cross-window-result.json"
+        subprocess.run([
+            str(binary), "--system", "vanilla", "--trace",
+            str(materialized.root / "trace.bin"), "--result", str(result),
+            "--mode", "window", "--window-manifest", str(manifest),
+            "--phase", "0", "--window-index", "0",
+            "--measure-start-item", "1", "--initial-memory-map",
+            str(initial_map),
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+           text=True)
+        self.assertEqual(json.loads(result.read_text())["verification"], "pass")
 
     def test_eager_window_inherits_prior_duplicate_store_state(self):
         operations = (
