@@ -20,6 +20,7 @@ TRANSLATING_PORT_PROXY_CC = REPO / "src" / "mem" / "translating_port_proxy.cc"
 PROCESS_CC = REPO / "src" / "sim" / "process.cc"
 SYSCALL_EMUL_HH = REPO / "src" / "sim" / "syscall_emul.hh"
 TIMING_SIMPLE_CC = REPO / "src" / "cpu" / "simple" / "timing.cc"
+ATOMIC_SIMPLE_CC = REPO / "src" / "cpu" / "simple" / "atomic.cc"
 GAPBS_CONFIG = (
     REPO / "configs" / "example" / "gem5_library" / "x86-gapbs-amu-se.py"
 )
@@ -229,6 +230,17 @@ class CiraUsefulnessTrackerContractTest(unittest.TestCase):
         self.assertIn("getPhysMem().functionalAccess(&shadow_pkt)", handle_write)
         self.assertIn("!FullSystem", handle_write)
         self.assertIn("!req->isSwap()", handle_write)
+
+    def test_no_data_writes_accept_address_check_requests_only(self):
+        for path in (ATOMIC_SIMPLE_CC, TIMING_SIMPLE_CC):
+            source = path.read_text(encoding="utf-8")
+            write_mem = source[source.index("::writeMem("):]
+            null_data = write_mem[
+                write_mem.index("if (data == NULL)"):
+                write_mem.index("}", write_mem.index("if (data == NULL)"))
+            ]
+            self.assertIn("Request::STORE_NO_DATA", null_data)
+            self.assertIn("Request::NO_ACCESS", null_data)
 
     def test_transition_machine(self):
         compiler = shutil.which("g++") or shutil.which("c++")

@@ -548,8 +548,9 @@ TimingSimpleCPU::writeMem(uint8_t *data, unsigned size,
     BaseMMU::Mode mode = BaseMMU::Write;
 
     if (data == NULL) {
-        assert(flags & Request::STORE_NO_DATA);
-        // This must be a cache block cleaning request
+        assert(flags & Request::STORE_NO_DATA || flags & Request::NO_ACCESS);
+        // Cache cleaning and address-check requests intentionally carry no
+        // store payload. NO_ACCESS still performs translation below.
         memset(newData, 0, size);
     } else {
         memcpy(newData, data, size);

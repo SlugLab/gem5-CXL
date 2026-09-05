@@ -159,28 +159,38 @@ def _window_coordinates(manifest, *, trace_sha256, phase_name, work_items,
     return plan.windows[window_index]
 
 
-def _partition_bc_lazy_window(source, phase, window, state):
-    """Yield one BC vertex window after only the causally required prefix."""
+def _partition_sliceable_lazy_window(source, phase, window, state):
+    """Yield a proved lazy window after only its causally required prefix."""
 
-    if source.meta.get("workload") != "gap_bc":
-        raise ReplayError("bounded GAP BC partition received another workload")
+    workload = source.meta.get("workload")
     phase_invocations = tuple(
         invocation for invocation in source.invocations
         if invocation.phase == phase
     )
-    if not phase_invocations or any(
-        invocation.kernel not in {
-            "gap_bc_bfs_level", "gap_bc_reverse_level"
-        }
-        for invocation in phase_invocations
-    ):
-        raise ReplayError("bounded GAP BC phase is not depth compact")
+    if workload == "gap_bc":
+        if not phase_invocations or any(
+            invocation.kernel not in {
+                "gap_bc_bfs_level", "gap_bc_reverse_level"
+            }
+            for invocation in phase_invocations
+        ):
+            raise ReplayError("bounded GAP BC phase is not depth compact")
+        expansion_mode = "bounded-gap-bc"
+    elif workload == "mcf":
+        if len(phase_invocations) != 1 or any(
+            invocation.kernel != "mcf_pricing_window"
+            for invocation in phase_invocations
+        ):
+            raise ReplayError("bounded MCF phase is not one pricing window")
+        expansion_mode = "bounded-mcf"
+    else:
+        raise ReplayError("bounded lazy partition received another workload")
     phase_items = sum(row.work_items for row in phase_invocations)
     if not (
         0 <= window.warmup_start < window.measure_start
         < window.measure_stop <= phase_items
     ):
-        raise ReplayError("bounded GAP BC window coordinates are invalid")
+        raise ReplayError("bounded lazy window coordinates are invalid")
     dynamic_initial = {}
     fixed_initial = {}
     expanded = 0
@@ -248,7 +258,15 @@ def _partition_bc_lazy_window(source, phase, window, state):
     state["phase_items"] = phase_items
     state["dynamic_initial"] = dynamic_initial
     state["fixed_initial"] = fixed_initial
-    state["expansion_mode"] = "bounded-gap-bc"
+    state["expansion_mode"] = expansion_mode
+
+
+def _partition_bc_lazy_window(source, phase, window, state):
+    """Compatibility wrapper for the bounded GAP BC partition."""
+
+    yield from _partition_sliceable_lazy_window(
+        source, phase, window, state
+    )
 
 
 def _write_segment_payload(root, operations, *, label="selected timing window"):
@@ -542,9 +560,9 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
             work_items=phase_items, window_index=window_index,
         )
 
-        if source.meta.get("workload") == "gap_bc":
+        if source.meta.get("workload") in {"gap_bc", "mcf"}:
             def partitioned_operations():
-                yield from _partition_bc_lazy_window(
+                yield from _partition_sliceable_lazy_window(
                     source, phase, window, state
                 )
         else:

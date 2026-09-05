@@ -444,8 +444,9 @@ AtomicSimpleCPU::writeMem(uint8_t *data, unsigned size, Addr addr,
 
     if (data == NULL) {
         assert(size <= 64);
-        assert(flags & Request::STORE_NO_DATA);
-        // This must be a cache block cleaning request
+        assert(flags & Request::STORE_NO_DATA || flags & Request::NO_ACCESS);
+        // Cache cleaning and address-check requests intentionally carry no
+        // store payload. NO_ACCESS still performs translation below.
         data = zero_array;
     }
 
