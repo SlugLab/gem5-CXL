@@ -744,6 +744,11 @@ class MatchedBreadthGem5Test(unittest.TestCase):
                 window_index=0, outdir=self.root / "pagerank-materialized",
             )
         bundle = canonical.read_bundle(materialized.root)
+        self.assertEqual(bundle.meta["execution_phase_ids"], [1, 2])
+        self.assertEqual(
+            list(dict.fromkeys(operation.phase for operation in bundle.operations)),
+            [1, 2],
+        )
         initial_map = replay._write_initial_memory_map(
             bundle, materialized.root, self.root / "pagerank-initial-map.txt"
         )
@@ -770,7 +775,7 @@ class MatchedBreadthGem5Test(unittest.TestCase):
             self.fail(f"PageRank window replay failed: {error.stderr.strip()}")
         value = json.loads(result.read_text(encoding="utf-8"))
         self.assertEqual(value["verification"], "pass")
-        self.assertEqual(value["host_region_entry_count"], 1)
+        self.assertEqual(value["host_region_entry_count"], 2)
 
     def test_eager_warmup_reads_snapshot_of_earlier_measured_store(self):
         operations = (

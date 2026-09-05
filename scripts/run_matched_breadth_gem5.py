@@ -185,6 +185,7 @@ def _partition_bc_lazy_window(source, phase, window, state):
     fixed_initial = {}
     expanded = 0
     phase_base = 0
+    selected_invocations = 0
     first_phase_ordinal = phase_invocations[0].ordinal
 
     def consume(mapped, invocation, operations, *, selected, base=0):
@@ -197,7 +198,7 @@ def _partition_bc_lazy_window(source, phase, window, state):
                 global_item = phase_base + operation.work_item
                 _remember_initial(dynamic_initial, operation)
                 yield False, dataclasses.replace(
-                    operation,
+                    _stage_dynamic_operation(state, operation),
                     work_item=global_item - window.warmup_start,
                 )
 
@@ -210,6 +211,9 @@ def _partition_bc_lazy_window(source, phase, window, state):
             if invocation_stop <= window.warmup_start:
                 lazy_registry.fast_forward(mapped, invocation)
             elif invocation_start < window.measure_stop:
+                if selected_invocations:
+                    _advance_execution_phase(state)
+                selected_invocations += 1
                 local_start = max(
                     0, window.warmup_start - invocation_start
                 )
@@ -418,6 +422,21 @@ def _remember_initial(words, operation, *, store_result_visible=False):
     words[operation.address] = (bits, initial)
 
 
+def _advance_execution_phase(state):
+    execution_phase = state.get("execution_phase", 0) + 1
+    if execution_phase >= 1 << 16:
+        raise ReplayError("materialized execution phase exceeds uint16")
+    state["execution_phase"] = execution_phase
+
+
+def _stage_dynamic_operation(state, operation):
+    execution_phase = state.get("execution_phase", 0)
+    phases = state.setdefault("execution_phase_ids", [])
+    if not phases or phases[-1] != execution_phase:
+        phases.append(execution_phase)
+    return dataclasses.replace(operation, phase=execution_phase)
+
+
 def _eager_initial_word(bundle, root, address, bits):
     width = bits // 8
     for record in bundle.meta.get("initial_memory", {}).values():
@@ -466,6 +485,8 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                 if operation.opcode in {
                     canonical.Opcode.BARRIER, canonical.Opcode.COMMIT,
                 }:
+                    if operation.opcode == canonical.Opcode.BARRIER:
+                        _advance_execution_phase(state)
                     state["fixed"] += 1
                     _remember_initial(fixed_initial, operation)
                     yield True, operation
@@ -498,7 +519,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                             ))
                         dynamic_initial[operation.address] = value
                     yield False, dataclasses.replace(
-                        operation,
+                        _stage_dynamic_operation(state, operation),
                         work_item=operation.work_item - window.warmup_start,
                     )
                 if operation.opcode.name.startswith("STORE_"):
@@ -554,6 +575,8 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                                 canonical.Opcode.BARRIER,
                                 canonical.Opcode.COMMIT,
                             }:
+                                if operation.opcode == canonical.Opcode.BARRIER:
+                                    _advance_execution_phase(state)
                                 state["fixed"] += 1
                                 _remember_initial(fixed_initial, operation)
                                 yield True, operation
@@ -576,7 +599,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
                                     store_result_visible=True,
                                 )
                                 yield False, dataclasses.replace(
-                                    operation,
+                                    _stage_dynamic_operation(state, operation),
                                     work_item=(
                                         global_item - window.warmup_start
                                     ),
@@ -631,6 +654,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         "measure_stop": window.measure_stop,
         "measure_start_item": warmup_items,
         "fixed_event_records": state["fixed"],
+        "execution_phase_ids": state.get("execution_phase_ids", []),
         "trace_path": "trace.bin",
         "trace_sha256": trace_sha256,
         "trace_record_bytes": canonical.TRACE_STRUCT.size,
@@ -647,6 +671,7 @@ def materialize_window_trace(trace, *, manifest, phase, window_index, outdir):
         "trace_sha256": fixed_trace_sha256,
         "trace_records": fixed_trace_records,
         "fixed_component": True,
+        "execution_phase_ids": [phase],
         "initial_memory": state.get(
             "fixed_initial_memory", meta["initial_memory"]
         ),
@@ -747,6 +772,27 @@ def load_prepared_window_trace(dynamic_root, fixed_root):
         raise ReplayError("prepared window shape is invalid")
     selected_items = record["warmup_items"] + record["measured_items"]
     phases = dynamic.meta.get("phases")
+    execution_phase_ids = dynamic.meta.get(
+        "execution_phase_ids", [record["phase"]]
+    )
+    if (
+        not isinstance(execution_phase_ids, list)
+        or not execution_phase_ids
+        or len(execution_phase_ids) != len(set(execution_phase_ids))
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            or value < 0 or value >= 1 << 16
+            for value in execution_phase_ids
+        )
+    ):
+        raise ReplayError("prepared window execution phases are invalid")
+    observed_execution_phases = []
+    for operation in dynamic.operations:
+        if (
+            not observed_execution_phases
+            or observed_execution_phases[-1] != operation.phase
+        ):
+            observed_execution_phases.append(operation.phase)
     expected_phase = {
         "id": record["phase"],
         "name": record["phase_name"],
@@ -759,7 +805,8 @@ def load_prepared_window_trace(dynamic_root, fixed_root):
         != record["measure_stop"] - record["measure_start"]
         or phases != [expected_phase]
         or not dynamic.operations
-        or any(operation.phase != record["phase"]
+        or observed_execution_phases != execution_phase_ids
+        or any(operation.phase not in execution_phase_ids
                or operation.work_item >= selected_items
                for operation in dynamic.operations)
         or len(fixed.operations) != record["fixed_event_records"]

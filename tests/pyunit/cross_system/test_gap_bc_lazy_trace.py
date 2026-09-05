@@ -298,6 +298,10 @@ class GapBCLazyTraceTest(unittest.TestCase):
         fixed = [operation for is_fixed, operation in rows if is_fixed]
         self.assertTrue(dynamic)
         self.assertEqual({row.work_item for row in dynamic}, {0, 1})
+        self.assertEqual(state["execution_phase_ids"], [0, 1])
+        self.assertEqual(
+            list(dict.fromkeys(row.phase for row in dynamic)), [0, 1]
+        )
         self.assertEqual(len(fixed), 6)
         self.assertEqual(state["phase_items"], 4)
         self.assertEqual(state["expansion_mode"], "bounded-gap-bc")
