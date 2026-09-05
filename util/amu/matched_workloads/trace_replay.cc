@@ -1221,20 +1221,38 @@ buildPhases(const std::vector<TraceRecord> &records)
 }
 
 std::unordered_map<uint64_t, uint64_t>
+buildPreviousStores(const std::vector<TraceRecord> &records)
+{
+    std::unordered_map<uint64_t, uint64_t> previous;
+    std::unordered_map<uint64_t, uint64_t> lastStore;
+    for (const auto &record : records) {
+        const auto opcode = static_cast<Opcode>(record.opcode);
+        if (!Memory::isLoad(opcode) && !Memory::isStore(opcode))
+            continue;
+        const auto found = lastStore.find(record.address);
+        if (found != lastStore.end())
+            previous.emplace(record.sequence, found->second);
+        if (Memory::isStore(opcode))
+            lastStore[record.address] = record.sequence;
+    }
+    return previous;
+}
+
+std::unordered_map<uint64_t, uint64_t>
 buildPreviousStores(const std::vector<Phase> &phases,
                     const std::vector<TraceRecord> &records)
 {
-    std::unordered_set<size_t> selected;
+    std::vector<uint8_t> selected(records.size(), 0);
     for (const auto &phase : phases) {
         for (const auto &group : phase.groups) {
-            selected.insert(
-                group.recordIndices.begin(), group.recordIndices.end());
+            for (const size_t index : group.recordIndices)
+                selected[index] = 1;
         }
     }
     std::unordered_map<uint64_t, uint64_t> previous;
     std::unordered_map<uint64_t, uint64_t> lastStore;
     for (size_t index = 0; index < records.size(); ++index) {
-        if (selected.count(index) == 0)
+        if (!selected[index])
             continue;
         const auto &record = records[index];
         const auto opcode = static_cast<Opcode>(record.opcode);
@@ -1986,7 +2004,7 @@ main(int argc, char **argv)
             outputBoundaries, records.size());
         writeAllocationMarker(memory.allocatedBytes());
         const auto phases = buildPhases(records);
-        const auto previousStore = buildPreviousStores(phases, records);
+        const auto previousStore = buildPreviousStores(records);
         std::unordered_map<uint64_t, size_t> commitSlots;
         size_t commitCount = 0;
         for (const auto &record : records) {
@@ -2005,13 +2023,13 @@ main(int argc, char **argv)
             const auto measured = selectGroups(phases, measureStartItem, false);
             if (measured.empty())
                 throw std::runtime_error("window measured range is empty");
+            const auto warmupPreviousStore =
+                buildPreviousStores(warmup, records);
 #ifndef TRACE_REPLAY_NATIVE
             m5_work_begin(selectedPhase, windowIndex);
             warmWorkerThreads();
 #endif
             if (!warmup.empty()) {
-                const auto warmupPreviousStore =
-                    buildPreviousStores(warmup, records);
                 executeTrace(system, warmup, records, memory, dependencies,
                              warmupPreviousStore, commitSlots, commits);
             }

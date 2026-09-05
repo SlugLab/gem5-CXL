@@ -1409,6 +1409,18 @@ class MatchedBreadthGem5Test(unittest.TestCase):
         self.assertLess(flush, execute)
         self.assertIn('"clflush (%0)"', source)
 
+    def test_window_dependency_index_is_built_before_roi_without_hash_set(self):
+        source = replay.SOURCE.read_text(encoding="utf-8")
+        helper = source[
+            source.index("buildPreviousStores(const std::vector<Phase>"):
+            source.index("std::vector<Phase>\nbuildOrderedPhases")
+        ]
+        self.assertIn("std::vector<uint8_t> selected", helper)
+        self.assertNotIn("std::unordered_set<size_t> selected", helper)
+        warmup_dependencies = source.index("warmupPreviousStore")
+        work_begin = source.index("m5_work_begin(selectedPhase, windowIndex);")
+        self.assertLess(warmup_dependencies, work_begin)
+
     def test_amu_rejects_per_request_drain_and_bad_counters(self):
         clean = {
             "verification": "pass",
