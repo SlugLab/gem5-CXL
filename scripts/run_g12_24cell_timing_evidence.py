@@ -755,7 +755,6 @@ def main(argv=None) -> int:
     root = options.root.resolve()
     try:
         require_free_space(root)
-        require_free_space(REPO)
         registry_value = _load_json(options.prepared, "prepared G12 registry")
         input_manifest = _load_json(options.inputs, "G12 input manifest")
         validate_input_manifest(input_manifest, registry_value)
@@ -865,4 +864,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

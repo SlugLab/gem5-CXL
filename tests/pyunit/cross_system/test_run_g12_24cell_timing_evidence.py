@@ -4,6 +4,9 @@
 import dataclasses
 import hashlib
 import json
+import argparse
+import contextlib
+import io
 import threading
 import tempfile
 import unittest
@@ -383,6 +386,25 @@ class RunG1224CellTimingEvidenceTest(unittest.TestCase):
             2,
         )
 
+    def test_main_checks_space_only_for_campaign_root(self):
+        campaign = self.root / "campaign-on-output-filesystem"
+        options = argparse.Namespace(
+            root=campaign,
+            prepared=self.root / "registry.json",
+            inputs=self.root / "inputs.json",
+        )
+        with mock.patch.object(
+            runner, "parse_args", return_value=options
+        ), mock.patch.object(
+            runner, "require_free_space"
+        ) as checked, mock.patch.object(
+            runner,
+            "_load_json",
+            side_effect=runner.CampaignError("stop after space preflight"),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([]), 1)
+        checked.assert_called_once_with(campaign.resolve())
+
 if __name__ == "__main__":
     unittest.main()
-
