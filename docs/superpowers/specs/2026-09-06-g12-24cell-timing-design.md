@@ -93,6 +93,14 @@ input SHA-256. MCF, AMG Gather, LULESH Scatter, and NPB CG reuse their current
 accepted immutable input and trace records. Reuse does not permit reuse of any
 old timing result: host-inline and CIRA are rerun at every latency.
 
+The current broad shared input catalog contains the frozen G12 graph but its
+`workloads.pr_spmv` selection still names G20. The G12 preparer therefore also
+writes a canonical `inputs.json` inside the fresh registry root. It contains
+exactly the six campaign workloads, selects the frozen G12 graph for PageRank
+and BC, and copies the four accepted non-graph input records with their source
+hashes. The G12 runner validates this manifest against the registry instead of
+merely hashing the broad catalog.
+
 The registry contains exactly 24 cells. It has schema 1, status `verified`, and
 a graph record with scale 12. Validation rejects scale 4, 14, or 20; a changed
 graph or CSR; a graph/trace mismatch; any missing workload or latency; and any
@@ -168,6 +176,7 @@ CSV contains exactly 24 rows and includes:
 - workload, latency, graph scale, and input SHA-256;
 - host cumulative ticks, nanoseconds, and entry count;
 - CIRA global and per-core busy ticks and nanoseconds;
+- exact host-ticks divided by CIRA-busy-ticks speedup after both stages pass;
 - global and per-core issued/completed counts;
 - PageRank descriptor compute/stall aggregate and per-core fields;
 - max-over-cores PageRank compute-plus-stall ticks;
