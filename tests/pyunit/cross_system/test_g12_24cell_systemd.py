@@ -11,7 +11,13 @@ class G1224CellSystemdTest(unittest.TestCase):
         self.assertIn("Restart=on-abnormal", text)
         self.assertIn("WantedBy=multi-user.target", text)
         self.assertIn("scripts/run_g12_24cell_timing_evidence.py", text)
-        self.assertIn("--jobs 2", text)
+        self.assertIn(
+            "--root /mnt/disk0/gem5-CXL-eval/"
+            "g12-timing-24cell-20260906-qualification-r1",
+            text,
+        )
+        self.assertIn("--jobs 1", text)
+        self.assertNotIn("g12-timing-24cell-20260906-formal-r1", text)
         self.assertIn("state.json", text)
         self.assertIn("--resume", text)
         self.assertNotIn("checkpoint", text.lower())
