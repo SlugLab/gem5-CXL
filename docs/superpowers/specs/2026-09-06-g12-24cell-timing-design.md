@@ -133,10 +133,13 @@ computed only after the host and CIRA evidence for a cell both pass.
 
 ## Campaign Identity and Resume
 
-The G12 state records the repository commit and hashes of the G12 runner and
-preparer, input manifest, prepared registry, replay binary, gem5 binary, m5
-library, gem5 configuration, and all four calibration records. A G14 prepared
-registry cannot have the same identity and is rejected before execution.
+The G12 state records the repository commit; canonical input-manifest and
+prepared-registry paths; and hashes of the G12 runner and preparer, input
+manifest, prepared registry, replay binary, gem5 binary, m5 library, gem5
+configuration, and all four calibration records. The paths allow an independent
+publisher to re-open the source identities, while the hashes detect changed
+content. A G14 prepared registry cannot have the same identity and is rejected
+before execution.
 
 Each stage writes to a monotonically numbered fresh attempt directory. Evidence
 is committed atomically only after its validation passes. Resume skips a
