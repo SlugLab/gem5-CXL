@@ -57,10 +57,11 @@ directed edges.
 
 ## Separate G12 Programs
 
-Two G12-specific entry points are added:
+Three G12-specific entry points are added:
 
 - `scripts/prepare_g12_24cell_registry.py`; and
-- `scripts/run_g12_24cell_timing_evidence.py`.
+- `scripts/run_g12_24cell_timing_evidence.py`; and
+- `scripts/publish_g12_24cell_timing_evidence.py`.
 
 They may reuse stable trace, timing, hashing, and evidence helper modules, but
 must not call a G14 entry point or accept a G14 registry. Their user-facing
@@ -69,11 +70,16 @@ messages, validation errors, state identity, and output names say G12.
 The existing files below are not behaviorally modified:
 
 - `scripts/prepare_g14_24cell_registry.py`; and
-- `scripts/run_24cell_timing_evidence.py`.
+- `scripts/run_24cell_timing_evidence.py`; and
+- `scripts/publish_24cell_timing_evidence.py`.
 
 This deliberate duplication prevents a G12 speed experiment from changing the
 accepted G14 evidence contract. Any common helper reused by both paths must
 retain its current interface and behavior.
+
+The G12 publisher imports only the G12 runner identity and validation helpers.
+Its README and manifest label the source as G12, and it rejects a G14 campaign
+before copying any evidence into a publication root.
 
 ## Registry Preparation
 
