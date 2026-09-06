@@ -12,6 +12,21 @@ class G1224CellSystemdTest(unittest.TestCase):
         self.assertIn("WantedBy=multi-user.target", text)
         self.assertIn("scripts/run_g12_24cell_timing_evidence.py", text)
         self.assertIn(
+            "WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/"
+            "g12-qualification-runtime-fd25928",
+            text,
+        )
+        self.assertIn(
+            "--gem5 /home/victoryang00/gem5-CXL/.worktrees/"
+            "evidence-24cell-timing-contract/build/X86/gem5.opt",
+            text,
+        )
+        self.assertIn(
+            "--m5-library /home/victoryang00/gem5-CXL/.worktrees/"
+            "evidence-24cell-timing-contract/util/m5/build/x86/out/libm5.a",
+            text,
+        )
+        self.assertIn(
             "--root /mnt/disk0/gem5-CXL-eval/"
             "g12-timing-24cell-20260906-qualification-r1",
             text,
