@@ -8,6 +8,7 @@ from unittest import mock
 
 from scripts import canonical_work_trace as canonical
 from scripts import prepare_g12_24cell_registry as prepare
+from scripts import pr_spmv_g12_lazy_trace as pagerank_g12
 from scripts import timing_evidence_24cell as evidence
 
 
@@ -182,6 +183,9 @@ class PrepareG1224CellRegistryTest(unittest.TestCase):
             f"{workload}:{latency}"
             for workload, latency in evidence.COORDINATES
         })
+
+    def test_preparer_uses_independent_g12_pagerank_helper(self):
+        self.assertIs(prepare.pr_spmv, pagerank_g12)
 
     def test_registry_rejects_non_g12_scale(self):
         for scale in (4, 14, 20):

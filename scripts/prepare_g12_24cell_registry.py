@@ -17,14 +17,14 @@ try:
     from scripts import canonical_work_trace as canonical
     from scripts import gap_bc_lazy_trace as gap_bc
     from scripts import lazy_work_trace as lazy
-    from scripts import pr_spmv_lazy_trace as pr_spmv
+    from scripts import pr_spmv_g12_lazy_trace as pr_spmv
     from scripts import stratified_timing as timing
     from scripts import timing_evidence_24cell as evidence
 except ImportError:
     import canonical_work_trace as canonical
     import gap_bc_lazy_trace as gap_bc
     import lazy_work_trace as lazy
-    import pr_spmv_lazy_trace as pr_spmv
+    import pr_spmv_g12_lazy_trace as pr_spmv
     import stratified_timing as timing
     import timing_evidence_24cell as evidence
 
