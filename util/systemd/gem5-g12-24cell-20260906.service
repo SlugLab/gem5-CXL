@@ -1,0 +1,17 @@
+[Unit]
+Description=G12 24-cell host-inline and CIRA timing campaign
+After=local-fs.target
+RequiresMountsFor=/mnt/disk0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/evidence-24cell-timing-contract
+Environment=PYTHONUNBUFFERED=1
+Restart=on-abnormal
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=5min
+ExecStart=/bin/bash -lc 'set --; if test -f /mnt/disk0/gem5-CXL-eval/g12-timing-24cell-20260906-formal-r1/state.json; then set -- --resume; fi; exec /opt/miniconda3/bin/python3 scripts/run_g12_24cell_timing_evidence.py --inputs /mnt/disk0/gem5-CXL-eval/g12-timing-24cell-inputs-20260906/inputs.json --prepared /mnt/disk0/gem5-CXL-eval/g12-timing-24cell-inputs-20260906/registry.json --calibration /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/formal-window-gate-r15/calibration/200ns/calibration.json --calibration /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/formal-window-gate-r15/calibration/500ns/calibration.json --calibration /mnt/disk0/gem5-CXL-eval/pr-offload-formal-a1e45e2d79-r13/qualification/primary/m2ndp/calibration/calibration.json --calibration /mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/formal-window-gate-r15/calibration/2us/calibration.json --gem5 build/X86/gem5.opt --m5-library util/m5/build/x86/out/libm5.a --root /mnt/disk0/gem5-CXL-eval/g12-timing-24cell-20260906-formal-r1 --jobs 2 "$@"'
+
+[Install]
+WantedBy=multi-user.target
