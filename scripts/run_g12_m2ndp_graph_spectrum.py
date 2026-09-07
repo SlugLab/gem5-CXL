@@ -187,6 +187,8 @@ def validate_evidence(row, workload, latency):
         or completed != expected
     ):
         raise SpectrumError("NDPSim launch count differs")
+    if workload == "gap_bc" and expected != 1:
+        raise SpectrumError("GAP BC evidence is not the selected BFS window")
     cycles = row.get("cycles")
     if not isinstance(cycles, int) or isinstance(cycles, bool) or cycles <= 0:
         raise SpectrumError("NDPSim cycle count is invalid")
@@ -236,8 +238,15 @@ def _provenance(trace_root, input_sha256, latency):
     manifest = load_json(template / "package.json")
     record = manifest.get("provenance", {})
     config = template / manifest["timing_config"]["path"]
+    trace_root = Path(trace_root)
+    if (trace_root / "trace.v2.json").is_file():
+        trace_sha256 = sha256_file(trace_root / "trace.v2.json")
+    else:
+        trace_sha256 = load_json(trace_root / "trace.meta.json").get(
+            "trace_sha256"
+        )
     return m2ndp.PackageProvenance(
-        trace_sha256=sha256_file(Path(trace_root) / "trace.v2.json"),
+        trace_sha256=trace_sha256,
         input_sha256=input_sha256,
         funcsim_path=record["funcsim_path"],
         ndpsim_path=record["ndpsim_path"],
@@ -278,6 +287,48 @@ def _run_lazy_cell(source, output, workload, latency, input_sha256):
             cxl_link_delay=latency,
         )
     return validate_evidence(evidence, workload, latency)
+
+
+def _prepare_gap_bc_window(cell, source, output):
+    """Materialize registry-selected phase 302/window 0, once for all links."""
+    from scripts import run_matched_breadth_gem5 as windowing
+
+    record = cell.get("window_manifest")
+    if not isinstance(record, dict):
+        raise SpectrumError("GAP BC timing-window manifest is missing")
+    manifest = Path(record.get("path", ""))
+    if not manifest.is_file() or sha256_file(manifest) != record.get("sha256"):
+        raise SpectrumError("GAP BC timing-window manifest SHA-256 differs")
+    if cell.get("phase") != 302 or cell.get("window_index") != 0:
+        raise SpectrumError("GAP BC selected BFS window identity differs")
+
+    selected = Path(output) / "gap_bc/_shared/bfs-window0"
+    meta_path = selected / "trace.meta.json"
+    if not meta_path.is_file():
+        if selected.parent.exists():
+            raise SpectrumError(
+                f"partial GAP BC selected-window package exists: {selected.parent}"
+            )
+        selected.parent.mkdir(parents=True)
+        windowing.materialize_window_trace(
+            source,
+            manifest=manifest,
+            phase=302,
+            window_index=0,
+            outdir=selected,
+        )
+    meta = load_json(meta_path)
+    if (
+        meta.get("source_trace_sha256") != cell["trace"]["sha256"]
+        or meta.get("window_index") != 0
+        or meta.get("warmup_start") != 7
+        or meta.get("measure_start") != 11
+        or meta.get("measure_stop") != 15
+        or meta.get("measure_start_item") != 4
+        or meta.get("trace_records", 0) <= 0
+    ):
+        raise SpectrumError("GAP BC selected BFS window contract differs")
+    return selected
 
 
 def _native_pr_resume_command():
@@ -543,6 +594,7 @@ def run_cell(workload, latency, *, inputs, registry, output):
         raise SpectrumError(f"G12 {workload} trace SHA-256 differs")
     if workload == "pr_spmv":
         return _run_native_pr_cell(Path(output).resolve(), latency)
+    trace = _prepare_gap_bc_window(source, trace, Path(output).resolve())
     return _run_lazy_cell(
         trace, Path(output).resolve(), workload, latency,
         source["input_sha256"],

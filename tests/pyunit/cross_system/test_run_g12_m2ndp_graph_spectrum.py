@@ -107,6 +107,21 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
     def test_cell_serialization_does_not_disable_partition_concurrency(self):
         self.assertEqual(runner.PR_NDPSIM_SERIAL_LAUNCH, "false")
 
+    def test_gap_bc_cell_is_one_registry_selected_bfs_window(self):
+        row = {
+            "status": "pass",
+            "verification": "pass",
+            "bit_exact": True,
+            "memory_match": "pass",
+            "cxl_link_delay": "200ns",
+            "completed_launches": 13,
+            "expected_launches": 13,
+            "cycles": 10,
+            "calibration": {"passed": True, "cxl_delay": "200ns"},
+        }
+        with self.assertRaisesRegex(runner.SpectrumError, "selected BFS window"):
+            runner.validate_evidence(row, "gap_bc", "200ns")
+
 
 if __name__ == "__main__":
     unittest.main()
