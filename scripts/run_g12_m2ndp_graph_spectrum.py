@@ -360,9 +360,12 @@ def _prepare_native_pr_trial(output):
         encoding="utf-8"
     ).splitlines()
     measured_names = [name for name in timing_names if "TRIAL1" in name]
+    completed_launches = metadata.get("funcsim_launches")
     if (
         len(timing_names) != metadata.get("ndpsim_launches")
         or len(measured_names) * 2 != len(timing_names)
+        or not isinstance(completed_launches, int)
+        or completed_launches <= len(measured_names)
         or not measured_names
         or not measured_names[0].startswith("K0_INIT_TRIAL1")
         or "ITER19" not in measured_names[-1]
@@ -376,7 +379,7 @@ def _prepare_native_pr_trial(output):
         if (
             manifest.get("graph_sha256") != G12_GRAPH_SHA256
             or manifest.get("source_trace_sha256") != source_hash
-            or manifest.get("dynamic_launches") != len(measured_names)
+            or manifest.get("dynamic_launches") != completed_launches
         ):
             raise SpectrumError("existing PageRank measured package differs")
         return shared / "trace", manifest
@@ -409,7 +412,8 @@ def _prepare_native_pr_trial(output):
         "source_trace_sha256": source_hash,
         "funcsim_bit_exact": True,
         "funcsim_output_sha256": expected_output,
-        "dynamic_launches": len(measured_names),
+        "timing_groups": len(measured_names),
+        "dynamic_launches": completed_launches,
         "timing_kernel_list_sha256": sha256_file(kernel_list),
         "timing_input_sha256": sha256_file(first_input),
         "timing_output_sha256": sha256_file(final_output),
