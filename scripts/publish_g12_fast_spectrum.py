@@ -338,6 +338,18 @@ def publish(rows, output):
     raw = output / "g12-fast-spectrum-raw.csv"
     if complete:
         atomic_csv(raw, rows)
+    measured_rows = [row for row in rows if row["system"] == "m2ndp"]
+    measured_complete = (
+        len(measured_rows) == 8
+        and all(
+            row["status"] == "pass"
+            and row["measurement_kind"] == "measured"
+            for row in measured_rows
+        )
+    )
+    measured_raw = output / "g12-m2ndp-measured-raw.csv"
+    if measured_complete:
+        atomic_csv(measured_raw, measured_rows)
     manifest = {
         "schema": 1,
         "status": "accepted" if complete else "partial",
@@ -348,6 +360,12 @@ def publish(rows, output):
         "raw": (
             {"path": str(raw), "sha256": sha256_file(raw)} if complete else None
         ),
+        "m2ndp_measured_raw": {
+            "status": "accepted" if measured_complete else "partial",
+            "row_count": sum(row["status"] == "pass" for row in measured_rows),
+            "path": str(measured_raw),
+            "sha256": sha256_file(measured_raw) if measured_complete else "",
+        },
     }
     atomic_json(output / "g12-fast-spectrum-manifest.json", manifest)
     return manifest

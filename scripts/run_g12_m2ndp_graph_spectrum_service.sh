@@ -42,4 +42,7 @@ done
 python3 "$repo/scripts/publish_g12_fast_spectrum.py" \
     --source "$output" \
     --output "$output/publication"
+python3 "$repo/scripts/generate_g12_m2ndp_latency_spectrum.py" \
+    --input "$output/publication/g12-m2ndp-measured-raw.csv" \
+    --output "$output/publication/g12-m2ndp-latency-spectrum"
 echo G12_GRAPH_M2NDP_ALL_PASS

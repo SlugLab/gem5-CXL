@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts import publish_g12_fast_spectrum as publisher
 
@@ -83,6 +85,18 @@ class PublishG12FastSpectrumTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(publisher.PublishError, "anchor graph identity differs"):
             publisher.build_rows(spec)
+
+    def test_eight_measured_m2ndp_rows_publish_when_anchors_are_pending(self):
+        spec = copy.deepcopy(self.spec)
+        spec["anchors"] = {}
+        spec["models"] = {}
+        rows = publisher.build_rows(spec)
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = publisher.publish(rows, Path(temporary))
+            record = manifest["m2ndp_measured_raw"]
+            self.assertEqual(record["status"], "accepted")
+            self.assertEqual(record["row_count"], 8)
+            self.assertTrue(Path(record["path"]).is_file())
 
 
 if __name__ == "__main__":

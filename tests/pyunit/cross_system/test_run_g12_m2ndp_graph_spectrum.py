@@ -103,6 +103,7 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
         self.assertIn("pr_spmv gap_bc", script)
         self.assertIn("200ns 500ns 1us 2us", script)
         self.assertIn("publish_g12_fast_spectrum.py", script)
+        self.assertIn("generate_g12_m2ndp_latency_spectrum.py", script)
 
     def test_cell_serialization_does_not_disable_partition_concurrency(self):
         self.assertEqual(runner.PR_NDPSIM_SERIAL_LAUNCH, "false")
