@@ -197,6 +197,7 @@ def read_cell(root, workload, latency):
 
 def parse_service_unit(path=SERVICE_UNIT):
     parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
     try:
         with Path(path).open(encoding="utf-8") as stream:
             parser.read_file(stream)

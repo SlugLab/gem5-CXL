@@ -93,6 +93,14 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
         with self.assertRaisesRegex(runner.SpectrumError, "launch count"):
             runner.validate_evidence(row, "gap_bc", "1us")
 
+    def test_service_is_sequential_and_has_no_start_timeout(self):
+        unit = runner.parse_service_unit(runner.SERVICE_UNIT)
+        self.assertEqual(unit["Service"]["TimeoutStartSec"], "infinity")
+        script = runner.SERVICE_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("&", script)
+        self.assertIn("pr_spmv gap_bc", script)
+        self.assertIn("200ns 500ns 1us 2us", script)
+
 
 if __name__ == "__main__":
     unittest.main()

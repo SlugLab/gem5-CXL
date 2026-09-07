@@ -1,0 +1,17 @@
+[Unit]
+Description=Sequential strict G12 PageRank and GAP BC M2NDP spectrum
+After=local-fs.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/victoryang00/gem5-CXL/.worktrees/evidence-24cell-timing-contract
+ExecStart=/bin/bash /home/victoryang00/gem5-CXL/.worktrees/evidence-24cell-timing-contract/scripts/run_g12_m2ndp_graph_spectrum_service.sh
+Environment="OPENBLAS_NUM_THREADS=1" "OMP_NUM_THREADS=1"
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
