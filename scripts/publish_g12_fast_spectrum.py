@@ -275,7 +275,9 @@ def discover_spec(source=DEFAULT_SOURCE):
             measured[f"{workload}:{latency}"] = {
                 "status": "pass",
                 "cycles": value.get("cycles"),
-                "core_period_ns": value.get("core_period_ns", "0.5"),
+                "core_period_ns": value.get("calibration", {}).get(
+                    "core_period_ns", value.get("core_period_ns", "0.5")
+                ),
                 "entry_count": value.get("expected_launches", 1),
                 "selected_link_latency": value.get(
                     "calibration", {}
