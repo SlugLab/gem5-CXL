@@ -74,6 +74,7 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
             "expected_launches": 1,
             "cycles": 10,
             "calibration": {"passed": True, "cxl_delay": "200ns"},
+            "serial_launch": False,
         }
         with self.assertRaisesRegex(runner.SpectrumError, "memory match"):
             runner.validate_evidence(row, "pr_spmv", "200ns")
@@ -89,6 +90,7 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
             "expected_launches": 3,
             "cycles": 10,
             "calibration": {"passed": True, "cxl_delay": "1us"},
+            "serial_launch": False,
         }
         with self.assertRaisesRegex(runner.SpectrumError, "launch count"):
             runner.validate_evidence(row, "gap_bc", "1us")
@@ -101,6 +103,9 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
         self.assertIn("pr_spmv gap_bc", script)
         self.assertIn("200ns 500ns 1us 2us", script)
         self.assertIn("publish_g12_fast_spectrum.py", script)
+
+    def test_cell_serialization_does_not_disable_partition_concurrency(self):
+        self.assertEqual(runner.PR_NDPSIM_SERIAL_LAUNCH, "false")
 
 
 if __name__ == "__main__":

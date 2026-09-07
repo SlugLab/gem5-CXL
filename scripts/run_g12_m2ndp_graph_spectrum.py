@@ -39,6 +39,7 @@ G12_NODES = 4096
 G12_DIRECTED_EDGES = 96772
 WORKLOADS = ("pr_spmv", "gap_bc")
 LATENCIES = ("200ns", "500ns", "1us", "2us")
+PR_NDPSIM_SERIAL_LAUNCH = "false"
 
 REPO = Path(__file__).resolve().parents[1]
 INPUT_ROOT = Path(
@@ -167,6 +168,8 @@ def validate_evidence(row, workload, latency):
         raise SpectrumError("NDPSim memory match did not pass")
     if row.get("cxl_link_delay") != latency:
         raise SpectrumError("NDPSim latency identity differs")
+    if workload == "pr_spmv" and row.get("serial_launch") is not False:
+        raise SpectrumError("PageRank partition concurrency is disabled")
     calibration = row.get("calibration")
     if (
         not isinstance(calibration, dict)
@@ -482,7 +485,8 @@ def _run_native_pr_cell(output, latency):
         str(ndpsim), "--trace", str(trace),
         "--num_hosts", "1", "--num_m2ndps", "1",
         "--config", str(config), "--output", "ndpsim.out",
-        "--synthetic_memory", "false", "--serial_launch", "true",
+        "--synthetic_memory", "false",
+        "--serial_launch", PR_NDPSIM_SERIAL_LAUNCH,
     ]
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
         "w", encoding="utf-8"
@@ -514,6 +518,7 @@ def _run_native_pr_cell(output, latency):
         "core_period_ns": str(calibration["core_period_ns"]),
         "observed_core_period_ns": str(observed_period_ns),
         "cxl_link_delay": latency,
+        "serial_launch": False,
         "calibration": calibration,
         "scope": package["scope"],
         "graph_sha256": G12_GRAPH_SHA256,
