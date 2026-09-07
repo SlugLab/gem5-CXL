@@ -39,4 +39,7 @@ PY
     done
 done
 
-echo G12_GRAPH_SPECTRUM_ALL_PASS
+python3 "$repo/scripts/publish_g12_fast_spectrum.py" \
+    --source "$output" \
+    --output "$output/publication"
+echo G12_GRAPH_M2NDP_ALL_PASS

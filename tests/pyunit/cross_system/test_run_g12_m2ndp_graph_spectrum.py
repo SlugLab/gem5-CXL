@@ -100,6 +100,7 @@ class G12M2NDPGraphSpectrumTest(unittest.TestCase):
         self.assertNotIn("&", script)
         self.assertIn("pr_spmv gap_bc", script)
         self.assertIn("200ns 500ns 1us 2us", script)
+        self.assertIn("publish_g12_fast_spectrum.py", script)
 
 
 if __name__ == "__main__":
