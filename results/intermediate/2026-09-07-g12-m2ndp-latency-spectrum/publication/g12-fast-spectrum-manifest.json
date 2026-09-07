@@ -1,0 +1,18 @@
+{
+  "graph_sha256": "759003842b672ad90eabbd5b045980e9ddf43a95bffb01b318db7fc4b8b551f1",
+  "m2ndp_measured_raw": {
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/g12-graph-m2ndp-r1/publication/g12-m2ndp-measured-raw.csv",
+    "row_count": 8,
+    "sha256": "6e9e8d579838107cf07c45684179498ab5b8433c4820f5c16b8321c1612b3a9f",
+    "status": "accepted"
+  },
+  "passed_rows": 8,
+  "progress": {
+    "path": "/mnt/disk0/gem5-CXL-eval/cira-amu-m2ndp-spectrum/shared/g12-graph-m2ndp-r1/publication/g12-fast-spectrum-progress.csv",
+    "sha256": "0e444a47bc73b4a6c1298741a94fef01d106b78de05c25abb5552dcb0eaaa5b1"
+  },
+  "raw": null,
+  "row_count": 24,
+  "schema": 1,
+  "status": "partial"
+}
