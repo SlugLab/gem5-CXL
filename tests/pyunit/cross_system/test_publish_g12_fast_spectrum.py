@@ -15,6 +15,9 @@ class PublishG12FastSpectrumTest(unittest.TestCase):
                     "status": "pass",
                     "cycles": 100,
                     "core_period_ns": "0.5",
+                    "selected_link_latency": 1397,
+                    "calibration_residual_ns": "0.004",
+                    "evidence_path": f"/{workload}/{latency}/evidence.json",
                     "evidence_sha256": ("a" if workload == "pr_spmv" else "b") * 64,
                 }
         anchors = {}
@@ -28,6 +31,8 @@ class PublishG12FastSpectrumTest(unittest.TestCase):
                     "latency": "1us",
                     "time_ns": "1000",
                     "entry_count": 20,
+                    "compute_ticks_per_core": "10;11;12;13",
+                    "queue_stall_ticks_per_core": "1;2;3;4",
                     "evidence_sha256": "c" * 64,
                 }
                 models[workload][system] = {
@@ -52,6 +57,11 @@ class PublishG12FastSpectrumTest(unittest.TestCase):
             {"measured", "calibrated-derived"},
         )
         self.assertEqual(len(rows), 24)
+        m2ndp = next(row for row in rows if row["system"] == "m2ndp")
+        self.assertEqual(m2ndp["selected_link_latency"], "1397")
+        self.assertEqual(m2ndp["calibration_residual_ns"], "0.004")
+        cira = next(row for row in rows if row["system"] == "cira")
+        self.assertEqual(cira["compute_ticks_per_core"], "10;11;12;13")
 
     def test_missing_model_stays_pending(self):
         spec = copy.deepcopy(self.spec)

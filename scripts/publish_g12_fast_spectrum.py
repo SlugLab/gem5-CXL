@@ -82,10 +82,17 @@ def _pending(workload, latency, system, reason):
         "system": system,
         "status": "pending",
         "measurement_kind": "",
+        "graph_sha256": G12_GRAPH_SHA256,
         "time_ns": "",
+        "time_ms": "",
         "cycles": "",
         "core_period_ns": "",
         "entry_count": "",
+        "selected_link_latency": "",
+        "calibration_residual_ns": "",
+        "compute_ticks_per_core": "",
+        "queue_stall_ticks_per_core": "",
+        "evidence_path": "",
         "evidence_sha256": "",
         "model_sha256": "",
         "reason": reason,
@@ -125,10 +132,23 @@ def build_rows(spec):
                     "system": "m2ndp",
                     "status": "pass",
                     "measurement_kind": "measured",
+                    "graph_sha256": G12_GRAPH_SHA256,
                     "time_ns": _format_decimal(Decimal(cycles) * period),
+                    "time_ms": _format_decimal(
+                        Decimal(cycles) * period / Decimal(10**6)
+                    ),
                     "cycles": str(cycles),
                     "core_period_ns": _format_decimal(period),
                     "entry_count": str(evidence.get("entry_count", 1)),
+                    "selected_link_latency": str(
+                        evidence.get("selected_link_latency", "")
+                    ),
+                    "calibration_residual_ns": str(
+                        evidence.get("calibration_residual_ns", "")
+                    ),
+                    "compute_ticks_per_core": "",
+                    "queue_stall_ticks_per_core": "",
+                    "evidence_path": str(evidence.get("evidence_path", "")),
                     "evidence_sha256": digest,
                     "model_sha256": "",
                     "reason": "",
@@ -165,10 +185,21 @@ def build_rows(spec):
                         "system": system,
                         "status": "pass",
                         "measurement_kind": "measured",
+                        "graph_sha256": G12_GRAPH_SHA256,
                         "time_ns": _format_decimal(anchor_time),
+                        "time_ms": _format_decimal(anchor_time / Decimal(10**6)),
                         "cycles": "",
                         "core_period_ns": "",
                         "entry_count": str(entry_count),
+                        "selected_link_latency": "",
+                        "calibration_residual_ns": "",
+                        "compute_ticks_per_core": str(
+                            anchor.get("compute_ticks_per_core", "")
+                        ),
+                        "queue_stall_ticks_per_core": str(
+                            anchor.get("queue_stall_ticks_per_core", "")
+                        ),
+                        "evidence_path": str(anchor.get("evidence_path", "")),
                         "evidence_sha256": anchor_sha,
                         "model_sha256": "",
                         "reason": "",
@@ -196,10 +227,23 @@ def build_rows(spec):
                     "system": system,
                     "status": "pass",
                     "measurement_kind": "calibrated-derived",
+                    "graph_sha256": G12_GRAPH_SHA256,
                     "time_ns": _format_decimal(anchor_time * factor),
+                    "time_ms": _format_decimal(
+                        anchor_time * factor / Decimal(10**6)
+                    ),
                     "cycles": "",
                     "core_period_ns": "",
                     "entry_count": str(entry_count),
+                    "selected_link_latency": "",
+                    "calibration_residual_ns": "",
+                    "compute_ticks_per_core": str(
+                        anchor.get("compute_ticks_per_core", "")
+                    ),
+                    "queue_stall_ticks_per_core": str(
+                        anchor.get("queue_stall_ticks_per_core", "")
+                    ),
+                    "evidence_path": str(anchor.get("evidence_path", "")),
                     "evidence_sha256": anchor_sha,
                     "model_sha256": model_sha,
                     "reason": "",
@@ -233,6 +277,13 @@ def discover_spec(source=DEFAULT_SOURCE):
                 "cycles": value.get("cycles"),
                 "core_period_ns": value.get("core_period_ns", "0.5"),
                 "entry_count": value.get("expected_launches", 1),
+                "selected_link_latency": value.get(
+                    "calibration", {}
+                ).get("selected_link_latency", ""),
+                "calibration_residual_ns": value.get(
+                    "calibration", {}
+                ).get("residual_ns", ""),
+                "evidence_path": str(path.resolve()),
                 "evidence_sha256": sha256_file(path),
             }
     return {
